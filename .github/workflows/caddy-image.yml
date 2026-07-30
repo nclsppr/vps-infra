@@ -25,12 +25,22 @@ concurrency:
 
 jobs:
   verify:
-    name: Verify multi-architecture build
+    name: Verify ${{ matrix.architecture }} build
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,9 +66,6 @@ jobs:
             echo "module=${module}"
           } >>"${GITHUB_OUTPUT}"
 
-      - name: Enable multi-architecture emulation
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-
       - name: Configure Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -67,14 +74,14 @@ jobs:
         with:
           context: platform/caddy
           file: platform/caddy/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: false
           build-args: |
             CADDY_BUILDER_IMAGE=${{ steps.inputs.outputs.builder }}
             CADDY_RUNTIME_IMAGE=${{ steps.inputs.outputs.runtime }}
             CADDY_DNS_MODULE=${{ steps.inputs.outputs.module }}
-          cache-from: type=gha,scope=caddy-platform
-          cache-to: type=gha,mode=max,scope=caddy-platform-pr
+          cache-from: type=gha,scope=caddy-platform-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=caddy-platform-pr-${{ matrix.architecture }}
 
   publish:
     name: Publish immutable image
