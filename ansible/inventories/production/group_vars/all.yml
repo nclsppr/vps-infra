@@ -1,0 +1,72 @@
+---
+# Valeurs publiques et non sensibles. Les adresses et clés publiques réelles
+# sont fournies par l'inventaire local ou par un fichier --extra-vars externe.
+vps_supported_ubuntu_releases:
+  - "24.04"
+
+vps_hostname: "{{ inventory_hostname }}"
+vps_timezone: Europe/Paris
+vps_admin_user: vpsadmin
+vps_deploy_user: deploy
+vps_static_user: vps-static
+# Le changement de port exige une migration en deux connexions et n'est pas
+# simulé par cette première tranche. On reste explicitement sur le port 22.
+vps_ssh_port: 22
+
+# Ces listes vides font échouer le bootstrap tant qu'une vraie clé publique
+# n'est pas explicitement fournie. Une clé publique n'est pas un secret, mais
+# elle ne doit pas être inventée par l'automatisation.
+vps_admin_authorized_keys: []
+vps_deploy_authorized_keys: []
+vps_live_apply_enabled: false
+# SHA complet déjà fusionné dans origin/main. La convergence refuse toute
+# valeur vide, branche, tag ou commit hors de main.
+vps_infra_revision: ""
+
+vps_swap_size_mb: 2048
+vps_unattended_reboot: false
+vps_unattended_reboot_time: "04:30"
+
+vps_docker_apt_key_url: https://download.docker.com/linux/ubuntu/gpg
+vps_docker_apt_key_sha256: 1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570
+vps_docker_apt_key_fingerprint: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+# Vérifié le 30 juillet 2026 dans les index officiels Docker Noble, pour amd64
+# et arm64. Le rôle vérifie aussi la présence de chaque version via APT puis la
+# version réellement installée avec dpkg-query.
+vps_docker_packages:
+  - name: containerd.io
+    version: 2.2.6-1~ubuntu.24.04~noble
+  - name: docker-ce
+    version: 5:29.6.2-1~ubuntu.24.04~noble
+  - name: docker-ce-cli
+    version: 5:29.6.2-1~ubuntu.24.04~noble
+  - name: docker-buildx-plugin
+    version: 0.36.0-1~ubuntu.24.04~noble
+  - name: docker-compose-plugin
+    version: 5.3.1-1~ubuntu.24.04~noble
+
+vps_docker_networks:
+  - name: app_surplasse
+    driver: bridge
+    internal: false
+    subnet: 172.30.10.0/24
+  - name: db_surplasse
+    driver: bridge
+    internal: true
+    subnet: 172.30.11.0/24
+  - name: app_parkventory
+    driver: bridge
+    internal: false
+    subnet: 172.30.20.0/24
+  - name: db_parkventory
+    driver: bridge
+    internal: true
+    subnet: 172.30.21.0/24
+  - name: ops
+    driver: bridge
+    internal: false
+    subnet: 172.30.30.0/24
+  - name: db_monitoring
+    driver: bridge
+    internal: true
+    subnet: 172.30.31.0/24

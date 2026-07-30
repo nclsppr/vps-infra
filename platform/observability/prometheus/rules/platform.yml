@@ -1,0 +1,52 @@
+groups:
+  - name: platform
+    rules:
+      - alert: PlatformTargetUnavailable
+        expr: up{project="platform"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Platform target {{ $labels.job }} is unavailable"
+          description: "Prometheus has not scraped {{ $labels.instance }} successfully for five minutes."
+
+      - alert: HostDiskSpaceLow
+        expr: |
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+          ) < 0.15
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Free disk space is below 15 percent"
+          description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} is running low."
+
+      - alert: HostDiskSpaceCritical
+        expr: |
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+          ) < 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Free disk space is below 5 percent"
+          description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} is critically full."
+
+      - alert: PostgreSQLConnectionsHigh
+        expr: |
+          sum(pg_stat_activity_count)
+          /
+          scalar(pg_settings_max_connections)
+          > 0.80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connection usage is above 80 percent"
+          description: "The shared cluster is approaching its configured connection limit."

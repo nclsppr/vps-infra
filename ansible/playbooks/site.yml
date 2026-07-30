@@ -1,0 +1,42 @@
+---
+- name: Converge the production VPS host
+  hosts: vps
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+
+  pre_tasks:
+    - name: Prove that the administrator connection works before hardening
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname != 'production-vps' or (ansible_host | default('')) != 'vps.example.invalid'
+          - (ansible_user | default('')) == vps_admin_user
+          - (ansible_user | default('')) not in ['root', vps_deploy_user]
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version in vps_supported_ubuntu_releases
+          - vps_ssh_port | int == 22
+          - ansible_port | int == vps_ssh_port | int
+          - vps_admin_authorized_keys | length > 0
+        fail_msg: >-
+          Refus du durcissement : site.yml doit déjà être connecté avec le
+          compte administrateur et le port SSH définitif sur un Ubuntu validé.
+
+    - name: Confirm the current connection is still responsive
+      ansible.builtin.wait_for_connection:
+        timeout: 20
+
+  roles:
+    - role: base
+    - role: docker
+    - role: layout
+    - role: deploy
+    - role: ssh
+    - role: firewall
+
+  post_tasks:
+    - name: Report host convergence without starting the platform
+      ansible.builtin.debug:
+        msg: >-
+          Convergence hôte terminée. Docker est disponible, mais aucun service
+          de plateforme ni aucune application n'a été démarré.

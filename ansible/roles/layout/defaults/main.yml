@@ -1,0 +1,20 @@
+---
+vps_platform_directories:
+  - path: /srv/vps
+    mode: "0755"
+  - path: /srv/vps/releases
+    mode: "0755"
+  - path: /srv/vps/rendered
+    mode: "0755"
+  - path: /srv/vps/runtime
+    mode: "0755"
+  - path: /srv/vps/runtime/config
+    mode: "0755"
+  - path: /srv/vps/state
+    mode: "0750"
+  - path: /srv/vps/logs
+    mode: "0750"
+
+vps_static_sites:
+  - personal
+  - papersempire

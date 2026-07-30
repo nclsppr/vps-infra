@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)
+readonly REPOSITORY_ROOT
+mode=production
+runtime_check=0
+failures=0
+warnings=0
+
+usage() {
+  echo "usage: doctor [--local] [--runtime]" >&2
+  exit 64
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --local) mode=local ;;
+    --runtime) runtime_check=1 ;;
+    -h|--help)
+      echo "usage: doctor [--local] [--runtime]"
+      exit 0
+      ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+pass() {
+  printf 'PASS  %s\n' "$1"
+}
+
+warn() {
+  printf 'WARN  %s\n' "$1"
+  warnings=$((warnings + 1))
+}
+
+fail() {
+  printf 'FAIL  %s\n' "$1"
+  failures=$((failures + 1))
+}
+
+check_command() {
+  local command_name=$1
+  if command -v "$command_name" >/dev/null 2>&1; then
+    pass "command available: $command_name"
+  else
+    fail "required command missing: $command_name"
+  fi
+}
+
+check_command git
+check_command python3
+
+if command -v docker >/dev/null 2>&1; then
+  pass "command available: docker"
+  if docker compose version >/dev/null 2>&1; then
+    pass "Docker Compose plugin available"
+  else
+    if [[ $mode == production ]]; then
+      fail "Docker Compose plugin unavailable"
+    else
+      warn "Docker Compose plugin unavailable"
+    fi
+  fi
+  if [[ $runtime_check -eq 1 ]]; then
+    if docker info >/dev/null 2>&1; then
+      pass "Docker daemon reachable"
+    else
+      fail "Docker daemon is not reachable"
+    fi
+  fi
+elif [[ $mode == production ]]; then
+  fail "required command missing: docker"
+else
+  warn "Docker unavailable; runtime checks skipped"
+fi
+
+if [[ $mode == local ]]; then
+  repository_dir=$REPOSITORY_ROOT
+  state_dir=
+  enable_file=
+  schema_file=$REPOSITORY_ROOT/schemas/production-release.schema.json
+else
+  repository_dir=/srv/vps/repository
+  state_dir=/var/lib/vps-controller
+  enable_file=/etc/vps/production-enabled
+  schema_file=/usr/local/share/vps-infra/schemas/production-release.schema.json
+  revision_file=/usr/local/share/vps-infra/controller-revision
+fi
+
+for executable in validate-release validate-compose check-public-safe reconcile plan-digests verify-state verify-github-evidence parse-forced-command forced-command deploy; do
+  if [[ -x $SCRIPT_DIR/$executable ]]; then
+    pass "executable script: scripts/$executable"
+  else
+    fail "script is missing or not executable: scripts/$executable"
+  fi
+done
+
+if "$SCRIPT_DIR/check-public-safe" --root "$repository_dir" >/dev/null; then
+  pass "repository is safe for public visibility"
+else
+  fail "public repository safety policy failed"
+fi
+
+if [[ -d $repository_dir/.git || -f $repository_dir/HEAD ]]; then
+  pass "infrastructure Git repository exists: $repository_dir"
+else
+  fail "infrastructure Git repository missing: $repository_dir"
+fi
+
+release_validator_args=(--schema "$schema_file")
+if [[ $mode == production ]]; then
+  release_validator_args+=(--require-json-schema)
+fi
+if "$SCRIPT_DIR/validate-release" "${release_validator_args[@]}" \
+  "$repository_dir/releases/production.yaml" >/dev/null; then
+  pass "production desired-state manifest is valid"
+else
+  fail "production desired-state manifest is invalid"
+fi
+
+if [[ $mode == production ]]; then
+  if [[ -d $state_dir ]]; then
+    pass "controller state directory exists: $state_dir"
+  else
+    fail "controller state directory missing: $state_dir"
+  fi
+  actual_origin=$(git -C "$repository_dir" remote get-url origin 2>/dev/null || true)
+  if [[ $actual_origin == https://github.com/nclsppr/vps-infra.git ]]; then
+    pass "infrastructure origin matches the public HTTPS allowlist"
+  else
+    fail "infrastructure origin differs from the public HTTPS allowlist"
+  fi
+  recorded_revision=$(tr -d '\r\n' <"$revision_file" 2>/dev/null || true)
+  mirror_revision=$(git -C "$repository_dir" rev-parse HEAD 2>/dev/null || true)
+  revision_metadata=$(stat -c '%u %a' -- "$revision_file" 2>/dev/null || true)
+  if [[ $recorded_revision =~ ^[0-9a-f]{40}$ && $recorded_revision == "$mirror_revision" ]]; then
+    pass "installed controller revision matches repository HEAD"
+  else
+    fail "installed controller revision does not match repository HEAD"
+  fi
+  if [[ $revision_metadata =~ ^0\ ([0-7]+)$ ]]; then
+    revision_mode=${BASH_REMATCH[1]}
+    if (( (8#$revision_mode & 8#022) == 0 )) && [[ ! -L $revision_file ]]; then
+      pass "controller revision marker is root-owned and immutable to non-root users"
+    else
+      fail "controller revision marker is writable by group/others or is a symlink"
+    fi
+  else
+    fail "controller revision marker is missing or not root-owned"
+  fi
+  for state_label in desired active; do
+    state_file="$state_dir/$state_label/state.json"
+    manifest_file="$state_dir/$state_label/manifest.json"
+    if [[ -f $state_file && -f $manifest_file ]]; then
+      if "$SCRIPT_DIR/verify-state" \
+        --label "$state_label" \
+        --state "$state_file" \
+        --manifest "$manifest_file" \
+        --repository "$repository_dir" \
+        --schema "$schema_file" >/dev/null; then
+        pass "$state_label state and manifest match their anchored Git commit"
+      else
+        fail "$state_label state is inconsistent"
+      fi
+    elif [[ -e $state_file || -e $manifest_file ]]; then
+      fail "$state_label state pair is incomplete"
+    else
+      warn "$state_label state has not been recorded yet"
+    fi
+  done
+  if [[ -e $enable_file ]]; then
+    warn "production activation marker exists; deploy may leave dry-run mode"
+  else
+    pass "production activation marker absent; DRY_RUN is enforced"
+  fi
+  if [[ -x /usr/local/libexec/vps/apply-release ]]; then
+    warn "apply-release is installed; inspect it independently before enabling production"
+  else
+    pass "apply-release absent; controller cannot perform a live deployment"
+  fi
+fi
+
+printf 'Doctor summary: %d failure(s), %d warning(s)\n' "$failures" "$warnings"
+if [[ $failures -gt 0 ]]; then
+  exit 1
+fi

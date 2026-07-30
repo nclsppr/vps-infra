@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""Validate rendered production Compose JSON against a fail-closed policy."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+IMAGE_REF_RE = re.compile(
+    r"^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    r"@sha256:[0-9a-f]{64}$"
+)
+PROJECTS = frozenset({"vps-platform", "surplasse", "parkventory"})
+APPLICATION_COMPONENTS = {
+    "surplasse": frozenset({"backend", "onboarding", "commande", "dashboard", "docs"}),
+    "parkventory": frozenset({"backend", "frontend"}),
+}
+PUBLIC_CADDY_PORTS = frozenset({(80, 80, "tcp"), (443, 443, "tcp"), (443, 443, "udp")})
+LOOPBACK_GRAFANA_PORT = (3000, 3000, "tcp")
+DANGEROUS_CAPABILITIES = frozenset({"ALL", "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"})
+PLATFORM_NETWORKS = frozenset(
+    {
+        "ops",
+        "app_surplasse",
+        "db_surplasse",
+        "app_parkventory",
+        "db_parkventory",
+        "db_monitoring",
+    }
+)
+PLATFORM_SERVICE_NETWORKS = {
+    "caddy": frozenset({"ops", "app_surplasse", "app_parkventory"}),
+    "postgresql": frozenset({"db_surplasse", "db_parkventory", "db_monitoring"}),
+    "prometheus": frozenset({"ops", "app_surplasse"}),
+    "grafana": frozenset({"ops"}),
+    "node-exporter": frozenset({"ops"}),
+    "postgres-exporter": frozenset({"ops", "db_monitoring"}),
+}
+PLATFORM_SERVICES = frozenset(PLATFORM_SERVICE_NETWORKS)
+PLATFORM_ALLOWED_CAPABILITIES = {
+    "caddy": frozenset({"NET_BIND_SERVICE"}),
+    "postgresql": frozenset({"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}),
+}
+PLATFORM_USERS = {
+    "caddy": None,
+    "postgresql": None,
+    "prometheus": None,
+    "grafana": "472:472",
+    "node-exporter": None,
+    "postgres-exporter": "65534:999",
+}
+PLATFORM_VOLUME_TARGETS = {
+    "caddy": frozenset({"/etc/caddy/Caddyfile", "/etc/caddy/routes", "/srv/www", "/data", "/config"}),
+    "postgresql": frozenset(
+        {
+            "/var/lib/postgresql/data",
+            "/etc/postgresql/postgresql.conf",
+            "/etc/postgresql/pg_hba.conf",
+            "/docker-entrypoint-initdb.d",
+        }
+    ),
+    "prometheus": frozenset(
+        {"/etc/prometheus/prometheus.yml", "/etc/prometheus/targets", "/etc/prometheus/rules", "/prometheus"}
+    ),
+    "grafana": frozenset(
+        {"/etc/grafana/provisioning", "/etc/grafana/dashboards", "/var/lib/grafana"}
+    ),
+    "node-exporter": frozenset({"/host/proc", "/host/sys", "/rootfs"}),
+    "postgres-exporter": frozenset(),
+}
+PLATFORM_WRITABLE_VOLUME_TARGETS = {
+    "caddy": frozenset({"/data", "/config"}),
+    "postgresql": frozenset({"/var/lib/postgresql/data"}),
+    "prometheus": frozenset({"/prometheus"}),
+    "grafana": frozenset({"/var/lib/grafana"}),
+}
+PLATFORM_VOLUME_CONTRACTS = {
+    "caddy": {
+        "/etc/caddy/Caddyfile": ("bind", "repo:platform/caddy/Caddyfile", True, {}),
+        "/etc/caddy/routes": ("bind", "repo:platform/caddy/routes", True, {}),
+        "/srv/www": ("bind", "/srv/www", True, {"create_host_path": False}),
+        "/data": ("volume", "caddy_data", False, {}),
+        "/config": ("volume", "caddy_config", False, {}),
+    },
+    "postgresql": {
+        "/var/lib/postgresql/data": ("volume", "postgresql_data", False, {}),
+        "/etc/postgresql/postgresql.conf": (
+            "bind", "repo:platform/postgres/postgresql.conf", True, {}
+        ),
+        "/etc/postgresql/pg_hba.conf": (
+            "bind", "repo:platform/postgres/pg_hba.conf", True, {}
+        ),
+        "/docker-entrypoint-initdb.d": ("bind", "repo:platform/postgres/initdb", True, {}),
+    },
+    "prometheus": {
+        "/etc/prometheus/prometheus.yml": (
+            "bind", "repo:platform/observability/prometheus/prometheus.yml", True, {}
+        ),
+        "/etc/prometheus/targets": (
+            "bind", "repo:platform/observability/prometheus/targets", True, {}
+        ),
+        "/etc/prometheus/rules": (
+            "bind", "repo:platform/observability/prometheus/rules", True, {}
+        ),
+        "/prometheus": ("volume", "prometheus_data", False, {}),
+    },
+    "grafana": {
+        "/etc/grafana/provisioning": (
+            "bind", "repo:platform/observability/grafana/provisioning", True, {}
+        ),
+        "/etc/grafana/dashboards": (
+            "bind", "repo:platform/observability/grafana/dashboards", True, {}
+        ),
+        "/var/lib/grafana": ("volume", "grafana_data", False, {}),
+    },
+    "node-exporter": {
+        "/host/proc": ("bind", "/proc", True, {}),
+        "/host/sys": ("bind", "/sys", True, {}),
+        "/rootfs": ("bind", "/", True, {"propagation": "rslave"}),
+    },
+    "postgres-exporter": {},
+}
+PLATFORM_NAMED_VOLUMES = {
+    "caddy_config": "vps-platform-caddy-config",
+    "caddy_data": "vps-platform-caddy-data",
+    "grafana_data": "vps-platform-grafana-data",
+    "postgresql_data": "vps-platform-postgresql-17-data",
+    "prometheus_data": "vps-platform-prometheus-data",
+}
+PLATFORM_SECRETS = {
+    "caddy": frozenset({"ovh_application_key", "ovh_application_secret", "ovh_consumer_key"}),
+    "postgresql": frozenset({"postgres_superuser_password", "postgres_exporter_password"}),
+    "grafana": frozenset({"grafana_admin_password", "grafana_secret_key"}),
+    "postgres-exporter": frozenset({"postgres_exporter_password"}),
+    "prometheus": frozenset(),
+    "node-exporter": frozenset(),
+}
+ALLOWED_SERVICE_KEYS = frozenset(
+    {
+        "cap_add",
+        "cap_drop",
+        "command",
+        "cpus",
+        "depends_on",
+        "entrypoint",
+        "environment",
+        "healthcheck",
+        "image",
+        "logging",
+        "mem_limit",
+        "networks",
+        "pid",
+        "pids_limit",
+        "ports",
+        "profiles",
+        "read_only",
+        "restart",
+        "secrets",
+        "security_opt",
+        "shm_size",
+        "stop_grace_period",
+        "tmpfs",
+        "user",
+        "volumes",
+    }
+)
+PLATFORM_BUDGETS = {
+    "caddy": (0.75, 268435456, 128, 30.0),
+    "postgresql": (1.5, 1610612736, 256, 60.0),
+    "prometheus": (0.5, 536870912, 128, 30.0),
+    "grafana": (0.5, 402653184, 128, 30.0),
+    "node-exporter": (0.25, 134217728, 64, None),
+    "postgres-exporter": (0.25, 134217728, 64, None),
+}
+PLATFORM_TMPFS = {
+    "caddy": ["/tmp:size=32m,mode=1777", "/run:size=8m,mode=0755"],
+    "postgresql": [
+        "/tmp:size=64m,mode=1777",
+        "/var/run/postgresql:size=16m,mode=2775,uid=999,gid=999",
+    ],
+    "prometheus": ["/tmp:size=32m,mode=1777"],
+    "grafana": [
+        "/tmp:size=64m,mode=1777",
+        "/var/log/grafana:size=32m,mode=0755,uid=472,gid=472",
+    ],
+    "node-exporter": ["/tmp:size=8m,mode=1777"],
+    "postgres-exporter": ["/tmp:size=8m,mode=1777"],
+}
+
+
+class ComposePolicyError(ValueError):
+    pass
+
+
+def fail(message: str) -> None:
+    raise ComposePolicyError(message)
+
+
+def as_port(value: Any, path: str) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        port = value
+    elif isinstance(value, str) and value.isdigit():
+        port = int(value)
+    else:
+        fail(f"{path}: port ranges and non-numeric ports are forbidden")
+    if not 1 <= port <= 65535:
+        fail(f"{path}: port must be between 1 and 65535")
+    return port
+
+
+def normalized_port(port: Any, path: str) -> tuple[str, int, int, str]:
+    if not isinstance(port, dict):
+        fail(f"{path}: use normalized long port syntax from 'docker compose config --format json'")
+    allowed = {"name", "mode", "host_ip", "target", "published", "protocol", "app_protocol"}
+    unknown = set(port) - allowed
+    if unknown:
+        fail(f"{path}: unknown keys: {', '.join(sorted(unknown))}")
+    if "target" not in port or "published" not in port:
+        fail(f"{path}: both target and published are required")
+    host_ip = port.get("host_ip", "")
+    if not isinstance(host_ip, str):
+        fail(f"{path}.host_ip: must be a string")
+    protocol = port.get("protocol", "tcp")
+    if protocol not in {"tcp", "udp"}:
+        fail(f"{path}.protocol: only tcp or udp are allowed")
+    mode = port.get("mode", "ingress")
+    if mode not in {"ingress", "host"}:
+        fail(f"{path}.mode: unsupported value {mode!r}")
+    return (
+        host_ip,
+        as_port(port["published"], f"{path}.published"),
+        as_port(port["target"], f"{path}.target"),
+        protocol,
+    )
+
+
+def duration_seconds(value: Any, path: str) -> float:
+    if not isinstance(value, str) or not value:
+        fail(f"{path}: must be a duration string")
+    units = {"ns": 1e-9, "us": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
+    position = 0
+    total = 0.0
+    for match in re.finditer(r"([0-9]+(?:\.[0-9]+)?)(ns|us|ms|s|m|h)", value):
+        if match.start() != position:
+            fail(f"{path}: invalid duration {value!r}")
+        total += float(match.group(1)) * units[match.group(2)]
+        position = match.end()
+    if position != len(value):
+        fail(f"{path}: invalid duration {value!r}")
+    return total
+
+
+def validate_runtime_contract(project: str, service_name: str, service: dict[str, Any]) -> None:
+    path = f"services.{service_name}"
+    if any(key in service for key in ("post_start", "pre_stop")):
+        fail(f"{path}: lifecycle hooks are forbidden")
+    if "oom_kill_disable" in service:
+        fail(f"{path}.oom_kill_disable: forbidden")
+    if any(key in service for key in ("scale", "deploy")):
+        fail(f"{path}: scaling overrides are forbidden")
+    if any(key in service for key in ("extra_hosts", "dns", "dns_search", "dns_opt")):
+        fail(f"{path}: host and DNS overrides are forbidden")
+    unknown = set(service) - ALLOWED_SERVICE_KEYS
+    if unknown:
+        fail(f"{path}: unsupported or dangerous keys: {', '.join(sorted(unknown))}")
+    is_migrator = service_name == "migrator" or service_name.endswith("_migrator")
+    profiles = service.get("profiles", [])
+    if is_migrator:
+        if profiles != ["migration"]:
+            fail(f"{path}.profiles: migrator requires exactly ['migration']")
+    elif profiles not in (None, []):
+        fail(f"{path}.profiles: long-running services may not be hidden behind profiles")
+
+    logging = service.get("logging")
+    expected_logging = {"driver": "local", "options": {"max-file": "3", "max-size": "10m"}}
+    if logging != expected_logging:
+        fail(f"{path}.logging: must use the bounded local driver contract")
+
+    cpus = service.get("cpus")
+    pids_limit = service.get("pids_limit")
+    try:
+        memory = int(service.get("mem_limit"))
+    except (TypeError, ValueError):
+        fail(f"{path}.mem_limit: a positive normalized byte limit is required")
+    stop_value = service.get("stop_grace_period")
+    stop_seconds = duration_seconds(stop_value, f"{path}.stop_grace_period") if stop_value is not None else None
+    if project == "vps-platform":
+        expected_cpu, expected_memory, expected_pids, expected_stop = PLATFORM_BUDGETS[service_name]
+        if cpus != expected_cpu or memory != expected_memory or pids_limit != expected_pids:
+            fail(f"{path}: resource limits differ from the audited platform budget")
+        if stop_seconds != expected_stop:
+            fail(f"{path}.stop_grace_period: differs from the audited platform budget")
+        if service.get("tmpfs") != PLATFORM_TMPFS[service_name]:
+            fail(f"{path}.tmpfs: differs from the audited platform allowlist")
+        if service_name == "postgres-exporter":
+            expected_depends = {
+                "postgresql": {"condition": "service_healthy", "restart": True, "required": True}
+            }
+            if service.get("depends_on") != expected_depends:
+                fail(f"{path}.depends_on: must wait only for healthy PostgreSQL")
+        elif service.get("depends_on") not in (None, {}):
+            fail(f"{path}.depends_on: unexpected dependency")
+        if service_name == "postgresql":
+            if int(service.get("shm_size", 0)) != 268435456:
+                fail(f"{path}.shm_size: must equal the audited PostgreSQL budget")
+        elif service.get("shm_size") is not None:
+            fail(f"{path}.shm_size: only PostgreSQL may define shared memory")
+    else:
+        if (
+            not isinstance(cpus, (int, float))
+            or isinstance(cpus, bool)
+            or not 0 < cpus <= 2
+            or not isinstance(pids_limit, int)
+            or isinstance(pids_limit, bool)
+            or not 0 < pids_limit <= 512
+            or not 16 * 1024 * 1024 <= memory <= 2 * 1024 * 1024 * 1024
+        ):
+            fail(f"{path}: application resource limits exceed the policy budget")
+        if stop_seconds is None or not 1 <= stop_seconds <= 120:
+            fail(f"{path}.stop_grace_period: must be between 1s and 120s")
+        if service.get("depends_on") not in (None, {}):
+            fail(f"{path}.depends_on: application projects use external platform readiness")
+        if service.get("shm_size") is not None:
+            fail(f"{path}.shm_size: application-specific shared memory is forbidden")
+        tmpfs = service.get("tmpfs", [])
+        if not isinstance(tmpfs, list) or any(
+            not isinstance(item, str)
+            or not re.fullmatch(r"/(?:tmp|run):size=(?:8|16|32|64)m,mode=(?:0755|1777)", item)
+            for item in tmpfs
+        ):
+            fail(f"{path}.tmpfs: only bounded /tmp or /run mounts are allowed")
+
+def service_networks(project: str, service_name: str, service: dict[str, Any]) -> set[str]:
+    raw_networks = service.get("networks")
+    if isinstance(raw_networks, dict):
+        networks = set(raw_networks)
+    else:
+        fail(f"services.{service_name}.networks: must be a non-empty normalized network map")
+    if not networks:
+        fail(f"services.{service_name}.networks: service must be isolated on explicit networks")
+
+    if project == "vps-platform":
+        expected = PLATFORM_SERVICE_NETWORKS.get(service_name)
+        if expected is None or networks != expected:
+            fail(
+                f"services.{service_name}.networks: expected {', '.join(sorted(expected or [])) or 'no networks'}"
+            )
+    else:
+        app_network = f"app_{project}"
+        db_network = f"db_{project}"
+        if service_name == "migrator" or service_name.endswith("_migrator"):
+            expected = {db_network}
+        elif service_name == "backend" or service_name.endswith("_backend"):
+            expected = {app_network, db_network}
+        else:
+            expected = {app_network}
+        if networks != expected:
+            fail(f"services.{service_name}.networks: expected {', '.join(sorted(expected))}")
+    for network_name, options in raw_networks.items():
+        normalized_options = {} if options is None else options
+        if not isinstance(normalized_options, dict):
+            fail(f"services.{service_name}.networks.{network_name}: options must be an object")
+        expected_options = (
+            {"aliases": ["postgresql"]}
+            if project == "vps-platform" and service_name == "postgresql"
+            else {}
+        )
+        if normalized_options != expected_options:
+            fail(
+                f"services.{service_name}.networks.{network_name}: "
+                "network aliases and addressing options differ from the exact contract"
+            )
+    return networks
+
+
+def validate_security(project: str, service_name: str, service: dict[str, Any]) -> None:
+    path = f"services.{service_name}"
+    if service.get("read_only") is not True:
+        fail(f"{path}.read_only: must be true")
+    security_opt = service.get("security_opt")
+    if not isinstance(security_opt, list) or "no-new-privileges:true" not in security_opt:
+        fail(f"{path}.security_opt: no-new-privileges:true is required")
+    if any("unconfined" in str(option).lower() for option in security_opt):
+        fail(f"{path}.security_opt: unconfined profiles are forbidden")
+    cap_drop = service.get("cap_drop")
+    if not isinstance(cap_drop, list) or "ALL" not in cap_drop:
+        fail(f"{path}.cap_drop: ALL is required")
+    cap_add_raw = service.get("cap_add", [])
+    if cap_add_raw is None:
+        cap_add_raw = []
+    if not isinstance(cap_add_raw, list) or any(not isinstance(item, str) for item in cap_add_raw):
+        fail(f"{path}.cap_add: must be an array")
+    cap_add = {cap.upper() for cap in cap_add_raw}
+    allowed = PLATFORM_ALLOWED_CAPABILITIES.get(service_name, frozenset()) if project == "vps-platform" else frozenset()
+    if cap_add - allowed:
+        dangerous = cap_add & DANGEROUS_CAPABILITIES
+        suffix = f" dangerous capabilities: {', '.join(sorted(dangerous))}" if dangerous else ""
+        fail(f"{path}.cap_add: capabilities outside the service allowlist.{suffix}")
+
+    user = service.get("user")
+    if user in {0, "0", "0:0", "root", "root:root"}:
+        fail(f"{path}.user: explicit root execution is forbidden")
+    if project == "vps-platform":
+        expected_user = PLATFORM_USERS.get(service_name)
+        if service_name not in PLATFORM_USERS or user != expected_user:
+            fail(f"{path}.user: does not match the audited platform image contract")
+    elif not isinstance(user, str) or not re.fullmatch(r"[1-9][0-9]*(?::[1-9][0-9]*)?", user):
+        fail(f"{path}.user: application services require an explicit numeric non-root user")
+
+    if service.get("pid") == "host" and not (project == "vps-platform" and service_name == "node-exporter"):
+        fail(f"{path}.pid: host namespace is forbidden")
+    if service.get("pid") not in {None, "host"}:
+        fail(f"{path}.pid: shared PID namespaces are forbidden")
+    if service.get("ipc") is not None or service.get("uts") is not None:
+        fail(f"{path}: shared IPC/UTS namespaces are forbidden")
+    if service.get("userns_mode") is not None:
+        fail(f"{path}.userns_mode: shared user namespaces are forbidden")
+    if service.get("cgroup") is not None or service.get("cgroup_parent") not in (None, ""):
+        fail(f"{path}: host or delegated cgroup access is forbidden")
+    if service.get("use_api_socket") is True:
+        fail(f"{path}.use_api_socket: Docker API access is forbidden")
+    for forbidden_key in (
+        "configs",
+        "device_cgroup_rules",
+        "gpus",
+        "group_add",
+        "links",
+        "external_links",
+        "runtime",
+        "sysctls",
+        "volumes_from",
+    ):
+        forbidden_value = service.get(forbidden_key)
+        if forbidden_value not in (None, False) and forbidden_value != []:
+            fail(f"{path}.{forbidden_key}: forbidden")
+    devices = service.get("devices")
+    if devices not in (None, False) and devices != []:
+        fail(f"{path}.devices: device passthrough is forbidden")
+    is_migrator = service_name == "migrator" or service_name.endswith("_migrator")
+    expected_restart = "no" if is_migrator else "unless-stopped"
+    if service.get("restart") != expected_restart:
+        fail(f"{path}.restart: expected {expected_restart!r}")
+    pids_limit = service.get("pids_limit")
+    cpus = service.get("cpus")
+    mem_limit = service.get("mem_limit")
+    if not isinstance(pids_limit, int) or isinstance(pids_limit, bool) or pids_limit <= 0:
+        fail(f"{path}.pids_limit: a positive limit is required")
+    if not isinstance(cpus, (int, float)) or isinstance(cpus, bool) or cpus <= 0:
+        fail(f"{path}.cpus: a positive limit is required")
+    try:
+        memory = int(mem_limit)
+    except (TypeError, ValueError):
+        fail(f"{path}.mem_limit: a positive normalized byte limit is required")
+    if memory <= 0:
+        fail(f"{path}.mem_limit: a positive normalized byte limit is required")
+
+
+def validate_volumes(
+    project: str,
+    service_name: str,
+    service: dict[str, Any],
+    repository_root: Path | None,
+) -> None:
+    volumes = service.get("volumes", [])
+    if volumes is None:
+        volumes = []
+    if not isinstance(volumes, list):
+        fail(f"services.{service_name}.volumes: must be an array")
+    seen_targets: set[str] = set()
+    for index, volume in enumerate(volumes):
+        path = f"services.{service_name}.volumes[{index}]"
+        if not isinstance(volume, dict):
+            fail(f"{path}: normalized long volume syntax is required")
+        allowed_volume_keys = {"type", "source", "target", "read_only", "bind", "volume"}
+        unknown_volume_keys = set(volume) - allowed_volume_keys
+        if unknown_volume_keys:
+            fail(f"{path}: unsupported keys: {', '.join(sorted(unknown_volume_keys))}")
+        source = volume.get("source")
+        target = volume.get("target")
+        volume_type = volume.get("type")
+        if not isinstance(source, str) or not isinstance(target, str):
+            fail(f"{path}: source and target strings are required")
+        if "/var/run/docker.sock" in source or "/run/docker.sock" in source:
+            fail(f"{path}: Docker socket mounts are forbidden")
+        if project != "vps-platform":
+            fail(f"{path}: application services may not use host or named-volume mounts")
+        allowed_targets = PLATFORM_VOLUME_TARGETS.get(service_name, frozenset())
+        if target not in allowed_targets:
+            fail(f"{path}: target {target!r} is outside the service allowlist")
+        if target in seen_targets:
+            fail(f"{path}: duplicate target {target!r}")
+        seen_targets.add(target)
+        expected_contract = PLATFORM_VOLUME_CONTRACTS[service_name][target]
+        expected_type, expected_source_spec, expected_read_only, expected_options = expected_contract
+        if expected_source_spec.startswith("repo:"):
+            if repository_root is None:
+                fail(f"{path}: repository root is required to verify platform bind sources")
+            expected_source = str(repository_root / expected_source_spec.removeprefix("repo:"))
+        else:
+            expected_source = expected_source_spec
+        if volume_type != expected_type or source != expected_source:
+            fail(
+                f"{path}: expected exact {expected_type} source {expected_source!r} "
+                f"for target {target!r}"
+            )
+        if bool(volume.get("read_only", False)) is not expected_read_only:
+            fail(f"{path}.read_only: differs from the exact platform mount contract")
+        option_key = "bind" if volume_type == "bind" else "volume"
+        if volume.get(option_key, {}) != expected_options:
+            fail(f"{path}.{option_key}: differs from the exact platform mount contract")
+        other_option_key = "volume" if volume_type == "bind" else "bind"
+        if other_option_key in volume:
+            fail(f"{path}.{other_option_key}: unexpected mount options")
+        if volume_type == "bind":
+            if volume.get("read_only") is not True:
+                fail(f"{path}: bind mounts must be read-only")
+            if source == "/" and not (service_name == "node-exporter" and target == "/rootfs"):
+                fail(f"{path}: host root may be mounted only by node-exporter at /rootfs read-only")
+            if service_name == "node-exporter":
+                expected_sources = {"/host/proc": "/proc", "/host/sys": "/sys", "/rootfs": "/"}
+                if expected_sources.get(target) != source:
+                    fail(f"{path}: node-exporter source/target pair is not allowlisted")
+        elif volume_type == "volume":
+            writable_targets = PLATFORM_WRITABLE_VOLUME_TARGETS.get(service_name, frozenset())
+            if target not in writable_targets:
+                fail(f"{path}: writable named volume target is outside the service allowlist")
+        else:
+            fail(f"{path}: only bind and named-volume mounts are allowed")
+    if project == "vps-platform":
+        required_targets = PLATFORM_VOLUME_TARGETS.get(service_name, frozenset())
+        if seen_targets != required_targets:
+            missing = required_targets - seen_targets
+            extra = seen_targets - required_targets
+            details = []
+            if missing:
+                details.append(f"missing {', '.join(sorted(missing))}")
+            if extra:
+                details.append(f"unexpected {', '.join(sorted(extra))}")
+            fail(f"services.{service_name}.volumes: {'; '.join(details)}")
+
+
+def validate_secrets(project: str, service_name: str, service: dict[str, Any]) -> None:
+    raw = service.get("secrets", [])
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        fail(f"services.{service_name}.secrets: must be an array")
+    sources: set[str] = set()
+    targets: set[str] = set()
+    for index, secret in enumerate(raw):
+        if not isinstance(secret, dict) or set(secret) != {"source", "target"}:
+            fail(
+                f"services.{service_name}.secrets[{index}]: "
+                "only exact normalized source and target keys are allowed"
+            )
+        source = secret.get("source")
+        target = secret.get("target")
+        if not isinstance(source, str) or not isinstance(target, str):
+            fail(f"services.{service_name}.secrets[{index}]: source and target strings are required")
+        if target != f"/run/secrets/{source}":
+            fail(f"services.{service_name}.secrets[{index}].target: must equal /run/secrets/{source}")
+        if source in sources or target in targets:
+            fail(f"services.{service_name}.secrets[{index}]: duplicate source or target")
+        sources.add(source)
+        targets.add(target)
+    if project == "vps-platform":
+        expected = PLATFORM_SECRETS.get(service_name)
+        if expected is None or sources != expected:
+            fail(f"services.{service_name}.secrets: does not match the platform allowlist")
+    else:
+        prefix = f"{project}_"
+        if any(not source.startswith(prefix) for source in sources):
+            fail(f"services.{service_name}.secrets: every secret must be scoped with {prefix!r}")
+
+    environment = service.get("environment", {})
+    if environment is None:
+        environment = {}
+    if not isinstance(environment, dict):
+        fail(f"services.{service_name}.environment: normalized object syntax is required")
+    for key, value in environment.items():
+        if re.search(
+            r"(?:PASSWORD|SECRET|TOKEN|API_KEY|APPLICATION_KEY|CONSUMER_KEY|PASS)(?:_|$)",
+            key,
+            re.I,
+        ):
+            if not key.upper().endswith("FILE"):
+                fail(f"services.{service_name}.environment.{key}: credential values must be file references")
+            if not isinstance(value, str) or value not in targets:
+                fail(
+                    f"services.{service_name}.environment.{key}: "
+                    "file reference must match an exact declared secret target"
+                )
+
+
+def validate_ports(project: str, service_name: str, service: dict[str, Any]) -> None:
+    ports = service.get("ports", [])
+    if not isinstance(ports, list):
+        fail(f"services.{service_name}.ports: must be an array")
+    for index, raw_port in enumerate(ports):
+        path = f"services.{service_name}.ports[{index}]"
+        host_ip, published, target, protocol = normalized_port(raw_port, path)
+        port_tuple = (published, target, protocol)
+        if project != "vps-platform":
+            fail(f"{path}: application projects may not publish host ports")
+        if service_name == "caddy":
+            if port_tuple not in PUBLIC_CADDY_PORTS:
+                fail(f"{path}: Caddy may publish only matching 80/tcp, 443/tcp, or 443/udp")
+            if host_ip != "0.0.0.0":
+                fail(f"{path}: public Caddy ports must bind explicitly to IPv4 0.0.0.0")
+        elif service_name == "grafana":
+            if port_tuple != LOOPBACK_GRAFANA_PORT or host_ip != "127.0.0.1":
+                fail(f"{path}: Grafana may publish only IPv4 127.0.0.1:3000/tcp")
+        else:
+            fail(f"{path}: only caddy and loopback Grafana may publish host ports")
+
+
+def validate_healthcheck(service_name: str, service: dict[str, Any]) -> None:
+    is_migrator = service_name == "migrator" or service_name.endswith("_migrator")
+    if is_migrator:
+        profiles = service.get("profiles", [])
+        if not isinstance(profiles, list) or "migration" not in profiles:
+            fail(f"services.{service_name}: migrator must be isolated behind the 'migration' profile")
+        restart = service.get("restart", "no")
+        if restart not in {"no", "none", False}:
+            fail(f"services.{service_name}.restart: migrator must never restart automatically")
+        return
+
+    healthcheck = service.get("healthcheck")
+    if not isinstance(healthcheck, dict):
+        fail(f"services.{service_name}.healthcheck: required for every long-running service")
+    required = {"test", "interval", "timeout", "retries", "start_period"}
+    missing = required - set(healthcheck)
+    if missing:
+        fail(f"services.{service_name}.healthcheck: missing {', '.join(sorted(missing))}")
+    if healthcheck.get("disable") is True:
+        fail(f"services.{service_name}.healthcheck: may not be disabled")
+    test = healthcheck.get("test")
+    if isinstance(test, list):
+        command_text = " ".join(str(part) for part in test)
+        if not test or test[0] not in {"CMD", "CMD-SHELL", "NONE"}:
+            fail(f"services.{service_name}.healthcheck.test: invalid normalized command")
+        if test[0] == "NONE":
+            fail(f"services.{service_name}.healthcheck.test: may not disable readiness")
+    elif isinstance(test, str) and test.strip():
+        command_text = test
+    else:
+        fail(f"services.{service_name}.healthcheck.test: must be a non-empty command")
+    if re.search(r"(?:curl|wget)\s+[^\n]*(?:\s-k\b|--no-check-certificate\b)", command_text):
+        fail(f"services.{service_name}.healthcheck.test: insecure TLS bypass is forbidden")
+    payload = re.sub(r"^(?:CMD-SHELL|CMD)\s+", "", command_text, flags=re.IGNORECASE).strip()
+    payload = re.sub(r"^(?:/bin/)?(?:ba|z|da)?sh\s+-c\s+", "", payload, flags=re.IGNORECASE).strip()
+    if payload.lower() in {":", "true", "/bin/true", "exit 0", "echo", "echo ok"}:
+        fail(f"services.{service_name}.healthcheck.test: trivial always-success probe is forbidden")
+    retries = healthcheck.get("retries")
+    if not isinstance(retries, int) or isinstance(retries, bool) or not 1 <= retries <= 20:
+        fail(f"services.{service_name}.healthcheck.retries: must be between 1 and 20")
+    duration_bounds = {
+        "interval": (1.0, 300.0),
+        "timeout": (0.1, 60.0),
+        "start_period": (1.0, 300.0),
+    }
+    for duration_key, (minimum, maximum) in duration_bounds.items():
+        seconds = duration_seconds(
+            healthcheck.get(duration_key),
+            f"services.{service_name}.healthcheck.{duration_key}",
+        )
+        if not minimum <= seconds <= maximum:
+            fail(
+                f"services.{service_name}.healthcheck.{duration_key}: "
+                f"must be between {minimum:g}s and {maximum:g}s"
+            )
+
+
+def validate_service(
+    project: str,
+    service_name: str,
+    value: Any,
+    repository_root: Path | None,
+) -> None:
+    if not isinstance(value, dict):
+        fail(f"services.{service_name}: must be an object")
+    if value.get("privileged") is True:
+        fail(f"services.{service_name}.privileged: forbidden")
+    if value.get("network_mode") == "host":
+        fail(f"services.{service_name}.network_mode: host networking is forbidden")
+    if "build" in value:
+        fail(f"services.{service_name}.build: production Compose may not build on the VPS")
+    image = value.get("image")
+    if not isinstance(image, str) or not IMAGE_REF_RE.fullmatch(image):
+        fail(f"services.{service_name}.image: must be pinned by sha256 digest")
+    validate_security(project, service_name, value)
+    validate_runtime_contract(project, service_name, value)
+    service_networks(project, service_name, value)
+    validate_volumes(project, service_name, value, repository_root)
+    validate_secrets(project, service_name, value)
+    validate_ports(project, service_name, value)
+    validate_healthcheck(service_name, value)
+
+
+def validate_top_level_resources(project: str, document: dict[str, Any]) -> None:
+    allowed_top_level = {"name", "services", "networks", "secrets", "volumes", "configs"}
+    unknown_top_level = {
+        key
+        for key in document
+        if key not in allowed_top_level and not (isinstance(key, str) and key.startswith("x-"))
+    }
+    if unknown_top_level:
+        fail(f"Compose document contains unsupported top-level keys: {', '.join(sorted(unknown_top_level))}")
+    if document.get("name") != project:
+        fail(f"name: Compose project name must be fixed to {project!r}")
+    expected_networks = (
+        set(PLATFORM_NETWORKS)
+        if project == "vps-platform"
+        else {f"app_{project}", f"db_{project}"}
+    )
+    networks = document.get("networks")
+    if not isinstance(networks, dict) or set(networks) != expected_networks:
+        fail(f"networks: expected exactly {', '.join(sorted(expected_networks))}")
+    for network_name, definition in networks.items():
+        if not isinstance(definition, dict) or definition.get("external") is not True:
+            fail(f"networks.{network_name}: must be external")
+        if definition.get("name") != network_name:
+            fail(f"networks.{network_name}.name: must remain stable")
+
+    volumes = document.get("volumes", {})
+    if not isinstance(volumes, dict):
+        fail("volumes: must be an object")
+    expected_volumes = PLATFORM_NAMED_VOLUMES if project == "vps-platform" else {}
+    if set(volumes) != set(expected_volumes):
+        fail(f"volumes: expected exactly {', '.join(sorted(expected_volumes)) or 'no named volumes'}")
+    for volume_name, expected_name in expected_volumes.items():
+        definition = volumes[volume_name]
+        if not isinstance(definition, dict) or definition.get("name") != expected_name:
+            fail(f"volumes.{volume_name}.name: must remain {expected_name!r}")
+
+    secrets = document.get("secrets", {})
+    if not isinstance(secrets, dict):
+        fail("secrets: must be an object")
+    used_secrets = {
+        secret["source"]
+        for service in document["services"].values()
+        for secret in (service.get("secrets") or [])
+        if isinstance(secret, dict) and isinstance(secret.get("source"), str)
+    }
+    if set(secrets) != used_secrets:
+        fail("secrets: definitions must match exactly the secrets referenced by services")
+    secret_path_prefix = "/etc/vps/secrets/platform/" if project == "vps-platform" else f"/etc/vps/secrets/{project}/"
+    secret_name_prefix = "vps-platform_" if project == "vps-platform" else f"{project}_"
+    for secret_name, definition in secrets.items():
+        if not isinstance(definition, dict):
+            fail(f"secrets.{secret_name}: must be an object")
+        if definition.get("name") != f"{secret_name_prefix}{secret_name}":
+            fail(f"secrets.{secret_name}.name: must be stable and project-scoped")
+        file_path = definition.get("file")
+        if not isinstance(file_path, str):
+            fail(f"secrets.{secret_name}.file: must live under {secret_path_prefix}")
+        pure_path = PurePosixPath(file_path)
+        expected_parent = PurePosixPath(secret_path_prefix)
+        expected_basename = secret_name.replace("_", "-")
+        if (
+            not pure_path.is_absolute()
+            or ".." in pure_path.parts
+            or pure_path.parent != expected_parent
+            or pure_path.name != expected_basename
+        ):
+            fail(
+                f"secrets.{secret_name}.file: must be the exact normalized path "
+                f"{expected_parent / expected_basename}"
+            )
+    configs = document.get("configs", {})
+    if configs not in ({}, None):
+        fail("configs: Compose configs are forbidden; use reviewed read-only files")
+
+
+def validate_compose(
+    project: str,
+    document: Any,
+    *,
+    expected_images: dict[str, str] | None = None,
+    repository_root: Path | None = None,
+    structural_only: bool = False,
+) -> None:
+    if project not in PROJECTS:
+        fail(f"project must be one of: {', '.join(sorted(PROJECTS))}")
+    if not isinstance(document, dict):
+        fail("Compose document must be an object")
+    services = document.get("services")
+    if not isinstance(services, dict) or not services:
+        fail("services: must be a non-empty object")
+    if project == "vps-platform" and set(services) != PLATFORM_SERVICES:
+        fail(f"services: platform requires exactly {', '.join(sorted(PLATFORM_SERVICES))}")
+    if project == "vps-platform":
+        if expected_images is None and not structural_only:
+            fail(
+                "services: platform production validation requires exact images from a "
+                "verified release manifest; use structural-only solely for local linting"
+            )
+        if expected_images is not None:
+            if set(expected_images) != PLATFORM_SERVICES:
+                fail("services: platform expected-image contract is incomplete")
+            for service_name, expected_image in expected_images.items():
+                if services[service_name].get("image") != expected_image:
+                    fail(
+                        f"services.{service_name}.image: differs from the verified "
+                        "release-manifest reference"
+                    )
+    if project != "vps-platform":
+        expected_services = set(APPLICATION_COMPONENTS[project]) | {"migrator"}
+        if set(services) != expected_services:
+            fail(
+                f"services: {project} requires exactly the verified integration services "
+                f"{', '.join(sorted(expected_services))}"
+            )
+        if expected_images is None:
+            fail(
+                f"services: {project} application Compose is locked until a verified "
+                "release-manifest integration bundle supplies exact image references"
+            )
+        if set(expected_images) != expected_services:
+            fail(f"services: {project} expected-image contract is incomplete")
+        for service_name, expected_image in expected_images.items():
+            if services[service_name].get("image") != expected_image:
+                fail(
+                    f"services.{service_name}.image: differs from the verified "
+                    "release-manifest reference"
+                )
+    for service_name, service in services.items():
+        if not isinstance(service_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", service_name):
+            fail(f"services: invalid service name {service_name!r}")
+        validate_service(project, service_name, service, repository_root)
+    validate_top_level_resources(project, document)
+    if project == "vps-platform":
+        caddy = services.get("caddy")
+        if not isinstance(caddy, dict):
+            fail("services.caddy: shared platform must contain the sole public edge")
+        normalized = {
+            (published, target, protocol)
+            for index, raw_port in enumerate(caddy.get("ports", []))
+            for _, published, target, protocol in [
+                normalized_port(raw_port, f"services.caddy.ports[{index}]")
+            ]
+        }
+        required_public = {(80, 80, "tcp"), (443, 443, "tcp")}
+        if not required_public.issubset(normalized):
+            fail("services.caddy.ports: shared edge must publish matching 80/tcp and 443/tcp")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("project", choices=sorted(PROJECTS))
+    parser.add_argument("compose_json", help="output of docker compose config --format json")
+    parser.add_argument(
+        "--repository-root",
+        help="exact repository root used to normalize reviewed platform bind sources",
+    )
+    parser.add_argument(
+        "--structural-only",
+        action="store_true",
+        help="local lint only; never authorizes deployment or image provenance",
+    )
+    args = parser.parse_args()
+    try:
+        with Path(args.compose_json).open("r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        if args.repository_root:
+            repository_root = Path(args.repository_root).resolve()
+        elif (SCRIPT_DIR.parent / "platform").is_dir():
+            repository_root = SCRIPT_DIR.parent.resolve()
+        else:
+            repository_root = Path("/srv/vps/repository")
+        validate_compose(
+            args.project,
+            document,
+            repository_root=repository_root,
+            structural_only=args.structural_only,
+        )
+    except (OSError, json.JSONDecodeError, ComposePolicyError) as exc:
+        print(f"compose validation failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"compose policy valid: {args.project} ({args.compose_json})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

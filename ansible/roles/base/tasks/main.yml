@@ -1,0 +1,203 @@
+---
+- name: Validate base host variables
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_version in vps_supported_ubuntu_releases
+      - vps_timezone is match('^[A-Za-z_+-]+(?:/[A-Za-z0-9_+.-]+)+$')
+      - vps_hostname is match('^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$')
+      - vps_swap_size_mb | int >= 0
+      - vps_swap_size_mb | int <= 16384
+    fail_msg: "Variables hôte invalides ou Ubuntu non pris en charge."
+
+- name: Refresh the APT cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Apply available safe package upgrades
+  ansible.builtin.apt:
+    upgrade: safe
+    update_cache: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    NEEDRESTART_MODE: a
+
+- name: Install the bounded host toolset
+  ansible.builtin.apt:
+    name: "{{ vps_base_packages }}"
+    state: present
+    install_recommends: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    NEEDRESTART_MODE: a
+
+- name: Set the stable host name
+  ansible.builtin.hostname:
+    name: "{{ vps_hostname }}"
+
+- name: Set the host timezone
+  community.general.timezone:
+    name: "{{ vps_timezone }}"
+
+- name: Enable time synchronisation
+  ansible.builtin.service:
+    name: chrony
+    enabled: true
+    state: started
+
+- name: Configure unattended package checks
+  ansible.builtin.template:
+    src: 20auto-upgrades.j2
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Bound unattended upgrades and reboot policy
+  ansible.builtin.template:
+    src: 52vps-unattended-upgrades.j2
+    dest: /etc/apt/apt.conf.d/52vps-unattended-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Ensure the journald drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Bound persistent journal usage
+  ansible.builtin.template:
+    src: journald-vps.conf.j2
+    dest: /etc/systemd/journald.conf.d/60-vps-infra.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart systemd-journald
+
+- name: Install conservative host sysctls
+  ansible.builtin.template:
+    src: sysctl-vps.conf.j2
+    dest: /etc/sysctl.d/60-vps-infra.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply host sysctls
+
+- name: Ensure the infrastructure marker directory exists
+  ansible.builtin.file:
+    path: /etc/vps/markers
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Inspect the configured swap file
+  ansible.builtin.stat:
+    path: "{{ vps_swap_path }}"
+  register: vps_swap_file
+  when: vps_swap_size_mb | int > 0
+
+- name: Refuse to resize an existing swap file implicitly
+  ansible.builtin.assert:
+    that:
+      - vps_swap_file.stat.size | int == (vps_swap_size_mb | int * 1024 * 1024)
+    fail_msg: >-
+      {{ vps_swap_path }} existe avec une autre taille. Sa migration doit être
+      opérée explicitement pour ne pas désactiver de mémoire sous charge.
+  when:
+    - vps_swap_size_mb | int > 0
+    - vps_swap_file.stat.exists
+
+- name: Allocate the swap file once
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/fallocate
+      - -l
+      - "{{ vps_swap_size_mb }}M"
+      - "{{ vps_swap_path }}"
+    creates: "{{ vps_swap_path }}"
+  register: vps_swap_allocation
+  when: vps_swap_size_mb | int > 0
+
+- name: Protect the swap file
+  ansible.builtin.file:
+    path: "{{ vps_swap_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: vps_swap_size_mb | int > 0
+
+- name: Detect whether the swap file has a swap signature
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/blkid
+      - -o
+      - value
+      - -s
+      - TYPE
+      - "{{ vps_swap_path }}"
+  register: vps_swap_type
+  changed_when: false
+  failed_when: vps_swap_type.rc not in [0, 2]
+  check_mode: false
+  when: vps_swap_size_mb | int > 0
+
+- name: Refuse an existing unformatted file at the swap path
+  ansible.builtin.assert:
+    that:
+      - vps_swap_type.stdout | default('') == 'swap' or vps_swap_allocation.changed
+    fail_msg: >-
+      {{ vps_swap_path }} existait avant ce passage sans signature swap. Ansible
+      refuse de l'écraser même si sa taille correspond à la valeur attendue.
+  when: vps_swap_size_mb | int > 0
+
+- name: Initialise only the swap file allocated by this passage
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/mkswap
+      - "{{ vps_swap_path }}"
+  changed_when: true
+  when:
+    - vps_swap_size_mb | int > 0
+    - vps_swap_type.stdout | default('') != 'swap'
+    - vps_swap_allocation.changed
+
+- name: Persist the swap mount
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: "^{{ vps_swap_path | regex_escape }}\\s+"
+    line: "{{ vps_swap_path }} none swap sw 0 0"
+    owner: root
+    group: root
+    mode: "0644"
+    state: present
+  when: vps_swap_size_mb | int > 0
+
+- name: Read active swap devices
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/awk
+      - NR>1 {print $1}
+      - /proc/swaps
+  register: vps_active_swaps
+  changed_when: false
+  check_mode: false
+  when: vps_swap_size_mb | int > 0
+
+- name: Activate the swap file
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/swapon
+      - "{{ vps_swap_path }}"
+  changed_when: true
+  when:
+    - vps_swap_size_mb | int > 0
+    - vps_swap_path not in vps_active_swaps.stdout_lines
+
+- name: Flush base service handlers before continuing
+  ansible.builtin.meta: flush_handlers

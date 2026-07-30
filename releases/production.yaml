@@ -1,0 +1,104 @@
+{
+  "schema": 1,
+  "environment": "production",
+  "activation_policy": "locked",
+  "platform": {
+    "enabled": false,
+    "compose_project": "vps-platform",
+    "published_ports": [],
+    "blocked_by": [
+      "alert-routing-and-delivery",
+      "caddy-ovh-image",
+      "external-networks-and-cidrs",
+      "immutable-image-digests",
+      "ovh-dns-credentials",
+      "platform-config-and-probes",
+      "platform-secrets-and-permissions",
+      "postgres-pgdata-and-compatibility"
+    ]
+  },
+  "applications": {
+    "personal": {
+      "enabled": false,
+      "type": "static",
+      "source_repository": "nclsppr/personal",
+      "source_branch": "main",
+      "published_ports": [],
+      "blocked_by": [
+        "protected-source-branch",
+        "public-smoke",
+        "route-inventory",
+        "static-artifact"
+      ]
+    },
+    "papersempire": {
+      "enabled": false,
+      "type": "static",
+      "source_repository": "nclsppr/papersempire",
+      "source_branch": "master",
+      "published_ports": [],
+      "blocked_by": [
+        "protected-source-branch",
+        "public-smoke",
+        "route-inventory",
+        "static-artifact"
+      ]
+    },
+    "surplasse": {
+      "enabled": false,
+      "type": "compose",
+      "source_repository": "nclsppr/surplasse",
+      "source_branch": "main",
+      "compose_project": "surplasse",
+      "published_ports": [],
+      "blocked_by": [
+        "platform-extraction",
+        "postgres-compatibility",
+        "postgres-role-provisioning",
+        "production-digests",
+        "protected-main",
+        "public-smoke",
+        "restore-proof",
+        "separated-migrations",
+        "stripe-connect-production-adapter",
+        "vps-integration-bundle"
+      ],
+      "migrations": {
+        "strategy": "blocked",
+        "runtime_auto_migrate": false,
+        "proven": false
+      }
+    },
+    "parkventory": {
+      "enabled": false,
+      "type": "compose",
+      "source_repository": "nclsppr/parkventory",
+      "source_branch": "main",
+      "compose_project": "parkventory",
+      "published_ports": [],
+      "blocked_by": [
+        "domain-and-dns",
+        "file-based-secrets",
+        "postgres-adr-alignment",
+        "postgres-compatibility",
+        "postgres-role-provisioning",
+        "production-images",
+        "production-oidc-provider",
+        "production-secrets",
+        "prometheus-metrics",
+        "protected-main",
+        "public-smoke",
+        "restore-proof",
+        "separated-migrations",
+        "structured-logs",
+        "tenant-isolation-and-rls",
+        "vps-integration-bundle"
+      ],
+      "migrations": {
+        "strategy": "blocked",
+        "runtime_auto_migrate": false,
+        "proven": false
+      }
+    }
+  }
+}

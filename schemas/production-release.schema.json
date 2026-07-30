@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nclsppr/vps-infra/schemas/production-release.schema.json",
+  "title": "vps-infra production desired state",
+  "description": "The Git desired state. Active and quarantine state are deliberately stored on the VPS, never in this manifest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "environment", "activation_policy", "platform", "applications"],
+  "properties": {
+    "schema": { "const": 1 },
+    "environment": { "const": "production" },
+    "activation_policy": { "const": "locked" },
+    "platform": { "$ref": "#/$defs/platform" },
+    "applications": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["personal", "papersempire", "surplasse", "parkventory"],
+      "properties": {
+        "personal": {
+          "$ref": "#/$defs/staticApplication",
+          "properties": {
+            "source_repository": { "const": "nclsppr/personal" },
+            "source_branch": { "const": "main" }
+          }
+        },
+        "papersempire": {
+          "$ref": "#/$defs/staticApplication",
+          "properties": {
+            "source_repository": { "const": "nclsppr/papersempire" },
+            "source_branch": { "const": "master" }
+          }
+        },
+        "surplasse": {
+          "$ref": "#/$defs/composeApplication",
+          "properties": {
+            "source_repository": { "const": "nclsppr/surplasse" },
+            "source_branch": { "const": "main" },
+            "compose_project": { "const": "surplasse" }
+          }
+        },
+        "parkventory": {
+          "$ref": "#/$defs/composeApplication",
+          "properties": {
+            "source_repository": { "const": "nclsppr/parkventory" },
+            "source_branch": { "const": "main" },
+            "compose_project": { "const": "parkventory" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha40": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "imageReference": {
+      "type": "string",
+      "pattern": "^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"
+    },
+    "blockReason": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "blockedBy": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/blockReason" }
+    },
+    "publishedPorts": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["80/tcp", "443/tcp", "443/udp", "127.0.0.1:3000/tcp"]
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "run_id", "run_attempt", "workflow_path", "conclusion", "url"],
+      "properties": {
+        "source_revision": { "$ref": "#/$defs/sha40" },
+        "run_id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "run_attempt": { "type": "integer", "minimum": 1 },
+        "workflow_path": { "const": ".github/workflows/vps-release.yml" },
+        "conclusion": { "const": "success" },
+        "url": {
+          "type": "string",
+          "pattern": "^https://github\\.com/nclsppr/[a-z0-9-]+/actions/runs/[1-9][0-9]*$"
+        }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "image"],
+      "properties": {
+        "source_revision": { "$ref": "#/$defs/sha40" },
+        "image": { "$ref": "#/$defs/imageReference" }
+      }
+    },
+    "integration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "artifact"],
+      "properties": {
+        "source_revision": { "$ref": "#/$defs/sha40" },
+        "artifact": { "$ref": "#/$defs/imageReference" }
+      }
+    },
+    "migrations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "runtime_auto_migrate", "proven"],
+      "properties": {
+        "strategy": { "enum": ["blocked", "dedicated"] },
+        "runtime_auto_migrate": { "const": false },
+        "proven": { "type": "boolean" },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+          "required": ["enabled", "compose_project", "published_ports", "blocked_by"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "compose_project": { "const": "vps-platform" },
+        "published_ports": { "$ref": "#/$defs/publishedPorts" },
+        "blocked_by": { "$ref": "#/$defs/blockedBy" },
+        "images": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["caddy", "postgres", "prometheus", "grafana", "node_exporter", "postgres_exporter"],
+          "properties": {
+            "caddy": { "$ref": "#/$defs/imageReference" },
+            "postgres": {
+              "allOf": [
+                { "$ref": "#/$defs/imageReference" },
+                {
+                  "pattern": "^docker\\.io/library/postgres:17(?:[.-][A-Za-z0-9_.-]+)?@sha256:[0-9a-f]{64}$"
+                }
+              ]
+            },
+            "prometheus": { "$ref": "#/$defs/imageReference" },
+            "grafana": { "$ref": "#/$defs/imageReference" },
+            "node_exporter": { "$ref": "#/$defs/imageReference" },
+            "postgres_exporter": { "$ref": "#/$defs/imageReference" }
+          }
+        },
+        "integration": { "$ref": "#/$defs/integration" },
+        "postgres": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["major", "pgdata"],
+          "properties": {
+            "major": { "const": 17 },
+            "pgdata": { "const": "/var/lib/postgresql/data/pgdata" }
+          }
+        },
+        "readiness_evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "alert-routing-and-delivery",
+            "caddy-ovh-image",
+            "external-networks-and-cidrs",
+            "immutable-image-digests",
+            "ovh-dns-credentials",
+            "platform-config-and-probes",
+            "platform-secrets-and-permissions",
+            "postgres-pgdata-and-compatibility"
+          ],
+          "properties": {
+            "alert-routing-and-delivery": { "$ref": "#/$defs/evidence" },
+            "caddy-ovh-image": { "$ref": "#/$defs/evidence" },
+            "external-networks-and-cidrs": { "$ref": "#/$defs/evidence" },
+            "immutable-image-digests": { "$ref": "#/$defs/evidence" },
+            "ovh-dns-credentials": { "$ref": "#/$defs/evidence" },
+            "platform-config-and-probes": { "$ref": "#/$defs/evidence" },
+            "platform-secrets-and-permissions": { "$ref": "#/$defs/evidence" },
+            "postgres-pgdata-and-compatibility": { "$ref": "#/$defs/evidence" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+          "then": {
+            "required": ["images", "integration", "postgres", "readiness_evidence"],
+            "properties": {
+              "blocked_by": { "maxItems": 0 },
+              "published_ports": {
+                "allOf": [
+                  { "contains": { "const": "80/tcp" } },
+                  { "contains": { "const": "443/tcp" } }
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "blocked_by": { "minItems": 1 },
+              "published_ports": { "maxItems": 0 }
+            },
+            "not": {
+              "anyOf": [
+                { "required": ["images"] },
+                { "required": ["integration"] },
+                { "required": ["postgres"] },
+                { "required": ["readiness_evidence"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "staticApplication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "type", "source_repository", "source_branch", "published_ports", "blocked_by"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "type": { "const": "static" },
+        "source_repository": { "type": "string" },
+        "source_branch": { "type": "string" },
+        "published_ports": { "type": "array", "maxItems": 0 },
+        "blocked_by": { "$ref": "#/$defs/blockedBy" },
+        "source_revision": { "$ref": "#/$defs/sha40" },
+        "artifact": { "$ref": "#/$defs/imageReference" },
+        "route_inventory_artifact": { "$ref": "#/$defs/imageReference" }
+        ,
+        "readiness_evidence": { "$ref": "#/$defs/staticReadinessEvidence" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+          "then": {
+            "required": ["source_revision", "artifact", "route_inventory_artifact", "readiness_evidence"],
+            "properties": { "blocked_by": { "maxItems": 0 } }
+          },
+          "else": {
+            "properties": { "blocked_by": { "minItems": 1 } },
+            "not": {
+              "anyOf": [
+                { "required": ["source_revision"] },
+                { "required": ["artifact"] },
+                { "required": ["route_inventory_artifact"] }
+                ,
+                { "required": ["readiness_evidence"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "staticReadinessEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protected-source-branch",
+        "public-smoke",
+        "route-inventory",
+        "static-artifact"
+      ],
+      "properties": {
+        "protected-source-branch": { "$ref": "#/$defs/evidence" },
+        "public-smoke": { "$ref": "#/$defs/evidence" },
+        "route-inventory": { "$ref": "#/$defs/evidence" },
+        "static-artifact": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "composeApplication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "type", "source_repository", "source_branch", "compose_project", "published_ports", "blocked_by", "migrations"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "type": { "const": "compose" },
+        "source_repository": { "type": "string" },
+        "source_branch": { "type": "string" },
+        "compose_project": { "enum": ["surplasse", "parkventory"] },
+        "published_ports": { "type": "array", "maxItems": 0 },
+        "blocked_by": { "$ref": "#/$defs/blockedBy" },
+        "components": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/component" }
+        },
+        "integration": { "$ref": "#/$defs/integration" },
+        "migrations": { "$ref": "#/$defs/migrations" },
+        "readiness_evidence": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/evidence" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+          "then": {
+            "required": ["components", "integration", "readiness_evidence"],
+            "properties": { "blocked_by": { "maxItems": 0 } }
+          },
+          "else": {
+            "properties": { "blocked_by": { "minItems": 1 } },
+            "not": {
+              "anyOf": [
+                { "required": ["components"] },
+                { "required": ["integration"] },
+                { "required": ["readiness_evidence"] }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

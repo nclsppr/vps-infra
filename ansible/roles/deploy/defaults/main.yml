@@ -1,0 +1,23 @@
+---
+vps_deploy_install_root: /usr/local/libexec/vps
+vps_deploy_gate_path: /usr/local/libexec/vps/forced-command
+vps_deploy_controller_path: /usr/local/libexec/vps/deploy
+vps_deploy_git_sha_length: 40
+vps_deploy_schema_root: /usr/local/share/vps-infra/schemas
+vps_deploy_repository_dir: /srv/vps/repository
+vps_deploy_repository_url: https://github.com/nclsppr/vps-infra.git
+vps_deploy_revision_path: /usr/local/share/vps-infra/controller-revision
+vps_deploy_state_dir: /var/lib/vps-controller
+vps_deploy_production_marker: /etc/vps/production-enabled
+vps_deploy_executables:
+  - check-public-safe
+  - deploy
+  - doctor
+  - forced-command
+  - parse-forced-command
+  - plan-digests
+  - reconcile
+  - validate-compose
+  - validate-release
+  - verify-github-evidence
+  - verify-state

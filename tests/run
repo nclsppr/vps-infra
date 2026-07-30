@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PYTHONDONTWRITEBYTECODE=1
+
+TESTS_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly TESTS_DIR
+
+python3 "$TESTS_DIR/test_release_controller.py"
+python3 "$TESTS_DIR/test_github_evidence.py"
+
+readonly valid_sha=0123456789abcdef0123456789abcdef01234567
+parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "deploy $valid_sha")
+[[ $parsed == "$valid_sha" ]]
+
+for invalid in \
+  "" \
+  "deploy" \
+  "deploy  $valid_sha" \
+  "deploy ${valid_sha} " \
+  "deploy 0123456789ABCDEF0123456789ABCDEF01234567" \
+  "deploy ${valid_sha}; id" \
+  "deploy ${valid_sha}$(printf '\nid')" \
+  "deploy \$(id)" \
+  "deploy ${valid_sha}\t" \
+  "doctor"; do
+  if "$TESTS_DIR/../scripts/parse-forced-command" "$invalid" >/dev/null 2>&1; then
+    echo "parser unexpectedly accepted: $invalid" >&2
+    exit 1
+  fi
+done
+
+for invalid in "" "doctor" "deploy ${valid_sha}; id"; do
+  if SSH_ORIGINAL_COMMAND=$invalid "$TESTS_DIR/../scripts/forced-command" >/dev/null 2>&1; then
+    echo "forced-command wrapper unexpectedly accepted: $invalid" >&2
+    exit 1
+  fi
+done
+
+echo "forced-command parser tests passed"

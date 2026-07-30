@@ -1,0 +1,14 @@
+{
+  "data-root": {{ vps_docker_data_root | to_json }},
+  "iptables": true,
+  "ip-forward": true,
+  "ipv6": false,
+  "live-restore": true,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-file": {{ vps_docker_log_max_files | string | to_json }},
+    "max-size": {{ vps_docker_log_max_size | to_json }}
+  },
+  "no-new-privileges": true,
+  "userland-proxy": false
+}

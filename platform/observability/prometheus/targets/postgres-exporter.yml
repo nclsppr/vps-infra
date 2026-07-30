@@ -1,0 +1,5 @@
+- targets:
+    - postgres-exporter:9187
+  labels:
+    project: platform
+    component: database

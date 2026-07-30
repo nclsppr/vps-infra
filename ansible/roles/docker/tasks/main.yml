@@ -1,0 +1,158 @@
+---
+- name: Validate Docker inputs before adding a repository
+  ansible.builtin.assert:
+    that:
+      - ansible_architecture in vps_docker_architecture_map
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_release == 'noble'
+      - vps_docker_apt_key_sha256 is match('^[0-9a-f]{64}$')
+      - vps_docker_apt_key_fingerprint is match('^[0-9A-F]{40}$')
+      - vps_docker_packages | length == 5
+      - vps_docker_packages | map(attribute='name') | unique | length == 5
+      - >-
+        vps_docker_packages | map(attribute='name') | list | sort ==
+        ['containerd.io', 'docker-buildx-plugin', 'docker-ce',
+         'docker-ce-cli', 'docker-compose-plugin']
+      - vps_docker_packages | map(attribute='version') | reject('equalto', '') | list | length == 5
+    fail_msg: >-
+      Le dépôt, l'architecture et toutes les versions Docker doivent être
+      explicitement validés pour Ubuntu 24.04 avant installation.
+
+- name: Create the APT keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download the Docker signing key with a pinned checksum
+  ansible.builtin.get_url:
+    url: "{{ vps_docker_apt_key_url }}"
+    dest: /etc/apt/keyrings/docker.asc
+    checksum: "sha256:{{ vps_docker_apt_key_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+
+- name: Read the Docker key fingerprints
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/gpg
+      - --batch
+      - --show-keys
+      - --with-colons
+      - /etc/apt/keyrings/docker.asc
+  register: vps_docker_key
+  changed_when: false
+  check_mode: false
+
+- name: Verify the Docker signing-key trust root
+  ansible.builtin.assert:
+    that:
+      - >-
+        ('fpr:::::::::' ~ vps_docker_apt_key_fingerprint ~ ':') in
+        vps_docker_key.stdout
+    fail_msg: "La clé APT Docker téléchargée n'a pas l'empreinte attendue."
+
+- name: Configure the official Docker APT repository
+  ansible.builtin.deb822_repository:
+    name: docker
+    types:
+      - deb
+    uris:
+      - https://download.docker.com/linux/ubuntu
+    suites:
+      - "{{ ansible_distribution_release }}"
+    components:
+      - stable
+    architectures:
+      - "{{ vps_docker_architecture_map[ansible_architecture] }}"
+    signed_by: /etc/apt/keyrings/docker.asc
+    state: present
+
+- name: Refresh APT metadata after adding Docker
+  ansible.builtin.apt:
+    update_cache: true
+
+- name: Pin the selected Docker package versions
+  ansible.builtin.template:
+    src: docker.pref.j2
+    dest: /etc/apt/preferences.d/docker
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install exact Docker Engine and Compose versions
+  ansible.builtin.apt:
+    name: "{{ vps_docker_packages | map(attribute='name') | zip(vps_docker_packages | map(attribute='version')) | map('join', '=') | list }}"
+    state: present
+    allow_downgrade: false
+    install_recommends: false
+    update_cache: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    NEEDRESTART_MODE: a
+
+- name: Hold Docker packages against unattended upgrades
+  ansible.builtin.dpkg_selections:
+    name: "{{ item.name }}"
+    selection: hold
+  loop: "{{ vps_docker_packages }}"
+  loop_control:
+    label: "{{ item.name }}={{ item.version }}"
+
+- name: Install the bounded Docker daemon configuration
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/bin/dockerd --validate --config-file=%s
+  notify: Restart Docker
+
+- name: Enable Docker without starting any platform service
+  ansible.builtin.service:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Apply Docker configuration before creating shared networks
+  ansible.builtin.meta: flush_handlers
+
+- name: Read installed Docker package versions
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg-query
+      - -W
+      - -f=${Version}
+      - "{{ item.name }}"
+  register: vps_docker_installed_versions
+  changed_when: false
+  check_mode: false
+  loop: "{{ vps_docker_packages }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Assert every Docker package has the selected version
+  ansible.builtin.assert:
+    that:
+      - item.stdout == item.item.version
+    fail_msg: >-
+      {{ item.item.name }} installé en {{ item.stdout }}, version attendue
+      {{ item.item.version }}.
+  loop: "{{ vps_docker_installed_versions.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: not ansible_check_mode
+
+- name: Confirm Compose v2 is available
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - compose
+      - version
+  changed_when: false
+  when: not ansible_check_mode

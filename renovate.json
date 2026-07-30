@@ -1,0 +1,54 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "timezone": "Europe/Paris",
+  "schedule": [
+    "* 0-5 * * 1"
+  ],
+  "dependencyDashboard": true,
+  "dependencyDashboardTitle": "Mises à jour de la plateforme",
+  "enabledManagers": [
+    "custom.regex"
+  ],
+  "branchConcurrentLimit": 2,
+  "prConcurrentLimit": 2,
+  "prHourlyLimit": 1,
+  "automerge": false,
+  "semanticCommits": "disabled",
+  "commitMessagePrefix": "deps:",
+  "commitMessageAction": "mets à jour",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Met à jour les tags lisibles et digests des images plateforme",
+      "managerFilePatterns": [
+        "/^platform\\/\\.env\\.example$/"
+      ],
+      "matchStrings": [
+        "(?<envName>[A-Z0-9_]+_IMAGE)=(?<depName>[a-zA-Z0-9._/-]+):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker",
+      "autoReplaceStringTemplate": "{{{envName}}}={{{depName}}}:{{{newValue}}}@{{{newDigest}}}"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Toute mise à jour majeure exige une décision opérateur",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "PostgreSQL et Caddy ne sont jamais des mises à jour ordinaires",
+      "matchPackageNames": [
+        "docker.io/library/caddy",
+        "docker.io/library/postgres"
+      ],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

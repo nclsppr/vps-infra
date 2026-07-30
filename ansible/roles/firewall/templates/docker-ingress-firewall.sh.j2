@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+managed_chain=VPS-INGRESS
+public_interface={{ vps_public_interface | quote }}
+
+ipt() {
+  /usr/sbin/iptables --wait 10 "$@"
+}
+
+# Insert a direct guard before touching the managed chain. If any following
+# command fails, public Docker forwarding is denied instead of becoming open.
+ipt -I DOCKER-USER 1 -i "$public_interface" -j DROP
+
+ipt -N "$managed_chain" 2>/dev/null || true
+ipt -F "$managed_chain"
+ipt -A "$managed_chain" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+ipt -A "$managed_chain" -i "$public_interface" -p tcp -m multiport --dports 80,443 -j ACCEPT
+ipt -A "$managed_chain" -i "$public_interface" -p udp --dport 443 -j ACCEPT
+ipt -A "$managed_chain" -i "$public_interface" -j DROP
+ipt -A "$managed_chain" -j RETURN
+
+# Keep exactly one jump before exactly one guard. During each rewrite, either
+# the direct guard or the already complete managed chain remains fail closed.
+while ipt -D DOCKER-USER -j "$managed_chain" 2>/dev/null; do :; done
+ipt -I DOCKER-USER 1 -j "$managed_chain"
+while ipt -D DOCKER-USER -i "$public_interface" -j DROP 2>/dev/null; do :; done
+ipt -I DOCKER-USER 2 -i "$public_interface" -j DROP

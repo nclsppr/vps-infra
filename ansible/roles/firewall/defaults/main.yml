@@ -1,0 +1,12 @@
+---
+vps_firewall_tcp_ports:
+  - "{{ vps_ssh_port | string }}"
+  - "80"
+  - "443"
+vps_firewall_udp_ports:
+  - "443"
+vps_firewall_initialised_marker: /etc/vps/markers/ufw-initialised-v1
+vps_public_interface: "{{ ansible_default_ipv4.interface }}"
+vps_firewall_managed_rule_pattern: >-
+  ^\[ *[0-9]+\] +(?:(?:22|80|443)/tcp|443/udp)( \(v6\))? +ALLOW IN
+  +Anywhere( \(v6\))? +# vps-infra managed$

@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Vérifier en ligne les preuves GitHub Actions d'une release validée."""
+
+from __future__ import annotations
+
+import argparse
+import ssl
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from release_policy import PolicyError, load_manifest, strict_json_loads  # noqa: E402
+
+
+GITHUB_API_ROOT = "https://api.github.com"
+GITHUB_API_VERSION = "2026-03-10"
+MAX_RESPONSE_BYTES = 1024 * 1024
+PLATFORM_REPOSITORY = "nclsppr/vps-infra"
+PLATFORM_BRANCH = "main"
+REQUIRED_WORKFLOW_PATH = ".github/workflows/vps-release.yml"
+ALLOWED_EVENTS = frozenset({"push", "workflow_dispatch"})
+
+
+class EvidenceError(ValueError):
+    """Raised when declared evidence cannot be independently confirmed."""
+
+
+@dataclass(frozen=True)
+class Evidence:
+    repository: str
+    branch: str
+    source_revision: str
+    run_id: str
+    html_url: str
+    workflow_path: str
+    run_attempt: int
+    paths: tuple[str, ...]
+
+
+FetchRun = Callable[[str, str, float], dict[str, Any]]
+FetchWorkflow = Callable[[str, str, float], dict[str, Any]]
+
+
+def _api_url(repository: str, run_id: str) -> str:
+    return f"{GITHUB_API_ROOT}/repos/{repository}/actions/runs/{run_id}"
+
+
+def _fetch_github_json(url: str, subject: str, timeout: float) -> dict[str, Any]:
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "vps-infra-release-evidence-verifier/1",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        },
+        method="GET",
+    )
+    opener = build_opener(
+        ProxyHandler({}),
+        HTTPSHandler(context=ssl.create_default_context()),
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            final_url = response.geturl()
+            if final_url != url:
+                raise EvidenceError(f"GitHub API a redirigé {subject} vers une URL inattendue")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > MAX_RESPONSE_BYTES:
+                        raise EvidenceError(f"réponse GitHub trop volumineuse pour {subject}")
+                except ValueError as exc:
+                    raise EvidenceError(f"Content-Length GitHub invalide pour {subject}") from exc
+            payload = response.read(MAX_RESPONSE_BYTES + 1)
+    except HTTPError as exc:
+        raise EvidenceError(f"GitHub API refuse {subject} avec HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise EvidenceError(f"GitHub API inaccessible pour {subject}: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise EvidenceError(f"délai GitHub API dépassé pour {subject}") from exc
+
+    if len(payload) > MAX_RESPONSE_BYTES:
+        raise EvidenceError(f"réponse GitHub trop volumineuse pour {subject}")
+    try:
+        value = strict_json_loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, PolicyError) as exc:
+        raise EvidenceError(f"réponse GitHub JSON invalide pour {subject}") from exc
+    if not isinstance(value, dict):
+        raise EvidenceError(f"réponse GitHub inattendue pour {subject}: objet requis")
+    return value
+
+
+def fetch_github_run(repository: str, run_id: str, timeout: float) -> dict[str, Any]:
+    """Fetch one public Actions run without credentials or ambient proxies."""
+
+    return _fetch_github_json(
+        _api_url(repository, run_id),
+        f"{repository} run {run_id}",
+        timeout,
+    )
+
+
+def fetch_github_workflow(
+    repository: str,
+    workflow_url: str,
+    timeout: float,
+) -> dict[str, Any]:
+    """Fetch workflow metadata after constraining the API URL to its repository."""
+
+    prefix = f"{GITHUB_API_ROOT}/repos/{quote(repository, safe='/')}/actions/workflows/"
+    workflow_id = workflow_url.removeprefix(prefix)
+    if (
+        not workflow_url.startswith(prefix)
+        or not workflow_id.isascii()
+        or not workflow_id.isdigit()
+        or workflow_id.startswith("0")
+    ):
+        raise EvidenceError(f"URL de workflow GitHub inattendue pour {repository}")
+    return _fetch_github_json(workflow_url, f"workflow {repository}/{workflow_id}", timeout)
+
+
+def _collect_evidence(manifest: dict[str, Any]) -> list[Evidence]:
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def add(repository: str, branch: str, value: dict[str, Any], path: str) -> None:
+        key = (repository, value["run_id"], value["source_revision"])
+        expected_url = value["url"]
+        workflow_path = value["workflow_path"]
+        run_attempt = value["run_attempt"]
+        if workflow_path != REQUIRED_WORKFLOW_PATH:
+            raise EvidenceError(
+                f"{path}.workflow_path: seul {REQUIRED_WORKFLOW_PATH!r} est autorisé"
+            )
+        if type(run_attempt) is not int or run_attempt < 1:
+            raise EvidenceError(f"{path}.run_attempt: entier strictement positif requis")
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = {
+                "branch": branch,
+                "html_url": expected_url,
+                "workflow_path": workflow_path,
+                "run_attempt": run_attempt,
+                "paths": [path],
+            }
+            return
+        if (
+            existing["branch"] != branch
+            or existing["html_url"] != expected_url
+            or existing["workflow_path"] != workflow_path
+            or existing["run_attempt"] != run_attempt
+        ):
+            raise EvidenceError(
+                f"preuves contradictoires pour {repository} run {value['run_id']}"
+            )
+        existing["paths"].append(path)
+
+    platform = manifest["platform"]
+    if platform["enabled"]:
+        for gate, value in platform["readiness_evidence"].items():
+            add(
+                PLATFORM_REPOSITORY,
+                PLATFORM_BRANCH,
+                value,
+                f"platform.readiness_evidence.{gate}",
+            )
+
+    for name, app in manifest["applications"].items():
+        if not app["enabled"]:
+            continue
+        repository = app["source_repository"]
+        branch = app["source_branch"]
+        for gate, value in app["readiness_evidence"].items():
+            add(
+                repository,
+                branch,
+                value,
+                f"applications.{name}.readiness_evidence.{gate}",
+            )
+        if app["type"] == "compose":
+            add(
+                repository,
+                branch,
+                app["migrations"]["evidence"],
+                f"applications.{name}.migrations.evidence",
+            )
+
+    return [
+        Evidence(
+            repository=repository,
+            branch=details["branch"],
+            source_revision=source_revision,
+            run_id=run_id,
+            html_url=details["html_url"],
+            workflow_path=details["workflow_path"],
+            run_attempt=details["run_attempt"],
+            paths=tuple(sorted(details["paths"])),
+        )
+        for (repository, run_id, source_revision), details in sorted(grouped.items())
+    ]
+
+
+def _require_equal(
+    evidence: Evidence,
+    field: str,
+    actual: Any,
+    expected: Any,
+) -> None:
+    if type(actual) is not type(expected) or actual != expected:
+        paths = ", ".join(evidence.paths)
+        raise EvidenceError(
+            f"{paths}: GitHub run {evidence.run_id} champ {field} "
+            f"attendu {expected!r}, reçu {actual!r}"
+        )
+
+
+def _verify_run(evidence: Evidence, run: dict[str, Any]) -> None:
+    repository = run.get("repository")
+    actual_repository = repository.get("full_name") if isinstance(repository, dict) else None
+    _require_equal(evidence, "repository.full_name", actual_repository, evidence.repository)
+    head_repository = run.get("head_repository")
+    actual_head_repository = (
+        head_repository.get("full_name") if isinstance(head_repository, dict) else None
+    )
+    _require_equal(
+        evidence,
+        "head_repository.full_name",
+        actual_head_repository,
+        evidence.repository,
+    )
+    _require_equal(evidence, "id", run.get("id"), int(evidence.run_id))
+    _require_equal(evidence, "html_url", run.get("html_url"), evidence.html_url)
+    _require_equal(evidence, "head_sha", run.get("head_sha"), evidence.source_revision)
+    _require_equal(evidence, "status", run.get("status"), "completed")
+    _require_equal(evidence, "conclusion", run.get("conclusion"), "success")
+    _require_equal(evidence, "head_branch", run.get("head_branch"), evidence.branch)
+    event = run.get("event")
+    if not isinstance(event, str) or event not in ALLOWED_EVENTS:
+        paths = ", ".join(evidence.paths)
+        raise EvidenceError(
+            f"{paths}: GitHub run {evidence.run_id} event {event!r} non autorisé"
+        )
+    _require_equal(evidence, "run_attempt", run.get("run_attempt"), evidence.run_attempt)
+    workflow_id = run.get("workflow_id")
+    if type(workflow_id) is not int or workflow_id < 1:
+        paths = ", ".join(evidence.paths)
+        raise EvidenceError(
+            f"{paths}: GitHub run {evidence.run_id} workflow_id invalide"
+        )
+    workflow_url = (
+        f"{GITHUB_API_ROOT}/repos/{evidence.repository}/actions/workflows/{workflow_id}"
+    )
+    _require_equal(evidence, "workflow_url", run.get("workflow_url"), workflow_url)
+    _require_equal(
+        evidence,
+        "path",
+        run.get("path"),
+        evidence.workflow_path,
+    )
+
+
+def _verify_workflow(
+    evidence: Evidence,
+    workflow_url: str,
+    workflow: dict[str, Any],
+) -> None:
+    workflow_id = int(workflow_url.rsplit("/", 1)[1])
+    _require_equal(evidence, "workflow.id", workflow.get("id"), workflow_id)
+    _require_equal(evidence, "workflow.url", workflow.get("url"), workflow_url)
+    _require_equal(evidence, "workflow.path", workflow.get("path"), evidence.workflow_path)
+    _require_equal(evidence, "workflow.state", workflow.get("state"), "active")
+
+
+def verify_manifest(
+    manifest: dict[str, Any],
+    *,
+    fetch_run: FetchRun = fetch_github_run,
+    fetch_workflow: FetchWorkflow = fetch_github_workflow,
+    timeout: float = 10.0,
+) -> int:
+    """Verify all unique online evidence and return the number of API runs checked."""
+
+    if timeout <= 0 or timeout > 60:
+        raise EvidenceError("le délai GitHub doit être compris entre 0 et 60 secondes")
+    evidence_items = _collect_evidence(manifest)
+    workflow_cache: dict[tuple[str, str], dict[str, Any]] = {}
+    for evidence in evidence_items:
+        run = fetch_run(evidence.repository, evidence.run_id, timeout)
+        if not isinstance(run, dict):
+            raise EvidenceError(
+                f"réponse simulée invalide pour {evidence.repository} run {evidence.run_id}"
+            )
+        _verify_run(evidence, run)
+        workflow_url = run["workflow_url"]
+        workflow_key = (evidence.repository, workflow_url)
+        workflow = workflow_cache.get(workflow_key)
+        if workflow is None:
+            workflow = fetch_workflow(evidence.repository, workflow_url, timeout)
+            if not isinstance(workflow, dict):
+                raise EvidenceError(
+                    f"réponse workflow simulée invalide pour {evidence.repository}"
+                )
+            workflow_cache[workflow_key] = workflow
+        _verify_workflow(evidence, workflow_url, workflow)
+    return len(evidence_items)
+
+
+def _timeout(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("nombre requis") from exc
+    if parsed <= 0 or parsed > 60:
+        raise argparse.ArgumentTypeError("valeur attendue dans ]0, 60]")
+    return parsed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "manifest",
+        nargs="?",
+        default="releases/production.yaml",
+        help="manifeste de release au sous-ensemble YAML compatible JSON",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=_timeout,
+        default=10.0,
+        help="délai maximal par appel GitHub API, en secondes (défaut: 10)",
+    )
+    args = parser.parse_args()
+
+    try:
+        manifest = load_manifest(args.manifest)
+        checked = verify_manifest(manifest, timeout=args.timeout)
+    except (OSError, PolicyError, EvidenceError) as exc:
+        print(f"échec de vérification des preuves GitHub: {exc}", file=sys.stderr)
+        return 1
+
+    if checked:
+        print(f"preuves GitHub confirmées: {checked} run(s) unique(s)")
+    else:
+        print("aucune preuve GitHub à vérifier: tous les composants sont désactivés")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

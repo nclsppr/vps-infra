@@ -1,0 +1,43 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+  external_labels:
+    environment: production
+    platform: vps
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - 127.0.0.1:9090
+        labels:
+          project: platform
+
+  - job_name: caddy
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/caddy.yml
+
+  - job_name: node-exporter
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/node-exporter.yml
+
+  - job_name: postgres-exporter
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/postgres-exporter.yml
+
+  - job_name: surplasse-backend
+    metrics_path: /q/metrics
+    scheme: http
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/surplasse.yml
+
+# Parkventory has no active scrape job. Its integration package must add one
+# only after its production readiness gates have succeeded.

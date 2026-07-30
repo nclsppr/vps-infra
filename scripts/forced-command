@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset CDPATH ENV BASH_ENV DRY_RUN VPS_CONTROLLER_TESTING VPS_REPOSITORY_DIR \
+  VPS_STATE_DIR VPS_LOCK_DIR VPS_PRODUCTION_ENABLE_FILE VPS_VALIDATE_RELEASE \
+  VPS_RECONCILE VPS_PLAN_DIGEST_READER VPS_APPLY_EXECUTABLE \
+  VPS_EXPECTED_ORIGIN VPS_SCHEMA_FILE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 \
+  GIT_CONFIG_VALUE_0
+
+if [ "$#" -ne 0 ]; then
+  echo "forced-command wrapper: arguments are forbidden" >&2
+  exit 64
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+sha=$("$script_dir/parse-forced-command" "${SSH_ORIGINAL_COMMAND-}") || exit $?
+
+exec /usr/bin/sudo -n -- /usr/local/libexec/vps/deploy "$sha"

@@ -1,0 +1,43 @@
+{
+	admin off
+	persist_config off
+	log {
+		output stdout
+		format json
+	}
+}
+
+(security_headers) {
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+}
+
+(static_site) {
+	import security_headers
+	encode zstd gzip
+	@html path / *.html */
+	header @html Cache-Control "no-cache"
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=3600"
+	file_server
+}
+
+(proxy_headers) {
+	header_up Host {http.request.host}
+}
+
+# Port interne au réseau ops uniquement : il n'est jamais publié sur l'hôte.
+http://:2019 {
+	@health path /healthz
+	respond @health "ok\n" 200
+	metrics /metrics
+	respond "Not found.\n" 404
+}
+
+import /etc/caddy/routes/*.caddy

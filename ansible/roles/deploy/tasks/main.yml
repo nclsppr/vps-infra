@@ -1,0 +1,375 @@
+---
+- name: Validate the bounded deployment identity
+  ansible.builtin.assert:
+    that:
+      - vps_deploy_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - vps_deploy_user not in ['root', vps_admin_user, vps_static_user]
+      - vps_deploy_install_root == '/usr/local/libexec/vps'
+      - vps_deploy_gate_path == '/usr/local/libexec/vps/forced-command'
+      - vps_deploy_controller_path == '/usr/local/libexec/vps/deploy'
+      - vps_deploy_schema_root == '/usr/local/share/vps-infra/schemas'
+      - vps_deploy_repository_dir == '/srv/vps/repository'
+      - vps_deploy_repository_url == 'https://github.com/nclsppr/vps-infra.git'
+      - vps_deploy_revision_path == '/usr/local/share/vps-infra/controller-revision'
+      - vps_deploy_state_dir == '/var/lib/vps-controller'
+      - vps_deploy_production_marker == '/etc/vps/production-enabled'
+      - vps_deploy_git_sha_length | int == 40
+      - vps_infra_revision is match('^[0-9a-f]{40}$')
+      - >-
+        vps_deploy_executables | list | sort ==
+        ['check-public-safe', 'deploy', 'doctor', 'forced-command',
+         'parse-forced-command', 'plan-digests', 'reconcile',
+         'validate-compose', 'validate-release', 'verify-github-evidence',
+         'verify-state']
+      - not (vps_live_apply_enabled | bool)
+    fail_msg: "Le contrat du compte ou de la commande de déploiement a dérivé."
+
+- name: Validate deployment public key syntax
+  ansible.builtin.assert:
+    that:
+      - item is match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
+      - "'\\n' not in item"
+      - "'\\r' not in item"
+    fail_msg: "Clé publique deploy invalide ou contenant déjà des options SSH."
+  loop: "{{ vps_deploy_authorized_keys }}"
+  loop_control:
+    label: "clé deploy déclarée"
+
+- name: Cryptographically parse deployment public keys
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ssh-keygen
+      - -l
+      - -f
+      - /dev/stdin
+    stdin: "{{ item }}\n"
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - vps_deploy_authorized_keys | length > 0
+  loop: "{{ vps_deploy_authorized_keys }}"
+  loop_control:
+    label: "clé deploy déclarée"
+
+- name: Create the deployment account with a valid shell
+  ansible.builtin.user:
+    name: "{{ vps_deploy_user }}"
+    comment: Forced-command deployment trigger
+    shell: /bin/bash
+    create_home: true
+    groups: ""
+    append: false
+    password_lock: true
+    state: present
+
+- name: Create the deployment SSH directory
+  ansible.builtin.file:
+    path: "/home/{{ vps_deploy_user }}/.ssh"
+    state: directory
+    owner: "{{ vps_deploy_user }}"
+    group: "{{ vps_deploy_user }}"
+    mode: "0700"
+
+- name: Install forced-command deployment keys
+  ansible.builtin.template:
+    src: authorized_keys.j2
+    dest: "/home/{{ vps_deploy_user }}/.ssh/authorized_keys"
+    owner: "{{ vps_deploy_user }}"
+    group: "{{ vps_deploy_user }}"
+    mode: "0600"
+
+- name: Create root-owned controller directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: "{{ vps_deploy_install_root }}"
+      mode: "0755"
+    - path: "{{ vps_deploy_install_root }}/lib"
+      mode: "0755"
+    - path: "{{ vps_deploy_schema_root }}"
+      mode: "0755"
+    - path: "{{ vps_deploy_repository_dir }}"
+      mode: "0700"
+    - path: "{{ vps_deploy_state_dir }}"
+      mode: "0700"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Initialise the fixed public infrastructure mirror at the requested commit
+  ansible.builtin.git:
+    repo: "{{ vps_deploy_repository_url }}"
+    dest: "{{ vps_deploy_repository_dir }}"
+    version: "{{ vps_infra_revision }}"
+    clone: true
+    update: true
+    force: false
+    recursive: false
+    track_submodules: false
+    single_branch: true
+  environment:
+    GIT_ALLOW_PROTOCOL: https
+    GIT_CONFIG_GLOBAL: /dev/null
+    GIT_CONFIG_SYSTEM: /dev/null
+    GIT_TERMINAL_PROMPT: "0"
+
+- name: Read the infrastructure mirror origin
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/git
+      - -C
+      - "{{ vps_deploy_repository_dir }}"
+      - remote
+      - get-url
+      - origin
+  register: vps_deploy_repository_origin
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Prove the fixed origin and deployable remote reference
+  when: not ansible_check_mode
+  block:
+    - name: Assert the mirror origin is not operator-controlled input
+      ansible.builtin.assert:
+        that:
+          - vps_deploy_repository_origin.stdout == vps_deploy_repository_url
+        fail_msg: "Le miroir vps-infra pointe vers une origine non autorisée."
+
+    - name: Verify origin main exists in the mirror
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - -C
+          - "{{ vps_deploy_repository_dir }}"
+          - show-ref
+          - --verify
+          - --quiet
+          - refs/remotes/origin/main
+      changed_when: false
+
+    - name: Read the checked-out infrastructure revision
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - -C
+          - "{{ vps_deploy_repository_dir }}"
+          - rev-parse
+          - HEAD
+      register: vps_deploy_repository_head
+      changed_when: false
+
+    - name: Prove the requested commit is checked out exactly
+      ansible.builtin.assert:
+        that:
+          - vps_deploy_repository_head.stdout == vps_infra_revision
+        fail_msg: "Le miroir n'est pas positionné sur le SHA vps-infra demandé."
+
+    - name: Prove the requested commit belongs to origin main
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - -C
+          - "{{ vps_deploy_repository_dir }}"
+          - merge-base
+          - --is-ancestor
+          - "{{ vps_infra_revision }}"
+          - refs/remotes/origin/main
+      changed_when: false
+
+    - name: Detect local modifications in the infrastructure mirror
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/git
+          - -C
+          - "{{ vps_deploy_repository_dir }}"
+          - status
+          - --porcelain
+          - --untracked-files=all
+      register: vps_deploy_repository_status
+      changed_when: false
+
+    - name: Refuse a modified infrastructure mirror
+      ansible.builtin.assert:
+        that:
+          - vps_deploy_repository_status.stdout == ''
+        fail_msg: "Le miroir vps-infra contient des modifications locales."
+
+- name: Inspect controller source files in the proven mirror
+  ansible.builtin.stat:
+    path: "{{ vps_deploy_repository_dir }}/scripts/{{ item }}"
+    follow: false
+  register: vps_deploy_source_executables
+  loop: "{{ vps_deploy_executables }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Refuse missing, non-regular or symlinked controller sources
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+    fail_msg: "La source contrôleur {{ item.item }} n'est pas un fichier régulier."
+  loop: "{{ vps_deploy_source_executables.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Inspect policy and schema sources in the proven mirror
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  register: vps_deploy_source_support_files
+  loop:
+    - "{{ vps_deploy_repository_dir }}/scripts/lib/release_policy.py"
+    - "{{ vps_deploy_repository_dir }}/schemas/production-release.schema.json"
+  when: not ansible_check_mode
+
+- name: Refuse missing, non-regular or symlinked policy sources
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+    fail_msg: "La source de confiance {{ item.item }} n'est pas un fichier régulier."
+  loop: "{{ vps_deploy_source_support_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Install reviewed controller executables from the proven mirror
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/{{ item }}"
+    dest: "{{ vps_deploy_install_root }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ vps_deploy_executables }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Install the dependency-free release policy module from the proven mirror
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/lib/release_policy.py"
+    dest: "{{ vps_deploy_install_root }}/lib/release_policy.py"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Install the production release schema from the proven mirror
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/schemas/production-release.schema.json"
+    dest: "{{ vps_deploy_schema_root }}/production-release.schema.json"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Record the exact installed controller revision
+  ansible.builtin.copy:
+    content: "{{ vps_infra_revision }}\n"
+    dest: "{{ vps_deploy_revision_path }}"
+    owner: root
+    group: root
+    mode: "0444"
+  when: not ansible_check_mode
+
+- name: Keep the live applicator absent in this non-activating tranche
+  ansible.builtin.file:
+    path: "{{ vps_deploy_install_root }}/apply-release"
+    state: absent
+
+- name: Keep production activation explicitly disabled
+  ansible.builtin.file:
+    path: "{{ vps_deploy_production_marker }}"
+    state: absent
+
+- name: Allow only the root-owned deployment controller through sudo
+  ansible.builtin.template:
+    src: deploy.sudoers.j2
+    dest: "/etc/sudoers.d/91-{{ vps_deploy_user }}-deploy"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Read deployment account groups
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/id
+      - -nG
+      - "{{ vps_deploy_user }}"
+  register: vps_deploy_groups
+  changed_when: false
+  check_mode: false
+
+- name: Prove deploy has no direct Docker or sudo capability
+  ansible.builtin.assert:
+    that:
+      - "'docker' not in vps_deploy_groups.stdout.split()"
+      - "'sudo' not in vps_deploy_groups.stdout.split()"
+      - vps_deploy_groups.stdout.split() == [vps_deploy_user]
+    fail_msg: >-
+      Le compte deploy possède un groupe supplémentaire. Il doit uniquement
+      pouvoir atteindre le contrôleur root-owned via sa règle sudoers bornée.
+
+- name: Inspect installed controller trust-root files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: vps_deploy_trust_root
+  loop:
+    - "{{ vps_deploy_gate_path }}"
+    - "{{ vps_deploy_controller_path }}"
+    - "{{ vps_deploy_install_root }}/lib/release_policy.py"
+    - "{{ vps_deploy_schema_root }}/production-release.schema.json"
+    - "{{ vps_deploy_revision_path }}"
+  when: not ansible_check_mode
+
+- name: Prove controller files are root-owned and not writable by deploy
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - not item.stat.wgrp
+      - not item.stat.woth
+    fail_msg: "Le fichier de confiance {{ item.item }} n'est pas protégé."
+  loop: "{{ vps_deploy_trust_root.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Inspect every installed controller executable
+  ansible.builtin.stat:
+    path: "{{ vps_deploy_install_root }}/{{ item }}"
+  register: vps_deploy_installed_executables
+  loop: "{{ vps_deploy_executables }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Prove every controller executable is a protected root-owned file
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.executable
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - not item.stat.wgrp
+      - not item.stat.woth
+    fail_msg: "L'exécutable de confiance {{ item.item }} n'est pas protégé."
+  loop: "{{ vps_deploy_installed_executables.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode

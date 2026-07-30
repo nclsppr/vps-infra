@@ -1,0 +1,3 @@
+{% for key in vps_deploy_authorized_keys %}
+restrict,command="{{ vps_deploy_gate_path }}" {{ key | trim }}
+{% endfor %}

@@ -1,0 +1,5 @@
+- targets:
+    - surplasse-backend:8080
+  labels:
+    project: surplasse
+    component: backend

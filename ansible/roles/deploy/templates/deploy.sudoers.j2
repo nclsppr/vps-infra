@@ -1,0 +1,4 @@
+Defaults:{{ vps_deploy_user }} env_reset
+Defaults:{{ vps_deploy_user }} secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Defaults:{{ vps_deploy_user }} !setenv
+{{ vps_deploy_user }} ALL=(root) NOPASSWD:NOSETENV: {{ vps_deploy_controller_path }}

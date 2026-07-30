@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  echo "forced-command parser: expected exactly one command string" >&2
+  exit 64
+fi
+
+original_command=$1
+case "$original_command" in
+  "deploy "*) sha=${original_command#"deploy "} ;;
+  *)
+    echo "forced-command parser: only 'deploy <sha40>' is accepted" >&2
+    exit 64
+    ;;
+esac
+
+if [ "$original_command" != "deploy $sha" ] || [ "${#sha}" -ne 40 ]; then
+  echo "forced-command parser: malformed deploy command" >&2
+  exit 64
+fi
+
+case "$sha" in
+  *[!0-9a-f]*)
+    echo "forced-command parser: SHA must be 40 lowercase hexadecimal characters" >&2
+    exit 64
+    ;;
+esac
+
+printf '%s\n' "$sha"

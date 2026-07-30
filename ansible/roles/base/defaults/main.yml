@@ -1,0 +1,25 @@
+---
+vps_base_packages:
+  - acl
+  - apt-transport-https
+  - ca-certificates
+  - chrony
+  - curl
+  - fail2ban
+  - git
+  - gnupg
+  - jq
+  - needrestart
+  - openssh-client
+  - python3-debian
+  - python3-jsonschema
+  - rsync
+  - unattended-upgrades
+  - unzip
+  - ufw
+  - xz-utils
+
+vps_swap_path: /swapfile
+vps_journald_system_max_use: 512M
+vps_journald_runtime_max_use: 128M
+vps_journald_max_file_sec: 7day
