@@ -749,6 +749,12 @@ class ComposePolicyTests(unittest.TestCase):
                     bind={"create_host_path": True}
                 ),
             ),
+            (
+                "omitted-bind-source-creation-policy",
+                lambda document: document["services"]["caddy"]["volumes"][0].update(
+                    bind={}
+                ),
+            ),
         ]
         for label, mutate in mutations:
             with self.subTest(label=label):
