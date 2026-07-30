@@ -29,8 +29,11 @@ La conception détaillée vit dans :
       l’ADR-0002 ;
 - [x] initialiser Git dans ce dossier et préparer la publication par pull
       request ;
-- [ ] ajouter une protection de `main` avec validations obligatoires ;
-- [ ] déclarer un environnement GitHub `production` ;
+- [x] protéger `main` avec pull request obligatoire, historique linéaire,
+      conversations résolues, administrateurs inclus et contrôle
+      `Repository contract` requis ;
+- [x] déclarer l’environnement GitHub `production`, limité à `main`, avec
+      validation humaine et `VPS_DEPLOY_ENABLED=false` ;
 - [x] ajouter un `CODEOWNERS` sur `platform/`,
       `ansible/`, `releases/` et les workflows ;
 - [x] épingler outils, Actions, paquets hôte et images ;
@@ -265,7 +268,9 @@ Critères :
 - [ ] digests en échec placés en quarantaine jusqu’au revert ou à une action
       explicite ;
 - [ ] journal de déploiement durable ;
-- [ ] environnement GitHub et concurrence globale configurés.
+- [x] environnement GitHub et concurrence globale configurés ; l’interrupteur
+      de production reste volontairement à `false` jusqu’aux preuves de la
+      phase 6.
 
 ## Phase 6 — répétition générale
 
