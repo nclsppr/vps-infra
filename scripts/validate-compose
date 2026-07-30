@@ -548,8 +548,12 @@ def validate_volumes(
         if bool(volume.get("read_only", False)) is not expected_read_only:
             fail(f"{path}.read_only: differs from the exact platform mount contract")
         option_key = "bind" if volume_type == "bind" else "volume"
-        if volume.get(option_key, {}) != expected_options:
-            fail(f"{path}.{option_key}: differs from the exact platform mount contract")
+        actual_options = volume.get(option_key, {})
+        if actual_options != expected_options:
+            fail(
+                f"{path}.{option_key}: expected exact options {expected_options!r}, "
+                f"got {actual_options!r}"
+            )
         other_option_key = "volume" if volume_type == "bind" else "bind"
         if other_option_key in volume:
             fail(f"{path}.{other_option_key}: unexpected mount options")

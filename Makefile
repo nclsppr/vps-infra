@@ -5,6 +5,7 @@ ANSIBLE_INVENTORY ?= ansible/inventories/production/hosts.yml
 ANSIBLE_EXTRA_VARS ?=
 PLATFORM_ENV ?= platform/.env.example
 MISE_EXEC := mise exec --
+COMPOSE := $(MISE_EXEC) docker-compose
 
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
@@ -58,7 +59,7 @@ check-platform: check-platform-config check-prometheus check-caddy ## Valider la
 check-platform-config: ## Rendre Compose puis appliquer la politique de production.
 	@rendered="$$(mktemp)"; \
 	trap 'rm -f -- "$$rendered"' EXIT; \
-	docker compose --env-file "$(PLATFORM_ENV)" --file platform/compose.yaml \
+	$(COMPOSE) --env-file "$(PLATFORM_ENV)" --file platform/compose.yaml \
 		config --format json >"$$rendered"; \
 	./scripts/validate-compose \
 		--structural-only \
