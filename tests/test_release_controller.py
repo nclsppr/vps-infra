@@ -740,7 +740,13 @@ class ComposePolicyTests(unittest.TestCase):
             (
                 "root-propagation",
                 lambda document: document["services"]["node-exporter"]["volumes"][2].update(
-                    bind={"propagation": "rshared"}
+                    bind={"create_host_path": False, "propagation": "rshared"}
+                ),
+            ),
+            (
+                "implicit-bind-source-creation",
+                lambda document: document["services"]["caddy"]["volumes"][0].update(
+                    bind={"create_host_path": True}
                 ),
             ),
         ]

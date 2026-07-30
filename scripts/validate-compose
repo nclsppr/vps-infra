@@ -83,8 +83,12 @@ PLATFORM_WRITABLE_VOLUME_TARGETS = {
 }
 PLATFORM_VOLUME_CONTRACTS = {
     "caddy": {
-        "/etc/caddy/Caddyfile": ("bind", "repo:platform/caddy/Caddyfile", True, {}),
-        "/etc/caddy/routes": ("bind", "repo:platform/caddy/routes", True, {}),
+        "/etc/caddy/Caddyfile": (
+            "bind", "repo:platform/caddy/Caddyfile", True, {"create_host_path": False}
+        ),
+        "/etc/caddy/routes": (
+            "bind", "repo:platform/caddy/routes", True, {"create_host_path": False}
+        ),
         "/srv/www": ("bind", "/srv/www", True, {"create_host_path": False}),
         "/data": ("volume", "caddy_data", False, {}),
         "/config": ("volume", "caddy_config", False, {}),
@@ -92,38 +96,69 @@ PLATFORM_VOLUME_CONTRACTS = {
     "postgresql": {
         "/var/lib/postgresql/data": ("volume", "postgresql_data", False, {}),
         "/etc/postgresql/postgresql.conf": (
-            "bind", "repo:platform/postgres/postgresql.conf", True, {}
+            "bind",
+            "repo:platform/postgres/postgresql.conf",
+            True,
+            {"create_host_path": False},
         ),
         "/etc/postgresql/pg_hba.conf": (
-            "bind", "repo:platform/postgres/pg_hba.conf", True, {}
+            "bind",
+            "repo:platform/postgres/pg_hba.conf",
+            True,
+            {"create_host_path": False},
         ),
-        "/docker-entrypoint-initdb.d": ("bind", "repo:platform/postgres/initdb", True, {}),
+        "/docker-entrypoint-initdb.d": (
+            "bind",
+            "repo:platform/postgres/initdb",
+            True,
+            {"create_host_path": False},
+        ),
     },
     "prometheus": {
         "/etc/prometheus/prometheus.yml": (
-            "bind", "repo:platform/observability/prometheus/prometheus.yml", True, {}
+            "bind",
+            "repo:platform/observability/prometheus/prometheus.yml",
+            True,
+            {"create_host_path": False},
         ),
         "/etc/prometheus/targets": (
-            "bind", "repo:platform/observability/prometheus/targets", True, {}
+            "bind",
+            "repo:platform/observability/prometheus/targets",
+            True,
+            {"create_host_path": False},
         ),
         "/etc/prometheus/rules": (
-            "bind", "repo:platform/observability/prometheus/rules", True, {}
+            "bind",
+            "repo:platform/observability/prometheus/rules",
+            True,
+            {"create_host_path": False},
         ),
         "/prometheus": ("volume", "prometheus_data", False, {}),
     },
     "grafana": {
         "/etc/grafana/provisioning": (
-            "bind", "repo:platform/observability/grafana/provisioning", True, {}
+            "bind",
+            "repo:platform/observability/grafana/provisioning",
+            True,
+            {"create_host_path": False},
         ),
         "/etc/grafana/dashboards": (
-            "bind", "repo:platform/observability/grafana/dashboards", True, {}
+            "bind",
+            "repo:platform/observability/grafana/dashboards",
+            True,
+            {"create_host_path": False},
         ),
         "/var/lib/grafana": ("volume", "grafana_data", False, {}),
     },
     "node-exporter": {
-        "/host/proc": ("bind", "/proc", True, {}),
-        "/host/sys": ("bind", "/sys", True, {}),
-        "/rootfs": ("bind", "/", True, {"propagation": "rslave"}),
+        "/host/proc": ("bind", "/proc", True, {"create_host_path": False}),
+        "/host/sys": ("bind", "/sys", True, {"create_host_path": False}),
+        "/rootfs": (
+            "bind",
+            "/",
+            True,
+            {"create_host_path": False, "propagation": "rslave"},
+        ),
     },
     "postgres-exporter": {},
 }

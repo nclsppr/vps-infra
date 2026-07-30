@@ -45,8 +45,18 @@ services:
       - "${CADDY_HTTPS_BIND_ADDRESS:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443/tcp"
       - "${CADDY_HTTPS_BIND_ADDRESS:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443/udp"
     volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./caddy/routes:/etc/caddy/routes:ro
+      - type: bind
+        source: ./caddy/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./caddy/routes
+        target: /etc/caddy/routes
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ${STATIC_ROOT:-/srv/www}
         target: /srv/www
@@ -99,9 +109,24 @@ services:
       - postgres_exporter_password
     volumes:
       - postgresql_data:/var/lib/postgresql/data
-      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
-      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
-      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - type: bind
+        source: ./postgres/postgresql.conf
+        target: /etc/postgresql/postgresql.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./postgres/pg_hba.conf
+        target: /etc/postgresql/pg_hba.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./postgres/initdb
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       db_surplasse:
         aliases:
@@ -146,9 +171,24 @@ services:
       - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-8GB}
       - --web.listen-address=0.0.0.0:9090
     volumes:
-      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./observability/prometheus/targets:/etc/prometheus/targets:ro
-      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+      - type: bind
+        source: ./observability/prometheus/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./observability/prometheus/targets
+        target: /etc/prometheus/targets
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./observability/prometheus/rules
+        target: /etc/prometheus/rules
+        read_only: true
+        bind:
+          create_host_path: false
       - prometheus_data:/prometheus
     networks:
       - ops
@@ -193,8 +233,18 @@ services:
     ports:
       - "127.0.0.1:${GRAFANA_PORT:-3000}:3000/tcp"
     volumes:
-      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - type: bind
+        source: ./observability/grafana/provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./observability/grafana/dashboards
+        target: /etc/grafana/dashboards
+        read_only: true
+        bind:
+          create_host_path: false
       - grafana_data:/var/lib/grafana
     networks:
       - ops
@@ -227,9 +277,25 @@ services:
       - --web.listen-address=0.0.0.0:9100
     pid: host
     volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro,rslave
+      - type: bind
+        source: /proc
+        target: /host/proc
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /sys
+        target: /host/sys
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /
+        target: /rootfs
+        read_only: true
+        bind:
+          create_host_path: false
+          propagation: rslave
     networks:
       - ops
     read_only: true
