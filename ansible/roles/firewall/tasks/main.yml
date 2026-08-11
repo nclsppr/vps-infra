@@ -141,11 +141,11 @@
   ansible.builtin.set_fact:
     vps_ufw_rule_lines: >-
       {{ vps_ufw_numbered_status.stdout_lines
-         | select('match', '^\\[ *[0-9]+\\]')
+         | select('match', '^\[ *[0-9]+\]')
          | list }}
     vps_ufw_unexpected_rule_lines: >-
       {{ vps_ufw_numbered_status.stdout_lines
-         | select('match', '^\\[ *[0-9]+\\]')
+         | select('match', '^\[ *[0-9]+\]')
          | reject('match', vps_firewall_managed_rule_pattern)
          | list }}
   when: not ansible_check_mode
@@ -158,19 +158,19 @@
       - vps_ufw_unexpected_rule_lines | length == 0
       - >-
         vps_ufw_rule_lines
-        | select('search', '] +22/tcp(?: \\(v6\\))? +ALLOW IN ')
+        | select('search', '] +22/tcp(?: \(v6\))? +ALLOW IN ')
         | list | length > 0
       - >-
         vps_ufw_rule_lines
-        | select('search', '] +80/tcp(?: \\(v6\\))? +ALLOW IN ')
+        | select('search', '] +80/tcp(?: \(v6\))? +ALLOW IN ')
         | list | length > 0
       - >-
         vps_ufw_rule_lines
-        | select('search', '] +443/tcp(?: \\(v6\\))? +ALLOW IN ')
+        | select('search', '] +443/tcp(?: \(v6\))? +ALLOW IN ')
         | list | length > 0
       - >-
         vps_ufw_rule_lines
-        | select('search', '] +443/udp(?: \\(v6\\))? +ALLOW IN ')
+        | select('search', '] +443/udp(?: \(v6\))? +ALLOW IN ')
         | list | length > 0
     fail_msg: >-
       UFW ne correspond pas à l'allowlist exacte 22/tcp, 80/tcp, 443/tcp et
