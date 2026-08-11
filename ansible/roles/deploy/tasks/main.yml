@@ -27,7 +27,8 @@
 - name: Validate deployment public key syntax
   ansible.builtin.assert:
     that:
-      - item is match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
+      - >-
+        item is match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
       - "'\\n' not in item"
       - "'\\r' not in item"
     fail_msg: "Clé publique deploy invalide ou contenant déjà des options SSH."

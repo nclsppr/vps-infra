@@ -1,7 +1,9 @@
 # Sources et preuves d’audit
 
-Sources consultées le 30 juillet 2026. Les liens externes pointent uniquement
-vers la documentation officielle des outils ou fournisseurs concernés.
+Sources initiales consultées le 30 juillet 2026. Les sources Ubuntu 26.04 et
+Docker `resolute` ont été vérifiées le 11 août 2026. Les liens externes pointent
+uniquement vers la documentation officielle des outils ou fournisseurs
+concernés.
 
 ## Instantané des dépôts
 
@@ -69,6 +71,11 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
 
 ### Configuration et reconstruction
 
+- [Canonical — notes de version Ubuntu 26.04 LTS](https://documentation.ubuntu.com/release-notes/26.04/) :
+  version `Resolute Raccoon`, publiée le 23 avril 2026 et prise en charge
+  pendant cinq ans.
+- [OVHcloud — cycle de vie des images](https://docs.ovhcloud.com/en/guides/public-cloud/compute/image-life-cycle) :
+  disponibilité d’Ubuntu 26.04 LTS dans le catalogue d’images OVHcloud.
 - [Ansible — Playbooks](https://docs.ansible.com/projects/ansible-core/devel/playbook_guide/playbooks_intro.html) :
   playbooks versionnables, idempotence et mode `--check`.
 - [OVHcloud — documentation VPS](https://help.ovhcloud.com/csm/fr-documentation-bare-metal-cloud-virtual-private-servers?id=kb_browse_cat&kb_id=203c4f65551974502d4c6e78b7421996) :
@@ -86,6 +93,11 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
 
 ### Docker et Compose
 
+- [Docker — installer Docker Engine sur Ubuntu](https://docs.docker.com/engine/install/ubuntu/) :
+  prise en charge d’Ubuntu Resolute 26.04 LTS sur `amd64` et `arm64`.
+- [Docker — index APT Ubuntu Resolute](https://download.docker.com/linux/ubuntu/dists/resolute/Release) :
+  architectures publiées et racine des index utilisés pour vérifier les
+  versions épinglées.
 - [Docker — utiliser Compose en production](https://docs.docker.com/compose/how-tos/production/) :
   configuration de production et recréation ciblée des services.
 - [Docker — réseaux Compose](https://docs.docker.com/compose/how-tos/networking/) :

@@ -12,7 +12,7 @@ hébergeant :
 
 Le socle reste volontairement simple :
 
-1. **Ansible** converge un Ubuntu 24.04 LTS neuf et durcit l’accès ;
+1. **Ansible** converge un Ubuntu 26.04 LTS neuf et durcit l’accès ;
 2. **Docker Compose** exploite le VPS unique, sans orchestrateur distribué ;
 3. une seule pile **plateforme** fournit Caddy, PostgreSQL, Prometheus,
    Grafana et les exporteurs ;

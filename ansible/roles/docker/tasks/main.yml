@@ -4,7 +4,7 @@
     that:
       - ansible_architecture in vps_docker_architecture_map
       - ansible_distribution == 'Ubuntu'
-      - ansible_distribution_release == 'noble'
+      - ansible_distribution_release == 'resolute'
       - vps_docker_apt_key_sha256 is match('^[0-9a-f]{64}$')
       - vps_docker_apt_key_fingerprint is match('^[0-9A-F]{40}$')
       - vps_docker_packages | length == 5
@@ -16,7 +16,7 @@
       - vps_docker_packages | map(attribute='version') | reject('equalto', '') | list | length == 5
     fail_msg: >-
       Validate the repository, architecture, and each Docker version for
-      Ubuntu 24.04 before installation.
+      Ubuntu 26.04 before installation.
 
 - name: Create the APT keyring directory
   ansible.builtin.file:

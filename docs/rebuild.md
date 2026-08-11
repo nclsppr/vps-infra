@@ -2,7 +2,7 @@
 
 ## Résultat attendu
 
-À partir d’un Ubuntu LTS neuf, d’une adresse IP, d’une clé SSH et des secrets
+À partir d’un Ubuntu 26.04 LTS neuf, d’une adresse IP, d’une clé SSH et des secrets
 conservés hors de la machine détruite, l’opérateur doit pouvoir :
 
 1. converger l’hôte avec Ansible ;
@@ -12,7 +12,7 @@ conservés hors de la machine détruite, l’opérateur doit pouvoir :
 5. vérifier les domaines et reprendre le trafic.
 
 La création ou la réinstallation de la ressource OVHcloud peut rester manuelle.
-Le contrat de ce dépôt commence à un Ubuntu 24.04 joignable en SSH : il ne
+Le contrat de ce dépôt commence à un Ubuntu 26.04 LTS joignable en SSH : il ne
 suppose ni snapshot, ni `cloud-init`, ni endpoint de provisioning tant que
 l’offre exacte n’a pas été observée. Un VPS OVHcloud et une instance Public
 Cloud n’ont pas le même plan de contrôle ; leur automatisation ne doit pas être
@@ -84,7 +84,7 @@ nouvelle deploy key en lecture seule.
 
 ## Phase 1 — créer l’hôte
 
-1. créer un VPS avec l’image Ubuntu LTS validée par le dépôt ;
+1. créer un VPS avec l’image Ubuntu 26.04 LTS validée par le dépôt ;
 2. injecter uniquement la clé SSH administrateur ;
 3. relever IPv4 et IPv6 ;
 4. ouvrir une première session et définir le moyen d’accès à la console de

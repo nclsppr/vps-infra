@@ -8,7 +8,7 @@ faut renseigner aucune valeur réelle dans ce dépôt public.
 À fournir par un canal privé :
 
 - l’offre et la région OVHcloud exactes ;
-- l’image Ubuntu LTS réellement installée ;
+- l’image Ubuntu 26.04 LTS (`resolute`) réellement installée ;
 - l’IPv4 et, si activée, l’IPv6 ;
 - le nom du compte initial fourni par l’image ;
 - le port SSH initial ; l’automatisation actuelle exige `22` et refusera
@@ -119,7 +119,8 @@ doit être disponible aux workflows de pull requests provenant de forks.
 Lors de la remise des accès :
 
 1. vérifier l’empreinte SSH via deux canaux ;
-2. collecter en lecture seule version d’OS, disques, mémoire, CPU, réseau et
+2. confirmer en lecture seule `VERSION_ID=26.04` et
+   `VERSION_CODENAME=resolute`, puis collecter disques, mémoire, CPU, réseau et
    règles de pare-feu OVHcloud ;
 3. exécuter Ansible en mode check lorsque les modules le permettent ;
 4. lancer `bootstrap.yml` en gardant la session initiale ouverte ;
