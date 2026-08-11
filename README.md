@@ -39,14 +39,16 @@ Le premier socle exécutable est livré :
 - manifeste de production, schéma, vérificateur de preuves GitHub et contrôleur
   de déploiement borné ;
 - validations locales et CI, dont détection de secrets pour dépôt public ;
-- workflow de production manuel, désactivé tant que le VPS n’est pas éprouvé ;
+- workflow de production manuel, désactivé tant que les portes de la plateforme
+  et des releases ne sont pas éprouvées ;
 - workflow multi-architecture Caddy : build de preuve en PR, publication GHCR
   et attestation uniquement depuis `main`.
 
-Aucune machine, zone DNS, image GHCR applicative ou donnée de production n’a
-été modifiée. Le manifeste garde donc toutes les unités à `enabled: false`, sa
-politique racine refuse toute activation et le contrôleur ne possède
-volontairement aucun applicateur live.
+The Atlas host is now provisioned from this repository. It passed bootstrap,
+repeated convergence, a bounded predictive check, and a complete reboot. No
+DNS zone, application release, platform service, or production data was
+changed. The manifest keeps every unit at `enabled: false`. Its root policy
+rejects activation, and the controller still has no live applicator.
 
 ## Démarrage local
 
@@ -77,6 +79,10 @@ make bootstrap \
 # Après avoir prouvé une seconde connexion avec le compte administrateur :
 # make converge récupère origin/main et n'installe que ce SHA prouvé.
 make converge \
+  ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
+
+# After successful convergence, predict drift without remote mutation.
+make converge-check \
   ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
 ```
 

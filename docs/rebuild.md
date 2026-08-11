@@ -58,7 +58,12 @@ make doctor-local
 # Depuis un poste de confiance, avec fichiers locaux ignorés par Git
 make bootstrap ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
 make converge ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
+make converge-check ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
 ```
+
+Run `converge-check` only after a successful normal convergence. It predicts
+drift from the same isolated `origin/main` snapshot and rejects every
+command-line option except the exact `--check --diff` pair.
 
 Le contrôleur `scripts/deploy <sha40>` sait valider et planifier un état désiré,
 mais reste en dry-run. L’activation live exige encore l’applicateur root-owned,

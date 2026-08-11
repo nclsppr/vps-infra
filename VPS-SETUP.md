@@ -1,9 +1,9 @@
 # Plan de mise en œuvre du VPS multi-projets
 
-> **Statut : socle local exécutable, production verrouillée.** Les playbooks,
-> la pile plateforme, le manifeste, les contrôles et les workflows sont livrés.
-> Ils restent fail-closed : aucun hôte, secret, DNS ni applicateur live n’est
-> configuré. L’ancien runbook archivé ne doit pas être appliqué.
+> **Status: Atlas host layer proven, production locked.** Atlas passed
+> bootstrap, repeated convergence, predictive check mode, and a complete
+> reboot. No production secret, DNS change, platform service, application, or
+> live applicator is configured. Do not use the archived runbook.
 
 ## Décision recommandée
 
@@ -53,7 +53,7 @@ versionné ne peut pas être la preuve d’une reconstruction.
 
 - [ ] confirmer l’offre, la région et l’image Ubuntu 26.04 LTS exactes chez
       OVHcloud ;
-- [ ] confirmer le fournisseur DNS de chaque zone ;
+- [x] confirmer le fournisseur DNS de chaque zone ;
 - [ ] choisir et épingler les modules DNS Caddy nécessaires à toutes les zones
       dont le certificat doit être émis avant la bascule ;
 - [ ] générer des jetons distincts et limités aux seules zones requises ;
@@ -61,6 +61,11 @@ versionné ne peut pas être la preuve d’une reconstruction.
 - [ ] documenter `--resolve` et le chemin de bascule HTTP-01 pour toute zone
       sans DNS-01 ;
 - [ ] décider le domaine Parkventory.
+
+Public DNS observation on 2026-08-12 confirms OVH authoritative name servers
+for `nicolaspieper.com`, `papersempire.com`, `surplasse.com`, and the legacy
+`pieper.fr` zone. This observation does not prove OVH API access or replace the
+required full zone export.
 
 ### Choisir la version PostgreSQL
 
@@ -113,16 +118,23 @@ ansible/
 
 Critères :
 
-- [ ] Ubuntu 26.04 LTS vierge accepté avec une seule clé SSH ;
-- [ ] seconde connexion prouvée avant durcissement ;
-- [ ] root et mots de passe SSH refusés ;
-- [ ] pare-feu limité à SSH/HTTP/HTTPS ;
-- [ ] Docker officiel et Compose installés ;
-- [ ] aucune toolchain applicative sur l’hôte ;
-- [ ] logs bornés, redémarrage et reboot vérifiés ;
-- [ ] second passage Ansible sans changement ;
-- [ ] `--check --diff` utilisé en CI sur un hôte jetable ou un scénario de
-      test adapté.
+- [x] Ubuntu 26.04 LTS vierge accepté avec une seule clé SSH ;
+- [x] seconde connexion prouvée avant durcissement ;
+- [x] root et mots de passe SSH refusés ;
+- [x] pare-feu limité à SSH/HTTP/HTTPS ;
+- [x] Docker officiel et Compose installés ;
+- [x] aucune toolchain applicative sur l’hôte ;
+- [x] logs bornés, redémarrage et reboot vérifiés ;
+- [x] second passage Ansible sans changement ;
+- [x] bounded `--check --diff` invocation covered by CI and executed on the
+      converged host without a predicted change.
+
+Atlas host evidence was collected on 2026-08-12. Both independent
+administrator keys opened new sessions, direct root SSH failed, UFW exposed
+only the declared ports, Docker had no container, the reboot created a new boot
+identifier, normal convergence reported `changed=0`, and predictive check mode
+reported `changed=0`. A full disposable-host platform rehearsal remains in
+Phase 6.
 
 ## Phase 3 — extraire la plateforme commune
 
