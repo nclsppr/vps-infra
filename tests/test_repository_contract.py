@@ -243,6 +243,44 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             1,
         )
 
+    def test_docker_apt_refresh_runs_only_after_repository_change(self) -> None:
+        tasks = yaml.safe_load(
+            (ROOT / "ansible/roles/docker/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        handlers = yaml.safe_load(
+            (ROOT / "ansible/roles/docker/handlers/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        repository_index, repository = next(
+            (index, task)
+            for index, task in enumerate(tasks)
+            if task["name"] == "Configure the official Docker APT repository"
+        )
+        refresh = next(
+            handler
+            for handler in handlers
+            if handler["name"] == "Refresh Docker APT metadata"
+        )
+        flush_index = next(
+            index
+            for index, task in enumerate(tasks)
+            if task["name"]
+            == "Apply Docker repository handlers before package installation"
+        )
+        install_index = next(
+            index
+            for index, task in enumerate(tasks)
+            if task["name"] == "Install exact Docker Engine and Compose versions"
+        )
+
+        self.assertEqual(repository["notify"], "Refresh Docker APT metadata")
+        self.assertIs(refresh["ansible.builtin.apt"]["update_cache"], True)
+        self.assertLess(repository_index, flush_index)
+        self.assertLess(flush_index, install_index)
+
     def test_normal_convergence_never_retires_an_administrator_key(self) -> None:
         tasks = yaml.safe_load(
             (ROOT / "ansible/roles/ssh/tasks/main.yml").read_text(encoding="utf-8")

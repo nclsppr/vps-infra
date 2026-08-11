@@ -71,10 +71,10 @@
       - "{{ vps_docker_architecture_map[ansible_architecture] }}"
     signed_by: /etc/apt/keyrings/docker.asc
     state: present
+  notify: Refresh Docker APT metadata
 
-- name: Refresh APT metadata after adding Docker
-  ansible.builtin.apt:
-    update_cache: true
+- name: Apply Docker repository handlers before package installation
+  ansible.builtin.meta: flush_handlers
 
 - name: Pin the selected Docker package versions
   ansible.builtin.template:
