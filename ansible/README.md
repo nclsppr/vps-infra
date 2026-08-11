@@ -1,6 +1,6 @@
 # Host Automation
 
-This directory configures an Ubuntu 24.04 LTS host. It contains no secret,
+This directory configures an Ubuntu 26.04 LTS host. It contains no secret,
 production address, or production inventory. Host convergence does not start
 the platform or an application.
 

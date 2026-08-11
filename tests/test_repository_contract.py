@@ -49,7 +49,7 @@ class SupplyChainContractTests(unittest.TestCase):
         packages = {item["name"]: item["version"] for item in variables["vps_docker_packages"]}
         self.assertEqual(packages["docker-ce-cli"], packages["docker-ce"])
         engine_match = re.fullmatch(
-            r"5:(\d+)\.(\d+)\.(\d+)-1~ubuntu\.24\.04~noble",
+            r"5:(\d+)\.(\d+)\.(\d+)-1~ubuntu\.26\.04~resolute",
             packages["docker-ce"],
         )
         self.assertIsNotNone(engine_match)

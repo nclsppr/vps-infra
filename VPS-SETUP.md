@@ -51,7 +51,7 @@ versionné ne peut pas être la preuve d’une reconstruction.
 
 ### Fournisseur et DNS
 
-- [ ] confirmer l’offre, la région et l’image Ubuntu LTS exactes chez
+- [ ] confirmer l’offre, la région et l’image Ubuntu 26.04 LTS exactes chez
       OVHcloud ;
 - [ ] confirmer le fournisseur DNS de chaque zone ;
 - [ ] choisir et épingler les modules DNS Caddy nécessaires à toutes les zones
@@ -113,7 +113,7 @@ ansible/
 
 Critères :
 
-- [ ] Ubuntu vierge accepté avec une seule clé SSH ;
+- [ ] Ubuntu 26.04 LTS vierge accepté avec une seule clé SSH ;
 - [ ] seconde connexion prouvée avant durcissement ;
 - [ ] root et mots de passe SSH refusés ;
 - [ ] pare-feu limité à SSH/HTTP/HTTPS ;
