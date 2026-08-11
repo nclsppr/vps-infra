@@ -105,6 +105,30 @@ class SupplyChainContractTests(unittest.TestCase):
 
 
 class SecurityBoundaryContractTests(unittest.TestCase):
+    def test_assert_conditions_are_yaml_strings(self) -> None:
+        def inspect_assertions(node: object, path: Path) -> None:
+            if isinstance(node, dict):
+                assertion = node.get("ansible.builtin.assert")
+                if isinstance(assertion, dict):
+                    conditions = assertion.get("that", [])
+                    if isinstance(conditions, str):
+                        conditions = [conditions]
+                    for condition in conditions:
+                        self.assertIsInstance(
+                            condition,
+                            str,
+                            f"{path}: assert condition parsed as {type(condition).__name__}",
+                        )
+                for value in node.values():
+                    inspect_assertions(value, path)
+            elif isinstance(node, list):
+                for value in node:
+                    inspect_assertions(value, path)
+
+        for path in (ROOT / "ansible").rglob("*.yml"):
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            inspect_assertions(document, path.relative_to(ROOT))
+
     def test_firewall_matches_original_published_ports(self) -> None:
         firewall = (
             ROOT / "ansible/roles/firewall/templates/docker-ingress-firewall.sh.j2"
