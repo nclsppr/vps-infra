@@ -35,6 +35,7 @@
     group: root
     mode: "0644"
     force: false
+  notify: Refresh Docker APT metadata
 
 - name: Read the Docker key fingerprints
   ansible.builtin.command:
@@ -71,10 +72,7 @@
       - "{{ vps_docker_architecture_map[ansible_architecture] }}"
     signed_by: /etc/apt/keyrings/docker.asc
     state: present
-
-- name: Refresh APT metadata after adding Docker
-  ansible.builtin.apt:
-    update_cache: true
+  notify: Refresh Docker APT metadata
 
 - name: Pin the selected Docker package versions
   ansible.builtin.template:
@@ -83,6 +81,10 @@
     owner: root
     group: root
     mode: "0644"
+  notify: Refresh Docker APT metadata
+
+- name: Apply Docker repository handlers before package installation
+  ansible.builtin.meta: flush_handlers
 
 - name: Install exact Docker Engine and Compose versions
   ansible.builtin.apt:
