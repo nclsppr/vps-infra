@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 
 import yaml
+from ansible.parsing.dataloader import DataLoader
+from ansible.template import Templar, trust_as_template
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +131,75 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         for path in (ROOT / "ansible").rglob("*.yml"):
             document = yaml.safe_load(path.read_text(encoding="utf-8"))
             inspect_assertions(document, path.relative_to(ROOT))
+
+    def test_ufw_validation_accepts_rendered_ipv4_and_ipv6_rules(self) -> None:
+        tasks = yaml.safe_load(
+            (ROOT / "ansible/roles/firewall/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        defaults = yaml.safe_load(
+            (ROOT / "ansible/roles/firewall/defaults/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        extraction = next(
+            task
+            for task in tasks
+            if task["name"] == "Extract rules outside the exact managed ingress allowlist"
+        )["ansible.builtin.set_fact"]
+        assertions = next(
+            task
+            for task in tasks
+            if task["name"]
+            == "Assert UFW is active with the exact managed ingress allowlist"
+        )["ansible.builtin.assert"]["that"]
+        output_lines = [
+            "Status: active",
+            "",
+            "     To                         Action      From",
+            "     --                         ------      ----",
+            "[ 1] 22/tcp                     ALLOW IN    Anywhere                   # vps-infra managed",
+            "[ 2] 80/tcp                     ALLOW IN    Anywhere                   # vps-infra managed",
+            "[ 3] 443/tcp                    ALLOW IN    Anywhere                   # vps-infra managed",
+            "[ 4] 443/udp                    ALLOW IN    Anywhere                   # vps-infra managed",
+            "[ 5] 22/tcp (v6)                ALLOW IN    Anywhere (v6)              # vps-infra managed",
+            "[ 6] 80/tcp (v6)                ALLOW IN    Anywhere (v6)              # vps-infra managed",
+            "[ 7] 443/tcp (v6)               ALLOW IN    Anywhere (v6)              # vps-infra managed",
+            "[ 8] 443/udp (v6)               ALLOW IN    Anywhere (v6)              # vps-infra managed",
+        ]
+        rendered_rules = output_lines[4:]
+        templar = Templar(
+            loader=DataLoader(),
+            variables={
+                "vps_ufw_numbered_status": {"stdout_lines": output_lines},
+                "vps_firewall_managed_rule_pattern": defaults[
+                    "vps_firewall_managed_rule_pattern"
+                ],
+            }
+        )
+
+        rule_lines = templar.template(
+            trust_as_template(extraction["vps_ufw_rule_lines"])
+        )
+        unexpected_rule_lines = templar.template(
+            trust_as_template(extraction["vps_ufw_unexpected_rule_lines"])
+        )
+        self.assertEqual(rule_lines, rendered_rules)
+        self.assertEqual(unexpected_rule_lines, [])
+
+        for condition, ipv4_rule, ipv6_rule in zip(
+            assertions[3:],
+            rendered_rules[:4],
+            rendered_rules[4:],
+            strict=True,
+        ):
+            for rule in (ipv4_rule, ipv6_rule):
+                result = Templar(
+                    loader=DataLoader(),
+                    variables={"vps_ufw_rule_lines": [rule]}
+                ).template(trust_as_template("{{ " + condition + " }}"))
+                self.assertIs(result, True)
 
     def test_firewall_matches_original_published_ports(self) -> None:
         firewall = (
