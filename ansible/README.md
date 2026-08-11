@@ -55,6 +55,11 @@ temporary directory. It installs the locked tools and dependencies in that
 directory. It then runs `site.yml` from the exported tree and passes the same
 commit as `vps_infra_revision`.
 
+An encrypted administrator key must already be unlocked in the caller's SSH
+agent. The script resolves and validates a caller-owned `SSH_AUTH_SOCK`, then
+passes that socket only to `ansible-playbook`. Git, mise, dependency setup, and
+Ansible Galaxy continue to run without access to the agent.
+
 The script uses absolute external inventory and public-key variable files. It
 starts Git and Ansible commands with a small environment allowlist. Therefore,
 a divergent branch, a tracked local modification, an untracked role, or an

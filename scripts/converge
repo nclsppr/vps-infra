@@ -44,6 +44,15 @@ inventory=$(realpath -- "$inventory")
 extra_vars=$(realpath -- "$extra_vars")
 readonly inventory extra_vars
 
+ssh_auth_sock=${SSH_AUTH_SOCK:-}
+if [[ -n $ssh_auth_sock ]]; then
+  ssh_auth_sock=$(realpath -- "$ssh_auth_sock") || \
+    fail "SSH_AUTH_SOCK does not resolve to a local path" "$EX_CONFIG"
+  [[ -S $ssh_auth_sock && -O $ssh_auth_sock ]] || \
+    fail "SSH_AUTH_SOCK must identify a caller-owned Unix socket" "$EX_CONFIG"
+fi
+readonly ssh_auth_sock
+
 safe_git() {
   "$env_executable" -i \
     HOME="$caller_home" \
@@ -80,6 +89,17 @@ readonly temporary_root
 checkout="$temporary_root/checkout"
 isolated_home="$temporary_root/home"
 readonly checkout isolated_home
+ansible_environment=(
+  "HOME=$isolated_home"
+  "PATH=$checkout/.venv/bin:$caller_path"
+  "LC_ALL=C.UTF-8"
+  "ANSIBLE_CONFIG=$checkout/ansible/ansible.cfg"
+  "ANSIBLE_COLLECTIONS_PATH=$checkout/.cache/ansible/collections"
+)
+if [[ -n $ssh_auth_sock ]]; then
+  ansible_environment+=("SSH_AUTH_SOCK=$ssh_auth_sock")
+fi
+readonly -a ansible_environment
 
 cleanup() {
   local status=$?
@@ -118,12 +138,7 @@ clean_command() {
   clean_command ../.venv/bin/ansible-galaxy collection install \
     --requirements-file collections/requirements.yml \
     --collections-path ../.cache/ansible/collections
-  "$env_executable" -i \
-    HOME="$isolated_home" \
-    PATH="$checkout/.venv/bin:$caller_path" \
-    LC_ALL=C.UTF-8 \
-    ANSIBLE_CONFIG="$checkout/ansible/ansible.cfg" \
-    ANSIBLE_COLLECTIONS_PATH="$checkout/.cache/ansible/collections" \
+  "$env_executable" -i "${ansible_environment[@]}" \
     ../.venv/bin/ansible-playbook \
       --inventory "$inventory" \
       --extra-vars "@$extra_vars" \
