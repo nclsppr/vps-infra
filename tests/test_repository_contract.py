@@ -210,6 +210,28 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("cd \"$checkout\"", converge)
         self.assertIn('--extra-vars "vps_infra_revision=$revision"', converge)
 
+    def test_convergence_keeps_the_ssh_control_path_short(self) -> None:
+        converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
+        self.assertIn("umask 077", converge)
+        self.assertIn(
+            'temporary_root=$("$mktemp_executable" -d '
+            "/tmp/vps-infra-converge.XXXXXXXX)",
+            converge,
+        )
+        representative_control_path = (
+            Path("/tmp").resolve()
+            / "vps-infra-converge.12345678/home/.ansible/cp"
+            / "0123456789abcdef0123456789abcdef01234567"
+        )
+        self.assertLess(len(os.fsencode(representative_control_path)), 104)
+
+    def test_convergence_explicitly_trusts_the_captured_mise_config(self) -> None:
+        converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
+        trust = 'clean_command "$mise_executable" trust "$checkout/mise.toml"'
+        install = 'clean_command "$mise_executable" install --locked'
+        self.assertIn(trust, converge)
+        self.assertLess(converge.index(trust), converge.index(install))
+
     def test_convergence_executes_the_captured_remote_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "repository"
@@ -414,6 +436,14 @@ fi
             execution = log.read_text(encoding="utf-8")
             self.assertIn("marker=remote-main", execution)
             self.assertNotIn("divergent-worktree", execution)
+            mise_calls = [
+                line for line in execution.splitlines() if line.startswith("mise=")
+            ]
+            self.assertEqual(len(mise_calls), 3)
+            self.assertIn(" trust ", mise_calls[0])
+            self.assertTrue(mise_calls[0].endswith("/mise.toml"))
+            self.assertIn(" install --locked", mise_calls[1])
+            self.assertIn(" exec -- uv sync --locked", mise_calls[2])
             self.assertIn(f"vps_infra_revision={remote_sha}", execution)
             self.assertIn(
                 "+refs/heads/main:refs/remotes/origin/main",

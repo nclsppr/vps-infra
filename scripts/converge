@@ -75,12 +75,11 @@ revision=$(safe_git -C "$REPOSITORY_ROOT" rev-parse --verify \
 [[ $revision =~ ^[0-9a-f]{40}$ ]] || fail "origin/main did not resolve to a full lowercase Git SHA"
 readonly revision
 
-temporary_root=$("$mktemp_executable" -d)
+temporary_root=$("$mktemp_executable" -d /tmp/vps-infra-converge.XXXXXXXX)
 readonly temporary_root
 checkout="$temporary_root/checkout"
 isolated_home="$temporary_root/home"
 readonly checkout isolated_home
-mkdir -m 0700 -- "$checkout" "$isolated_home"
 
 cleanup() {
   local status=$?
@@ -94,6 +93,7 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+mkdir -m 0700 -- "$checkout" "$isolated_home"
 
 safe_git -C "$REPOSITORY_ROOT" archive --format=tar "$revision" | \
   "$tar_executable" -xf - -C "$checkout"
@@ -111,6 +111,7 @@ clean_command() {
 
 (
   cd "$checkout"
+  clean_command "$mise_executable" trust "$checkout/mise.toml"
   clean_command "$mise_executable" install --locked
   clean_command "$mise_executable" exec -- uv sync --locked
   cd ansible
