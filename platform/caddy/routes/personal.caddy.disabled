@@ -1,0 +1,15 @@
+{$PERSONAL_DOMAIN:nicolaspieper.com} {
+	log
+	root * /srv/www/personal/current
+	import static_site
+	handle_errors {
+		@not_found expression {err.status_code} == 404
+		rewrite @not_found /404.html
+		file_server
+	}
+}
+
+{$PERSONAL_WWW_DOMAIN:www.nicolaspieper.com}, {$PERSONAL_LEGACY_DOMAIN:nicolas.pieper.fr} {
+	import security_headers
+	redir https://{$PERSONAL_DOMAIN:nicolaspieper.com}{uri} 308
+}

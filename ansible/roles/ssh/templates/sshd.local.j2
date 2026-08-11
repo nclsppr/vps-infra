@@ -1,0 +1,7 @@
+[sshd]
+enabled = true
+backend = systemd
+port = {{ vps_ssh_port }}
+maxretry = {{ vps_fail2ban_maxretry }}
+findtime = {{ vps_fail2ban_findtime }}
+bantime = {{ vps_fail2ban_bantime }}

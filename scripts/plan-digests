@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Print only artifact digests introduced by activate/update plan actions."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from release_policy import PolicyError, strict_json_loads  # noqa: E402
+
+REFERENCE_RE = re.compile(r"^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+(?::[A-Za-z0-9_.-]+)?@(sha256:[0-9a-f]{64})$")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("plan")
+    args = parser.parse_args()
+    try:
+        value = strict_json_loads(Path(args.plan).read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or value.get("schema") != 1:
+            raise ValueError("unsupported plan schema")
+        actions = value.get("actions")
+        if not isinstance(actions, list):
+            raise ValueError("actions must be an array")
+        digests: set[str] = set()
+        for action in actions:
+            if not isinstance(action, dict):
+                raise ValueError("action must be an object")
+            if action.get("action") not in {"activate", "update"}:
+                continue
+            references = action.get("desired_references")
+            if not isinstance(references, dict):
+                raise ValueError("changed action must carry a desired_references object")
+            for reference in references.values():
+                if not isinstance(reference, str):
+                    raise ValueError("desired reference must be a string")
+                match = REFERENCE_RE.fullmatch(reference)
+                if match is None:
+                    raise ValueError(f"invalid desired reference: {reference!r}")
+                digests.add(match.group(1))
+    except (OSError, PolicyError, ValueError) as exc:
+        print(f"plan digest extraction failed: {exc}", file=sys.stderr)
+        return 1
+    for digest in sorted(digests):
+        print(digest)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,141 @@
+# Shared Platform
+
+This directory contains the shared platform baseline. Do not start it on a
+production host until the controller has validated every required secret,
+external network, and immutable image reference.
+
+## Image versions
+
+The platform uses the following service versions:
+
+| Service | Version |
+|---|---|
+| Caddy | `2.11.4-alpine` |
+| PostgreSQL | `17.10-bookworm` |
+| Prometheus | `3.13.1-busybox` |
+| Grafana | `13.1.1` |
+| Node Exporter | `1.12.1` |
+| PostgreSQL Exporter | `0.20.1` |
+
+Each Compose image reference contains a readable tag and an immutable digest.
+The upstream Caddy image does not contain an OVH DNS provider. CI builds one
+Caddy image with `caddy-dns/ovh` v1.1.0 at commit
+`17fd665136b593153167bf9dfee9a3c0bd2c7ac0`. Production must use the published
+image by digest in `CADDY_PLATFORM_IMAGE`.
+
+## Application state
+
+The production release manifest disables all four applications. Therefore,
+the base platform has no active application route, scrape target, or alert
+rule. Each candidate file has a `.disabled` suffix:
+
+```text
+platform/caddy/routes/
+  papersempire.caddy.disabled
+  parkventory.caddy.disabled
+  personal.caddy.disabled
+  surplasse.caddy.disabled
+
+platform/observability/prometheus/
+  targets/surplasse.yml.disabled
+  rules/surplasse.yml.disabled
+```
+
+`scripts/validate-application-state` requires the file state to match
+`releases/production.yaml`. It rejects an unknown file and an active file for a
+disabled application. This locked baseline also rejects every enabled
+application. A reviewed integration package must update the validator and
+activate each required file as part of the same versioned release change. An
+environment variable cannot activate a file.
+
+The base Caddy service does not receive an OVH credential or an application
+network. The Caddy entry point requires the three OVH credential files only
+when `surplasse.caddy` is active. This requirement makes an incomplete
+Surplasse activation fail before Caddy starts.
+
+## Network boundaries
+
+Ansible creates six external Docker networks. The base platform joins only the
+two platform networks:
+
+| Network | Subnet | Base platform members |
+|---|---|---|
+| `ops` | `172.30.30.0/24` | Caddy, Prometheus, Grafana, and exporters |
+| `db_monitoring` | `172.30.31.0/24` | PostgreSQL and PostgreSQL Exporter |
+| `app_surplasse` | `172.30.10.0/24` | None |
+| `db_surplasse` | `172.30.11.0/24` | None |
+| `app_parkventory` | `172.30.20.0/24` | None |
+| `db_parkventory` | `172.30.21.0/24` | None |
+
+A reviewed application integration package attaches only the required
+services to an application network. It must use a unique alias such as
+`surplasse-backend`. It must not use a generic alias such as `backend`.
+
+PostgreSQL does not join `ops`. Caddy, Grafana, and Prometheus have no direct
+TCP path to PostgreSQL. PostgreSQL Exporter joins `db_monitoring` for SQL access
+and `ops` for metrics access. Database roles and `pg_hba.conf` enforce the
+database authorization boundary.
+
+Caddy publishes `80/tcp`, `443/tcp`, and `443/udp`. Grafana binds to
+`127.0.0.1:3000` for an SSH tunnel. No other platform service publishes a host
+port. The public bindings use IPv4. Do not publish an `AAAA` record for this
+host until the repository defines and verifies an equivalent IPv6 policy.
+
+## Secrets
+
+The repository contains no secret value. SOPS and Ansible will create these
+base platform files under `/etc/vps/secrets/platform`:
+
+| File | Container reader |
+|---|---|
+| `postgres-superuser-password` | PostgreSQL startup process |
+| `postgres-exporter-password` | Numeric group `999` |
+| `grafana-admin-password` | UID `472` |
+| `grafana-secret-key` | UID `472` |
+
+The parent directory has mode `0700` and owner `root`. A secret with one reader
+has mode `0400`. The PostgreSQL Exporter password has mode `0440` and owner
+`root:999`. The PostgreSQL initialization process runs as `999:999`. The
+exporter runs as `65534:999`.
+
+An active Surplasse integration also requires three scoped OVH DNS credential
+files. The integration package must add those Compose secrets and the related
+file variables. Do not add them to the disabled base platform.
+
+## PostgreSQL
+
+The volume name `vps-platform-postgresql-17-data` identifies the major version.
+A PostgreSQL 18 change requires a migration plan. The bootstrap creates only
+the `postgres_exporter` read role.
+
+A separate idempotent controller must create an application database and its
+roles. It must use a `NOLOGIN` owner and separate migration and runtime roles.
+Parkventory has no database or role while its production readiness gates are
+incomplete.
+
+The current memory values require a VPS with at least 4 GiB of memory. Ansible
+must render host-specific values after the operator confirms the host size.
+
+## Local validation
+
+Run the complete contract from the repository root:
+
+```bash
+make check
+```
+
+The contract performs these platform checks:
+
+- It renders Compose and applies the structural production policy.
+- It validates the active Prometheus configuration.
+- It validates each inactive Prometheus rule candidate.
+- It validates Caddy with the inactive route set.
+- It validates all Caddy route candidates with placeholder OVH credentials.
+
+The checks do not start the platform. They do not call the OVH API. The
+`--structural-only` Compose mode is valid only for local analysis. A production
+controller must use the exact references from the release manifest and the
+verified integration package.
+
+Prometheus alert rules have no configured Alertmanager or notification
+channel. Production activation requires a tested external alert path.

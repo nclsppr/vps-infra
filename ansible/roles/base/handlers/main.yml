@@ -1,0 +1,12 @@
+---
+- name: Restart systemd-journald
+  ansible.builtin.service:
+    name: systemd-journald
+    state: restarted
+
+- name: Apply host sysctls
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sysctl
+      - --system
+  changed_when: true

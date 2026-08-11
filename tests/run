@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PYTHONDONTWRITEBYTECODE=1
+
+TESTS_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly TESTS_DIR
+readonly VALID_SHA=0123456789abcdef0123456789abcdef01234567
+
+if [[ $EUID -eq 0 ]]; then
+  command -v setpriv >/dev/null 2>&1 || {
+    echo "test runner requires setpriv when executed as root" >&2
+    exit 78
+  }
+
+  guard_root=$(mktemp -d)
+  set +e
+  VPS_CONTROLLER_TESTING=1 \
+    VPS_REPOSITORY_DIR="$guard_root/repository" \
+    VPS_STATE_DIR="$guard_root/state" \
+    VPS_LOCK_DIR="$guard_root/lock" \
+    VPS_PRODUCTION_ENABLE_FILE="$guard_root/production-enabled" \
+    "$TESTS_DIR/../scripts/deploy" "$VALID_SHA" \
+    >"$guard_root/stdout" 2>"$guard_root/stderr"
+  guard_status=$?
+  set -e
+  if [[ $guard_status -ne 78 ]] || \
+    ! grep -Fxq 'deploy refused: root cannot use controller test mode' "$guard_root/stderr" || \
+    [[ -e $guard_root/repository || -e $guard_root/state || -e $guard_root/lock || \
+      -e $guard_root/production-enabled ]]; then
+    echo "root controller test guard failed" >&2
+    rm -rf -- "$guard_root"
+    exit 1
+  fi
+  rm -rf -- "$guard_root"
+
+  if setpriv --reuid=65534 --regid=65534 --clear-groups -- \
+    /bin/true >/dev/null 2>&1; then
+    set +e
+    setpriv --reuid=65534 --regid=65534 --clear-groups -- \
+      /bin/bash -s -- "$TESTS_DIR/run" <<'UNPRIVILEGED_TESTS'
+set -Eeuo pipefail
+test_runner=$1
+private_root=$(mktemp -d /tmp/vps-infra-tests.XXXXXX)
+cleanup() {
+  local status=$?
+  rm -rf -- "$private_root"
+  exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+mkdir -m 0700 -- "$private_root/home" "$private_root/tmp"
+HOME="$private_root/home" \
+  TMPDIR="$private_root/tmp" \
+  XDG_CONFIG_HOME="$private_root/home/.config" \
+  "$test_runner"
+UNPRIVILEGED_TESTS
+    test_status=$?
+    set -e
+    exit "$test_status"
+  fi
+
+  echo "unprivileged user context unavailable: controller integration tests skipped" >&2
+  export VPS_CONTROLLER_ROOT_SAFE_SKIP=1
+fi
+
+python3 "$TESTS_DIR/test_release_controller.py"
+python3 "$TESTS_DIR/test_github_evidence.py"
+python3 "$TESTS_DIR/test_repository_contract.py"
+
+parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "deploy $VALID_SHA")
+[[ $parsed == "$VALID_SHA" ]]
+
+for invalid in \
+  "" \
+  "deploy" \
+  "deploy  $VALID_SHA" \
+  "deploy ${VALID_SHA} " \
+  "deploy 0123456789ABCDEF0123456789ABCDEF01234567" \
+  "deploy ${VALID_SHA}; id" \
+  "deploy ${VALID_SHA}$(printf '\nid')" \
+  "deploy \$(id)" \
+  "deploy ${VALID_SHA}\t" \
+  "doctor"; do
+  if "$TESTS_DIR/../scripts/parse-forced-command" "$invalid" >/dev/null 2>&1; then
+    echo "parser unexpectedly accepted: $invalid" >&2
+    exit 1
+  fi
+done
+
+for invalid in "" "doctor" "deploy ${VALID_SHA}; id"; do
+  if SSH_ORIGINAL_COMMAND=$invalid "$TESTS_DIR/../scripts/forced-command" >/dev/null 2>&1; then
+    echo "forced-command wrapper unexpectedly accepted: $invalid" >&2
+    exit 1
+  fi
+done
+
+echo "forced-command parser tests passed"

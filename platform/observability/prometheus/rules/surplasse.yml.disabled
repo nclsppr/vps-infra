@@ -1,0 +1,57 @@
+groups:
+  - name: surplasse-backend
+    rules:
+      - alert: SurplasseBackendMetricsUnavailable
+        expr: up{job="surplasse-backend"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          project: surplasse
+        annotations:
+          summary: Surplasse Backend metrics are unavailable
+          description: Prometheus has not scraped the Backend successfully for five minutes.
+
+      - alert: SurplasseBackendHighServerErrorRatio
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{job="surplasse-backend",status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(http_server_requests_seconds_count{job="surplasse-backend"}[5m])), 0.001)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          project: surplasse
+        annotations:
+          summary: Surplasse Backend server error ratio is high
+          description: More than five percent of Backend requests have returned a 5xx response for ten minutes.
+
+      - alert: SurplasseMagicLinkDeliveryFailure
+        expr: increase(surplasse_magic_link_deliveries_total{outcome="failed"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          project: surplasse
+        annotations:
+          summary: A Surplasse magic link delivery has failed
+          description: At least one magic link delivery failed during the last ten minutes.
+
+      - alert: SurplassePaymentFailure
+        expr: increase(surplasse_payment_intent_events_total{outcome="failed"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          project: surplasse
+        annotations:
+          summary: A Surplasse payment has failed
+          description: At least one reconciled payment failure occurred during the last ten minutes.
+
+      - alert: SurplasseRefundFailure
+        expr: increase(surplasse_refunds_total{outcome="failed"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          project: surplasse
+        annotations:
+          summary: A Surplasse refund has failed
+          description: At least one refund failure occurred during the last ten minutes.

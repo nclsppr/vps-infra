@@ -1,0 +1,6 @@
+# Parkventory is deliberately absent from the imported *.caddy set.
+#
+# Activation requires all readiness gates in docs/architecture.md, a real
+# PARKVENTORY_DOMAIN, immutable application images and a reviewed fragment.
+# PARKVENTORY_ENABLED=false is informational and must never be treated as a
+# runtime feature flag that can bypass those gates.

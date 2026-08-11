@@ -1,0 +1,77 @@
+---
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Commit complet de vps-infra à déployer
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Request bounded deployment
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    env:
+      REVISION: ${{ inputs.revision }}
+      VPS_DEPLOY_ENABLED: ${{ vars.VPS_DEPLOY_ENABLED }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+    steps:
+      - name: Refuse an unprovisioned deployment
+        run: |
+          if [ "${VPS_DEPLOY_ENABLED}" != "true" ]; then
+            echo "Production deployment is disabled until the OVHcloud host is provisioned." >&2
+            exit 1
+          fi
+
+      - name: Check out requested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.revision }}
+          fetch-depth: 0
+
+      - name: Validate immutable revision
+        run: |
+          if ! printf '%s' "${REVISION}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "revision must be a complete lowercase Git SHA" >&2
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "${REVISION}"
+          git fetch origin main
+          git merge-base --is-ancestor "${REVISION}" origin/main
+
+      - name: Configure bounded SSH identity
+        run: |
+          test -n "${VPS_HOST}"
+          test -n "${VPS_USER}"
+          test -n "${VPS_SSH_KEY}"
+          test -n "${VPS_KNOWN_HOSTS}"
+          install -d -m 0700 "${RUNNER_TEMP}/ssh"
+          printf '%s\n' "${VPS_SSH_KEY}" > "${RUNNER_TEMP}/ssh/key"
+          printf '%s\n' "${VPS_KNOWN_HOSTS}" > "${RUNNER_TEMP}/ssh/known_hosts"
+          chmod 0600 "${RUNNER_TEMP}/ssh/key" "${RUNNER_TEMP}/ssh/known_hosts"
+
+      - name: Request exact deployment
+        run: |
+          ssh \
+            -i "${RUNNER_TEMP}/ssh/key" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${RUNNER_TEMP}/ssh/known_hosts" \
+            "${VPS_USER}@${VPS_HOST}" \
+            "deploy ${REVISION}"

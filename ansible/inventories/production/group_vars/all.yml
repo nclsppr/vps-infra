@@ -1,0 +1,71 @@
+---
+# These values are public and not sensitive. The local inventory or an external
+# --extra-vars file supplies each production address and public key.
+vps_supported_ubuntu_releases:
+  - "24.04"
+
+vps_hostname: "{{ inventory_hostname }}"
+vps_timezone: Europe/Paris
+vps_admin_user: vpsadmin
+vps_deploy_user: deploy
+vps_static_user: vps-static
+# A port change requires a two-connection migration. This baseline keeps port
+# 22 and does not simulate that migration.
+vps_ssh_port: 22
+
+# Empty lists stop bootstrap until the operator supplies a public key. A public
+# key is not a secret. The automation must not create one.
+vps_admin_authorized_keys: []
+vps_deploy_authorized_keys: []
+vps_live_apply_enabled: false
+# This value must be a full Git SHA that is reachable from origin/main.
+# Convergence rejects an empty value, branch, tag, or commit outside main.
+vps_infra_revision: ""
+
+vps_swap_size_mb: 2048
+vps_unattended_reboot: false
+vps_unattended_reboot_time: "04:30"
+
+vps_docker_apt_key_url: https://download.docker.com/linux/ubuntu/gpg
+vps_docker_apt_key_sha256: 1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570
+vps_docker_apt_key_fingerprint: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+# Verified on 11 August 2026 in the official Docker Noble indexes for amd64 and
+# arm64. The role also verifies package availability through APT. It then uses
+# dpkg-query to verify each installed version.
+vps_docker_packages:
+  - name: containerd.io
+    version: 2.2.6-1~ubuntu.24.04~noble
+  - name: docker-ce
+    version: 5:29.7.2-1~ubuntu.24.04~noble
+  - name: docker-ce-cli
+    version: 5:29.7.2-1~ubuntu.24.04~noble
+  - name: docker-buildx-plugin
+    version: 0.36.0-1~ubuntu.24.04~noble
+  - name: docker-compose-plugin
+    version: 5.3.1-1~ubuntu.24.04~noble
+
+vps_docker_networks:
+  - name: app_surplasse
+    driver: bridge
+    internal: false
+    subnet: 172.30.10.0/24
+  - name: db_surplasse
+    driver: bridge
+    internal: true
+    subnet: 172.30.11.0/24
+  - name: app_parkventory
+    driver: bridge
+    internal: false
+    subnet: 172.30.20.0/24
+  - name: db_parkventory
+    driver: bridge
+    internal: true
+    subnet: 172.30.21.0/24
+  - name: ops
+    driver: bridge
+    internal: false
+    subnet: 172.30.30.0/24
+  - name: db_monitoring
+    driver: bridge
+    internal: true
+    subnet: 172.30.31.0/24

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PYTHONDONTWRITEBYTECODE=1
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)
+readonly REPOSITORY_ROOT
+
+"$SCRIPT_DIR/validate-release" --require-json-schema \
+  "$REPOSITORY_ROOT/releases/production.yaml"
+"$SCRIPT_DIR/verify-github-evidence" \
+  "$REPOSITORY_ROOT/releases/production.yaml"
+"$SCRIPT_DIR/check-public-safe" --root "$REPOSITORY_ROOT"
+"$SCRIPT_DIR/validate-application-state" --root "$REPOSITORY_ROOT"
+"$REPOSITORY_ROOT/tests/run"
+
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck \
+    "$SCRIPT_DIR/check" \
+    "$SCRIPT_DIR/converge" \
+    "$SCRIPT_DIR/deploy" \
+    "$SCRIPT_DIR/doctor" \
+    "$SCRIPT_DIR/forced-command" \
+    "$SCRIPT_DIR/parse-forced-command" \
+    "$REPOSITORY_ROOT/tests/run"
+else
+  echo "shellcheck unavailable: shell analysis skipped" >&2
+fi

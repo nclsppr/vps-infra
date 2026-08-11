@@ -1,0 +1,14 @@
+---
+# Copier ce fichier vers hosts.yml, qui doit rester hors de Git.
+# .invalid est volontairement non routable : aucun hôte réel n'est ciblé par
+# l'exemple commité.
+all:
+  children:
+    vps:
+      hosts:
+        production-vps:
+          ansible_host: vps.example.invalid
+          ansible_port: 22
+          # Bootstrap : root ou l'utilisateur initial fourni par OVHcloud.
+          # Site : remplacer par la valeur de vps_admin_user.
+          ansible_user: root

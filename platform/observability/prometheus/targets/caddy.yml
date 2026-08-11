@@ -1,0 +1,5 @@
+- targets:
+    - caddy:2019
+  labels:
+    project: platform
+    component: edge

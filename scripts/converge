@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+readonly EX_USAGE=64
+readonly EX_CONFIG=78
+readonly EXPECTED_ORIGIN=https://github.com/nclsppr/vps-infra.git
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly SCRIPT_DIR
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)
+readonly REPOSITORY_ROOT
+
+fail() {
+  local message=$1
+  local status=${2:-1}
+  echo "converge refused: $message" >&2
+  exit "$status"
+}
+
+resolve_executable() {
+  local name=$1
+  local path
+  path=$(type -P -- "$name") || fail "required command is unavailable: $name" "$EX_CONFIG"
+  realpath -- "$path"
+}
+
+readonly caller_path=${PATH:-/usr/local/bin:/usr/bin:/bin}
+readonly caller_home=${HOME:-/nonexistent}
+git_executable=$(resolve_executable git)
+tar_executable=$(resolve_executable tar)
+mise_executable=$(resolve_executable mise)
+mktemp_executable=$(resolve_executable mktemp)
+env_executable=$(resolve_executable env)
+readonly git_executable tar_executable mise_executable mktemp_executable env_executable
+
+inventory=${ANSIBLE_INVENTORY:-}
+extra_vars=${ANSIBLE_EXTRA_VARS:-}
+[[ -n $inventory && -f $inventory && ! -L $inventory ]] || \
+  fail "ANSIBLE_INVENTORY must identify a regular local inventory file" "$EX_USAGE"
+[[ -n $extra_vars && -f $extra_vars && ! -L $extra_vars ]] || \
+  fail "ANSIBLE_EXTRA_VARS must identify a regular local public-key variable file" "$EX_USAGE"
+inventory=$(realpath -- "$inventory")
+extra_vars=$(realpath -- "$extra_vars")
+readonly inventory extra_vars
+
+safe_git() {
+  "$env_executable" -i \
+    HOME="$caller_home" \
+    PATH="$caller_path" \
+    LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    "$git_executable" \
+      -c protocol.file.allow=never \
+      -c protocol.ext.allow=never \
+      "$@"
+}
+
+origin_url=$(safe_git -C "$REPOSITORY_ROOT" remote get-url origin 2>/dev/null) || \
+  fail "the repository has no origin remote" "$EX_CONFIG"
+[[ $origin_url == "$EXPECTED_ORIGIN" ]] || \
+  fail "origin URL differs from the repository allowlist" "$EX_CONFIG"
+
+safe_git -C "$REPOSITORY_ROOT" fetch \
+  --force \
+  --no-tags \
+  --no-recurse-submodules \
+  origin \
+  +refs/heads/main:refs/remotes/origin/main || \
+  fail "bounded fetch of origin/main failed"
+
+revision=$(safe_git -C "$REPOSITORY_ROOT" rev-parse --verify \
+  'refs/remotes/origin/main^{commit}') || fail "origin/main does not resolve to a commit"
+[[ $revision =~ ^[0-9a-f]{40}$ ]] || fail "origin/main did not resolve to a full lowercase Git SHA"
+readonly revision
+
+temporary_root=$("$mktemp_executable" -d)
+readonly temporary_root
+checkout="$temporary_root/checkout"
+isolated_home="$temporary_root/home"
+readonly checkout isolated_home
+mkdir -m 0700 -- "$checkout" "$isolated_home"
+
+cleanup() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [[ -d $temporary_root && $temporary_root != / ]]; then
+    rm -rf -- "$temporary_root"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+safe_git -C "$REPOSITORY_ROOT" archive --format=tar "$revision" | \
+  "$tar_executable" -xf - -C "$checkout"
+
+clean_command() {
+  "$env_executable" -i \
+    HOME="$isolated_home" \
+    PATH="$caller_path" \
+    LC_ALL=C.UTF-8 \
+    XDG_CACHE_HOME="$isolated_home/.cache" \
+    XDG_CONFIG_HOME="$isolated_home/.config" \
+    XDG_DATA_HOME="$isolated_home/.local/share" \
+    "$@"
+}
+
+(
+  cd "$checkout"
+  clean_command "$mise_executable" install --locked
+  clean_command "$mise_executable" exec -- uv sync --locked
+  cd ansible
+  clean_command ../.venv/bin/ansible-galaxy collection install \
+    --requirements-file collections/requirements.yml \
+    --collections-path ../.cache/ansible/collections
+  "$env_executable" -i \
+    HOME="$isolated_home" \
+    PATH="$checkout/.venv/bin:$caller_path" \
+    LC_ALL=C.UTF-8 \
+    ANSIBLE_CONFIG="$checkout/ansible/ansible.cfg" \
+    ANSIBLE_COLLECTIONS_PATH="$checkout/.cache/ansible/collections" \
+    ../.venv/bin/ansible-playbook \
+      --inventory "$inventory" \
+      --extra-vars "@$extra_vars" \
+      --extra-vars "vps_infra_revision=$revision" \
+      playbooks/site.yml
+)

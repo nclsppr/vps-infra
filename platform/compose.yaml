@@ -1,0 +1,347 @@
+name: vps-platform
+
+x-logging: &default-logging
+  driver: local
+  options:
+    max-file: "3"
+    max-size: 10m
+
+x-common-hardening: &common-hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging: *default-logging
+
+services:
+  caddy:
+    <<: *common-hardening
+    image: ${CADDY_PLATFORM_IMAGE:?CADDY_PLATFORM_IMAGE is required}
+    ports:
+      - "${CADDY_HTTP_BIND_ADDRESS:-0.0.0.0}:${CADDY_HTTP_PORT:-80}:80/tcp"
+      - "${CADDY_HTTPS_BIND_ADDRESS:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443/tcp"
+      - "${CADDY_HTTPS_BIND_ADDRESS:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - type: bind
+        source: ./caddy/Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./caddy/routes
+        target: /etc/caddy/routes
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${STATIC_ROOT:-/srv/www}
+        target: /srv/www
+        read_only: true
+        bind:
+          create_host_path: false
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - ops
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /run:size=8m,mode=0755
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    pids_limit: 128
+    cpus: "0.75"
+    mem_limit: 256m
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:2019/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  postgresql:
+    <<: *common-hardening
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: platform_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_superuser_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=trust --data-checksums
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_EXPORTER_PASSWORD_FILE: /run/secrets/postgres_exporter_password
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    secrets:
+      - postgres_superuser_password
+      - postgres_exporter_password
+    volumes:
+      - postgresql_data:/var/lib/postgresql/data
+      - type: bind
+        source: ./postgres/postgresql.conf
+        target: /etc/postgresql/postgresql.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./postgres/pg_hba.conf
+        target: /etc/postgresql/pg_hba.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./postgres/initdb
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      db_monitoring:
+        aliases:
+          - postgresql
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /var/run/postgresql:size=16m,mode=2775,uid=999,gid=999
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    pids_limit: 256
+    cpus: "1.50"
+    mem_limit: 1536m
+    shm_size: 256m
+    stop_grace_period: 1m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --host=/var/run/postgresql --username=$${POSTGRES_USER} --dbname=$${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  prometheus:
+    <<: *common-hardening
+    image: ${PROMETHEUS_IMAGE:?PROMETHEUS_IMAGE is required}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-15d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-8GB}
+      - --web.listen-address=0.0.0.0:9090
+    volumes:
+      - type: bind
+        source: ./observability/prometheus/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./observability/prometheus/targets
+        target: /etc/prometheus/targets
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./observability/prometheus/rules
+        target: /etc/prometheus/rules
+        read_only: true
+        bind:
+          create_host_path: false
+      - prometheus_data:/prometheus
+    networks:
+      - ops
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    cpus: "0.50"
+    mem_limit: 512m
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  grafana:
+    <<: *common-hardening
+    image: ${GRAFANA_IMAGE:?GRAFANA_IMAGE is required}
+    environment:
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://127.0.0.1:3000}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_SECURITY_SECRET_KEY__FILE: /run/secrets/grafana_secret_key
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      GF_PLUGINS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_LOG_MODE: console
+    secrets:
+      - grafana_admin_password
+      - grafana_secret_key
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000/tcp"
+    volumes:
+      - type: bind
+        source: ./observability/grafana/provisioning
+        target: /etc/grafana/provisioning
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./observability/grafana/dashboards
+        target: /etc/grafana/dashboards
+        read_only: true
+        bind:
+          create_host_path: false
+      - grafana_data:/var/lib/grafana
+    networks:
+      - ops
+    user: "472:472"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /var/log/grafana:size=32m,mode=0755,uid=472,gid=472
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    cpus: "0.50"
+    mem_limit: 384m
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  node-exporter:
+    <<: *common-hardening
+    image: ${NODE_EXPORTER_IMAGE:?NODE_EXPORTER_IMAGE is required}
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/storage/.+)($$|/)
+      - --web.listen-address=0.0.0.0:9100
+    pid: host
+    volumes:
+      - type: bind
+        source: /proc
+        target: /host/proc
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /sys
+        target: /host/sys
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /
+        target: /rootfs
+        read_only: true
+        bind:
+          create_host_path: false
+          propagation: rslave
+    networks:
+      - ops
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    cpus: "0.25"
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  postgres-exporter:
+    <<: *common-hardening
+    image: ${POSTGRES_EXPORTER_IMAGE:?POSTGRES_EXPORTER_IMAGE is required}
+    # The shared password file is root:999 0440: PostgreSQL init runs as
+    # UID/GID 999, while the exporter keeps its unprivileged UID and joins only
+    # that read-only group.
+    user: "65534:999"
+    environment:
+      DATA_SOURCE_URI: postgresql:5432/postgres?sslmode=disable
+      DATA_SOURCE_USER: postgres_exporter
+      DATA_SOURCE_PASS_FILE: /run/secrets/postgres_exporter_password
+      PG_EXPORTER_COLLECTION_TIMEOUT: 15s
+    secrets:
+      - postgres_exporter_password
+    depends_on:
+      postgresql:
+        condition: service_healthy
+        restart: true
+    networks:
+      - ops
+      - db_monitoring
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    cpus: "0.25"
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:9187/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+secrets:
+  postgres_superuser_password:
+    file: ${POSTGRES_SUPERUSER_PASSWORD_FILE:-/etc/vps/secrets/platform/postgres-superuser-password}
+  postgres_exporter_password:
+    file: ${POSTGRES_EXPORTER_PASSWORD_FILE:-/etc/vps/secrets/platform/postgres-exporter-password}
+  grafana_admin_password:
+    file: ${GRAFANA_ADMIN_PASSWORD_FILE:-/etc/vps/secrets/platform/grafana-admin-password}
+  grafana_secret_key:
+    file: ${GRAFANA_SECRET_KEY_FILE:-/etc/vps/secrets/platform/grafana-secret-key}
+
+networks:
+  ops:
+    external: true
+    name: ${OPS_NETWORK_NAME:-ops}
+  db_monitoring:
+    external: true
+    name: ${POSTGRES_MONITORING_NETWORK_NAME:-db_monitoring}
+
+volumes:
+  caddy_data:
+    name: vps-platform-caddy-data
+  caddy_config:
+    name: vps-platform-caddy-config
+  postgresql_data:
+    name: vps-platform-postgresql-17-data
+  prometheus_data:
+    name: vps-platform-prometheus-data
+  grafana_data:
+    name: vps-platform-grafana-data

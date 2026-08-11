@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Create a non-mutating reconciliation plan from desired and active manifests."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from release_policy import (  # noqa: E402
+    PolicyError,
+    SHA40_RE,
+    canonical_json,
+    iter_digests,
+    load_manifest,
+    strict_json_loads,
+)
+
+
+class ReconcileError(ValueError):
+    pass
+
+
+def unit_state(manifest: dict[str, Any], unit: str) -> dict[str, Any]:
+    if unit == "platform":
+        value = manifest["platform"]
+        references = dict(value.get("images", {}))
+        if value.get("integration", {}).get("artifact") is not None:
+            references["integration"] = value["integration"]["artifact"]
+        return {
+            "enabled": value["enabled"],
+            "compose_project": value["compose_project"],
+            "references": references,
+            "postgres": value.get("postgres"),
+            "published_ports": value["published_ports"],
+        }
+    value = manifest["applications"][unit]
+    state: dict[str, Any] = {
+        "enabled": value["enabled"],
+        "type": value["type"],
+        "source_repository": value["source_repository"],
+        "source_branch": value["source_branch"],
+    }
+    if value["type"] == "static":
+        state["references"] = {
+            "site": value.get("artifact"),
+            "routes": value.get("route_inventory_artifact"),
+        }
+        state["source_revision"] = value.get("source_revision")
+    else:
+        state["compose_project"] = value["compose_project"]
+        state["references"] = {
+            **{
+                component: definition["image"]
+                for component, definition in value.get("components", {}).items()
+            },
+            "integration": value.get("integration", {}).get("artifact"),
+        }
+        state["migrations"] = value["migrations"]
+    return state
+
+
+def fingerprint(value: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(value).encode("ascii")).hexdigest()
+
+
+def quarantined_digests(manifest: dict[str, Any], quarantine_dir: Path) -> list[str]:
+    blocked: list[str] = []
+    artifact_dir = quarantine_dir / "artifacts"
+    for digest in sorted(set(iter_digests(manifest))):
+        digest_hex = digest.removeprefix("sha256:")
+        if (artifact_dir / f"{digest_hex}.json").is_file():
+            blocked.append(digest)
+    return blocked
+
+
+def create_plan(
+    desired: dict[str, Any],
+    active: dict[str, Any] | None,
+    desired_commit: str,
+    active_commit: str | None,
+    quarantine_dir: Path,
+) -> dict[str, Any]:
+    if not SHA40_RE.fullmatch(desired_commit):
+        raise ReconcileError("desired commit must be a full lowercase Git SHA")
+    if active_commit is not None and not SHA40_RE.fullmatch(active_commit):
+        raise ReconcileError("active commit must be a full lowercase Git SHA")
+    blocked = quarantined_digests(desired, quarantine_dir)
+    if blocked:
+        raise ReconcileError(f"desired artifacts are quarantined: {', '.join(blocked)}")
+
+    actions: list[dict[str, Any]] = []
+    units = ["platform", "personal", "papersempire", "surplasse", "parkventory"]
+    for unit in units:
+        desired_state = unit_state(desired, unit)
+        active_state = unit_state(active, unit) if active is not None else None
+        desired_state["infrastructure_revision"] = desired_commit
+        if active_state is not None:
+            active_state["infrastructure_revision"] = active_commit
+        desired_enabled = desired_state["enabled"]
+        active_enabled = bool(active_state and active_state["enabled"])
+        if active_enabled and not desired_enabled:
+            raise ReconcileError(
+                f"{unit}: automatic disable/removal is forbidden; use a separately reviewed retirement procedure"
+            )
+        if not desired_enabled:
+            action = "unchanged-disabled"
+        elif not active_enabled:
+            action = "activate"
+        elif fingerprint(desired_state) != fingerprint(active_state):
+            action = "update"
+        else:
+            action = "unchanged"
+        item: dict[str, Any] = {
+            "unit": unit,
+            "action": action,
+            "desired_fingerprint": fingerprint(desired_state),
+            "active_fingerprint": fingerprint(active_state) if active_state else None,
+        }
+        if action in {"activate", "update"}:
+            active_references = active_state.get("references", {}) if active_state else {}
+            item["desired_references"] = {
+                key: reference
+                for key, reference in desired_state.get("references", {}).items()
+                if reference is not None and active_references.get(key) != reference
+            }
+        if desired_state.get("type") == "compose" and action in {"activate", "update"}:
+            migrations = desired_state["migrations"]
+            item["migration_gate"] = {
+                "automatic": False,
+                "strategy": migrations["strategy"],
+                "proven": migrations["proven"],
+                "evidence": migrations.get("evidence"),
+            }
+        actions.append(item)
+
+    return {
+        "schema": 1,
+        "desired_commit": desired_commit,
+        "active_commit": active_commit,
+        "changes_required": any(item["action"] in {"activate", "update"} for item in actions),
+        "automatic_migrations": False,
+        "actions": actions,
+    }
+
+
+def read_active_commit(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        value = strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, PolicyError) as exc:
+        raise ReconcileError(f"cannot read active state {path}: {exc}") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("commit"), str):
+        raise ReconcileError(f"{path}: active state must contain a commit string")
+    return value["commit"]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--desired", required=True)
+    parser.add_argument("--desired-commit", required=True)
+    parser.add_argument("--active-manifest")
+    parser.add_argument("--active-state")
+    parser.add_argument("--quarantine-dir", required=True)
+    parser.add_argument("--output")
+    args = parser.parse_args()
+    try:
+        desired = load_manifest(args.desired)
+        active_path = Path(args.active_manifest) if args.active_manifest else None
+        active = load_manifest(active_path) if active_path and active_path.is_file() else None
+        active_state_path = Path(args.active_state) if args.active_state else None
+        plan = create_plan(
+            desired,
+            active,
+            args.desired_commit,
+            read_active_commit(active_state_path),
+            Path(args.quarantine_dir),
+        )
+    except (PolicyError, ReconcileError) as exc:
+        print(f"reconciliation refused: {exc}", file=sys.stderr)
+        return 1
+
+    rendered = json.dumps(plan, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        output = Path(args.output)
+        temporary = output.with_name(f".{output.name}.tmp")
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temporary.write_text(rendered, encoding="utf-8")
+            temporary.chmod(0o600)
+            temporary.replace(output)
+        except OSError as exc:
+            print(f"reconciliation failed to write plan: {exc}", file=sys.stderr)
+            return 1
+    else:
+        print(rendered, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

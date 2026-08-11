@@ -1,0 +1,8 @@
+---
+profile: production
+strict: true
+offline: true
+exclude_paths:
+  - .venv/
+  - docs/archive/
+  - ansible/inventories/production/hosts.yml

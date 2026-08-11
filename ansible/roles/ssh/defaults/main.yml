@@ -1,0 +1,5 @@
+---
+vps_sshd_config_path: /etc/ssh/sshd_config.d/00-vps-infra.conf
+vps_fail2ban_bantime: 1h
+vps_fail2ban_findtime: 10m
+vps_fail2ban_maxretry: 5

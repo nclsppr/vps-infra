@@ -1,0 +1,6 @@
+---
+profile: production
+# `vps_` is the repository-wide public-variable namespace shared by roles.
+# It deliberately replaces ansible-lint's role-name prefix convention.
+skip_list:
+  - var-naming[no-role-prefix]

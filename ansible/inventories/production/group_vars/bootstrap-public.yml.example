@@ -1,0 +1,9 @@
+---
+# Exemple à copier hors du dépôt puis à passer avec :
+#   --extra-vars @/chemin/vers/bootstrap-public.yml
+vps_admin_authorized_keys:
+  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIREMPLACER cle-administration
+
+# Peut rester vide jusqu'à la création de l'environnement GitHub production.
+vps_deploy_authorized_keys:
+  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIREMPLACER cle-deploiement-github

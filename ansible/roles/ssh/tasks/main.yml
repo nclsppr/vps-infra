@@ -1,0 +1,180 @@
+---
+- name: Validate SSH hardening preconditions
+  ansible.builtin.assert:
+    that:
+      - (ansible_user | default('')) == vps_admin_user
+      - vps_admin_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - vps_deploy_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - vps_admin_user not in ['root', vps_deploy_user]
+      - vps_admin_authorized_keys | length > 0
+      - vps_ssh_port | int == 22
+      - ansible_port | int == vps_ssh_port | int
+      - vps_deploy_gate_path == '/usr/local/libexec/vps/forced-command'
+    fail_msg: >-
+      SSH hardening requires a verified administrator connection, at least one
+      declared key, and the final SSH port.
+
+- name: Keep the administrator account converged
+  ansible.builtin.user:
+    name: "{{ vps_admin_user }}"
+    comment: VPS administrator managed by Ansible
+    shell: /bin/bash
+    create_home: true
+    groups:
+      - sudo
+    append: true
+    password_lock: true
+    state: present
+
+- name: Validate administrator public key syntax before convergence
+  ansible.builtin.assert:
+    that:
+      - item is match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
+      - "'\\n' not in item"
+      - "'\\r' not in item"
+    fail_msg: "The administrator public key is invalid or contains SSH options."
+  loop: "{{ vps_admin_authorized_keys }}"
+  loop_control:
+    label: "declared administrator key"
+
+- name: Cryptographically parse administrator public keys before SSH reload
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ssh-keygen
+      - -l
+      - -f
+      - /dev/stdin
+    stdin: "{{ item }}\n"
+  changed_when: false
+  when: not ansible_check_mode
+  loop: "{{ vps_admin_authorized_keys }}"
+  loop_control:
+    label: "declared administrator key"
+
+- name: Keep the administrator SSH directory private
+  ansible.builtin.file:
+    path: "/home/{{ vps_admin_user }}/.ssh"
+    state: directory
+    owner: "{{ vps_admin_user }}"
+    group: "{{ vps_admin_user }}"
+    mode: "0700"
+
+- name: Add declared administrator keys without retiring a proven key
+  ansible.builtin.lineinfile:
+    path: "/home/{{ vps_admin_user }}/.ssh/authorized_keys"
+    line: "{{ item | trim }}"
+    create: true
+    owner: "{{ vps_admin_user }}"
+    group: "{{ vps_admin_user }}"
+    mode: "0600"
+  loop: "{{ vps_admin_authorized_keys }}"
+  loop_control:
+    label: "declared administrator key"
+
+- name: Read the complete administrator key file without changing it
+  ansible.builtin.slurp:
+    src: "/home/{{ vps_admin_user }}/.ssh/authorized_keys"
+  register: vps_admin_authorized_keys_file
+
+- name: Refuse undeclared administrator key drift
+  ansible.builtin.assert:
+    that:
+      - >-
+        (
+          vps_admin_authorized_keys_file.content | b64decode | split('\n') |
+          map('trim') | reject('equalto', '') | list |
+          difference(vps_admin_authorized_keys | map('trim') | list)
+        ) | length == 0
+    fail_msg: >-
+      The administrator key file contains an undeclared key. Keep that key in
+      vps_admin_authorized_keys until an independent login proves its
+      replacement. Retire the key with a separate explicit operation.
+
+- name: Keep administrator sudo access explicit
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/90-{{ vps_admin_user }}"
+    content: "{{ vps_admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+
+- name: Remove the obsolete late-loading SSH drop-in name
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d/99-vps-infra.conf
+    state: absent
+  notify:
+    - Validate OpenSSH configuration
+    - Reload OpenSSH
+
+- name: Install the OpenSSH hardening drop-in
+  ansible.builtin.template:
+    src: 00-vps-infra.conf.j2
+    dest: "{{ vps_sshd_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Validate OpenSSH configuration
+    - Reload OpenSSH
+
+- name: Configure bounded SSH brute-force protection
+  ansible.builtin.template:
+    src: sshd.local.j2
+    dest: /etc/fail2ban/jail.d/sshd.local
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart fail2ban
+
+- name: Lock the root password after administrator proof
+  ansible.builtin.user:
+    name: root
+    password_lock: true
+
+- name: Validate and apply SSH configuration while this session remains open
+  ansible.builtin.meta: flush_handlers
+
+- name: Read effective deploy SSH policy
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -T
+      - -C
+      - "user={{ vps_deploy_user }},host=localhost,addr=127.0.0.1"
+  register: vps_sshd_deploy_policy
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Prove deploy cannot obtain an interactive or forwarded session
+  ansible.builtin.assert:
+    that:
+      - "'forcecommand ' ~ vps_deploy_gate_path in vps_sshd_deploy_policy.stdout"
+      - "'disableforwarding yes' in vps_sshd_deploy_policy.stdout"
+      - "'permittty no' in vps_sshd_deploy_policy.stdout"
+      - "'passwordauthentication no' in vps_sshd_deploy_policy.stdout"
+    fail_msg: "The effective OpenSSH policy for the deploy account is insufficient."
+  when: not ansible_check_mode
+
+- name: Read effective administrator SSH policy
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -T
+      - -C
+      - "user={{ vps_admin_user }},host=localhost,addr=127.0.0.1"
+  register: vps_sshd_admin_policy
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Prove password and root authentication are effectively disabled
+  ansible.builtin.assert:
+    that:
+      - "'port ' ~ (vps_ssh_port | string) in vps_sshd_admin_policy.stdout"
+      - "'permitrootlogin no' in vps_sshd_admin_policy.stdout"
+      - "'passwordauthentication no' in vps_sshd_admin_policy.stdout"
+      - "'kbdinteractiveauthentication no' in vps_sshd_admin_policy.stdout"
+    fail_msg: "The effective global OpenSSH policy is insufficient."
+  when: not ansible_check_mode

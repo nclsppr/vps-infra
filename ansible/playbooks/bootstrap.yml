@@ -1,0 +1,122 @@
+---
+- name: Bootstrap a fresh Ubuntu host without hardening SSH yet
+  hosts: vps
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  serial: 1
+
+  pre_tasks:
+    - name: Validate bootstrap inputs before changing the host
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname != 'production-vps' or (ansible_host | default('')) != 'vps.example.invalid'
+          - vps_admin_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+          - vps_admin_user not in ['root', vps_deploy_user]
+          - vps_admin_authorized_keys | length > 0
+          - (ansible_user | default('root')) != vps_deploy_user
+        fail_msg: >-
+          Refus du bootstrap : renseigner un hôte réel et au moins une clé
+          publique administrateur. Le compte deploy ne peut pas bootstrapper.
+
+    - name: Validate administrator public key syntax
+      ansible.builtin.assert:
+        that:
+          - item is match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
+          - "'\\n' not in item"
+          - "'\\r' not in item"
+        fail_msg: "Clé publique administrateur invalide ou préfixée d'options SSH."
+      loop: "{{ vps_admin_authorized_keys }}"
+      loop_control:
+        index_var: vps_admin_key_index
+        label: "clé publique {{ vps_admin_key_index + 1 }}"
+
+    - name: Ensure Python is available on a minimal Ubuntu image
+      ansible.builtin.raw: >-
+        test -x /usr/bin/python3 ||
+        (apt-get update -qq && DEBIAN_FRONTEND=noninteractive
+        apt-get install -y -qq python3)
+      register: bootstrap_python
+      changed_when: "'Setting up python3' in bootstrap_python.stdout"
+
+    - name: Gather facts after Python bootstrap
+      ansible.builtin.setup:
+
+    - name: Refuse an unsupported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version in vps_supported_ubuntu_releases
+        fail_msg: >-
+          Cette automatisation accepte uniquement les versions Ubuntu
+          explicitement validées : {{ vps_supported_ubuntu_releases | join(', ') }}.
+
+  tasks:
+    - name: Install the public-key validation tool
+      ansible.builtin.apt:
+        name: openssh-client
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_MODE: a
+
+    - name: Cryptographically parse administrator public keys
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/ssh-keygen
+          - -l
+          - -f
+          - /dev/stdin
+        stdin: "{{ item }}\n"
+      changed_when: false
+      when: not ansible_check_mode
+      loop: "{{ vps_admin_authorized_keys }}"
+      loop_control:
+        label: "clé administrateur déclarée"
+
+    - name: Create the administrator account
+      ansible.builtin.user:
+        name: "{{ vps_admin_user }}"
+        comment: VPS administrator managed by Ansible
+        shell: /bin/bash
+        create_home: true
+        groups:
+          - sudo
+        append: true
+        password_lock: true
+        state: present
+
+    - name: Create the administrator SSH directory
+      ansible.builtin.file:
+        path: "/home/{{ vps_admin_user }}/.ssh"
+        state: directory
+        owner: "{{ vps_admin_user }}"
+        group: "{{ vps_admin_user }}"
+        mode: "0700"
+
+    - name: Install only the declared administrator keys
+      ansible.builtin.copy:
+        dest: "/home/{{ vps_admin_user }}/.ssh/authorized_keys"
+        content: "{{ vps_admin_authorized_keys | map('trim') | join('\n') }}\n"
+        owner: "{{ vps_admin_user }}"
+        group: "{{ vps_admin_user }}"
+        mode: "0600"
+
+    - name: Grant passwordless administration to the key-only account
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/90-{{ vps_admin_user }}"
+        content: "{{ vps_admin_user }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Explain the mandatory second connection
+      ansible.builtin.debug:
+        msg: >-
+          Bootstrap terminé sans modifier sshd ni le pare-feu. Ouvrir une
+          nouvelle connexion avec {{ vps_admin_user }}, conserver la session
+          initiale ouverte, remplacer ansible_user dans l'inventaire, puis
+          exécuter playbooks/site.yml. Ce second play refusera root.

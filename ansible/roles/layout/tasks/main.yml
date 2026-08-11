@@ -1,0 +1,151 @@
+---
+- name: Validate managed directory and network names
+  ansible.builtin.assert:
+    that:
+      - vps_static_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - vps_static_sites | list | sort == ['papersempire', 'personal']
+      - >-
+        vps_docker_networks | map(attribute='name') | list | sort ==
+        ['app_parkventory', 'app_surplasse', 'db_monitoring',
+         'db_parkventory', 'db_surplasse', 'ops']
+      - >-
+        vps_docker_networks | map(attribute='name') | unique | length ==
+        vps_docker_networks | length
+      - vps_docker_networks | map(attribute='driver') | unique | list == ['bridge']
+      - >-
+        vps_docker_networks | selectattr('name', 'equalto', 'app_surplasse') |
+        map(attribute='subnet') | list == ['172.30.10.0/24']
+      - >-
+        vps_docker_networks | selectattr('name', 'equalto', 'db_surplasse') |
+        map(attribute='subnet') | list == ['172.30.11.0/24']
+      - >-
+        vps_docker_networks | selectattr('name', 'equalto', 'app_parkventory') |
+        map(attribute='subnet') | list == ['172.30.20.0/24']
+      - >-
+        vps_docker_networks | selectattr('name', 'equalto', 'db_parkventory') |
+        map(attribute='subnet') | list == ['172.30.21.0/24']
+      - >-
+        vps_docker_networks | selectattr('name', 'equalto', 'ops') |
+        map(attribute='subnet') | list == ['172.30.30.0/24']
+      - >-
+        vps_docker_networks | selectattr('name', 'equalto', 'db_monitoring') |
+        map(attribute='subnet') | list == ['172.30.31.0/24']
+      - >-
+        vps_docker_networks | selectattr('internal', 'equalto', true) |
+        map(attribute='name') | list | sort ==
+        ['db_monitoring', 'db_parkventory', 'db_surplasse']
+      - >-
+        vps_docker_networks | selectattr('internal', 'equalto', false) |
+        map(attribute='name') | list | sort ==
+        ['app_parkventory', 'app_surplasse', 'ops']
+    fail_msg: >-
+      Les identités statiques et les six réseaux externes sont un contrat de
+      plateforme ; toute modification requiert une décision explicite.
+
+- name: Create the non-login static release account
+  ansible.builtin.user:
+    name: "{{ vps_static_user }}"
+    comment: Unprivileged static release extractor
+    shell: /usr/sbin/nologin
+    create_home: false
+    home: /nonexistent
+    password_lock: true
+    state: present
+
+- name: Create stable platform directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop: "{{ vps_platform_directories }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Create the private secret root
+  ansible.builtin.file:
+    path: /etc/vps/secrets
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Create the static web root
+  ansible.builtin.file:
+    path: /srv/www
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create per-site release roots
+  ansible.builtin.file:
+    path: "/srv/www/{{ item }}/releases"
+    state: directory
+    owner: "{{ vps_static_user }}"
+    group: "{{ vps_static_user }}"
+    mode: "0755"
+  loop: "{{ vps_static_sites }}"
+
+- name: Inspect managed external Docker networks
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - network
+      - inspect
+      - "{{ item.name }}"
+  register: vps_network_inspection
+  changed_when: false
+  failed_when: vps_network_inspection.rc not in [0, 1]
+  check_mode: false
+  loop: "{{ vps_docker_networks }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Create missing external Docker networks
+  ansible.builtin.command:
+    argv: >-
+      {{
+        ['/usr/bin/docker', 'network', 'create', '--driver', item.item.driver,
+         '--subnet', item.item.subnet,
+         '--label', 'com.nclsppr.vps-infra.managed=true']
+        + (item.item.internal | bool | ternary(['--internal'], []))
+        + [item.item.name]
+      }}
+  changed_when: true
+  when: item.rc == 1
+  loop: "{{ vps_network_inspection.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Parse existing managed Docker networks
+  ansible.builtin.set_fact:
+    vps_existing_networks: >-
+      {{
+        (vps_existing_networks | default([]))
+        + [
+          {
+            'expected': item.item,
+            'actual': (item.stdout | from_json | first)
+          }
+        ]
+      }}
+  when: item.rc == 0
+  loop: "{{ vps_network_inspection.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: Refuse to mutate incompatible existing networks
+  ansible.builtin.assert:
+    that:
+      - item.actual.Driver == item.expected.driver
+      - item.actual.Internal | bool == item.expected.internal | bool
+      - item.actual.IPAM.Config | map(attribute='Subnet') | list == [item.expected.subnet]
+      - item.actual.Labels['com.nclsppr.vps-infra.managed'] | default('') == 'true'
+    fail_msg: >-
+      Le réseau {{ item.expected.name }} existe avec un pilote, un mode interne
+      ou une provenance inattendus. Il ne sera jamais supprimé implicitement.
+  loop: "{{ vps_existing_networks | default([]) }}"
+  loop_control:
+    label: "{{ item.expected.name }}"

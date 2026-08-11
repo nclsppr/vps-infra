@@ -1,0 +1,7 @@
+---
+vps_docker_data_root: /var/lib/docker
+vps_docker_log_max_size: 10m
+vps_docker_log_max_files: "5"
+vps_docker_architecture_map:
+  x86_64: amd64
+  aarch64: arm64

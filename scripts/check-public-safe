@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Fail closed when a public repository contains operational secrets or inventory."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+KEY_MATERIAL_RE = re.compile(
+    rb"-----BEGIN (?:OPENSSH |RSA |EC |DSA |PGP )?PRIVATE KEY-----|AGE-SECRET-KEY-1[A-Z0-9]+"
+)
+KNOWN_CREDENTIAL_PATTERNS = (
+    ("GitHub token", re.compile(rb"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")),
+    ("AWS access key", re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+    ("Slack token", re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    ("Stripe live key", re.compile(rb"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b")),
+)
+CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    rb"^[ \t]*(?:-[ \t]*)?(?:export[ \t]+)?"
+    rb"([A-Z0-9_]*(?:PASSWORD(?!S)|SECRET(?!S)|TOKEN(?!S)|PRIVATE_KEY)[A-Z0-9_]*|"
+    rb"DATABASE_URL|VPS_SSH_KEY)"
+    rb"[ \t]*[:=][ \t]*([^\r\n]+?)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+SAFE_VALUE_RE = re.compile(
+    rb"^(?:\$\{[A-Z_][A-Z0-9_]*\}|\$\{\{[ \t]*secrets\.[A-Z_][A-Z0-9_]*[ \t]*\}\}|"
+    rb"\{\{[ \t]*[A-Z_][A-Z0-9_.]*[ \t]*\}\}|<[^>]+>|<generate:.+>|"
+    rb"REDACTED|CHANGEME|EXAMPLE|PLACEHOLDER|x{3,}|ENC\[[^]]+\]|secret://.+)$",
+    re.IGNORECASE,
+)
+DYNAMIC_SECRET_REFERENCE_RE = re.compile(
+    rb"^\$\(cat[ \t]+['\"]?\$\{[A-Z_][A-Z0-9_]*\}['\"]?\)$",
+    re.IGNORECASE,
+)
+NON_CREDENTIAL_KEY_SUFFIX_RE = re.compile(
+    rb"(?:_LOCK|_ENCRYPTION|_PATH|_VALUE|_RE|_PATTERNS|_PREFIX|_SOURCES)$",
+    re.IGNORECASE,
+)
+FORBIDDEN_KEY_NAMES = {
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
+FORBIDDEN_KEY_SUFFIXES = {".key", ".p12", ".pfx", ".jks", ".keystore"}
+
+
+def repository_files(root: Path) -> list[Path]:
+    if (root / ".git").exists():
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-co", "--exclude-standard", "-z"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # A modified tracked path is selected by --cached and an untracked path
+        # by --others. Preserve order while making the no-double-scan contract
+        # explicit if Git ever returns the same byte path from both selectors.
+        names = list(dict.fromkeys(name for name in result.stdout.split(b"\0") if name))
+        return [root / os.fsdecode(name) for name in names]
+    return [path for path in root.rglob("*") if path.is_file() and ".git" not in path.parts]
+
+
+def check_filename(relative: Path) -> list[str]:
+    failures: list[str] = []
+    name = relative.name
+    lower_name = name.lower()
+    if lower_name == ".env" or (lower_name.startswith(".env.") and not lower_name.endswith(".example")):
+        failures.append("environment file is forbidden in the public repository")
+    if lower_name in FORBIDDEN_KEY_NAMES or Path(lower_name).suffix in FORBIDDEN_KEY_SUFFIXES:
+        failures.append("private-key or keystore filename is forbidden")
+    if relative.parts[:3] == ("ansible", "inventories", "production"):
+        inside_inventory = relative.parts[3:]
+        allowed = (
+            inside_inventory in {("README.md",), (".gitkeep",), ("hosts.example.yml",)}
+            or (
+                len(inside_inventory) == 2
+                and inside_inventory[0] == "group_vars"
+                and (
+                    inside_inventory[1] == "all.yml"
+                    or ".example" in inside_inventory[1]
+                    or ".sample" in inside_inventory[1]
+                )
+            )
+        )
+        if not allowed:
+            failures.append("concrete production inventory is forbidden; publish only an example")
+    return failures
+
+
+def check_content(path: Path, relative: Path) -> list[str]:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read file safely: {exc}"]
+    if b"\0" in data[:8192]:
+        return []
+    failures: list[str] = []
+    if KEY_MATERIAL_RE.search(data):
+        failures.append("private key material detected")
+    for label, pattern in KNOWN_CREDENTIAL_PATTERNS:
+        if pattern.search(data):
+            failures.append(f"{label} detected")
+    for match in CREDENTIAL_ASSIGNMENT_RE.finditer(data):
+        key = match.group(1).strip()
+        value = match.group(2).strip()
+        if key.upper().endswith(b"_FILE") or NON_CREDENTIAL_KEY_SUFFIX_RE.search(key):
+            continue
+        if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {b"'", b'"'}:
+            value = value[1:-1].strip()
+        if not SAFE_VALUE_RE.fullmatch(value) and not DYNAMIC_SECRET_REFERENCE_RE.fullmatch(value):
+            failures.append("credential-like assignment with a concrete value detected")
+            break
+    if relative.parts[:3] == ("ansible", "inventories", "production"):
+        for match in re.finditer(rb"(?im)^\s*ansible_host\s*:\s*['\"]?([^\s'\"#]+)", data):
+            host = match.group(1).decode("ascii", errors="ignore")
+            if not (
+                host.endswith(".invalid")
+                or host in {"127.0.0.1", "localhost"}
+                or host.startswith("{{")
+                or host.startswith("${")
+                or host.startswith("<")
+            ):
+                failures.append("concrete production ansible_host is forbidden")
+                break
+    return failures
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default=".", help="repository root")
+    args = parser.parse_args()
+    root = Path(args.root).resolve()
+    failures: list[tuple[Path, str]] = []
+    try:
+        paths = repository_files(root)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"public-safety check failed: cannot enumerate repository files: {exc}", file=sys.stderr)
+        return 2
+    for path in paths:
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            failures.append((path, "path escapes repository root"))
+            continue
+        for message in check_filename(relative):
+            failures.append((relative, message))
+        for message in check_content(path, relative):
+            failures.append((relative, message))
+    if failures:
+        for relative, message in failures:
+            print(f"public-safety violation: {relative}: {message}", file=sys.stderr)
+        return 1
+    print(f"public-safety check passed: {len(paths)} repository files inspected")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

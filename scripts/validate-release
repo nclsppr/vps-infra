@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Validate a production release without network access or external packages."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from release_policy import PolicyError, iter_digests, load_manifest, strict_json_loads  # noqa: E402
+
+
+def validate_json_schema(schema: dict, manifest: dict, *, required: bool) -> None:
+    try:
+        from jsonschema import validators
+        from jsonschema.exceptions import SchemaError
+    except ImportError as exc:
+        if required:
+            raise PolicyError(
+                "the jsonschema package is required for production validation"
+            ) from exc
+        return
+    try:
+        validator_class = validators.validator_for(schema)
+        validator_class.check_schema(schema)
+        errors = sorted(
+            validator_class(schema).iter_errors(manifest),
+            key=lambda error: tuple(str(part) for part in error.absolute_path),
+        )
+    except SchemaError as exc:
+        raise PolicyError(f"invalid JSON Schema: {exc.message}") from exc
+    if errors:
+        error = errors[0]
+        path = ".".join(str(part) for part in error.absolute_path) or "manifest"
+        raise PolicyError(f"JSON Schema violation at {path}: {error.message}")
+
+
+def default_schema_path() -> str:
+    local_schema = SCRIPT_DIR.parent / "schemas" / "production-release.schema.json"
+    installed_schema = Path("/usr/local/share/vps-infra/schemas/production-release.schema.json")
+    if local_schema.is_file():
+        return str(local_schema)
+    return str(installed_schema)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "manifest",
+        nargs="?",
+        default="releases/production.yaml",
+        help="JSON-compatible YAML desired-state manifest",
+    )
+    parser.add_argument(
+        "--schema",
+        default=default_schema_path(),
+        help="JSON Schema to syntax-check alongside the dependency-free policy",
+    )
+    parser.add_argument(
+        "--print-digests",
+        action="store_true",
+        help="print the unique validated sha256 digests, one per line",
+    )
+    parser.add_argument(
+        "--require-json-schema",
+        action="store_true",
+        help="fail if the Draft 2020-12 jsonschema validator is unavailable",
+    )
+    args = parser.parse_args()
+
+    try:
+        schema = strict_json_loads(Path(args.schema).read_text(encoding="utf-8"))
+        if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
+            raise PolicyError(f"{args.schema}: unsupported or missing JSON Schema dialect")
+        manifest = load_manifest(args.manifest)
+        validate_json_schema(schema, manifest, required=args.require_json_schema)
+    except (OSError, PolicyError) as exc:
+        print(f"release validation failed: {exc}", file=sys.stderr)
+        return 1
+
+    if args.print_digests:
+        for digest in sorted(set(iter_digests(manifest))):
+            print(digest)
+    else:
+        print(f"release manifest valid: {args.manifest}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
