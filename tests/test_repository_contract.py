@@ -243,7 +243,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             1,
         )
 
-    def test_docker_apt_refresh_runs_only_after_repository_or_pin_change(
+    def test_docker_apt_refresh_runs_only_after_key_repository_or_pin_change(
         self,
     ) -> None:
         tasks = yaml.safe_load(
@@ -293,6 +293,12 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertEqual(repository["notify"], "Refresh Docker APT metadata")
         self.assertEqual(pin["notify"], "Refresh Docker APT metadata")
         self.assertIs(refresh["ansible.builtin.apt"]["update_cache"], True)
+        self.assertFalse(
+            any(
+                task.get("ansible.builtin.apt", {}).get("update_cache") is True
+                for task in tasks
+            )
+        )
         self.assertLess(key_index, repository_index)
         self.assertLess(repository_index, pin_index)
         self.assertLess(pin_index, flush_index)
