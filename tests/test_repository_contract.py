@@ -243,7 +243,9 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             1,
         )
 
-    def test_docker_apt_refresh_runs_only_after_repository_change(self) -> None:
+    def test_docker_apt_refresh_runs_only_after_repository_or_pin_change(
+        self,
+    ) -> None:
         tasks = yaml.safe_load(
             (ROOT / "ansible/roles/docker/tasks/main.yml").read_text(
                 encoding="utf-8"
@@ -254,10 +256,21 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
+        key_index, key = next(
+            (index, task)
+            for index, task in enumerate(tasks)
+            if task["name"]
+            == "Download the Docker signing key with a pinned checksum"
+        )
         repository_index, repository = next(
             (index, task)
             for index, task in enumerate(tasks)
             if task["name"] == "Configure the official Docker APT repository"
+        )
+        pin_index, pin = next(
+            (index, task)
+            for index, task in enumerate(tasks)
+            if task["name"] == "Pin the selected Docker package versions"
         )
         refresh = next(
             handler
@@ -276,9 +289,13 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             if task["name"] == "Install exact Docker Engine and Compose versions"
         )
 
+        self.assertEqual(key["notify"], "Refresh Docker APT metadata")
         self.assertEqual(repository["notify"], "Refresh Docker APT metadata")
+        self.assertEqual(pin["notify"], "Refresh Docker APT metadata")
         self.assertIs(refresh["ansible.builtin.apt"]["update_cache"], True)
-        self.assertLess(repository_index, flush_index)
+        self.assertLess(key_index, repository_index)
+        self.assertLess(repository_index, pin_index)
+        self.assertLess(pin_index, flush_index)
         self.assertLess(flush_index, install_index)
 
     def test_normal_convergence_never_retires_an_administrator_key(self) -> None:

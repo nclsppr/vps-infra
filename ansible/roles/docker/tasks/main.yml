@@ -35,6 +35,7 @@
     group: root
     mode: "0644"
     force: false
+  notify: Refresh Docker APT metadata
 
 - name: Read the Docker key fingerprints
   ansible.builtin.command:
@@ -73,9 +74,6 @@
     state: present
   notify: Refresh Docker APT metadata
 
-- name: Apply Docker repository handlers before package installation
-  ansible.builtin.meta: flush_handlers
-
 - name: Pin the selected Docker package versions
   ansible.builtin.template:
     src: docker.pref.j2
@@ -83,6 +81,10 @@
     owner: root
     group: root
     mode: "0644"
+  notify: Refresh Docker APT metadata
+
+- name: Apply Docker repository handlers before package installation
+  ansible.builtin.meta: flush_handlers
 
 - name: Install exact Docker Engine and Compose versions
   ansible.builtin.apt:
