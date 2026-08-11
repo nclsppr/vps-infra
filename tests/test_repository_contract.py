@@ -216,15 +216,29 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("umask 077", converge)
         self.assertIn(
             'temporary_root=$("$mktemp_executable" -d '
-            "/tmp/vps-infra-converge.XXXXXXXX)",
+            "/tmp/vps-c.XXXXXXXX)",
             converge,
         )
         representative_control_path = (
             Path("/tmp").resolve()
-            / "vps-infra-converge.12345678/home/.ansible/cp"
-            / "0123456789abcdef0123456789abcdef01234567"
+            / "vps-c.12345678/cp"
+            / (
+                # OpenSSH expands %C to a 40-character SHA-1 and briefly
+                # appends a dot plus 16 random characters before rename.
+                "0123456789abcdef0123456789abcdef01234567"
+                ".ABCDEFGHIJKLMNOP"
+            )
         )
         self.assertLess(len(os.fsencode(representative_control_path)), 104)
+        self.assertIn(
+            '"ANSIBLE_SSH_CONTROL_PATH_DIR=$control_path_dir"',
+            converge,
+        )
+        self.assertEqual(converge.count("ANSIBLE_SSH_CONTROL_PATH_DIR"), 1)
+        self.assertIn(
+            'mkdir -m 0700 -- "$checkout" "$isolated_home" "$control_path_dir"',
+            converge,
+        )
 
     def test_convergence_explicitly_trusts_the_captured_mise_config(self) -> None:
         converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
@@ -356,6 +370,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 f"""#!/bin/sh
 set -eu
 [ -z "${{SSH_AUTH_SOCK+x}}" ]
+[ -z "${{ANSIBLE_SSH_CONTROL_PATH_DIR+x}}" ]
 case " $* " in
   *" fetch "*)
     printf '%s\\n' "$*" >>{quoted_log}
@@ -382,6 +397,7 @@ exec {real_git} "$@"
                 f"""#!/bin/sh
 set -eu
 [ -z "${{SSH_AUTH_SOCK+x}}" ]
+[ -z "${{ANSIBLE_SSH_CONTROL_PATH_DIR+x}}" ]
 printf 'galaxy=%s\\n' "$PWD $*" >>{quoted_log}
 """,
             )
@@ -391,9 +407,11 @@ printf 'galaxy=%s\\n' "$PWD $*" >>{quoted_log}
 set -eu
 [ -z "${{ANSIBLE_LIBRARY+x}}" ]
 [ -n "${{SSH_AUTH_SOCK+x}}" ]
+[ -d "$ANSIBLE_SSH_CONTROL_PATH_DIR" ]
 IFS= read -r marker < ../marker.txt
 printf 'playbook_directory=%s\\n' "$PWD" >>{quoted_log}
 printf 'marker=%s\\n' "$marker" >>{quoted_log}
+printf 'control_path_dir=%s\\n' "$ANSIBLE_SSH_CONTROL_PATH_DIR" >>{quoted_log}
 printf 'ssh_auth_sock=%s\\n' "$SSH_AUTH_SOCK" >>{quoted_log}
 printf 'arguments=%s\\n' "$*" >>{quoted_log}
 """,
@@ -403,6 +421,7 @@ printf 'arguments=%s\\n' "$*" >>{quoted_log}
                 f"""#!/bin/sh
 set -eu
 [ -z "${{SSH_AUTH_SOCK+x}}" ]
+[ -z "${{ANSIBLE_SSH_CONTROL_PATH_DIR+x}}" ]
 printf 'mise=%s\\n' "$PWD $*" >>{quoted_log}
 if [ "${{1:-}}" = exec ]; then
   mkdir -p .venv/bin
@@ -467,6 +486,10 @@ fi
             self.assertIn(
                 f"ssh_auth_sock={agent_socket_path.resolve()}",
                 execution,
+            )
+            self.assertRegex(
+                execution,
+                r"(?m)^control_path_dir=/tmp/vps-c\.[A-Za-z0-9]+/cp$",
             )
             mise_calls = [
                 line for line in execution.splitlines() if line.startswith("mise=")
