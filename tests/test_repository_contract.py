@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -354,6 +355,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 fake_bin / "git",
                 f"""#!/bin/sh
 set -eu
+[ -z "${{SSH_AUTH_SOCK+x}}" ]
 case " $* " in
   *" fetch "*)
     printf '%s\\n' "$*" >>{quoted_log}
@@ -379,6 +381,7 @@ exec {real_git} "$@"
                 galaxy_template,
                 f"""#!/bin/sh
 set -eu
+[ -z "${{SSH_AUTH_SOCK+x}}" ]
 printf 'galaxy=%s\\n' "$PWD $*" >>{quoted_log}
 """,
             )
@@ -387,9 +390,11 @@ printf 'galaxy=%s\\n' "$PWD $*" >>{quoted_log}
                 f"""#!/bin/sh
 set -eu
 [ -z "${{ANSIBLE_LIBRARY+x}}" ]
+[ -n "${{SSH_AUTH_SOCK+x}}" ]
 IFS= read -r marker < ../marker.txt
 printf 'playbook_directory=%s\\n' "$PWD" >>{quoted_log}
 printf 'marker=%s\\n' "$marker" >>{quoted_log}
+printf 'ssh_auth_sock=%s\\n' "$SSH_AUTH_SOCK" >>{quoted_log}
 printf 'arguments=%s\\n' "$*" >>{quoted_log}
 """,
             )
@@ -397,6 +402,7 @@ printf 'arguments=%s\\n' "$*" >>{quoted_log}
                 fake_bin / "mise",
                 f"""#!/bin/sh
 set -eu
+[ -z "${{SSH_AUTH_SOCK+x}}" ]
 printf 'mise=%s\\n' "$PWD $*" >>{quoted_log}
 if [ "${{1:-}}" = exec ]; then
   mkdir -p .venv/bin
@@ -423,6 +429,28 @@ fi
                     "PYTHONPATH": "/untrusted/python",
                 }
             )
+            invalid_socket = support / "not-a-socket"
+            invalid_socket.write_text("not a socket\n", encoding="utf-8")
+            invalid_environment = environment.copy()
+            invalid_environment["SSH_AUTH_SOCK"] = str(invalid_socket)
+            invalid_agent = subprocess.run(
+                [converge],
+                cwd=root,
+                env=invalid_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(invalid_agent.returncode, 78)
+            self.assertIn("caller-owned Unix socket", invalid_agent.stderr)
+            self.assertFalse(log.exists())
+
+            agent_socket_path = support / "agent.sock"
+            agent_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(agent_socket.close)
+            agent_socket.bind(str(agent_socket_path))
+            environment["SSH_AUTH_SOCK"] = str(agent_socket_path)
             result = subprocess.run(
                 [converge],
                 cwd=root,
@@ -436,6 +464,10 @@ fi
             execution = log.read_text(encoding="utf-8")
             self.assertIn("marker=remote-main", execution)
             self.assertNotIn("divergent-worktree", execution)
+            self.assertIn(
+                f"ssh_auth_sock={agent_socket_path.resolve()}",
+                execution,
+            )
             mise_calls = [
                 line for line in execution.splitlines() if line.startswith("mise=")
             ]
