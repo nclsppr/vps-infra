@@ -84,17 +84,19 @@ revision=$(safe_git -C "$REPOSITORY_ROOT" rev-parse --verify \
 [[ $revision =~ ^[0-9a-f]{40}$ ]] || fail "origin/main did not resolve to a full lowercase Git SHA"
 readonly revision
 
-temporary_root=$("$mktemp_executable" -d /tmp/vps-infra-converge.XXXXXXXX)
+temporary_root=$("$mktemp_executable" -d /tmp/vps-c.XXXXXXXX)
 readonly temporary_root
 checkout="$temporary_root/checkout"
 isolated_home="$temporary_root/home"
-readonly checkout isolated_home
+control_path_dir="$temporary_root/cp"
+readonly checkout isolated_home control_path_dir
 ansible_environment=(
   "HOME=$isolated_home"
   "PATH=$checkout/.venv/bin:$caller_path"
   "LC_ALL=C.UTF-8"
   "ANSIBLE_CONFIG=$checkout/ansible/ansible.cfg"
   "ANSIBLE_COLLECTIONS_PATH=$checkout/.cache/ansible/collections"
+  "ANSIBLE_SSH_CONTROL_PATH_DIR=$control_path_dir"
 )
 if [[ -n $ssh_auth_sock ]]; then
   ansible_environment+=("SSH_AUTH_SOCK=$ssh_auth_sock")
@@ -113,7 +115,7 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -m 0700 -- "$checkout" "$isolated_home"
+mkdir -m 0700 -- "$checkout" "$isolated_home" "$control_path_dir"
 
 safe_git -C "$REPOSITORY_ROOT" archive --format=tar "$revision" | \
   "$tar_executable" -xf - -C "$checkout"
