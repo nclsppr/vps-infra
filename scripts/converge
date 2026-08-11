@@ -18,6 +18,22 @@ fail() {
   exit "$status"
 }
 
+ansible_playbook_options=()
+case $# in
+  0)
+    ;;
+  2)
+    if [[ $1 != --check || $2 != --diff ]]; then
+      fail "arguments must be empty or exactly: --check --diff" "$EX_USAGE"
+    fi
+    ansible_playbook_options=(--check --diff)
+    ;;
+  *)
+    fail "arguments must be empty or exactly: --check --diff" "$EX_USAGE"
+    ;;
+esac
+readonly -a ansible_playbook_options
+
 resolve_executable() {
   local name=$1
   local path
@@ -140,10 +156,16 @@ clean_command() {
   clean_command ../.venv/bin/ansible-galaxy collection install \
     --requirements-file collections/requirements.yml \
     --collections-path ../.cache/ansible/collections
+  ansible_playbook_command=(../.venv/bin/ansible-playbook)
+  if ((${#ansible_playbook_options[@]} > 0)); then
+    ansible_playbook_command+=("${ansible_playbook_options[@]}")
+  fi
+  ansible_playbook_command+=(
+    --inventory "$inventory"
+    --extra-vars "@$extra_vars"
+    --extra-vars "vps_infra_revision=$revision"
+    playbooks/site.yml
+  )
   "$env_executable" -i "${ansible_environment[@]}" \
-    ../.venv/bin/ansible-playbook \
-      --inventory "$inventory" \
-      --extra-vars "@$extra_vars" \
-      --extra-vars "vps_infra_revision=$revision" \
-      playbooks/site.yml
+    "${ansible_playbook_command[@]}"
 )
