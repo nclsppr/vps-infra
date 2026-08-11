@@ -338,10 +338,102 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
         self.assertIn("./scripts/converge", makefile)
+        self.assertIn("./scripts/converge --check --diff", makefile)
         self.assertIn("+refs/heads/main:refs/remotes/origin/main", converge)
         self.assertIn("archive --format=tar \"$revision\"", converge)
         self.assertIn("cd \"$checkout\"", converge)
         self.assertIn('--extra-vars "vps_infra_revision=$revision"', converge)
+        self.assertIn('"${ansible_playbook_options[@]}"', converge)
+
+    def test_tasks_forced_outside_check_mode_are_read_only(self) -> None:
+        expected = {
+            (
+                "base",
+                "Detect whether the swap file has a swap signature",
+            ): [
+                "/usr/sbin/blkid",
+                "-o",
+                "value",
+                "-s",
+                "TYPE",
+                "{{ vps_swap_path }}",
+            ],
+            ("base", "Read active swap devices"): [
+                "/usr/bin/awk",
+                "NR>1 {print $1}",
+                "/proc/swaps",
+            ],
+            ("deploy", "Read the infrastructure mirror origin"): [
+                "/usr/bin/git",
+                "-C",
+                "{{ vps_deploy_repository_dir }}",
+                "remote",
+                "get-url",
+                "origin",
+            ],
+            ("deploy", "Read deployment account groups"): [
+                "/usr/bin/id",
+                "-nG",
+                "{{ vps_deploy_user }}",
+            ],
+            ("docker", "Read the Docker key fingerprints"): [
+                "/usr/bin/gpg",
+                "--batch",
+                "--show-keys",
+                "--with-colons",
+                "/etc/apt/keyrings/docker.asc",
+            ],
+            ("docker", "Read installed Docker package versions"): [
+                "/usr/bin/dpkg-query",
+                "-W",
+                "-f=${Version}",
+                "{{ item.name }}",
+            ],
+            ("firewall", "Read effective UFW policy"): [
+                "/usr/sbin/ufw",
+                "status",
+                "verbose",
+            ],
+            ("firewall", "Read every numbered UFW rule"): [
+                "/usr/sbin/ufw",
+                "status",
+                "numbered",
+            ],
+            ("layout", "Inspect managed external Docker networks"): [
+                "/usr/bin/docker",
+                "network",
+                "inspect",
+                "{{ item.name }}",
+            ],
+            ("ssh", "Read effective deploy SSH policy"): [
+                "/usr/sbin/sshd",
+                "-T",
+                "-C",
+                "user={{ vps_deploy_user }},host=localhost,addr=127.0.0.1",
+            ],
+            ("ssh", "Read effective administrator SSH policy"): [
+                "/usr/sbin/sshd",
+                "-T",
+                "-C",
+                "user={{ vps_admin_user }},host=localhost,addr=127.0.0.1",
+            ],
+        }
+        observed: dict[tuple[str, str], list[str]] = {}
+        for task_file in sorted((ROOT / "ansible/roles").glob("*/tasks/main.yml")):
+            role = task_file.parent.parent.name
+            for task in yaml.safe_load(task_file.read_text(encoding="utf-8")):
+                if task.get("check_mode") is not False:
+                    continue
+                module_keys = {
+                    key for key in task if key.startswith("ansible.builtin.")
+                }
+                self.assertEqual(module_keys, {"ansible.builtin.command"})
+                self.assertIs(task.get("changed_when"), False)
+                observed[(role, task["name"])] = task["ansible.builtin.command"][
+                    "argv"
+                ]
+
+        self.assertEqual(observed, expected)
 
     def test_convergence_keeps_the_ssh_control_path_short(self) -> None:
         converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
@@ -637,6 +729,55 @@ fi
                 execution,
             )
 
+            log.unlink()
+            check_result = subprocess.run(
+                [converge, "--check", "--diff"],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(check_result.returncode, 0, check_result.stderr)
+            check_execution = log.read_text(encoding="utf-8")
+            self.assertRegex(
+                check_execution,
+                rf"(?m)^arguments=--check --diff .*vps_infra_revision={remote_sha} .*playbooks/site\.yml$",
+            )
+
+            log.unlink()
+            for unsupported_arguments in (
+                ["--check"],
+                ["--diff", "--check"],
+                ["--check", "--diff", "--limit", "atlas"],
+            ):
+                refused = subprocess.run(
+                    [converge, *unsupported_arguments],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(refused.returncode, 64)
+                self.assertIn(
+                    "arguments must be empty or exactly: --check --diff",
+                    refused.stderr,
+                )
+                self.assertFalse(log.exists())
+
+            result = subprocess.run(
+                [converge],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
             log.unlink()
             (root / "fail-fetch").touch()
             failed_fetch = subprocess.run(

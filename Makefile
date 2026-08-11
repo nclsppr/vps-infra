@@ -9,7 +9,8 @@ COMPOSE := $(MISE_EXEC) docker-compose
 
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
-	check-prometheus check-caddy check-json bootstrap converge doctor-local
+	check-prometheus check-caddy check-json bootstrap converge converge-check \
+	doctor-local
 
 help: ## Show the available commands.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "%-24s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -130,6 +131,11 @@ converge: ## Run host convergence from an isolated snapshot of origin/main.
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge
+
+converge-check: ## Predict host changes from an isolated snapshot of origin/main.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --check --diff
 
 doctor-local: ## Audit the local checkout without contact with the VPS.
 	./scripts/doctor --local

@@ -49,6 +49,25 @@ make converge \
   ANSIBLE_EXTRA_VARS=/private/path/bootstrap-public.yml
 ```
 
+After a successful convergence, run the bounded predictive check:
+
+```bash
+make converge-check \
+  ANSIBLE_EXTRA_VARS=/private/path/bootstrap-public.yml
+```
+
+`converge-check` always supplies both `--check` and `--diff`. The wrapper
+rejects every other command-line argument. This restriction prevents an
+operator-controlled Ansible option from changing the captured playbook scope
+or execution policy.
+
+Run this mode only after one successful normal convergence. It is a predictive
+drift check, not a bootstrap rehearsal. Ansible skips command-based Docker
+network creation and some final effective-state assertions in check mode. An
+expired APT cache can also report a predicted change without refreshing the
+cache. The repository contract allowlists every command that must execute
+outside check mode and requires each command to be read-only.
+
 `scripts/converge` fetches `main` with an explicit destination refspec. It
 captures the full `origin/main` commit once. It exports that commit to a new
 temporary directory. It installs the locked tools and dependencies in that
