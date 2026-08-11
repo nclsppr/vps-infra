@@ -16,30 +16,6 @@ services:
   caddy:
     <<: *common-hardening
     image: ${CADDY_PLATFORM_IMAGE:?CADDY_PLATFORM_IMAGE is required}
-    environment:
-      OVH_ENDPOINT: ${OVH_ENDPOINT:-ovh-eu}
-      OVH_APPLICATION_KEY_FILE: /run/secrets/ovh_application_key
-      OVH_APPLICATION_SECRET_FILE: /run/secrets/ovh_application_secret
-      OVH_CONSUMER_KEY_FILE: /run/secrets/ovh_consumer_key
-      PERSONAL_DOMAIN: ${PERSONAL_DOMAIN:-nicolaspieper.com}
-      PERSONAL_WWW_DOMAIN: ${PERSONAL_WWW_DOMAIN:-www.nicolaspieper.com}
-      PERSONAL_LEGACY_DOMAIN: ${PERSONAL_LEGACY_DOMAIN:-nicolas.pieper.fr}
-      PAPERSEMPIRE_DOMAIN: ${PAPERSEMPIRE_DOMAIN:-papersempire.com}
-      SURPLASSE_DOMAIN: ${SURPLASSE_DOMAIN:-surplasse.com}
-      SURPLASSE_BASE_URL: ${SURPLASSE_BASE_URL:-https://surplasse.com}
-      SURPLASSE_ONBOARDING_ORIGIN: ${SURPLASSE_ONBOARDING_ORIGIN:-https://surplasse.com}
-      SURPLASSE_DASHBOARD_ORIGIN: ${SURPLASSE_DASHBOARD_ORIGIN:-https://dashboard.surplasse.com}
-      SURPLASSE_BACKEND_UPSTREAM: ${SURPLASSE_BACKEND_UPSTREAM:-surplasse-backend:8080}
-      SURPLASSE_ONBOARDING_UPSTREAM: ${SURPLASSE_ONBOARDING_UPSTREAM:-surplasse-onboarding:8080}
-      SURPLASSE_COMMANDE_UPSTREAM: ${SURPLASSE_COMMANDE_UPSTREAM:-surplasse-commande:8080}
-      SURPLASSE_DASHBOARD_UPSTREAM: ${SURPLASSE_DASHBOARD_UPSTREAM:-surplasse-dashboard:8080}
-      SURPLASSE_DOCS_UPSTREAM: ${SURPLASSE_DOCS_UPSTREAM:-surplasse-docs:8080}
-      PARKVENTORY_ENABLED: "false"
-      PARKVENTORY_DOMAIN: ${PARKVENTORY_DOMAIN:-parkventory.invalid}
-    secrets:
-      - ovh_application_key
-      - ovh_application_secret
-      - ovh_consumer_key
     ports:
       - "${CADDY_HTTP_BIND_ADDRESS:-0.0.0.0}:${CADDY_HTTP_PORT:-80}:80/tcp"
       - "${CADDY_HTTPS_BIND_ADDRESS:-0.0.0.0}:${CADDY_HTTPS_PORT:-443}:443/tcp"
@@ -67,8 +43,6 @@ services:
       - caddy_config:/config
     networks:
       - ops
-      - app_surplasse
-      - app_parkventory
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -128,12 +102,6 @@ services:
         bind:
           create_host_path: false
     networks:
-      db_surplasse:
-        aliases:
-          - postgresql
-      db_parkventory:
-        aliases:
-          - postgresql
       db_monitoring:
         aliases:
           - postgresql
@@ -192,7 +160,6 @@ services:
       - prometheus_data:/prometheus
     networks:
       - ops
-      - app_surplasse
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -350,12 +317,6 @@ services:
       start_period: 10s
 
 secrets:
-  ovh_application_key:
-    file: ${OVH_APPLICATION_KEY_FILE:-/etc/vps/secrets/platform/ovh-application-key}
-  ovh_application_secret:
-    file: ${OVH_APPLICATION_SECRET_FILE:-/etc/vps/secrets/platform/ovh-application-secret}
-  ovh_consumer_key:
-    file: ${OVH_CONSUMER_KEY_FILE:-/etc/vps/secrets/platform/ovh-consumer-key}
   postgres_superuser_password:
     file: ${POSTGRES_SUPERUSER_PASSWORD_FILE:-/etc/vps/secrets/platform/postgres-superuser-password}
   postgres_exporter_password:
@@ -369,18 +330,6 @@ networks:
   ops:
     external: true
     name: ${OPS_NETWORK_NAME:-ops}
-  app_surplasse:
-    external: true
-    name: ${SURPLASSE_APP_NETWORK_NAME:-app_surplasse}
-  db_surplasse:
-    external: true
-    name: ${SURPLASSE_DB_NETWORK_NAME:-db_surplasse}
-  app_parkventory:
-    external: true
-    name: ${PARKVENTORY_APP_NETWORK_NAME:-app_parkventory}
-  db_parkventory:
-    external: true
-    name: ${PARKVENTORY_DB_NETWORK_NAME:-db_parkventory}
   db_monitoring:
     external: true
     name: ${POSTGRES_MONITORING_NETWORK_NAME:-db_monitoring}

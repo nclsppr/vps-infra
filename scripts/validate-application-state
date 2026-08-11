@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Validate that application configuration matches the release enable state."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+APPLICATIONS = ("personal", "papersempire", "surplasse", "parkventory")
+PLATFORM_TARGETS = frozenset({"caddy.yml", "node-exporter.yml", "postgres-exporter.yml"})
+PLATFORM_RULES = frozenset({"platform.yml"})
+SURPLASSE_TARGET_REFERENCE = "/etc/prometheus/targets/surplasse.yml"
+
+
+class ApplicationStateError(ValueError):
+    """A versioned application file does not match the release state."""
+
+
+def _load_manifest(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ApplicationStateError(f"cannot read release manifest {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ApplicationStateError("release manifest must be an object")
+    return value
+
+
+def _validate_exact_directory(path: Path, expected_names: set[str]) -> None:
+    try:
+        entries = list(path.iterdir())
+    except OSError as exc:
+        raise ApplicationStateError(f"cannot read configuration directory {path}: {exc}") from exc
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            raise ApplicationStateError(f"configuration entry must be a regular file: {entry}")
+    actual_names = {entry.name for entry in entries}
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        unexpected = sorted(actual_names - expected_names)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        raise ApplicationStateError(f"{path}: {'; '.join(details)}")
+
+
+def validate_repository(repository_root: Path, manifest_path: Path | None = None) -> None:
+    root = repository_root.resolve()
+    manifest_file = manifest_path or root / "releases" / "production.yaml"
+    manifest = _load_manifest(manifest_file)
+    platform = manifest.get("platform")
+    applications = manifest.get("applications")
+    if not isinstance(platform, dict) or not isinstance(platform.get("enabled"), bool):
+        raise ApplicationStateError("platform.enabled must be a Boolean")
+    if not isinstance(applications, dict):
+        raise ApplicationStateError("applications must be an object")
+
+    for name in APPLICATIONS:
+        application = applications.get(name)
+        if not isinstance(application, dict) or not isinstance(application.get("enabled"), bool):
+            raise ApplicationStateError(f"applications.{name}.enabled must be a Boolean")
+        if application["enabled"] and not platform["enabled"]:
+            raise ApplicationStateError(f"applications.{name} cannot be enabled while platform is disabled")
+        if application["enabled"]:
+            raise ApplicationStateError(
+                f"applications.{name} cannot be enabled by the locked platform baseline"
+            )
+
+    route_dir = root / "platform" / "caddy" / "routes"
+    route_names = {f"{name}.caddy.disabled" for name in APPLICATIONS}
+    _validate_exact_directory(route_dir, route_names)
+
+    target_dir = root / "platform" / "observability" / "prometheus" / "targets"
+    rule_dir = root / "platform" / "observability" / "prometheus" / "rules"
+    _validate_exact_directory(
+        target_dir,
+        set(PLATFORM_TARGETS) | {"surplasse.yml.disabled"},
+    )
+    _validate_exact_directory(
+        rule_dir,
+        set(PLATFORM_RULES) | {"surplasse.yml.disabled"},
+    )
+
+    prometheus_config = (
+        root / "platform" / "observability" / "prometheus" / "prometheus.yml"
+    ).read_text(encoding="utf-8")
+    if SURPLASSE_TARGET_REFERENCE in prometheus_config:
+        raise ApplicationStateError(
+            "Surplasse scrape target reference must be absent from prometheus.yml"
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--manifest")
+    args = parser.parse_args()
+    manifest = Path(args.manifest).resolve() if args.manifest else None
+    try:
+        validate_repository(Path(args.root), manifest)
+    except (ApplicationStateError, OSError) as exc:
+        print(f"application state validation failed: {exc}", file=sys.stderr)
+        return 1
+    print("application state matches the release manifest")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -302,6 +302,21 @@ class ReleasePolicyTests(unittest.TestCase):
             self.assertEqual(set(result.stdout.splitlines()), {f"sha256:{DIGEST_A}", f"sha256:{DIGEST_B}"})
             self.assertNotIn(f"sha256:{DIGEST_C}", result.stdout)
 
+    def test_new_infrastructure_revision_updates_each_active_unit(self) -> None:
+        active = sample_manifest()
+        enable_platform(active)
+        desired = json.loads(json.dumps(active))
+        plan = RECONCILE_POLICY.create_plan(
+            desired,
+            active,
+            SHA_B,
+            SHA_A,
+            Path("/nonexistent-quarantine"),
+        )
+        platform = next(item for item in plan["actions"] if item["unit"] == "platform")
+        self.assertEqual(platform["action"], "update")
+        self.assertTrue(plan["changes_required"])
+
     def test_single_component_update_quarantines_only_the_new_digest(self) -> None:
         active = sample_manifest()
         enable_parkventory(active)
@@ -457,15 +472,10 @@ def secret_definitions(sources: set[str]) -> dict:
 def platform_caddy() -> dict:
     service = hardened_service(
         image("ghcr.io/nclsppr/vps-infra/caddy"),
-        {"ops", "app_surplasse", "app_parkventory"},
+        {"ops"},
         user=None,
     )
     service["cap_add"] = ["NET_BIND_SERVICE"]
-    service["secrets"] = [
-        {"source": "ovh_application_key"},
-        {"source": "ovh_application_secret"},
-        {"source": "ovh_consumer_key"},
-    ]
     service["ports"] = [
         {"target": 80, "published": "80", "protocol": "tcp", "host_ip": "0.0.0.0"},
         {"target": 443, "published": "443", "protocol": "tcp", "host_ip": "0.0.0.0"},
@@ -495,7 +505,7 @@ def platform_document(*, include_grafana: bool = True) -> dict:
     del include_grafana
     postgresql = hardened_service(
         image("docker.io/library/postgres"),
-        {"db_surplasse", "db_parkventory", "db_monitoring"},
+        {"db_monitoring"},
         user=None,
     )
     postgresql["cap_add"] = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
@@ -526,7 +536,7 @@ def platform_document(*, include_grafana: bool = True) -> dict:
     ]
     prometheus = hardened_service(
         image("docker.io/prom/prometheus"),
-        {"ops", "app_surplasse"},
+        {"ops"},
         user=None,
     )
     prometheus["volumes"] = [
@@ -871,8 +881,8 @@ class ComposePolicyTests(unittest.TestCase):
 
     def test_secret_traversal_and_unknown_top_level_are_rejected(self) -> None:
         document = platform_document()
-        document["secrets"]["ovh_application_key"]["file"] = (
-            "/etc/vps/secrets/platform/../platform/ovh-application-key"
+        document["secrets"]["postgres_superuser_password"]["file"] = (
+            "/etc/vps/secrets/platform/../platform/postgres-superuser-password"
         )
         with self.assertRaisesRegex(COMPOSE_POLICY.ComposePolicyError, "exact normalized path"):
             validate_platform_document(document)
@@ -884,7 +894,7 @@ class ComposePolicyTests(unittest.TestCase):
 
     def test_network_options_and_secret_target_overrides_are_rejected(self) -> None:
         document = platform_document()
-        document["services"]["postgresql"]["networks"]["db_surplasse"] = {
+        document["services"]["postgresql"]["networks"]["db_monitoring"] = {
             "aliases": ["postgresql"],
             "ipv4_address": "172.30.11.10",
         }
@@ -892,7 +902,7 @@ class ComposePolicyTests(unittest.TestCase):
             validate_platform_document(document)
 
         document = platform_document()
-        document["services"]["caddy"]["secrets"][0].update(
+        document["services"]["postgresql"]["secrets"][0].update(
             target="/etc/passwd",
             uid="0",
             gid="0",
@@ -1003,6 +1013,17 @@ class PublicSafetyTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if os.geteuid() == 0:
+            if os.environ.get("VPS_CONTROLLER_ROOT_SAFE_SKIP") == "1":
+                raise unittest.SkipTest(
+                    "controller integration tests require an unprivileged user"
+                )
+            raise PermissionError(
+                "ControllerTests require an unprivileged user; run tests/run"
+            )
+
     def create_repository(self, root: Path) -> tuple[Path, Path, str]:
         source = root / "source"
         remote = root / "remote.git"
@@ -1063,6 +1084,7 @@ class ControllerTests(unittest.TestCase):
                     ["git", "-C", str(repository), "remote", "get-url", "origin"], text=True
                 ).strip(),
                 "VPS_SCHEMA_FILE": str(SCHEMA),
+                "GIT_CONFIG_PARAMETERS": "'protocol.file.allow=never'",
             }
         )
         return environment

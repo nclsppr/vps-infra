@@ -18,9 +18,13 @@ if [[ $# -ne 1 || ! $1 =~ ^[0-9a-f]{40}$ ]]; then
 fi
 readonly requested_sha=$1
 
-# Overrides are accepted only for unprivileged local tests. A sudo/root invocation
-# always uses the root-owned production paths below, regardless of SSH environment.
-if [[ ${VPS_CONTROLLER_TESTING:-0} == 1 && ${EUID} -ne 0 ]]; then
+# Overrides are accepted only for unprivileged local tests. A root invocation
+# with a test flag is an operator error. It must stop before any file mutation.
+if [[ ${VPS_CONTROLLER_TESTING:-0} == 1 && ${EUID} -eq 0 ]]; then
+  echo "deploy refused: root cannot use controller test mode" >&2
+  exit "$EX_CONFIG"
+fi
+if [[ ${VPS_CONTROLLER_TESTING:-0} == 1 ]]; then
   readonly production_mode=0
   readonly repository_dir=${VPS_REPOSITORY_DIR:?VPS_REPOSITORY_DIR is required in test mode}
   readonly state_dir=${VPS_STATE_DIR:?VPS_STATE_DIR is required in test mode}
@@ -217,9 +221,18 @@ if [[ $production_mode -eq 1 ]]; then
 fi
 
 export GIT_OPTIONAL_LOCKS=0
-unset GIT_CONFIG GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE \
+for variable_name in "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"; do
+  unset "$variable_name"
+done
+unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_SYSTEM \
+  GIT_DIR GIT_WORK_TREE \
+  GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+  GIT_COMMON_DIR GIT_NAMESPACE GIT_EXEC_PATH GIT_TEMPLATE_DIR \
   GIT_SSH GIT_SSH_COMMAND GIT_SSH_VARIANT GIT_PROXY_COMMAND \
+  PYTHONHOME PYTHONPATH VIRTUAL_ENV \
   http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY no_proxy
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
 actual_origin=$(git -C "$repository_dir" remote get-url origin 2>/dev/null) || \
   fail "repository has no fetch URL for the root-owned origin remote"
 [[ $actual_origin == "$expected_origin" ]] || \

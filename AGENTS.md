@@ -1,27 +1,37 @@
-# Consignes du dépôt
+# Repository Instructions
 
-## Périmètre
+## Scope
 
-Ce dépôt public est la source de vérité de l’hôte VPS, de la plateforme commune
-et des versions à déployer. Il ne doit jamais contenir de secret, de clé privée,
-d’inventaire de production ni de donnée métier.
+This public repository is the source of truth for the VPS host, the shared
+platform, and the selected release state. Never add a secret, a private key, a
+production inventory, or business data to this repository.
 
-## Règles
+## Technical Writing
 
-- La documentation et les messages opérateur sont en français ; le code et les
-  identifiants techniques restent en anglais.
-- Les images et artefacts de production sont référencés par digest immuable.
-- Les builds applicatifs ne s’exécutent pas sur le VPS de production.
-- Les changements PostgreSQL, Caddy, migrations et secrets nécessitent une
-  validation explicite ; aucun fallback silencieux n’est autorisé.
-- Les scripts sont sûrs par défaut : validation ou dry-run avant mutation,
-  cibles bornées et refus des variables manquantes.
-- Ne jamais créer un vrai inventaire, un fichier `.env`, une clé, un jeton ou un
-  fichier déchiffré dans Git.
-- Exécuter `make check` avant tout commit.
+- Write in clear technical English. Follow ASD-STE100 Simplified Technical
+  English principles.
+- Use precise and unambiguous terminology. Use short declarative sentences.
+- Use active voice when it makes responsibility clear.
+- Use one term consistently for each concept. Do not use unnecessary synonyms.
+- Do not use vague language, marketing language, or unnecessary jargon.
+- Use ISO/IEC/IEEE 24765 terminology when it applies.
+- Apply these rules to documentation, operator messages, code comments, pull
+  requests, and commit messages.
 
-## État externe
+## Engineering Rules
 
-Les adresses OVHcloud, identifiants API, zones DNS, clés SSH et secrets de
-production seront fournis séparément. Leur absence est une porte attendue, pas
-une invitation à inventer des valeurs.
+- Reference each production image and artifact by an immutable digest.
+- Do not run application builds on the production VPS.
+- Require explicit validation for PostgreSQL, Caddy, migration, and secret
+  changes. Do not use a silent fallback.
+- Make each script safe by default. Validate or use a dry run before a mutation.
+  Bound each target. Reject each missing variable.
+- Never create a real inventory, a `.env` file, a key, a token, or a decrypted
+  file in Git.
+- Run `make check` before each commit.
+
+## External State
+
+OVHcloud addresses, API identifiers, DNS zones, SSH keys, and production
+secrets are supplied separately. Their absence is an expected gate. Do not
+invent a value.

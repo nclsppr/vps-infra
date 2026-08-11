@@ -1,105 +1,138 @@
-# Automatisation de l'hôte
+# Host Automation
 
-Cette tranche prépare un Ubuntu 24.04 LTS. Elle ne contient aucun secret, ne
-connaît aucune IP réelle et ne démarre ni plateforme ni application.
+This directory configures an Ubuntu 24.04 LTS host. It contains no secret,
+production address, or production inventory. Host convergence does not start
+the platform or an application.
 
-## Préparer le contrôleur
+## Prepare the controller
 
-Depuis la racine du dépôt, installer l'unique environnement Python verrouillé,
-puis la collection Ansible dans le cache local déclaré par `ansible.cfg` :
+Run these commands from the repository root:
 
 ```bash
 make setup
-mise exec -- ansible-galaxy collection install \
-  --requirements-file ansible/collections/requirements.yml \
-  --collections-path .cache/ansible/collections
-cd ansible
-cp inventories/production/hosts.example.yml inventories/production/hosts.yml
-cp inventories/production/group_vars/bootstrap-public.yml.example \
-  /chemin/prive/bootstrap-public.yml
+cp ansible/inventories/production/hosts.example.yml \
+  ansible/inventories/production/hosts.yml
+cp ansible/inventories/production/group_vars/bootstrap-public.yml.example \
+  /private/path/bootstrap-public.yml
 ```
 
-`pyproject.toml` et `uv.lock` à la racine sont l'unique contrat de version pour
-Python et `ansible-core` ; aucun environnement Ansible secondaire n'est créé
-dans ce sous-répertoire.
+The root `pyproject.toml` and `uv.lock` files define the Python and
+`ansible-core` versions. The Ansible directory does not have a second Python
+environment.
 
-Sur le VPS, le contrôleur reste dépendance-légère mais exige le paquet Ubuntu
-`python3-jsonschema` pour valider le schéma Draft 2020-12 en plus de sa politique
-Python sans framework. Il est installé par le rôle `base` ; le contrôleur refuse
-la production si cette validation indépendante manque.
+The managed VPS requires the Ubuntu `python3-jsonschema` package. The base role
+installs it. The deployment controller uses it to validate the Draft 2020-12
+release schema. Production validation stops if this independent schema check
+is unavailable.
 
-Renseigner l'adresse réelle et vérifier manuellement l'empreinte SSH obtenue
-via OVHcloud ou la console avant de l'ajouter à `known_hosts`. Ne jamais
-désactiver `host_key_checking` et ne pas accepter automatiquement une empreinte
-obtenue sur le même chemin réseau que la connexion.
+Confirm the SSH host-key fingerprint through the OVHcloud console before you
+add it to `known_hosts`. Keep host-key checking enabled. Do not accept a
+fingerprint through the same network path as the SSH connection.
 
-## Exécuter en deux temps
+## Bootstrap and converge
 
-Le bootstrap crée seulement le compte administrateur et sa règle sudo. Il ne
-touche ni à sshd ni au pare-feu :
+Bootstrap creates only the administrator account and its sudo rule. It does
+not change OpenSSH or the firewall:
 
 ```bash
-ansible-playbook playbooks/bootstrap.yml \
-  --extra-vars @/chemin/prive/bootstrap-public.yml
+make bootstrap \
+  ANSIBLE_EXTRA_VARS=/private/path/bootstrap-public.yml
 ```
 
-Conserver cette session ouverte, vérifier une nouvelle connexion SSH avec
-`vpsadmin`, puis mettre `ansible_user: vpsadmin` dans l’inventaire. La
-convergence exige le SHA complet d’un commit déjà présent sur `origin/main` :
+Keep the bootstrap session open. Prove a new SSH connection with `vpsadmin`.
+Then set `ansible_user: vpsadmin` in the inventory.
+
+Run host convergence from the repository root:
 
 ```bash
-git fetch origin main
-# Noter le SHA complet retourné par : git rev-parse origin/main
-ansible-playbook playbooks/site.yml \
-  --extra-vars @/chemin/prive/bootstrap-public.yml \
-  --extra-vars vps_infra_revision=<sha-complet-de-origin-main>
+make converge \
+  ANSIBLE_EXTRA_VARS=/private/path/bootstrap-public.yml
 ```
 
-`site.yml` refuse de s'exécuter avec `root` ou `deploy`. Vérifier ensuite un
-second passage sans changement et le mode prédictif :
+`scripts/converge` fetches `main` with an explicit destination refspec. It
+captures the full `origin/main` commit once. It exports that commit to a new
+temporary directory. It installs the locked tools and dependencies in that
+directory. It then runs `site.yml` from the exported tree and passes the same
+commit as `vps_infra_revision`.
 
-```bash
-ansible-playbook playbooks/site.yml \
-  --extra-vars @/chemin/prive/bootstrap-public.yml \
-  --extra-vars vps_infra_revision=<sha-complet-de-origin-main>
-ansible-playbook playbooks/site.yml --check --diff \
-  --extra-vars @/chemin/prive/bootstrap-public.yml \
-  --extra-vars vps_infra_revision=<sha-complet-de-origin-main>
+The script uses absolute external inventory and public-key variable files. It
+starts Git and Ansible commands with a small environment allowlist. Therefore,
+a divergent branch, a tracked local modification, an untracked role, or an
+external Ansible plugin path cannot change the executed playbook tree. A fetch,
+archive, dependency, or collection failure stops before Ansible contacts the
+host.
+
+`site.yml` rejects the `root` and `deploy` connection users. Run a second
+convergence and a predictive check after the first successful convergence.
+Use the same captured revision method for each command. Do not run `site.yml`
+directly from an arbitrary working tree.
+
+## Administrator key rotation
+
+Normal convergence adds each declared administrator key. It does not remove an
+existing key. It reports and stops on an undeclared key. This behavior prevents
+a persistent OpenSSH control connection from hiding an unusable replacement
+key.
+
+Use this two-phase procedure:
+
+1. Keep the proven key in `vps_admin_authorized_keys`.
+2. Add the replacement key to the same variable.
+3. Run convergence.
+4. Start a new SSH process with the replacement private key. Set
+   `ControlMaster=no` and `ControlPath=none`. Keep host-key checking enabled.
+5. Use a separate explicit operation to retire the old key.
+6. Remove the retired key from `vps_admin_authorized_keys`.
+7. Run convergence again. Prove one more new SSH connection.
+
+Do not replace all keys in one unverified operation. The normal convergence
+role intentionally does not implement key retirement.
+
+The initial SSH port is 22. A port migration must open the old and new ports,
+prove a connection to the new port, and then close the old port.
+
+## Firewall state
+
+After UFW takes control, each convergence checks the exact numbered rule set.
+An unknown manual rule, such as a public `5432/tcp` rule, stops the playbook.
+The playbook reports the rule. It does not remove it. The operator must review
+and remove the rule explicitly.
+
+The Docker `DOCKER-USER` policy accepts only the original published ports
+`80/tcp`, `443/tcp`, and `443/udp` on the public interface. It uses conntrack
+original-destination ports because Docker evaluates this chain after DNAT. An
+allow rule also requires the conntrack DNAT state and original packet direction.
+It drops direct non-DNAT forwarding and all other new public Docker forwarding.
+
+## Deployment controller
+
+The `deploy` account is locked and is not a member of the `docker` group. It
+has a valid shell because OpenSSH requires one. `ForceCommand` sends every key
+to a parser that accepts only `deploy <full-git-sha>`.
+
+The controller files are installed under `/usr/local/libexec/vps`. The marker
+`/etc/vps/production-enabled` and the executable `apply-release` are absent.
+The current controller can validate and plan. It cannot activate production.
+
+The deploy role initializes the root-owned mirror at `/srv/vps/repository` from
+the single allowed public origin:
+
+```text
+https://github.com/nclsppr/vps-infra.git
 ```
 
-Cette première tranche fixe SSH sur le port 22. Changer ce port dans une seule
-convergence serait trompeur et risquerait le verrouillage ; une future migration
-devra ouvrir l'ancien et le nouveau port, prouver une seconde connexion, puis
-fermer l'ancien.
+It verifies that the requested commit is reachable from `origin/main`. It also
+verifies a clean checkout before it installs root-owned controller files. The
+file `/usr/local/share/vps-infra/controller-revision` records the installed
+commit.
 
-Après la première prise de contrôle UFW, chaque convergence vérifie l’ensemble
-exact des règles numérotées. Une règle manuelle ou héritée, par exemple un
-`5432/tcp`, fait échouer le playbook ; elle est affichée mais jamais supprimée
-implicitement. L’opérateur doit l’examiner et la retirer explicitement avant de
-relancer la convergence.
+## Prepared Docker networks
 
-Le compte `deploy` est verrouillé, absent du groupe `docker` et possède un
-shell valide uniquement pour satisfaire OpenSSH. `ForceCommand` redirige toute
-clé vers un filtre qui accepte exclusivement `deploy <sha-git-complet>`. Le
-contrôleur est installé sous `/usr/local/libexec/vps`, mais le marqueur
-`/etc/vps/production-enabled` et l'applicateur `apply-release` restent absents :
-il ne peut produire qu'une validation et un plan sans activation de production.
+Ansible creates six external Docker networks with fixed properties. The locked
+base platform joins only `ops` and `db_monitoring`. PostgreSQL joins only
+`db_monitoring`. Caddy and Prometheus join only `ops`.
 
-Le rôle initialise aussi le miroir root-owned `/srv/vps/repository` depuis
-l’unique origine publique autorisée
-`https://github.com/nclsppr/vps-infra.git`. Il prouve que le SHA demandé est
-exactement checkouté, appartient à `origin/main` et ne comporte aucune
-modification locale avant d’installer les scripts root-owned depuis ce miroir.
-Le SHA installé est enregistré dans
-`/usr/local/share/vps-infra/controller-revision`. Cette origine et cette
-révision ne sont jamais dérivées de la commande SSH reçue.
-
-## Frontières réseau préparées
-
-Ansible crée six réseaux Docker externes aux projets Compose. PostgreSQL rejoint
-uniquement `db_surplasse`, `db_parkventory` et le réseau interne
-`db_monitoring` (`172.30.31.0/24`). Le PostgreSQL Exporter rejoint
-`db_monitoring` pour lire la base et `ops` pour être scrappé. Caddy, Prometheus
-et Grafana n'obtiennent ainsi aucun chemin TCP direct vers PostgreSQL via
-`ops`. Un réseau existant dont le pilote, le caractère interne, le CIDR ou le
-label de gestion diffère fait échouer la convergence sans être supprimé.
+The four application networks remain empty until a reviewed application
+integration package attaches the required services. An existing network with
+an unexpected driver, internal flag, CIDR, or management label stops
+convergence. Ansible does not delete that network.

@@ -25,20 +25,11 @@ APPLICATION_COMPONENTS = {
 PUBLIC_CADDY_PORTS = frozenset({(80, 80, "tcp"), (443, 443, "tcp"), (443, 443, "udp")})
 LOOPBACK_GRAFANA_PORT = (3000, 3000, "tcp")
 DANGEROUS_CAPABILITIES = frozenset({"ALL", "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"})
-PLATFORM_NETWORKS = frozenset(
-    {
-        "ops",
-        "app_surplasse",
-        "db_surplasse",
-        "app_parkventory",
-        "db_parkventory",
-        "db_monitoring",
-    }
-)
+PLATFORM_NETWORKS = frozenset({"ops", "db_monitoring"})
 PLATFORM_SERVICE_NETWORKS = {
-    "caddy": frozenset({"ops", "app_surplasse", "app_parkventory"}),
-    "postgresql": frozenset({"db_surplasse", "db_parkventory", "db_monitoring"}),
-    "prometheus": frozenset({"ops", "app_surplasse"}),
+    "caddy": frozenset({"ops"}),
+    "postgresql": frozenset({"db_monitoring"}),
+    "prometheus": frozenset({"ops"}),
     "grafana": frozenset({"ops"}),
     "node-exporter": frozenset({"ops"}),
     "postgres-exporter": frozenset({"ops", "db_monitoring"}),
@@ -170,7 +161,7 @@ PLATFORM_NAMED_VOLUMES = {
     "prometheus_data": "vps-platform-prometheus-data",
 }
 PLATFORM_SECRETS = {
-    "caddy": frozenset({"ovh_application_key", "ovh_application_secret", "ovh_consumer_key"}),
+    "caddy": frozenset(),
     "postgresql": frozenset({"postgres_superuser_password", "postgres_exporter_password"}),
     "grafana": frozenset({"grafana_admin_password", "grafana_secret_key"}),
     "postgres-exporter": frozenset({"postgres_exporter_password"}),

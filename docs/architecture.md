@@ -125,22 +125,28 @@ Toutes les images amont portent un tag lisible et un digest. Renovate propose
 les mises à jour dans le dépôt VPS ; les versions majeures, Caddy et PostgreSQL
 ne sont jamais fusionnés automatiquement.
 
-## Caddy commun
+## Shared Caddy service
 
-Caddy est le seul propriétaire des certificats et des ports publics. Sa
-configuration racine importe des fragments versionnés :
+Caddy is the only owner of public ports and TLS certificates. The locked base
+platform imports no application route. Each versioned route candidate has a
+`.disabled` suffix:
 
 ```text
 platform/caddy/
   Caddyfile
   routes/
-    personal.caddy
-    papersempire.caddy
+    personal.caddy.disabled
+    papersempire.caddy.disabled
     parkventory.caddy.disabled
-    surplasse.caddy
+    surplasse.caddy.disabled
 ```
 
-Le fragment Surplasse doit conserver les invariants déjà présents :
+`scripts/validate-application-state` rejects every enabled application in this
+baseline. A reviewed integration revision must replace that locked policy. It
+must activate the route, required network attachment, and required secret
+mounts in one versioned change.
+
+The Surplasse route candidate must preserve these requirements:
 
 - domaine apex, API, Dashboard, documentation et sous-domaines établissements ;
 - certificat wildcard par DNS-01 ;
@@ -273,33 +279,26 @@ La production reste désactivée tant que le dépôt ne fournit pas :
 Mailpit, Vite et l’image Maven de développement ne rejoignent jamais le VPS de
 production.
 
-## Isolation réseau
+## Network isolation
 
-Les réseaux sont créés par Ansible et déclarés `external` dans les différents
-Compose. Il ne faut pas mettre tous les conteneurs sur un unique réseau `web`
-ou `db`.
-
-Proposition :
+Ansible creates six external Docker networks. The locked base platform uses
+only these memberships:
 
 ```text
-app_surplasse       Caddy, Prometheus, modules Surplasse
-db_surplasse        PostgreSQL, Backend Surplasse
-app_parkventory     Caddy, Prometheus, modules Parkventory
-db_parkventory      PostgreSQL, Backend Parkventory
+app_surplasse       empty
+db_surplasse        empty
+app_parkventory     empty
+db_parkventory      empty
 db_monitoring       PostgreSQL, PostgreSQL Exporter
-ops                 Caddy, Prometheus, Grafana et exporteurs
+ops                 Caddy, Prometheus, Grafana, and exporters
 ```
 
-PostgreSQL rejoint chaque réseau `db_*` sous un alias stable, mais un backend ne
-rejoint que son propre réseau. Cette segmentation réduit la découverte et les
-chemins accidentels ; elle ne crée pas deux serveurs. Les rôles et `pg_hba.conf`
-restent la vraie frontière d’autorisation d’un cluster commun. Caddy et
-Prometheus rejoignent les réseaux applicatifs nécessaires, sans accès aux
-réseaux de données. PostgreSQL et PostgreSQL Exporter partagent un réseau
-interne `db_monitoring` dédié ; seul l’exporteur rejoint aussi `ops` pour être
-scrapé. Caddy, Grafana et Prometheus n’ont ainsi aucun chemin TCP direct vers
-PostgreSQL. Le rôle exporteur est limité par `pg_hba.conf` au CIDR de ce réseau
-et ne possède que `pg_monitor`.
+A reviewed integration package attaches a platform service or an application
+service only to the required application network. PostgreSQL and PostgreSQL
+Exporter share the internal `db_monitoring` network. Only the exporter also
+joins `ops`. Caddy, Grafana, and Prometheus have no direct TCP path to
+PostgreSQL. The exporter role has only `pg_monitor` and `pg_hba.conf` limits it
+to the `db_monitoring` subnet.
 
 Aucun service applicatif ne publie de port. Grafana peut écouter sur
 `127.0.0.1` seulement et s’ouvrir par tunnel SSH. Les endpoints de métriques,
@@ -357,32 +356,33 @@ valider les deux projets et répéter sauvegarde/restauration.
 Les mises à jour mineures sont des releases plateforme planifiées. Une mise à
 jour majeure n’est jamais un déploiement applicatif ordinaire.
 
-## Prometheus et Grafana partagés
+## Shared Prometheus and Grafana services
 
-Les fichiers actuels de Surplasse servent de point de départ, mais les noms
-codés `backend`, `prometheus` et les UID propres au projet doivent être
-généralisés.
-
-La plateforme possède :
+The locked platform loads only platform targets and platform rules. It keeps
+the Surplasse target and rule as inactive candidates:
 
 ```text
 platform/observability/
   prometheus/
     prometheus.yml
     targets/
-      applications.yml
-      platform.yml
+      caddy.yml
+      node-exporter.yml
+      postgres-exporter.yml
+      surplasse.yml.disabled
     rules/
       platform.yml
-      surplasse.yml
-      parkventory.yml
+      surplasse.yml.disabled
   grafana/
     provisioning/
     dashboards/
       platform/
       surplasse/
-      parkventory/
 ```
+
+A reviewed Surplasse integration must activate both files and add the related
+Prometheus job in the same versioned change. The base platform must not produce
+an alert for a disabled application.
 
 Les cibles utilisent des labels bornés comme `project` et `environment`, jamais
 un email, une commande, un établissement ou un jeton. Le dashboard Surplasse

@@ -32,12 +32,5 @@ scrape_configs:
       - files:
           - /etc/prometheus/targets/postgres-exporter.yml
 
-  - job_name: surplasse-backend
-    metrics_path: /q/metrics
-    scheme: http
-    file_sd_configs:
-      - files:
-          - /etc/prometheus/targets/surplasse.yml
-
-# Parkventory has no active scrape job. Its integration package must add one
-# only after its production readiness gates have succeeded.
+# Application scrape jobs are inactive. A verified integration package must
+# add a job only after the application readiness gates succeed.

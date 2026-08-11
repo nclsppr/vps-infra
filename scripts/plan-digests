@@ -34,8 +34,8 @@ def main() -> int:
             if action.get("action") not in {"activate", "update"}:
                 continue
             references = action.get("desired_references")
-            if not isinstance(references, dict) or not references:
-                raise ValueError("changed action must carry desired_references")
+            if not isinstance(references, dict):
+                raise ValueError("changed action must carry a desired_references object")
             for reference in references.values():
                 if not isinstance(reference, str):
                     raise ValueError("desired reference must be a string")

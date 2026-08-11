@@ -78,9 +78,9 @@ https://{$SURPLASSE_DOMAIN:surplasse.com}, https://*.{$SURPLASSE_DOMAIN:surplass
 		redir {$SURPLASSE_BASE_URL:https://surplasse.com}{uri} 308
 	}
 
-	# Ces endpoints n'existent aujourd'hui que dans le serveur de
-	# developpement Surplasse. Les envoyer vers l'image NGINX onboarding
-	# produirait un 404 trompeur et ferait croire le parcours Connect livrable.
+	# These endpoints exist only in the Surplasse development server. Do not
+	# send them to the onboarding NGINX image. That image returns a misleading
+	# 404 response and does not implement the Connect operation.
 	@stripe_connect_unavailable {
 		host {$SURPLASSE_DOMAIN:surplasse.com}
 		path /stripe-connect/config /stripe-connect/account-session

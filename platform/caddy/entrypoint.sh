@@ -28,8 +28,15 @@ load_secret() {
   unset "${file_variable_name}"
 }
 
-load_secret OVH_APPLICATION_KEY
-load_secret OVH_APPLICATION_SECRET
-load_secret OVH_CONSUMER_KEY
+surplasse_route=/etc/caddy/routes/surplasse.caddy
+if [ -e "${surplasse_route}" ]; then
+  if [ ! -f "${surplasse_route}" ] || [ -L "${surplasse_route}" ]; then
+    printf 'Error: the active Surplasse route must be a regular file.\n' >&2
+    exit 1
+  fi
+  load_secret OVH_APPLICATION_KEY
+  load_secret OVH_APPLICATION_SECRET
+  load_secret OVH_CONSUMER_KEY
+fi
 
 exec "$@"

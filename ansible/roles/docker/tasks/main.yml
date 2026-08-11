@@ -15,8 +15,8 @@
          'docker-ce-cli', 'docker-compose-plugin']
       - vps_docker_packages | map(attribute='version') | reject('equalto', '') | list | length == 5
     fail_msg: >-
-      Le dépôt, l'architecture et toutes les versions Docker doivent être
-      explicitement validés pour Ubuntu 24.04 avant installation.
+      Validate the repository, architecture, and each Docker version for
+      Ubuntu 24.04 before installation.
 
 - name: Create the APT keyring directory
   ansible.builtin.file:
@@ -54,7 +54,7 @@
       - >-
         ('fpr:::::::::' ~ vps_docker_apt_key_fingerprint ~ ':') in
         vps_docker_key.stdout
-    fail_msg: "La clé APT Docker téléchargée n'a pas l'empreinte attendue."
+    fail_msg: "The downloaded Docker APT key has an unexpected fingerprint."
 
 - name: Configure the official Docker APT repository
   ansible.builtin.deb822_repository:
@@ -88,6 +88,7 @@
   ansible.builtin.apt:
     name: "{{ vps_docker_packages | map(attribute='name') | zip(vps_docker_packages | map(attribute='version')) | map('join', '=') | list }}"
     state: present
+    allow_change_held_packages: true
     allow_downgrade: false
     install_recommends: false
     update_cache: false
@@ -141,8 +142,8 @@
     that:
       - item.stdout == item.item.version
     fail_msg: >-
-      {{ item.item.name }} installé en {{ item.stdout }}, version attendue
-      {{ item.item.version }}.
+      Installed {{ item.item.name }} version {{ item.stdout }}. Expected
+      version {{ item.item.version }}.
   loop: "{{ vps_docker_installed_versions.results }}"
   loop_control:
     label: "{{ item.item.name }}"

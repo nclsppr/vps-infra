@@ -100,6 +100,9 @@ def create_plan(
     for unit in units:
         desired_state = unit_state(desired, unit)
         active_state = unit_state(active, unit) if active is not None else None
+        desired_state["infrastructure_revision"] = desired_commit
+        if active_state is not None:
+            active_state["infrastructure_revision"] = active_commit
         desired_enabled = desired_state["enabled"]
         active_enabled = bool(active_state and active_state["enabled"])
         if active_enabled and not desired_enabled:

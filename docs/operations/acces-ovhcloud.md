@@ -21,11 +21,11 @@ faut renseigner aucune valeur réelle dans ce dépôt public.
 La clé SSH **privée** ne doit jamais être copiée dans Git, une issue ou un log.
 Le bootstrap utilise la clé déjà détenue par l’opérateur.
 
-La première tranche publique est volontairement IPv4 : Caddy publie sur
-`0.0.0.0` et la chaîne `DOCKER-USER` gérée est prouvée avec `iptables`. Même si
-OVHcloud attribue une IPv6, aucun `AAAA` ne doit pointer vers le VPS avant une
-extension revue qui borne `ip6tables`/UFW, lie Caddy sur IPv6 et rejoue les
-probes depuis Internet en IPv4 **et** en IPv6.
+The first public release supports IPv4 only. Caddy binds to `0.0.0.0`. The
+managed `DOCKER-USER` chain matches each original published port after Docker
+DNAT and drops every other new public forwarding path. Do not point an `AAAA`
+record to the VPS until a reviewed change defines the equivalent IPv6 policy
+and verifies external IPv4 and IPv6 probes.
 
 ## API OVHcloud : trois identités, jamais un jeton global
 
