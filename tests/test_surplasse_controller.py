@@ -137,6 +137,7 @@ class SurplasseControllerTests(unittest.TestCase):
             capture_output=True,
             text=True,
             env=environment,
+            timeout=20,
         )
 
     def rendered_compose(self, root: Path) -> Path:
@@ -510,7 +511,13 @@ class SurplasseControllerTests(unittest.TestCase):
     def test_unsafe_manifest_target_blocks_rotation_before_secret_changes(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("the helper intentionally forbids root test mode")
-        for unsafe_kind in ("directory", "symlink", "hardlink", "wrong-mode"):
+        for unsafe_kind in (
+            "directory",
+            "fifo",
+            "symlink",
+            "hardlink",
+            "wrong-mode",
+        ):
             with self.subTest(unsafe_kind=unsafe_kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 protected_root = root / "target"
@@ -527,6 +534,9 @@ class SurplasseControllerTests(unittest.TestCase):
                 if unsafe_kind == "directory":
                     manifest.unlink()
                     manifest.mkdir(mode=0o700)
+                elif unsafe_kind == "fifo":
+                    manifest.unlink()
+                    os.mkfifo(manifest, mode=0o400)
                 elif unsafe_kind == "symlink":
                     manifest.unlink()
                     manifest.symlink_to(protected_root / "surplasse-smtp-host")
