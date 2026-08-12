@@ -1,9 +1,11 @@
 # Plan de mise en œuvre du VPS multi-projets
 
-> **Status: Atlas host layer proven, production locked.** Atlas passed
-> bootstrap, repeated convergence, predictive check mode, and a complete
-> reboot. No production secret, DNS change, platform service, application, or
-> live applicator is configured. Do not use the archived runbook.
+> **Status: Atlas static edge and internal platform live, dynamic production
+> locked.** Atlas passed bootstrap, repeated convergence, predictive check
+> mode, and a complete reboot. The three approved static sites use the Atlas
+> IPv4 address and HTTPS. The private PostgreSQL and observability platform is
+> active. No dynamic application or live release applicator is active. Do not
+> use the archived runbook.
 
 ## Décision recommandée
 
@@ -131,12 +133,13 @@ Critères :
 - [x] bounded `--check --diff` invocation covered by CI and executed on the
       converged host without a predicted change.
 
-Atlas host evidence was collected on 2026-08-12. Both independent
+Initial Atlas host evidence was collected on 2026-08-12. Both independent
 administrator keys opened new sessions, direct root SSH failed, UFW exposed
 only the declared ports, Docker had no container, the reboot created a new boot
 identifier, normal convergence reported `changed=0`, and predictive check mode
-reported `changed=0`. A full disposable-host platform rehearsal remains in
-Phase 6.
+reported `changed=0`. This evidence predates the bounded static-edge and
+internal-platform rollout recorded in Phase 7. A full disposable-host platform
+rehearsal remains in Phase 6.
 
 ## Phase 3 — extraire la plateforme commune
 
@@ -325,32 +328,41 @@ Critères :
 
 ## Phase 6 — répétition générale
 
-Sur un VPS ou une VM jetable :
+Atlas proves the checked production steps below. This does not replace the
+remaining full-stack rehearsal on a disposable VPS or VM.
 
-- [ ] lancer bootstrap puis convergence ;
-- [ ] vérifier un second passage idempotent ;
-- [ ] déployer la plateforme ;
-- [ ] déployer les sites statiques ;
-- [ ] restaurer une base de test ou initialiser des bases vides ;
+- [x] run bootstrap and convergence;
+- [x] verify an idempotent second convergence;
+- [x] deploy the bounded public edge and private internal platform;
+- [x] deploy the three approved static sites;
+- [x] run an isolated restore rehearsal from a verified PostgreSQL backup;
 - [ ] déployer Surplasse ;
-- [ ] garder Parkventory désactivé si ses portes ne sont pas toutes vertes ;
-- [ ] redémarrer complètement la machine ;
-- [ ] vérifier ports, TLS, CORS, SSE, métriques et dashboards ;
+- [x] keep dynamic Parkventory disabled because its gates are not all green;
+- [ ] reboot the complete current platform and application topology;
+- [x] verify public ports, static TLS, private metrics, and Grafana;
+- [ ] verify CORS and SSE through the future dynamic Surplasse routes;
 - [ ] simuler une release défectueuse et son rollback ;
 - [ ] chronométrer la reconstruction et corriger le runbook.
 
 ## Phase 7 — bascule de production
 
-- [ ] baisser les TTL à l’avance ;
-- [ ] déployer sans changer le DNS ;
-- [ ] sonder le nouvel hôte avec résolution forcée ;
-- [ ] sauvegarder et vérifier les données selon le chantier dédié ;
-- [ ] basculer les A ou nameservers ; ne publier les AAAA qu’après preuve du
-      pare-feu, des binds et des probes IPv6 ;
-- [ ] vérifier les enregistrements mail sans aucune réécriture implicite ;
-- [ ] lancer des probes externes ;
-- [ ] observer la plateforme ;
-- [ ] conserver un chemin de retour pendant la fenêtre convenue.
+- [ ] lower TTL values before the next cutover;
+- [x] deploy and probe the three static releases before the DNS change;
+- [x] probe the new host with forced IPv4 resolution;
+- [x] create a verified PostgreSQL backup and complete an isolated restore
+      rehearsal;
+- [x] point the apex and `www` A records for `nicolaspieper.com`,
+      `papersempire.com`, and `parkventory.com` to Atlas. Remove their previous
+      AAAA records. Do not add an Atlas AAAA record before IPv6 edge proof;
+- [x] preserve and verify the existing mail records;
+- [x] run external DNS, HTTP, HTTPS, certificate, redirect, and port probes;
+- [x] observe PostgreSQL, Prometheus targets, Grafana health, and container
+      restart counts;
+- [x] retain the pre-cutover DNS snapshot and the previous hosting targets for
+      rollback during the TTL window.
+
+This cutover applies only to the three static sites. `surplasse.com` keeps its
+previous DNS target. Dynamic Surplasse and Parkventory remain disabled.
 
 ## Ordre recommandé
 

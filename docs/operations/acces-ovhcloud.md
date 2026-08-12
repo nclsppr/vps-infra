@@ -1,7 +1,8 @@
 # Préparer l’accès OVHcloud
 
-Ce document décrit les seules informations externes encore nécessaires. Il ne
-faut renseigner aucune valeur réelle dans ce dépôt public.
+This document records the verified OVHcloud state and the external information
+that the remaining rollout still requires. Do not add a real credential or
+secret value to this public repository.
 
 ## Accès initial au VPS
 
@@ -23,16 +24,20 @@ Le bootstrap utilise la clé déjà détenue par l’opérateur.
 
 ## Verified Atlas host layer
 
-The operator completed the host procedure on 2026-08-12. Atlas runs Ubuntu
-26.04 LTS on `amd64`. It has six CPUs and more than 11 GiB of memory. Bootstrap,
-fresh administrator connections, SSH hardening, the exact UFW policy, Docker,
-repeated convergence, predictive check mode, and a complete reboot passed.
-Direct root SSH fails. No application toolchain, platform container, production
-secret, production marker, or live applicator is present.
+The operator completed the host procedure and the bounded static rollout on
+2026-08-12. Atlas runs Ubuntu 26.04 LTS on `amd64`. It has six CPUs and more
+than 11 GiB of memory. Bootstrap, fresh administrator connections, SSH
+hardening, the exact UFW policy, Docker, repeated convergence, predictive check
+mode, and a complete reboot passed. Direct root SSH fails.
 
-The installed controller and repository mirror record the exact approved
-`main` revision. A normal convergence and the bounded `--check --diff` mode
-both reported `changed=0` after the reboot.
+The Caddy static edge and the private PostgreSQL, Prometheus, Grafana, Node
+Exporter, and PostgreSQL Exporter platform are active. The platform uses
+file-based secrets outside Git. No dynamic application container, application
+secret set, production marker, or live release applicator is present.
+
+The installed repository mirror records the exact approved `main` revision. A
+normal convergence and the bounded `--check --diff` mode both reported
+`changed=0` after HTTPS activation.
 
 The first public release supports IPv4 only. Caddy binds to `0.0.0.0`. The
 managed `DOCKER-USER` chain matches each original published port after Docker
@@ -100,6 +105,10 @@ Toutes les valeurs sont matérialisées hors Git. Il faudra confirmer l’endpoi
 OVHcloud (`ovh-eu` ou autre), les zones réellement hébergées chez OVHcloud et
 les routes observées avant de finaliser chaque politique.
 
+Any API credential copied into a chat is compromised. Revoke it immediately.
+Do not reuse it for Caddy, deployment automation, or a later DNS change. Create
+a new short-lived and zone-scoped identity when another mutation is required.
+
 ## DNS à exporter avant toute mutation
 
 Pour chaque zone :
@@ -116,10 +125,16 @@ Pour chaque zone :
 L’automatisation comparera cet export à l’état API. Elle ne réécrira jamais les
 enregistrements mail implicitement.
 
-Public observation on 2026-08-12 confirmed that every declared zone uses OVH
-authoritative name servers. The application domains still point to their
-previous hosts. This observation does not replace an API export of A, AAAA,
-CNAME, MX, SPF, DKIM, DMARC, CAA, wildcard, redirect, and TTL state.
+Before the 2026-08-12 cutover, the operator captured the complete visible zone
+tables outside Git. After the cutover, every OVH authoritative name server and
+the `1.1.1.1` and `8.8.8.8` resolvers returned the Atlas IPv4 address for the
+apex and `www` names of `nicolaspieper.com`, `papersempire.com`, and
+`parkventory.com`. These names have no AAAA answer. The existing mail records
+remain unchanged. `surplasse.com` still points to its previous host.
+
+The captured tables support rollback, but they do not replace a reusable API
+export of A, AAAA, CNAME, MX, SPF, DKIM, DMARC, CAA, wildcard, redirect, and TTL
+state.
 
 ## Activation GitHub
 
