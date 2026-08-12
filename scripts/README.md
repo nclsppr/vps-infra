@@ -61,7 +61,7 @@ The operator-facing deployment form of `deploy-static` accepts seven bounded
 arguments:
 
 ```text
-deploy-static <personal|papersempire> <source-sha40> \
+deploy-static <personal|papersempire|parkventory> <source-sha40> \
   <site-ref@sha256> <routes-ref@sha256> \
   <integration-sha40> <integration-ref@sha256> \
   <caddy-image@sha256>

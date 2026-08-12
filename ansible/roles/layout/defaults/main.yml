@@ -18,6 +18,7 @@ vps_platform_directories:
 vps_static_sites:
   - personal
   - papersempire
+  - parkventory
 
 vps_static_jobs_backing_path: /run/private/vps-static-jobs
 vps_static_jobs_mount_unit: 'run-private-vps\x2dstatic\x2djobs.mount'

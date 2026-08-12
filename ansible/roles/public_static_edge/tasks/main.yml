@@ -16,19 +16,22 @@
       - >-
         vps_public_static_edge_files | sort ==
         ['Caddyfile', 'compose.yaml', 'expected-images.json', 'validate-compose']
-      - vps_public_static_edge_routes | sort == ['papersempire.caddy', 'personal.caddy']
+      - >-
+        vps_public_static_edge_routes | sort ==
+        ['papersempire.caddy', 'parkventory.caddy', 'personal.caddy']
       - >-
         vps_public_static_edge_route_sources ==
         {'prepare': 'routes-prepare', 'activate': 'routes-activate'}
       - >-
         vps_public_static_edge_domains | sort ==
-        ['nicolaspieper.com', 'papersempire.com',
-         'www.nicolaspieper.com', 'www.papersempire.com']
-      - vps_public_static_edge_dns_zones | length == 2
+        ['nicolaspieper.com', 'papersempire.com', 'parkventory.com',
+         'www.nicolaspieper.com', 'www.papersempire.com',
+         'www.parkventory.com']
+      - vps_public_static_edge_dns_zones | length == 3
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='zone') | list | sort ==
-        ['nicolaspieper.com', 'papersempire.com']
+        ['nicolaspieper.com', 'papersempire.com', 'parkventory.com']
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='names') | flatten | list | sort ==
@@ -214,6 +217,7 @@
       loop:
         - personal
         - papersempire
+        - parkventory
 
     - name: Require protected relative static release links
       ansible.builtin.assert:
@@ -238,6 +242,7 @@
       loop:
         - personal
         - papersempire
+        - parkventory
 
     - name: Require protected static release directories
       ansible.builtin.assert:
@@ -525,10 +530,10 @@
           - >-
             vps_public_static_edge_route_entries.files |
             map(attribute='path') | map('basename') | list | sort ==
-            ['papersempire.caddy', 'personal.caddy']
+            ['papersempire.caddy', 'parkventory.caddy', 'personal.caddy']
           - >-
             vps_public_static_edge_route_entries.files |
-            selectattr('isreg', 'equalto', true) | list | length == 2
+            selectattr('isreg', 'equalto', true) | list | length == 3
           - >-
             (vps_public_static_edge_provenance.results[0].content |
              b64decode | trim) == vps_infra_revision

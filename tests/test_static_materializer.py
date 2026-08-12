@@ -2712,6 +2712,31 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
                 (ROOT / "platform/caddy/routes/personal.caddy.disabled").read_bytes(),
             )
 
+    def test_parkventory_static_profile_is_digest_bound_and_demo_only(self) -> None:
+        profile = MATERIALIZER.PROFILES["parkventory"]
+        self.assertEqual(profile.source_repository, "nclsppr/parkventory")
+        self.assertEqual(profile.source_ref, "refs/heads/main")
+        self.assertEqual(
+            profile.signer_workflow,
+            "nclsppr/parkventory/.github/workflows/vps-release.yml",
+        )
+        self.assertEqual(profile.canonical_domain, "parkventory.com")
+        self.assertEqual(profile.redirect_domains, ("www.parkventory.com",))
+        self.assertEqual(
+            profile.site_repository,
+            "ghcr.io/nclsppr/parkventory/site",
+        )
+        self.assertEqual(
+            profile.routes_repository,
+            "ghcr.io/nclsppr/parkventory/routes",
+        )
+        route = (
+            ROOT / "platform/caddy/routes/parkventory.caddy.disabled"
+        ).read_text(encoding="utf-8")
+        self.assertIn("root * /srv/www/parkventory/current", route)
+        self.assertNotIn("reverse_proxy", route)
+        self.assertNotIn("/api", route)
+
     def test_probe_budget_and_bind_permissions_fail_closed(self) -> None:
         with mock.patch.object(MATERIALIZER.time, "monotonic", return_value=10.1):
             self.assertEqual(

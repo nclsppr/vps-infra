@@ -60,9 +60,9 @@ zones concernés et ajouter une expiration.
 
 ### 2. Identité ACME permanente de Caddy pour les routes DNS-01
 
-The first Personal and Papers Empire edge uses HTTP-01 and receives no OVH
-credential. The following identity is reserved for a later route that genuinely
-requires DNS-01, such as a Surplasse wildcard certificate.
+The first Personal, Papers Empire, and Parkventory demo edge uses HTTP-01 and
+receives no OVH credential. The following identity is reserved for a later
+route that genuinely requires DNS-01, such as a Surplasse wildcard certificate.
 
 Le module `caddy-dns/ovh` retenu consomme alors un endpoint, une application
 key, une application secret et une consumer key. Ces trois valeurs sont créées
@@ -111,6 +111,7 @@ Pour chaque zone :
 - délégation et serveurs autoritatifs ;
 - redirections historiques, notamment `nicolas.pieper.fr` ;
 - origine canonique exacte `https://papersempire.com`.
+- Parkventory apex origin `https://parkventory.com` and its `www` redirect.
 
 L’automatisation comparera cet export à l’état API. Elle ne réécrira jamais les
 enregistrements mail implicitement.

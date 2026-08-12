@@ -62,12 +62,12 @@ versionné ne peut pas être la preuve d’une reconstruction.
 - [ ] exporter toutes les zones, surtout les enregistrements mail ;
 - [ ] documenter `--resolve` et le chemin de bascule HTTP-01 pour toute zone
       sans DNS-01 ;
-- [ ] décider le domaine Parkventory.
+- [x] use `parkventory.com` as the Parkventory apex domain.
 
 Public DNS observation on 2026-08-12 confirms OVH authoritative name servers
-for `nicolaspieper.com`, `papersempire.com`, `surplasse.com`, and the legacy
-`pieper.fr` zone. This observation does not prove OVH API access or replace the
-required full zone export.
+for `nicolaspieper.com`, `papersempire.com`, `parkventory.com`,
+`surplasse.com`, and the legacy `pieper.fr` zone. This observation does not
+prove OVH API access or replace the required full zone export.
 
 ### Choisir la version PostgreSQL
 
@@ -217,6 +217,12 @@ platform/
 
 ### Parkventory
 
+- [x] build the explicitly labeled static demo for the root path;
+- [x] package deterministic static site and route inventory OCI payloads;
+- [x] add the bounded static materializer profile and shared Caddy route;
+- [ ] publish and attest the exact static artifacts from protected `main`;
+- [ ] deploy the static release, cut over DNS, and run strict public probes;
+- [ ] keep the backend application disabled during the static demo release;
 - [x] repartir d’un commit propre : vérifié sur `21f711c684d3` ;
 - [ ] refaire ce contrôle et revoir tout changement de worktree avant de figer
       chaque artefact de production ;
@@ -357,13 +363,13 @@ définir Caddy + PostgreSQL + observabilité communs
         ↓
 livrer le contrôleur de promotion/déploiement
         ↓
-packager personal/papersempire et extraire Surplasse
+package Personal, Papers Empire, and the Parkventory demo; extract Surplasse
         ↓
 répéter le déploiement complet depuis zéro
         ↓
 basculer les projets validés
         ↓
-Parkventory lorsqu’il est production-ready
+Parkventory backend when it is production-ready
 ```
 
 Cette séquence évite de bloquer la plateforme sur Parkventory et évite aussi de

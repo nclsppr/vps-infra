@@ -203,9 +203,8 @@ réserver sa place :
 4. exécuter des contrôles de cohérence propres au produit ;
 5. seulement ensuite autoriser les migrations vers la release active.
 
-`personal` et `papersempire` n’ont aucun état serveur. Les sauvegardes
-`localStorage` restent dans les navigateurs des utilisateurs tant que le domaine
-et le schéma ne changent pas.
+Personal, Papers Empire, and the Parkventory demo have no server state. Browser
+`localStorage` remains on the client while its origin and schema stay stable.
 
 ## Phase 5 — réconcilier les applications
 
@@ -213,7 +212,7 @@ et le schéma ne changent pas.
 
 1. lit le manifeste au commit d’infrastructure choisi ;
 2. refuse Parkventory tant que `enabled: false` ;
-3. récupère et active les deux releases statiques ;
+3. retrieve and activate the three static releases;
 4. tire les images Surplasse ;
 5. exécute les migrations contrôlées ;
 6. démarre les Compose applicatifs avec `--wait` ;
@@ -247,12 +246,12 @@ Le DNS ne change qu’après une vérification complète. Les enregistrements ma
 sont jamais remplacés par une génération automatique sans comparaison exacte
 avec l’export.
 
-For Personal and Papers Empire, the first deployment uses HTTP-01 without an
-OVH credential. The preparation phase serves explicit HTTP routes. The cutover
-then points the apex and `www` A records to Atlas and removes all previous AAAA
-records before the HTTPS activation phase can start. Strict public TLS probes
-run during that controlled cutover, with the captured DNS state available for
-rollback.
+For Personal, Papers Empire, and the Parkventory demo, the first deployment
+uses HTTP-01 without an OVH credential. The preparation phase serves explicit
+HTTP routes. The cutover then points the apex and `www` A records to Atlas and
+removes all previous AAAA records before the HTTPS activation phase can start.
+Strict public TLS probes run during that controlled cutover, with the captured
+DNS state available for rollback.
 
 ## Phase 7 — basculer et observer
 
@@ -266,9 +265,9 @@ rollback.
 6. observer erreurs, saturation, certificats et métriques ;
 7. conserver l’ancien hébergement disponible pendant la fenêtre de retour.
 
-Pour `personal` et `papersempire`, GitHub Pages peut rester la production
-jusqu’à cette étape. Le nouveau workflow VPS se valide en parallèle sans
-prétendre que le domaine est déjà migré.
+GitHub Pages can keep serving each current static surface until this step. The
+VPS workflows can be validated in parallel without claiming that a domain has
+already moved.
 
 ## Critères d’acceptation
 

@@ -45,7 +45,11 @@
       "required": ["repository", "revision"],
       "properties": {
         "repository": {
-          "enum": ["nclsppr/personal", "nclsppr/papersempire"]
+          "enum": [
+            "nclsppr/personal",
+            "nclsppr/papersempire",
+            "nclsppr/parkventory"
+          ]
         },
         "revision": {
           "type": "string",
