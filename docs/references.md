@@ -129,6 +129,11 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
   authentification limitée au registre via la configuration Docker.
 - [ORAS — registres OCI compatibles](https://oras.land/docs/compatible_oci_registries/) :
   push et pull de fichiers dans GHCR.
+- [ORAS - release 1.3.3](https://github.com/oras-project/oras/releases/tag/v1.3.3) :
+  version locked by `mise` for local and CI artifact publication.
+- [ORAS - manifest fetch](https://oras.land/docs/commands/oras_manifest_fetch/) and
+  [blob fetch](https://oras.land/docs/commands/oras_blob_fetch/) : exact
+  manifest and layer retrieval without an application build.
 
 ### État désiré et mises à jour
 

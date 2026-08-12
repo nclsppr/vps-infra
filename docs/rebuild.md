@@ -120,7 +120,7 @@ Le playbook `site.yml` :
 6. crée les réseaux externes ;
 7. installe le wrapper de déploiement root-owned depuis un SHA `vps-infra`
    prouvé sur `origin/main` ;
-8. installe l’outil OCI utilisé pour les sites statiques ;
+8. installs the attestation client used for static sites;
 9. installe les fichiers déchiffrés avec les propriétaires et modes attendus ;
 10. configure la clé GHCR en lecture seule ;
 11. configure l’origine HTTPS publique de `vps-infra`, ou une deploy key si sa
@@ -129,12 +129,30 @@ Le playbook `site.yml` :
     avec commande forcée ;
 13. lance les validations hôte.
 
-La tranche actuelle livre les points 1 à 7 et 11 à 13, avec le dépôt public en
-HTTPS et une clé de déclenchement seulement si elle est fournie. Elle crée la
-racine privée des secrets mais ne matérialise encore aucune valeur. ORAS, le
-login GHCR, les secrets déchiffrés, l’applicateur live et leurs validations
-restent donc des portes explicites ; `site.yml` n’active aucun service de
-plateforme.
+The current tranche delivers points 1 to 8 and 11 to 13. It uses the public
+HTTPS repository and installs a trigger key only when the operator supplies
+one. GitHub CLI 2.97.0 is pinned by release archive and executable checksums.
+Personal, Papers Empire, and platform integration are public GHCR packages.
+Their materializer uses anonymous bounded registry downloads in short-lived
+systemd `DynamicUser` executions. One execution fetches each attestation bundle
+set. The root orchestrator copies that set and removes the fetch state. A new
+sequential offline execution of the same fixed transient unit gives the local
+bundle and digest-bound OCI manifest to GitHub CLI. The fixed unit name
+prevents concurrent worker creation. No execution receives an operator token.
+ORAS remains in the locked local and
+CI toolchain; reconstruction does not install it on Atlas.
+
+Before a static activation, supply the exact application source revision, site
+digest, route digest, platform integration revision, integration digest, and
+Caddy image digest. The integration package and the protected infrastructure
+mirror must name the same Caddy image. An attestation proves the exact source
+ref and workflow. It does not prove branch protection. Restore the repository
+rulesets as a separate reconstruction step before production activation.
+
+The role creates the private secret root but does not materialize a secret. A
+GHCR credential for private application images, decrypted secrets, the live
+applicator, and their validations remain explicit gates. `site.yml` does not
+activate a platform service or an application.
 
 Le compte de livraison n’entre pas dans le groupe `docker`. Une règle restreinte
 autorise seulement le wrapper root-owned, par chemin absolu et sans `SETENV`.
@@ -205,8 +223,9 @@ fichier hosts :
 
 - validation TLS stricte si les certificats ont été obtenus par DNS-01 avant la
   bascule ;
-- inventaire complet généré pour `personal` : EN/FR, Work, CV, Blog et
-  articles, Dashboard, Claude, archive, erreurs, assets et redirections ;
+- complete `personal` file inventory: EN/FR, Work, CV, Blog, articles,
+  Dashboard, Claude, archive, error pages, and assets;
+- separate probes for domain redirects, including the historical domain;
 - jeu, langues, Dashboard et documentation de Papers Empire ;
 - santé Backend, Onboarding, Commande, Dashboard et documentation Surplasse ;
 - fermeture publique des métriques, Swagger et interfaces internes ;

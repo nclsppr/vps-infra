@@ -193,46 +193,105 @@ Avant tout rechargement :
 ```text
 /srv/www/
   personal/
-    releases/<digest-artefact>/
-    current -> releases/<digest-artefact>
+    releases/sha256-<site-manifest-digest>/
+    current -> releases/sha256-<site-manifest-digest>
   papersempire/
-    releases/<digest-artefact>/
-    current -> releases/<digest-artefact>
+    releases/sha256-<site-manifest-digest>/
+    current -> releases/sha256-<site-manifest-digest>
 ```
 
-Chaque CI fabrique une archive statique, calcule son checksum et la publie comme
-artefact OCI dans GHCR. Le manifeste VPS référence son digest, pas un tag
-mutable. Un outil tel qu’ORAS peut tirer cet artefact par digest ; son ajout à
-l’hôte doit lui-même être épinglé et vérifié.
+Each CI workflow creates a static archive, calculates its checksum, and
+publishes it as an OCI artifact in GHCR. The VPS manifest references its digest,
+not a mutable tag. ORAS remains pinned in the local and CI publication tooling.
+The host materializer downloads registry objects directly with transfer limits
+and verifies their digests. It does not depend on ORAS.
 
-Le SHA source reste une annotation obligatoire, mais le nom de release utilise
-le digest de l’artefact : un même commit reconstruit dans un environnement
-différent peut produire des octets différents.
+The source SHA remains a required annotation, but the release name uses the
+artifact digest. The same commit rebuilt in another environment can produce
+different bytes.
 
-Le contrat OCI fixe un type d’artefact, une archive déterministe, son SHA-256,
-l’annotation de révision et des bornes de taille et de nombre de fichiers. Le
-script générique `deploy-static` :
+The implemented OCI envelope uses these exact versioned media types:
 
-1. vérifie l’application contre une allowlist ;
-2. télécharge le digest attendu dans un répertoire temporaire ;
-3. vérifie type, checksum, taille, nombre de fichiers et archive déterministe ;
-4. refuse chemins absolus, traversées `..`, symlinks, hardlinks, devices,
-   sockets et bombes de décompression ;
-5. extrait sans privilège dans `releases/<digest-artefact>` sans écraser une
-   autre release ;
-6. sonde la nouvelle racine avec un Caddy temporaire utilisant l’image
-   plateforme exacte, jamais avec le vhost encore pointé sur `current` ;
-7. remplace atomiquement le symlink `current` ;
-8. sonde publiquement et revient au symlink précédent en cas d’échec ;
-9. conserve au moins les trois dernières releases.
+- site artifact: `application/vnd.vps-infra.static-site.v1`;
+- site layer: `application/vnd.vps-infra.static-site.v1+tar+gzip`;
+- inventory artifact: `application/vnd.vps-infra.route-inventory.v1`;
+- inventory layer: `application/vnd.vps-infra.route-inventory.v1+json`;
+- integration artifact: `application/vnd.vps-infra.platform-integration.v1`;
+- integration archive layer:
+  `application/vnd.vps-infra.platform-integration.v1+tar+gzip`;
+- integration inventory layer:
+  `application/vnd.vps-infra.platform-integration.inventory.v1+json`.
 
-Pour `personal`, la CI doit construire un répertoire public par allowlist. Le
-checkout actuel contient des fichiers comme `AGENTS.md`, `infos/` et `.claude/`
-qui ne doivent jamais rejoindre la racine web. La même allowlist génère un
-inventaire de routes : toutes les pages EN/FR, Work, CV, Blog et articles,
-Dashboard, Claude, archive `v2022`, erreurs et redirections de domaines sont
-sondées. Cet inventaire évite qu’une nouvelle route publique soit oubliée par
-un smoke codé à la main.
+The site and route manifests contain one layer. The integration manifest
+contains its deterministic archive and canonical inventory. All three
+manifests use exact configs and exact `source`, `revision`, and `created`
+annotations. The standalone `deploy-static` primitive:
+
+1. checks the application against an allowlist;
+2. accepts the full application revision and full platform integration
+   revision, plus exact site, route, integration, and Caddy digests;
+3. downloads each site, route, and integration manifest or payload in a
+   network-enabled systemd `DynamicUser` execution with an in-transfer size
+   limit, then copies it as root while it verifies the caller-known digest;
+   payload copies also use the exact size from a reconstructed manifest;
+4. verifies separate site, route, and integration attestations against the
+   exact repository, full revision, source ref, and signer workflow, and rejects
+   self-hosted signers;
+5. verifies each manifest and layer, the profile limits, canonical inventories,
+   and the archive-to-inventory bijection;
+6. rejects absolute paths, `..` traversal, symbolic links, hard links, devices,
+   sockets, and decompression bombs;
+7. runs all untrusted manifest, gzip, tar, inventory, package, and attestation
+   parsing in short-lived systemd `DynamicUser` units on a dedicated bounded
+   tmpfs;
+8. extracts the site and exact integration package with safe `openat`
+   operations, then makes the complete release root-owned;
+9. fsyncs every file and then each directory from the deepest directory to the
+   release root;
+10. probes the new root with temporary Caddy from the exact platform image and
+    does not use the virtual host that still points to `current`;
+11. renames the release to the site OCI manifest digest, fsyncs its parent, and
+    atomically replaces the `current` symlink;
+12. restores and fsyncs the previous `current` target if the activation fsync
+    fails after replacement.
+
+A network-enabled `DynamicUser` execution downloads bounded attestation
+objects. The root orchestrator copies the exact bundle set and removes that
+execution state. A separate sequential offline execution of the same fixed
+transient unit gives the root-owned bundle and local OCI manifest to GitHub CLI
+through `--bundle`. The fixed unit name prevents concurrent worker creation.
+Success depends only on the verifier exit code after the full cgroup exits.
+GitHub CLI receives no credential. The
+attested source ref is not a branch-protection proof. Repository branch
+protection remains a separate production gate.
+
+The exact integration package retains each route with a `.disabled` suffix.
+The materializer copies only the selected application route to a temporary
+probe tree and removes the suffix from that copy. It first runs `caddy validate`
+against the exact packaged Caddyfile and temporary routes. It then adds
+`local_certs` exactly once to another temporary copy and starts an HTTPS probe
+on loopback. The probe requests every inventory route and compares its response
+checksum. It also checks the 404 body, the `no-cache` HTML policy, the
+`public, max-age=3600` asset policy, gzip for a payload larger than 1 KiB,
+security headers, and configured redirects.
+
+The Caddy digest must match both the protected `CADDY_PLATFORM_IMAGE` promotion
+point and the exact integration package, but the platform does not have to be
+active. A failed validation or probe leaves `current` unchanged. Activation
+uses protected directory file descriptors and an exact relative symlink target.
+The local certificate probe does not replace the future strict public TLS
+probe. The future live applicator must still add public-failure rollback,
+persistent quarantine, and a policy that retains at least three old releases.
+The locked controller cannot invoke this primitive.
+
+For `personal`, CI must build the public directory from an allowlist. The
+checkout contains files such as `AGENTS.md`, `infos/`, and `.claude/`. These
+files must never enter the web root. The same allowlist generates the route
+inventory. Temporary Caddy probes all EN/FR, Work, CV, Blog, article,
+Dashboard, Claude, `v2022` archive, error-page, and asset file routes. Domain
+redirects are not file routes. They remain part of the future public smoke
+test. This inventory prevents a new file route from being omitted from a
+handwritten smoke test.
 
 Pour `papersempire`, l’artefact est le répertoire `site/` déjà assemblé par le
 workflow : jeu, Dashboard, documentation Retype et pages de langue. Servir le

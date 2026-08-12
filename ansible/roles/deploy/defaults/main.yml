@@ -9,9 +9,22 @@ vps_deploy_repository_url: https://github.com/nclsppr/vps-infra.git
 vps_deploy_revision_path: /usr/local/share/vps-infra/controller-revision
 vps_deploy_state_dir: /var/lib/vps-controller
 vps_deploy_production_marker: /etc/vps/production-enabled
+vps_gh_version: "2.97.0"
+vps_gh_install_path: /usr/local/bin/gh
+vps_gh_cache_root: /var/cache/vps-infra/gh
+vps_gh_archives:
+  x86_64:
+    release_architecture: amd64
+    archive_sha256: a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112
+    binary_sha256: 141507c337e8b202ad398550c3b73d72f5af92e86f71665214538a81efd4c409
+  aarch64:
+    release_architecture: arm64
+    archive_sha256: 73ea440ecad9c9e284429997ee6f93577bc6f7bc6fba357ef62c53ad8fb641a5
+    binary_sha256: ccbb0f14178faefac1cb0f336a853071fa63a1d0df23ef5ab7a304fe3859e082
 vps_deploy_executables:
   - check-public-safe
   - deploy
+  - deploy-static
   - doctor
   - forced-command
   - parse-forced-command

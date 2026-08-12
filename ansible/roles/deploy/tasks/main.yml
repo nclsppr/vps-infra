@@ -3,7 +3,7 @@
   ansible.builtin.assert:
     that:
       - vps_deploy_user is match('^[a-z_][a-z0-9_-]{0,30}$')
-      - vps_deploy_user not in ['root', vps_admin_user, vps_static_user]
+      - vps_deploy_user not in ['root', vps_admin_user]
       - vps_deploy_install_root == '/usr/local/libexec/vps'
       - vps_deploy_gate_path == '/usr/local/libexec/vps/forced-command'
       - vps_deploy_controller_path == '/usr/local/libexec/vps/deploy'
@@ -15,12 +15,26 @@
       - vps_deploy_production_marker == '/etc/vps/production-enabled'
       - vps_deploy_git_sha_length | int == 40
       - vps_infra_revision is match('^[0-9a-f]{40}$')
+      - vps_gh_version == '2.97.0'
+      - vps_gh_install_path == '/usr/local/bin/gh'
+      - vps_gh_cache_root == '/var/cache/vps-infra/gh'
+      - vps_gh_archives.keys() | list | sort == ['aarch64', 'x86_64']
+      - ansible_architecture in vps_gh_archives
+      - >-
+        vps_gh_archives[ansible_architecture].release_architecture in
+        ['amd64', 'arm64']
+      - >-
+        vps_gh_archives[ansible_architecture].archive_sha256 is
+        match('^[0-9a-f]{64}$')
+      - >-
+        vps_gh_archives[ansible_architecture].binary_sha256 is
+        match('^[0-9a-f]{64}$')
       - >-
         vps_deploy_executables | list | sort ==
-        ['check-public-safe', 'deploy', 'doctor', 'forced-command',
-         'parse-forced-command', 'plan-digests', 'reconcile',
-         'validate-compose', 'validate-release', 'verify-github-evidence',
-         'verify-state']
+        ['check-public-safe', 'deploy', 'deploy-static', 'doctor',
+         'forced-command', 'parse-forced-command', 'plan-digests',
+         'reconcile', 'validate-compose', 'validate-release',
+         'verify-github-evidence', 'verify-state']
       - not (vps_live_apply_enabled | bool)
     fail_msg: "Le contrat du compte ou de la commande de déploiement a dérivé."
 
@@ -97,8 +111,110 @@
       mode: "0700"
     - path: "{{ vps_deploy_state_dir }}"
       mode: "0700"
+    - path: "{{ vps_gh_cache_root }}"
+      mode: "0755"
   loop_control:
     label: "{{ item.path }}"
+
+- name: Select the pinned GitHub CLI archive for this architecture
+  ansible.builtin.set_fact:
+    vps_gh_archive: "{{ vps_gh_archives[ansible_architecture] }}"
+    vps_gh_extraction_dir: >-
+      {{ vps_gh_cache_root ~ '/' ~ vps_gh_version ~ '-' ~
+         vps_gh_archives[ansible_architecture].release_architecture }}
+    vps_gh_archive_path: >-
+      {{ vps_gh_cache_root ~ '/gh_' ~ vps_gh_version ~ '_linux_' ~
+         vps_gh_archives[ansible_architecture].release_architecture ~ '.tar.gz' }}
+    vps_gh_download_url: >-
+      {{ 'https://github.com/cli/cli/releases/download/v' ~ vps_gh_version ~
+         '/gh_' ~ vps_gh_version ~ '_linux_' ~
+         vps_gh_archives[ansible_architecture].release_architecture ~ '.tar.gz' }}
+
+- name: Create the versioned GitHub CLI extraction directory
+  ansible.builtin.file:
+    path: "{{ vps_gh_extraction_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download the pinned GitHub CLI release archive
+  ansible.builtin.get_url:
+    url: "{{ vps_gh_download_url }}"
+    dest: "{{ vps_gh_archive_path }}"
+    checksum: "sha256:{{ vps_gh_archive.archive_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+  when: not ansible_check_mode
+
+- name: Extract the verified GitHub CLI archive
+  ansible.builtin.unarchive:
+    src: "{{ vps_gh_archive_path }}"
+    dest: "{{ vps_gh_extraction_dir }}"
+    owner: root
+    group: root
+    mode: "go-w"
+    remote_src: true
+    creates: >-
+      {{ vps_gh_extraction_dir ~ '/gh_' ~ vps_gh_version ~ '_linux_' ~
+         vps_gh_archive.release_architecture ~ '/bin/gh' }}
+  when: not ansible_check_mode
+
+- name: Inspect the extracted GitHub CLI executable
+  ansible.builtin.stat:
+    path: >-
+      {{ vps_gh_extraction_dir ~ '/gh_' ~ vps_gh_version ~ '_linux_' ~
+         vps_gh_archive.release_architecture ~ '/bin/gh' }}
+    follow: false
+    checksum_algorithm: sha256
+  register: vps_gh_extracted
+  when: not ansible_check_mode
+
+- name: Verify the extracted GitHub CLI executable checksum
+  ansible.builtin.assert:
+    that:
+      - vps_gh_extracted.stat.exists
+      - vps_gh_extracted.stat.isreg
+      - not vps_gh_extracted.stat.islnk
+      - vps_gh_extracted.stat.uid == 0
+      - vps_gh_extracted.stat.gid == 0
+      - not vps_gh_extracted.stat.wgrp
+      - not vps_gh_extracted.stat.woth
+      - vps_gh_extracted.stat.checksum == vps_gh_archive.binary_sha256
+    fail_msg: "The extracted GitHub CLI executable does not match the approved checksum."
+  when: not ansible_check_mode
+
+- name: Install the verified GitHub CLI executable
+  ansible.builtin.copy:
+    src: >-
+      {{ vps_gh_extraction_dir ~ '/gh_' ~ vps_gh_version ~ '_linux_' ~
+         vps_gh_archive.release_architecture ~ '/bin/gh' }}
+    dest: "{{ vps_gh_install_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  when: not ansible_check_mode
+
+- name: Read the installed GitHub CLI version
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_gh_install_path }}"
+      - version
+  register: vps_gh_version_output
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Prove the installed GitHub CLI version
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_gh_version_output.stdout is
+        regex('(?m)^gh version\\s+' ~ (vps_gh_version | regex_escape) ~ '(?:\\s|$)')
+    fail_msg: "The installed GitHub CLI version differs from the approved version."
+  when: not ansible_check_mode
 
 - name: Initialise the fixed public infrastructure mirror at the requested commit
   ansible.builtin.git:
@@ -229,6 +345,7 @@
   loop:
     - "{{ vps_deploy_repository_dir }}/scripts/lib/release_policy.py"
     - "{{ vps_deploy_repository_dir }}/scripts/lib/platform_proof.py"
+    - "{{ vps_deploy_repository_dir }}/scripts/lib/platform_integration.py"
     - "{{ vps_deploy_repository_dir }}/schemas/production-release.schema.json"
   when: not ansible_check_mode
 
@@ -271,6 +388,16 @@
   ansible.builtin.copy:
     src: "{{ vps_deploy_repository_dir }}/scripts/lib/platform_proof.py"
     dest: "{{ vps_deploy_install_root }}/lib/platform_proof.py"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Install the platform integration verifier for the static materializer
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/lib/platform_integration.py"
+    dest: "{{ vps_deploy_install_root }}/lib/platform_integration.py"
     remote_src: true
     owner: root
     group: root
@@ -344,6 +471,7 @@
     - "{{ vps_deploy_controller_path }}"
     - "{{ vps_deploy_install_root }}/lib/release_policy.py"
     - "{{ vps_deploy_install_root }}/lib/platform_proof.py"
+    - "{{ vps_deploy_install_root }}/lib/platform_integration.py"
     - "{{ vps_deploy_schema_root }}/production-release.schema.json"
     - "{{ vps_deploy_revision_path }}"
   when: not ansible_check_mode

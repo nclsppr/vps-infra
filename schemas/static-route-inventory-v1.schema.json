@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nclsppr/vps-infra/schemas/static-route-inventory-v1.schema.json",
+  "title": "vps-infra static route inventory v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "schema", "site", "source", "routes"],
+  "properties": {
+    "contract": { "const": "vps-infra.route-inventory.v1" },
+    "schema": { "const": 1 },
+    "site": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archive_bytes",
+        "archive_sha256",
+        "file_count",
+        "uncompressed_bytes"
+      ],
+      "properties": {
+        "archive_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 78643200
+        },
+        "archive_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "file_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5000
+        },
+        "uncompressed_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 157286400
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "revision"],
+      "properties": {
+        "repository": {
+          "enum": ["nclsppr/personal", "nclsppr/papersempire"]
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "routes": {
+      "type": "array",
+      "maxItems": 5000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bytes", "file", "path", "sha256", "status"],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 157286400
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "path": {
+            "type": "string",
+            "pattern": "^/",
+            "maxLength": 4096
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "status": { "const": 200 }
+        }
+      }
+    }
+  }
+}

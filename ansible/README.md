@@ -138,6 +138,25 @@ The controller files are installed under `/usr/local/libexec/vps`. The marker
 `/etc/vps/production-enabled` and the executable `apply-release` are absent.
 The current controller can validate and plan. It cannot activate production.
 
+The deploy role also installs GitHub CLI 2.97.0 from its official release
+archive. It selects `amd64` or `arm64`, verifies the archive SHA-256, verifies
+the extracted executable with a second SHA-256, and confirms the installed
+version. The role then installs
+`/usr/local/libexec/vps/deploy-static` and its platform integration verifier.
+Current Personal, Papers Empire, and platform integration packages are public,
+so this path does not install a registry credential.
+
+`deploy-static` is not an SSH command and is not allowed by the deploy sudo
+rule. A future reviewed applicator must supply the application, the application
+source revision, the exact site and route references, the platform integration
+revision and reference, and the exact Caddy image. The materializer runs
+registry fetches, validation, extraction, and GitHub attestation verification
+in short-lived systemd `DynamicUser` units. A dedicated bounded tmpfs stores
+each private runtime directory. Attestation fetch and offline GitHub
+verification use separate sequential executions of one fixed transient unit.
+This unit name serializes worker creation in systemd. Each accepted file is
+copied into a root-owned tree and made durable before activation.
+
 The deploy role initializes the root-owned mirror at `/srv/vps/repository` from
 the single allowed public origin:
 

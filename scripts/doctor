@@ -94,7 +94,7 @@ else
   revision_file=/usr/local/share/vps-infra/controller-revision
 fi
 
-for executable in validate-release validate-compose check-public-safe reconcile plan-digests verify-state verify-github-evidence parse-forced-command forced-command deploy; do
+for executable in validate-release validate-compose check-public-safe reconcile plan-digests verify-state verify-github-evidence parse-forced-command forced-command deploy deploy-static; do
   if [[ -x $SCRIPT_DIR/$executable ]]; then
     pass "executable script: scripts/$executable"
   else
@@ -126,6 +126,36 @@ else
 fi
 
 if [[ $mode == production ]]; then
+  case $(uname -m) in
+    x86_64)
+      expected_gh_sha256=141507c337e8b202ad398550c3b73d72f5af92e86f71665214538a81efd4c409
+      ;;
+    aarch64)
+      expected_gh_sha256=ccbb0f14178faefac1cb0f336a853071fa63a1d0df23ef5ab7a304fe3859e082
+      ;;
+    *)
+      expected_gh_sha256=
+      fail "GitHub CLI architecture is outside the approved set: $(uname -m)"
+      ;;
+  esac
+  if [[ -x /usr/local/bin/gh ]] && \
+    /usr/local/bin/gh version 2>/dev/null | grep -Eq '^gh version[[:space:]]+2\.97\.0([[:space:]]|$)'; then
+    gh_metadata=$(stat -c '%u %g %a' -- /usr/local/bin/gh 2>/dev/null || true)
+    if [[ $gh_metadata =~ ^0\ 0\ ([0-7]+)$ ]] && \
+      (( (8#${BASH_REMATCH[1]} & 8#022) == 0 )); then
+      pass "GitHub CLI 2.97.0 is root-owned and protected"
+    else
+      fail "GitHub CLI is writable by a non-root identity"
+    fi
+    actual_gh_sha256=$(sha256sum -- /usr/local/bin/gh 2>/dev/null | awk '{print $1}')
+    if [[ -n $expected_gh_sha256 && $actual_gh_sha256 == "$expected_gh_sha256" ]]; then
+      pass "GitHub CLI binary matches the approved architecture-specific SHA-256"
+    else
+      fail "GitHub CLI binary SHA-256 is not approved for this architecture"
+    fi
+  else
+    fail "verified GitHub CLI 2.97.0 is unavailable"
+  fi
   if [[ -d $state_dir ]]; then
     pass "controller state directory exists: $state_dir"
   else
