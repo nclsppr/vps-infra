@@ -255,15 +255,23 @@ annotations. The standalone `deploy-static` primitive:
 12. restores and fsyncs the previous `current` target if the activation fsync
     fails after replacement.
 
-A network-enabled `DynamicUser` execution downloads bounded attestation
-objects. The root orchestrator copies the exact bundle set and removes that
-execution state. A separate sequential offline execution of the same fixed
-transient unit gives the root-owned bundle and local OCI manifest to GitHub CLI
-through `--bundle`. The fixed unit name prevents concurrent worker creation.
-Success depends only on the verifier exit code after the full cgroup exits.
-GitHub CLI receives no credential. The
-attested source ref is not a branch-protection proof. Repository branch
-protection remains a separate production gate.
+A separate network-enabled `DynamicUser` execution uses the checksum-pinned
+GitHub CLI and its embedded TUF bootstrap roots to obtain one current Sigstore
+trusted-root snapshot per deployment. Its runtime, memory, per-file size,
+inode, and tmpfs use are bounded. GitHub CLI does not expose an in-transfer
+size limit for this TUF operation. The root orchestrator validates and copies
+the two-record root only when it matches the versioned SHA-256. A root rotation
+fails closed until a reviewed repository update changes that digest. The
+orchestrator removes the fetch state and reuses that exact snapshot for all
+three attestations. Other network-enabled executions download bounded
+attestation objects. The root orchestrator copies each exact bundle set and
+removes its execution state. A separate sequential offline execution of the
+same fixed transient unit gives the root-owned bundle, trusted root, and local
+OCI manifest to GitHub CLI through `--bundle` and `--custom-trusted-root`. The
+fixed unit name prevents concurrent worker creation. Success depends only on
+the verifier exit code after the full cgroup exits. GitHub CLI receives no
+credential. The attested source ref is not a branch-protection proof.
+Repository branch protection remains a separate production gate.
 
 The exact integration package retains each route with a `.disabled` suffix.
 The materializer copies only the selected application route to a temporary

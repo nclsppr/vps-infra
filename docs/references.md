@@ -118,6 +118,9 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
 - [GitHub — attestations d’artefacts](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations) :
   provenance et vérification des images, avec limites selon le plan et la
   visibilité du dépôt.
+- [GitHub - vérifier des attestations hors connexion](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/verify-attestations-offline) :
+  acquisition d'une racine de confiance actuelle, bundle local et option
+  `--custom-trusted-root` pour une vérification sans réseau.
 - [GitHub — usage sécurisé des Actions](https://docs.github.com/en/actions/reference/security/secure-use) :
   risques des runners auto-hébergés persistants et recommandations de sécurité.
 - [GitHub — permissions des packages](https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages) :

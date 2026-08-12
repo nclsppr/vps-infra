@@ -118,6 +118,11 @@ MAX_ATTESTATIONS = 8
 MAX_ATTESTATION_BUNDLE_SET_BYTES = MAX_ATTESTATIONS * (
     MAX_ATTESTATION_BUNDLE_BYTES + 1
 )
+TRUSTED_ROOT_MEDIA_TYPE = "application/vnd.dev.sigstore.trustedroot+json;version=0.1"
+MAX_TRUSTED_ROOT_BYTES = 1 * MIB
+TRUSTED_ROOT_SHA256 = (
+    "sha256:65ca537f6ed8a47fd0e560c421baa1f6c1efb8b25fc200d8c5c02c0e92eb2b9c"
+)
 MAX_ISOLATED_WORKER_INODES = 16_384
 
 
@@ -1512,6 +1517,96 @@ def run_attestation_fetch_worker(reference: str, output_path: Path) -> None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def validate_trusted_root_jsonl(raw: bytes) -> None:
+    if not raw or len(raw) > MAX_TRUSTED_ROOT_BYTES:
+        fail("GitHub trusted root size is outside its limit")
+    if not raw.endswith(b"\n"):
+        fail("GitHub trusted root must have a final LF")
+    lines = raw.splitlines(keepends=True)
+    if len(lines) != 2 or any(not line.endswith(b"\n") for line in lines):
+        fail("GitHub trusted root must contain exactly two LF-terminated records")
+    for index, line in enumerate(lines):
+        body = line[:-1]
+        if not body or b"\r" in body or b"\n" in body:
+            fail(f"GitHub trusted root record {index} is invalid")
+        value = strict_json_bytes(
+            body,
+            f"GitHub trusted root record {index}",
+            canonical=False,
+            allow_utf8=True,
+        )
+        if not isinstance(value, dict) or value.get("mediaType") != TRUSTED_ROOT_MEDIA_TYPE:
+            fail(f"GitHub trusted root record {index} has an invalid media type")
+
+
+def run_trusted_root_fetch_worker(output_path: Path) -> None:
+    require_unprivileged_worker("GitHub trusted root fetch worker")
+    worker_home = Path(os.environ.get("HOME", ""))
+    if output_path.name != "trusted-root.jsonl" or output_path.parent != worker_home:
+        fail("GitHub trusted root output must stay inside its protected worker home")
+    scratch = worker_home / "scratch"
+    scratch_output = scratch / "trusted-root.jsonl"
+    try:
+        scratch.mkdir(mode=0o700)
+        descriptor = os.open(
+            scratch_output,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o400,
+        )
+        try:
+            environment = safe_environment(scratch)
+            environment["XDG_CACHE_HOME"] = str(scratch / ".cache")
+            environment["XDG_STATE_HOME"] = str(scratch / ".local/state")
+            try:
+                result = subprocess.run(
+                    [
+                        str(GH_PATH),
+                        "attestation",
+                        "trusted-root",
+                        "--hostname",
+                        "github.com",
+                    ],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=descriptor,
+                    stderr=subprocess.DEVNULL,
+                    env=environment,
+                    timeout=300,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                fail(f"GitHub trusted root fetch failed: {exc}")
+            if result.returncode != 0:
+                fail("GitHub trusted root fetch failed")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        raw = read_bounded_file(
+            scratch_output,
+            MAX_TRUSTED_ROOT_BYTES,
+            "GitHub trusted root",
+        )
+        validate_trusted_root_jsonl(raw)
+        output_fd = os.open(
+            output_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o400,
+        )
+        try:
+            view = memoryview(raw)
+            while view:
+                written = os.write(output_fd, view)
+                view = view[written:]
+            os.fchmod(output_fd, 0o444)
+            os.fsync(output_fd)
+        finally:
+            os.close(output_fd)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if set(worker_home.iterdir()) != {output_path}:
+        fail("GitHub trusted root fetch worker left unexpected runtime files")
+
+
 def copy_trusted_worker_file(
     source: Path,
     destination: Path,
@@ -1636,10 +1731,86 @@ def copy_trusted_worker_file(
         os.close(destination_parent_fd)
 
 
+def fetch_github_trusted_root_isolated(
+    trusted_directory: Path,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> Path:
+    trusted_root = trusted_directory / f"trusted-root-{secrets.token_hex(8)}.jsonl"
+    state: IsolatedWorkerState | None = None
+    failure: BaseException | None = None
+    try:
+        try:
+            state = run_isolated_worker(
+                "rootfetch",
+                [
+                    str(PYTHON_PATH),
+                    str(Path(__file__)),
+                    "--trusted-root-fetch-worker",
+                    "{STATE_DIRECTORY}/trusted-root.jsonl",
+                ],
+                inputs=(
+                    Path(__file__),
+                    SCRIPT_DIRECTORY / "lib/platform_integration.py",
+                    GH_PATH,
+                ),
+                runtime_seconds=300,
+                memory_max="256M",
+                memory_swap_max="64M",
+                file_size_max=str(MAX_TRUSTED_ROOT_BYTES),
+                network=True,
+            )
+            copy_trusted_worker_file(
+                state.physical_root / "trusted-root.jsonl",
+                trusted_root,
+                expected_uid=state.uid,
+                expected_gid=state.gid,
+                maximum_size=MAX_TRUSTED_ROOT_BYTES,
+                expected_digest=TRUSTED_ROOT_SHA256,
+                label="GitHub trusted root",
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            validate_trusted_root_jsonl(
+                read_bounded_file(
+                    trusted_root,
+                    MAX_TRUSTED_ROOT_BYTES,
+                    "trusted GitHub root",
+                )
+            )
+        except BaseException as exc:
+            failure = exc
+        if state is not None:
+            try:
+                cleanup_isolated_worker_state(state)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            if trusted_root.exists() or trusted_root.is_symlink():
+                unlink_trusted_file(
+                    trusted_root,
+                    expected_uid=trusted_uid,
+                    expected_gid=trusted_gid,
+                )
+            raise failure
+        return trusted_root
+    except BaseException:
+        if trusted_root.exists() or trusted_root.is_symlink():
+            unlink_trusted_file(
+                trusted_root,
+                expected_uid=trusted_uid,
+                expected_gid=trusted_gid,
+            )
+        raise
+
+
 def verify_github_provenance_isolated(
     reference: str,
     *,
     subject_path: Path,
+    trusted_root: Path,
     repository: str,
     source_revision: str,
     source_ref: str,
@@ -1690,8 +1861,12 @@ def verify_github_provenance_isolated(
             str(subject_path),
             "--bundle",
             str(trusted_bundle),
+            "--custom-trusted-root",
+            str(trusted_root),
             "--digest-alg",
             "sha256",
+            "--hostname",
+            "github.com",
             "--repo",
             repository,
             "--source-digest",
@@ -1705,7 +1880,7 @@ def verify_github_provenance_isolated(
         verifier_state = run_isolated_worker(
             "attestverify",
             verifier_command,
-            inputs=(GH_PATH, subject_path, trusted_bundle),
+            inputs=(GH_PATH, subject_path, trusted_bundle, trusted_root),
             runtime_seconds=120,
             memory_max="256M",
             memory_swap_max="64M",
@@ -5400,28 +5575,34 @@ def deploy_locked(
             integration_revision,
         )
 
-        for reference, subject_path in (
-            (site_reference, site_manifest_path),
-            (routes_reference, routes_manifest_path),
-        ):
+        trusted_root = fetch_github_trusted_root_isolated(download_root)
+        try:
+            for reference, subject_path in (
+                (site_reference, site_manifest_path),
+                (routes_reference, routes_manifest_path),
+            ):
+                verify_github_provenance_isolated(
+                    reference,
+                    subject_path=subject_path,
+                    trusted_root=trusted_root,
+                    repository=profile.source_repository,
+                    source_revision=source_revision,
+                    source_ref=profile.source_ref,
+                    signer_workflow=profile.signer_workflow,
+                    trusted_directory=download_root,
+                )
             verify_github_provenance_isolated(
-                reference,
-                subject_path=subject_path,
-                repository=profile.source_repository,
-                source_revision=source_revision,
-                source_ref=profile.source_ref,
-                signer_workflow=profile.signer_workflow,
+                integration_reference,
+                subject_path=integration_manifest_path,
+                trusted_root=trusted_root,
+                repository="nclsppr/vps-infra",
+                source_revision=integration_revision,
+                source_ref=INTEGRATION_SOURCE_REF,
+                signer_workflow=INTEGRATION_SIGNER_WORKFLOW,
                 trusted_directory=download_root,
             )
-        verify_github_provenance_isolated(
-            integration_reference,
-            subject_path=integration_manifest_path,
-            repository="nclsppr/vps-infra",
-            source_revision=integration_revision,
-            source_ref=INTEGRATION_SOURCE_REF,
-            signer_workflow=INTEGRATION_SIGNER_WORKFLOW,
-            trusted_directory=download_root,
-        )
+        finally:
+            unlink_trusted_file(trusted_root)
 
         archive_path = download_root / "site.tar.gz"
         inventory_path = download_root / "routes.json"
@@ -5647,6 +5828,12 @@ def main(argv: list[str] | None = None) -> int:
                 fail("attestation fetch worker received a mutable reference")
             parse_digest_reference(reference, repository, "attestation reference")
             run_attestation_fetch_worker(reference, Path(output))
+            return 0
+        if arguments and arguments[0] == "--trusted-root-fetch-worker":
+            if len(arguments) != 2:
+                fail("GitHub trusted root fetch worker received an invalid argument count")
+            _, output = arguments
+            run_trusted_root_fetch_worker(Path(output))
             return 0
         if arguments and arguments[0] == "--registry-fetch-worker":
             if len(arguments) != 3:
