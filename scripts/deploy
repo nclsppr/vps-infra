@@ -32,10 +32,8 @@ if [[ ${VPS_CONTROLLER_TESTING:-0} == 1 ]]; then
   readonly enable_file=${VPS_PRODUCTION_ENABLE_FILE:?VPS_PRODUCTION_ENABLE_FILE is required in test mode}
   readonly validator=${VPS_VALIDATE_RELEASE:-"$SCRIPT_DIR/validate-release"}
   readonly reconciler=${VPS_RECONCILE:-"$SCRIPT_DIR/reconcile"}
-  readonly plan_digest_reader=${VPS_PLAN_DIGEST_READER:-"$SCRIPT_DIR/plan-digests"}
   readonly state_verifier=${VPS_STATE_VERIFIER:-"$SCRIPT_DIR/verify-state"}
   readonly evidence_verifier=${VPS_EVIDENCE_VERIFIER:-"$SCRIPT_DIR/verify-github-evidence"}
-  readonly apply_executable=${VPS_APPLY_EXECUTABLE:-}
   readonly expected_origin=${VPS_EXPECTED_ORIGIN:?VPS_EXPECTED_ORIGIN is required in test mode}
   readonly schema_file=${VPS_SCHEMA_FILE:-"$SCRIPT_DIR/../schemas/production-release.schema.json"}
 else
@@ -46,10 +44,8 @@ else
   readonly enable_file=/etc/vps/production-enabled
   readonly validator=/usr/local/libexec/vps/validate-release
   readonly reconciler=/usr/local/libexec/vps/reconcile
-  readonly plan_digest_reader=/usr/local/libexec/vps/plan-digests
   readonly state_verifier=/usr/local/libexec/vps/verify-state
   readonly evidence_verifier=/usr/local/libexec/vps/verify-github-evidence
-  readonly apply_executable=/usr/local/libexec/vps/apply-release
   readonly expected_origin=https://github.com/nclsppr/vps-infra.git
   readonly schema_file=/usr/local/share/vps-infra/schemas/production-release.schema.json
 fi
@@ -62,6 +58,7 @@ readonly journal_file="$state_dir/journal.jsonl"
 lock_acquired=0
 staging_dir=
 
+# shellcheck disable=SC2329  # The trap invokes this function indirectly.
 cleanup() {
   local exit_status=$?
   if [[ -n ${staging_dir:-} && -d $staging_dir ]]; then
@@ -156,33 +153,7 @@ append_journal() {
   chmod 0600 "$journal_file"
 }
 
-quarantine_failure() {
-  local reason=$1
-  local timestamp=$2
-  local commit_file="$quarantine_dir/commits/${requested_sha}.json"
-  if [[ ! -e $commit_file ]]; then
-    printf '{"schema":1,"commit":"%s","reason":"%s","recorded_at":"%s"}\n' \
-      "$requested_sha" "$reason" "$timestamp" >"$commit_file"
-    chmod 0600 "$commit_file"
-  fi
-  local changed_digest_file="$staging_dir/changed-digests"
-  if ! "$plan_digest_reader" "$plans_dir/${requested_sha}.json" >"$changed_digest_file"; then
-    echo "deploy: commit quarantined, but changed artifact digests could not be derived" >&2
-    return
-  fi
-  while IFS= read -r digest; do
-    [[ -n $digest ]] || continue
-    local digest_hex=${digest#sha256:}
-    local artifact_file="$quarantine_dir/artifacts/${digest_hex}.json"
-    if [[ ! -e $artifact_file ]]; then
-      printf '{"schema":1,"digest":"%s","commit":"%s","reason":"%s","recorded_at":"%s"}\n' \
-        "$digest" "$requested_sha" "$reason" "$timestamp" >"$artifact_file"
-      chmod 0600 "$artifact_file"
-    fi
-  done <"$changed_digest_file"
-}
-
-install -d -m 0700 -- "$state_dir" "$desired_dir" "$active_dir" \
+install -d -m 0700 -- "$state_dir" \
   "$quarantine_dir/commits" "$quarantine_dir/artifacts" "$plans_dir"
 mkdir -p -- "$(dirname -- "$lock_dir")"
 
@@ -198,7 +169,6 @@ printf '%s\n' "$$" >"$lock_dir/owner"
 
 [[ -x $validator ]] || fail "validator is not executable: $validator" "$EX_CONFIG"
 [[ -x $reconciler ]] || fail "reconciler is not executable: $reconciler" "$EX_CONFIG"
-[[ -x $plan_digest_reader ]] || fail "plan digest reader is not executable: $plan_digest_reader" "$EX_CONFIG"
 [[ -x $state_verifier ]] || fail "state verifier is not executable: $state_verifier" "$EX_CONFIG"
 [[ -x $evidence_verifier ]] || fail "evidence verifier is not executable: $evidence_verifier" "$EX_CONFIG"
 [[ -d $repository_dir/.git || -f $repository_dir/HEAD ]] || fail "repository is not initialized: $repository_dir" "$EX_CONFIG"
@@ -206,7 +176,6 @@ if [[ $production_mode -eq 1 ]]; then
   require_root_owned_immutable "$0"
   require_root_owned_immutable "$validator"
   require_root_owned_immutable "$reconciler"
-  require_root_owned_immutable "$plan_digest_reader"
   require_root_owned_immutable "$state_verifier"
   require_root_owned_immutable "$evidence_verifier"
   require_root_owned_immutable "$schema_file"
@@ -214,9 +183,6 @@ if [[ $production_mode -eq 1 ]]; then
   require_root_owned_immutable "$repository_dir/.git/config"
   if [[ -e $enable_file ]]; then
     require_root_owned_immutable "$enable_file"
-  fi
-  if [[ -e $apply_executable ]]; then
-    require_root_owned_immutable "$apply_executable"
   fi
 fi
 
@@ -281,11 +247,42 @@ validator_args=(--schema "$schema_file")
 if [[ $production_mode -eq 1 ]]; then
   validator_args+=(--require-json-schema)
 fi
-"$validator" "${validator_args[@]}" "$staging_dir/manifest.json" >/dev/null || \
+validator_args+=(--print-platform-integration-revision)
+if ! platform_integration_revision=$("$validator" \
+  "${validator_args[@]}" "$staging_dir/manifest.json"); then
   fail "target release manifest is invalid"
+fi
+
+if [[ -n $platform_integration_revision ]]; then
+  [[ $platform_integration_revision =~ ^[0-9a-f]{40}$ ]] || \
+    fail "validated platform integration revision has an unexpected format"
+  git -C "$repository_dir" cat-file -e "${platform_integration_revision}^{commit}" 2>/dev/null || \
+    fail "platform integration source revision is unavailable in the infrastructure repository"
+  git -C "$repository_dir" merge-base --is-ancestor \
+    "$platform_integration_revision" "$requested_sha" || \
+    fail "platform integration source revision is not an ancestor of the requested release commit"
+fi
 
 manifest_hash=$(sha256_file "$staging_dir/manifest.json")
+
+deployment_mode=dry-run
+if [[ -e $enable_file ]]; then
+  deployment_mode=live
+fi
+
+"$evidence_verifier" "$staging_dir/manifest.json" >/dev/null || {
+  append_journal "evidence-refused" "$deployment_mode" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fail "independent GitHub Actions evidence verification failed; desired and active state are unchanged"
+}
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# The installed release policy accepts only activation_policy=locked. A marker
+# cannot override that policy. A future live path requires a separately audited
+# policy and controller revision.
+if [[ $deployment_mode == live ]]; then
+  append_journal "activation-locked" "live" "$timestamp"
+  fail "activation_policy=locked refuses live deployment; desired and active state are unchanged" "$EX_CONFIG"
+fi
 
 reconcile_args=(
   --desired "$staging_dir/manifest.json"
@@ -300,42 +297,11 @@ if [[ -f $active_dir/state.json ]]; then
   reconcile_args+=(--active-state "$active_dir/state.json")
 fi
 "$reconciler" "${reconcile_args[@]}" || fail "desired state cannot be reconciled safely"
+install -d -m 0700 -- "$desired_dir"
 atomic_copy "$staging_dir/manifest.json" "$desired_dir/manifest.json"
 write_metadata "$desired_dir/state.json" "$requested_sha" "$manifest_hash" "$timestamp"
 
-dry_run=1
-if [[ -e $enable_file ]]; then
-  dry_run=0
-fi
-if [[ $dry_run == 1 ]]; then
-  append_journal "validated" "dry-run" "$timestamp"
-  printf '{"schema":1,"mode":"dry-run","result":"validated","desired":"%s","active":"unchanged","plan":"%s"}\n' \
-    "$requested_sha" "$plans_dir/${requested_sha}.json"
-  exit "$EX_CONFIG"
-fi
-
-if [[ -z $apply_executable || ! -x $apply_executable ]]; then
-  append_journal "applicator-unavailable" "live" "$timestamp"
-  fail "production marker exists but no root-owned apply-release executable is installed; active state is unchanged" "$EX_UNAVAILABLE"
-fi
-
-"$evidence_verifier" "$staging_dir/manifest.json" >/dev/null || {
-  append_journal "evidence-refused" "live" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  fail "independent GitHub Actions evidence verification failed; active state is unchanged"
-}
-
-if ! "$apply_executable" \
-  --commit "$requested_sha" \
-  --manifest "$staging_dir/manifest.json" \
-  --plan "$plans_dir/${requested_sha}.json"; then
-  failure_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  quarantine_failure "apply-failed" "$failure_timestamp"
-  append_journal "quarantined" "live" "$failure_timestamp"
-  fail "apply-release failed; desired commit and artifacts are quarantined while active remains unchanged"
-fi
-
-atomic_copy "$staging_dir/manifest.json" "$active_dir/manifest.json"
-write_metadata "$active_dir/state.json" "$requested_sha" "$manifest_hash" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-append_journal "active" "live" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-printf '{"schema":1,"mode":"live","result":"active","desired":"%s","active":"%s"}\n' \
-  "$requested_sha" "$requested_sha"
+append_journal "validated" "dry-run" "$timestamp"
+printf '{"schema":1,"mode":"dry-run","result":"validated","desired":"%s","active":"unchanged","plan":"%s"}\n' \
+  "$requested_sha" "$plans_dir/${requested_sha}.json"
+exit "$EX_CONFIG"

@@ -59,10 +59,16 @@ def main() -> int:
         default=default_schema_path(),
         help="JSON Schema to syntax-check alongside the dependency-free policy",
     )
-    parser.add_argument(
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
         "--print-digests",
         action="store_true",
         help="print the unique validated sha256 digests, one per line",
+    )
+    output_group.add_argument(
+        "--print-platform-integration-revision",
+        action="store_true",
+        help="print the validated platform integration source revision when declared",
     )
     parser.add_argument(
         "--require-json-schema",
@@ -84,6 +90,10 @@ def main() -> int:
     if args.print_digests:
         for digest in sorted(set(iter_digests(manifest))):
             print(digest)
+    elif args.print_platform_integration_revision:
+        integration = manifest["platform"].get("integration")
+        if integration is not None:
+            print(integration["source_revision"])
     else:
         print(f"release manifest valid: {args.manifest}")
     return 0

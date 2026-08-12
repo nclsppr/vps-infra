@@ -67,6 +67,27 @@
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/blockReason" }
     },
+    "platformBlockedBy": {
+      "allOf": [
+        { "$ref": "#/$defs/blockedBy" },
+        {
+          "minItems": 8,
+          "maxItems": 8,
+          "items": {
+            "enum": [
+              "alert-routing-and-delivery",
+              "caddy-ovh-image",
+              "external-networks-and-cidrs",
+              "immutable-image-digests",
+              "ovh-dns-credentials",
+              "platform-config-and-probes",
+              "platform-secrets-and-permissions",
+              "postgres-pgdata-and-compatibility"
+            ]
+          }
+        }
+      ]
+    },
     "publishedPorts": {
       "type": "array",
       "uniqueItems": true,
@@ -122,7 +143,13 @@
     "platform": {
       "type": "object",
       "additionalProperties": false,
-          "required": ["enabled", "compose_project", "published_ports", "blocked_by"],
+      "required": ["enabled", "compose_project", "published_ports", "blocked_by"],
+      "dependentRequired": {
+        "images": ["integration", "postgres", "readiness_evidence"],
+        "integration": ["images", "postgres", "readiness_evidence"],
+        "postgres": ["images", "integration", "readiness_evidence"],
+        "readiness_evidence": ["images", "integration", "postgres"]
+      },
       "properties": {
         "enabled": { "type": "boolean" },
         "compose_project": { "const": "vps-platform" },
@@ -200,16 +227,8 @@
           },
           "else": {
             "properties": {
-              "blocked_by": { "minItems": 1 },
+              "blocked_by": { "$ref": "#/$defs/platformBlockedBy" },
               "published_ports": { "maxItems": 0 }
-            },
-            "not": {
-              "anyOf": [
-                { "required": ["images"] },
-                { "required": ["integration"] },
-                { "required": ["postgres"] },
-                { "required": ["readiness_evidence"] }
-              ]
             }
           }
         }

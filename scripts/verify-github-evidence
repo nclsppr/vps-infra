@@ -163,7 +163,7 @@ def _collect_evidence(manifest: dict[str, Any]) -> list[Evidence]:
         existing["paths"].append(path)
 
     platform = manifest["platform"]
-    if platform["enabled"]:
+    if "readiness_evidence" in platform:
         for gate, value in platform["readiness_evidence"].items():
             add(
                 PLATFORM_REPOSITORY,

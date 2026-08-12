@@ -135,6 +135,55 @@ même avec des champs de preuve syntaxiquement complets. Le manifeste commité
 garde donc la plateforme et les quatre applications désactivées. Le marqueur
 hôte et l’applicateur live sont absents eux aussi.
 
+### Locked platform candidate declaration
+
+The locked policy can record a complete candidate declaration before
+activation. This declaration is not provenance-complete. The platform stays
+disabled, publishes no port, and retains all current blockers. The four
+candidate fields are an all-or-nothing group:
+
+```yaml
+platform:
+  enabled: false
+  compose_project: vps-platform
+  published_ports: []
+  blocked_by: [<all-current-platform-blockers>]
+  images: <six-immutable-image-references>
+  integration:
+    source_revision: <full-vps-infra-commit>
+    artifact: ghcr.io/nclsppr/vps-infra/platform-integration@sha256:<digest>
+  postgres:
+    major: 17
+    pgdata: /var/lib/postgresql/data/pgdata
+  readiness_evidence: <all-platform-evidence>
+```
+
+The validator rejects a partial candidate. It also rejects a mutable reference,
+an unexpected registry repository, a PostgreSQL major mismatch, and evidence
+that is not bound to the integration revision. The controller requires the
+integration revision to be an ancestor of the requested release commit. The
+online evidence check runs before desired state is written. Reconciliation
+returns `unchanged-disabled`, emits no applicable runtime reference, and still
+rejects a quarantined candidate digest.
+
+Candidate metadata is not an activation request. While
+`activation_policy: locked` is the only accepted policy, the controller rejects
+the production marker even if an applicator exists. It cannot create active
+state.
+
+The evidence run does not yet certify each declared OCI digest. The manifest
+therefore retains the provenance blockers. A later workflow must verify the
+digest, OCI labels, and attestation explicitly before those blockers can be
+removed.
+
+The schema stays at version 1 and still accepts the legacy manifest. An older
+controller does not understand the candidate fields. Before a controller
+downgrade, first use the current controller to record a legacy manifest that
+omits all four candidate fields. Verify that `desired/manifest.json` contains
+no candidate. Only then converge the older controller revision. Reverting the
+controller first makes the old validator fail closed on the persisted
+candidate.
+
 Les tags lisibles peuvent être conservés comme annotations, mais Compose
 consomme les digests. Une mise à jour est donc un diff Git relisible et un
 rollback est d’abord un revert du manifeste.
@@ -290,25 +339,24 @@ Le compte SSH de livraison :
 - peut appeler uniquement un script root-owned via une règle `sudoers`
   explicite, avec chemins absolus et sans `SETENV`.
 
-Le script `deploy` livré accepte seulement un SHA Git complet. Il :
+The delivered `deploy` script accepts only a full Git commit ID. It:
 
-1. prend un verrou global atomique ;
-2. vérifie l’origine HTTPS publique exacte et récupère uniquement `main` ;
-3. vérifie que le SHA est un commit atteignable depuis `origin/main` ;
-4. lit le manifeste directement depuis cet objet Git et le valide ;
-5. refuse les références mutables, les ports ou readiness incomplets et les
-   digests mis en quarantaine ;
-6. écrit l’état désiré et un plan de réconciliation, sans migration automatique ;
-7. reste en dry-run tant que `/etc/vps/production-enabled` est absent ;
-8. refuse tout passage live si l’applicateur root-owned n’est pas installé.
+1. acquires one atomic global lock;
+2. verifies the exact public HTTPS origin and fetches only `main`;
+3. verifies that the requested commit is reachable from `origin/main`;
+4. reads the manifest from that Git object and validates it;
+5. verifies that the platform integration revision is an ancestor of the
+   requested release commit;
+6. verifies declared GitHub evidence before it writes desired state;
+7. rejects quarantined digests and writes a non-mutating reconciliation plan;
+8. records desired state only after all previous checks succeed;
+9. rejects `/etc/vps/production-enabled` while `activation_policy` is locked.
 
-L’applicateur live n’est volontairement pas livré avant l’accès au VPS et les
-artefacts applicatifs. Son contrat final ajoutera, après répétition sur hôte
-jetable : vérification disque/Docker, checkout immuable sous
-`/srv/vps/releases/<sha>`, rendu sous `/srv/vps/rendered/<sha>`, pulls par
-digest, migrations explicitement autorisées, activation ciblée, probes,
-rollback compatible et journal détaillé. Le marqueur seul ne suffira jamais à
-contourner l’absence de cet applicateur.
+The locked controller does not contain an applicator execution path. A future
+audited revision must add disk and Docker checks, an immutable checkout,
+configuration rendering, digest pulls, explicitly authorized migrations,
+targeted activation, probes, compatible rollback, and a durable journal. The
+production marker alone can never enable that future path.
 
 Les projets Compose ont des noms fixes (`vps-platform`, `surplasse` et
 `parkventory`) afin qu’un nouveau chemin de checkout ne crée pas de nouveaux

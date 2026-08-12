@@ -36,6 +36,9 @@ PLATFORM_IMAGE_REPOSITORIES = {
     "postgres_exporter": "docker.io/prometheuscommunity/postgres-exporter",
 }
 PLATFORM_INTEGRATION_REPOSITORY = "ghcr.io/nclsppr/vps-infra/platform-integration"
+PLATFORM_CANDIDATE_KEYS = frozenset(
+    {"images", "integration", "postgres", "readiness_evidence"}
+)
 
 STATIC_ARTIFACT_REPOSITORIES = {
     "personal": (
@@ -329,10 +332,16 @@ def _validate_platform(value: Any) -> None:
     _validate_ports(platform["published_ports"], f"{path}.published_ports", platform=True, enabled=enabled)
     _validate_blocked_by(platform["blocked_by"], f"{path}.blocked_by", required_nonempty=not enabled)
 
+    candidate_keys = PLATFORM_CANDIDATE_KEYS & platform.keys()
+    missing_candidate_keys = PLATFORM_CANDIDATE_KEYS - candidate_keys
+    if candidate_keys and missing_candidate_keys:
+        _fail(
+            path,
+            "platform candidate fields must be declared together; missing keys: "
+            f"{', '.join(sorted(missing_candidate_keys))}",
+        )
+
     if not enabled:
-        unexpected = {"images", "integration", "postgres", "readiness_evidence"} & platform.keys()
-        if unexpected:
-            _fail(path, f"disabled platform must omit unknown artifacts: {', '.join(sorted(unexpected))}")
         if set(platform["blocked_by"]) != PLATFORM_READINESS_GATES:
             missing = PLATFORM_READINESS_GATES - set(platform["blocked_by"])
             extra = set(platform["blocked_by"]) - PLATFORM_READINESS_GATES
@@ -342,9 +351,10 @@ def _validate_platform(value: Any) -> None:
             if extra:
                 details.append(f"unknown {', '.join(sorted(extra))}")
             _fail(f"{path}.blocked_by", "; ".join(details))
-        return
+        if not candidate_keys:
+            return
 
-    if not {"images", "integration", "postgres", "readiness_evidence"}.issubset(platform):
+    if missing_candidate_keys:
         _fail(
             path,
             "enabled platform requires images, an immutable integration bundle, "
@@ -629,7 +639,7 @@ def load_manifest(path: str | Path) -> dict[str, Any]:
 
 def iter_image_references(manifest: dict[str, Any]) -> Iterable[str]:
     platform = manifest["platform"]
-    if platform["enabled"]:
+    if PLATFORM_CANDIDATE_KEYS.issubset(platform):
         yield from platform["images"].values()
         yield platform["integration"]["artifact"]
     for app in manifest["applications"].values():
