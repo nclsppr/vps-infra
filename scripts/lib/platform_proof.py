@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import hashlib
+import re
+from datetime import date
 from typing import Any, Iterable
 
 from release_policy import (
@@ -16,7 +18,8 @@ from release_policy import (
 )
 
 
-PLATFORM_PROOF_CONTRACT = "vps-infra.platform-proof.v1"
+PLATFORM_PROOF_CONTRACT = "vps-infra.platform-proof.v2"
+PLATFORM_VEX_CONTRACT = "vps-infra.platform-vex.v1"
 PLATFORM_REPOSITORY = "nclsppr/vps-infra"
 PLATFORM_WORKFLOW_PATH = ".github/workflows/vps-release.yml"
 PLATFORM_PROOF_CONTROLS = {
@@ -57,6 +60,30 @@ def proof_artifact_name(subject: str, run_id: str, run_attempt: int) -> str:
     )
 
 
+def validate_vulnerability_policy(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {
+        "contract",
+        "digest",
+        "valid_until",
+    }:
+        _fail("vulnerability_policy: exact contract, digest, and valid_until required")
+    if value["contract"] != PLATFORM_VEX_CONTRACT:
+        _fail(f"vulnerability_policy.contract: {PLATFORM_VEX_CONTRACT} required")
+    digest = value["digest"]
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        _fail("vulnerability_policy.digest: lowercase sha256 digest required")
+    valid_until = value["valid_until"]
+    if not isinstance(valid_until, str):
+        _fail("vulnerability_policy.valid_until: ISO date required")
+    try:
+        date.fromisoformat(valid_until)
+    except ValueError as exc:
+        raise PolicyError(
+            "vulnerability_policy.valid_until: ISO date required"
+        ) from exc
+    return dict(value)
+
+
 def build_platform_proof(
     candidate_value: Any,
     *,
@@ -64,11 +91,15 @@ def build_platform_proof(
     run_id: str,
     run_attempt: int,
     verified_gates: Iterable[str],
+    vulnerability_policy: Any,
 ) -> dict[str, Any]:
     candidate = validate_platform_candidate(candidate_value)
     if source_revision != candidate["integration"]["source_revision"]:
         _fail("source_revision must match candidate integration source revision")
     gates = validate_proof_gates(list(verified_gates))
+    validated_vulnerability_policy = validate_vulnerability_policy(
+        vulnerability_policy
+    )
     subject = platform_candidate_subject(candidate)
     artifact_name = proof_artifact_name(subject, run_id, run_attempt)
     return {
@@ -83,6 +114,7 @@ def build_platform_proof(
             "attempt": run_attempt,
         },
         "artifact_name": artifact_name,
+        "vulnerability_policy": validated_vulnerability_policy,
         "verified_gates": gates,
         "controls": dict(PLATFORM_PROOF_CONTROLS),
     }
@@ -104,6 +136,7 @@ def validate_platform_proof(
     run_id: str,
     run_attempt: int,
     verified_gates: Iterable[str],
+    vulnerability_policy: Any,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         _fail("platform proof: object required")
@@ -113,6 +146,7 @@ def validate_platform_proof(
         run_id=run_id,
         run_attempt=run_attempt,
         verified_gates=verified_gates,
+        vulnerability_policy=vulnerability_policy,
     )
     if value != expected:
         _fail("platform proof does not match its candidate and workflow run")

@@ -1,0 +1,73 @@
+{
+  "contract": "vps-infra.platform-vex.v1",
+  "statements": [
+    {
+      "service": "grafana",
+      "image": "docker.io/grafana/grafana:13.1.3-slim@sha256:0d2091fa32b712dd93c20376f21f3feb32789afcda6d1a3595da463fbff303c7",
+      "platform": "linux/amd64",
+      "target": "usr/share/grafana/bin/grafana",
+      "package": {
+        "name": "github.com/grafana/tempo",
+        "purl": "pkg:golang/github.com/grafana/tempo@v1.5.1-0.20260427112133-525d1bab07e0",
+        "installed_version": "v1.5.1-0.20260427112133-525d1bab07e0"
+      },
+      "vulnerability_id": "CVE-2026-21728",
+      "severity": "HIGH",
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The Grafana binary embeds Tempo code, but the Grafana product does not start a Tempo server or the affected Tempo request path.",
+      "expires_on": "2026-09-11"
+    },
+    {
+      "service": "grafana",
+      "image": "docker.io/grafana/grafana:13.1.3-slim@sha256:0d2091fa32b712dd93c20376f21f3feb32789afcda6d1a3595da463fbff303c7",
+      "platform": "linux/amd64",
+      "target": "usr/share/grafana/bin/grafana",
+      "package": {
+        "name": "github.com/grafana/tempo",
+        "purl": "pkg:golang/github.com/grafana/tempo@v1.5.1-0.20260427112133-525d1bab07e0",
+        "installed_version": "v1.5.1-0.20260427112133-525d1bab07e0"
+      },
+      "vulnerability_id": "CVE-2026-28377",
+      "severity": "HIGH",
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The Grafana binary embeds Tempo code, but the Grafana product does not start a Tempo server or the affected Tempo request path.",
+      "expires_on": "2026-09-11"
+    },
+    {
+      "service": "postgres_exporter",
+      "image": "docker.io/prometheuscommunity/postgres-exporter:v0.20.1@sha256:4f3d82803c1f99ea5e767890de3557d2479ebbc711f63f2e04c663daa840057a",
+      "platform": "linux/amd64",
+      "target": "bin/postgres_exporter",
+      "package": {
+        "name": "golang.org/x/text",
+        "purl": "pkg:golang/golang.org/x/text@v0.38.0",
+        "installed_version": "v0.38.0"
+      },
+      "vulnerability_id": "CVE-2026-56852",
+      "severity": "HIGH",
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "A govulncheck scan of the postgres_exporter binary confirms that its entry points do not call the vulnerable symbols.",
+      "expires_on": "2026-08-26"
+    },
+    {
+      "service": "postgres_exporter",
+      "image": "docker.io/prometheuscommunity/postgres-exporter:v0.20.1@sha256:4f3d82803c1f99ea5e767890de3557d2479ebbc711f63f2e04c663daa840057a",
+      "platform": "linux/amd64",
+      "target": "bin/postgres_exporter",
+      "package": {
+        "name": "stdlib",
+        "purl": "pkg:golang/stdlib@v1.26.4",
+        "installed_version": "v1.26.4"
+      },
+      "vulnerability_id": "CVE-2026-39822",
+      "severity": "HIGH",
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "A govulncheck scan of the postgres_exporter binary confirms that its entry points do not call the vulnerable symbols.",
+      "expires_on": "2026-08-26"
+    }
+  ]
+}

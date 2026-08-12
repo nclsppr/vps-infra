@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nclsppr/vps-infra/schemas/platform-vex-v1.schema.json",
+  "title": "Digest-bound platform vulnerability exception policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "statements"],
+  "$defs": {
+    "image": {
+      "type": "string",
+      "pattern": "^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[0-9a-f]{64}$"
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "purl", "installed_version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "purl": { "type": "string", "pattern": "^pkg:[a-z0-9.+-]+/[A-Za-z0-9._~/%+:-]+@[A-Za-z0-9._+~-]+$", "maxLength": 512 },
+        "installed_version": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "statement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service", "image", "platform", "target", "package", "vulnerability_id", "severity", "status", "justification", "impact_statement", "expires_on"],
+      "properties": {
+        "service": {
+          "enum": ["caddy", "grafana", "node_exporter", "postgres", "postgres_exporter", "prometheus"]
+        },
+        "image": { "$ref": "#/$defs/image" },
+        "platform": { "enum": ["linux/amd64", "linux/arm64"] },
+        "target": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "package": { "$ref": "#/$defs/package" },
+        "vulnerability_id": { "type": "string", "pattern": "^CVE-[0-9]{4}-[0-9]{4,}$" },
+        "severity": { "const": "HIGH" },
+        "status": { "const": "not_affected" },
+        "justification": { "const": "vulnerable_code_not_in_execute_path" },
+        "impact_statement": { "type": "string", "minLength": 20, "maxLength": 1000 },
+        "expires_on": { "type": "string", "format": "date" }
+      }
+    }
+  },
+  "properties": {
+    "contract": { "const": "vps-infra.platform-vex.v1" },
+    "statements": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": { "$ref": "#/$defs/statement" }
+    }
+  }
+}

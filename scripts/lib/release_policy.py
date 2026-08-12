@@ -35,7 +35,7 @@ EXPECTED_APPLICATIONS = {
 
 PLATFORM_IMAGE_REPOSITORIES = {
     "caddy": "ghcr.io/nclsppr/vps-infra/caddy",
-    "postgres": "docker.io/library/postgres",
+    "postgres": "ghcr.io/nclsppr/vps-infra/postgres",
     "prometheus": "docker.io/prom/prometheus",
     "grafana": "docker.io/grafana/grafana",
     "node_exporter": "docker.io/prom/node-exporter",
@@ -403,10 +403,10 @@ def _validate_platform_candidate_fields(value: Any, path: str) -> str:
     _expect_exact_keys(postgres, f"{path}.postgres", {"major", "pgdata"})
     _expect_literal(postgres["major"], 17, f"{path}.postgres.major")
     postgres_tag = _image_tag(images["postgres"])
-    if postgres_tag is None or not re.fullmatch(r"17(?:[.-][A-Za-z0-9_.-]+)?", postgres_tag):
+    if postgres_tag is None or not re.fullmatch(r"sha-[0-9a-f]{40}", postgres_tag):
         _fail(
             f"{path}.images.postgres",
-            "tag must be present and its major must match platform.postgres.major (17)",
+            "tag must identify the full PostgreSQL image source revision",
         )
     _expect_literal(
         postgres["pgdata"],

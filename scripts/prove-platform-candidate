@@ -27,6 +27,11 @@ from platform_proof import (  # noqa: E402
     build_platform_proof,
     platform_proof_bytes,
 )
+from platform_vex import (  # noqa: E402
+    VexError,
+    VexPolicy,
+    load_vex_policy,
+)
 from release_policy import (  # noqa: E402
     PolicyError,
     platform_candidate_subject,
@@ -37,11 +42,18 @@ from release_policy import (  # noqa: E402
 
 MAX_COMMAND_BYTES = 16 * 1024 * 1024
 TRIVY_SEVERITIES = "HIGH,CRITICAL"
+VEX_POLICY_PATH = REPOSITORY_ROOT / "policies/platform-vex-v1.json"
+VEX_SCHEMA_PATH = REPOSITORY_ROOT / "schemas/platform-vex-v1.schema.json"
 EXPECTED_IMAGE_SOURCES = {
     "caddy": "https://github.com/nclsppr/vps-infra",
     "grafana": "https://github.com/grafana/grafana",
     "node_exporter": "https://github.com/prometheus/node_exporter",
+    "postgres": "https://github.com/nclsppr/vps-infra",
     "prometheus": "https://github.com/prometheus/prometheus",
+}
+FIRST_PARTY_IMAGE_WORKFLOWS = {
+    "caddy": "nclsppr/vps-infra/.github/workflows/caddy-image.yml",
+    "postgres": "nclsppr/vps-infra/.github/workflows/postgres-image.yml",
 }
 IMAGE_PLATFORMS = {
     "caddy": ("linux/amd64", "linux/arm64"),
@@ -105,6 +117,10 @@ def _repository(reference: str) -> str:
 
 def _declared_digest(reference: str) -> str:
     return reference.rsplit("@", maxsplit=1)[1]
+
+
+def _declared_tag(reference: str) -> str:
+    return reference.rsplit("@", maxsplit=1)[0].rsplit(":", maxsplit=1)[1]
 
 
 def _inspect_exact_manifest(reference: str) -> dict[str, Any]:
@@ -185,15 +201,23 @@ def _verify_labels(service: str, reference: str, config: dict[str, Any]) -> str 
         raise ProofError(
             f"OCI source label for {reference} must be {expected_source}"
         )
-    if service != "caddy":
+    if service not in FIRST_PARTY_IMAGE_WORKFLOWS:
         return None
     revision = labels.get("org.opencontainers.image.revision")
     if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ProofError(f"OCI revision label for {reference} must be a full commit")
+    if _declared_tag(reference) != f"sha-{revision}":
+        raise ProofError(f"OCI revision label for {reference} must match its sha tag")
     return revision
 
 
-def _scan(reference: str, platform: str, report_path: Path) -> None:
+def _scan(
+    service: str,
+    reference: str,
+    platform: str,
+    report_path: Path,
+    vex_policy: VexPolicy,
+) -> None:
     _command(
         [
             "trivy",
@@ -207,7 +231,7 @@ def _scan(reference: str, platform: str, report_path: Path) -> None:
             "--severity",
             TRIVY_SEVERITIES,
             "--exit-code",
-            "1",
+            "0",
             "--format",
             "json",
             "--output",
@@ -220,14 +244,15 @@ def _scan(reference: str, platform: str, report_path: Path) -> None:
     except OSError as exc:
         raise ProofError(f"Trivy did not write {report_path}") from exc
     report = _strict_json_bytes(report_bytes, f"Trivy report for {reference} {platform}")
-    for result in report.get("Results", []):
-        if not isinstance(result, dict):
-            raise ProofError(f"Trivy report for {reference} is invalid")
-        vulnerabilities = result.get("Vulnerabilities") or []
-        if vulnerabilities:
-            raise ProofError(
-                f"Trivy reported a HIGH or CRITICAL vulnerability for {reference}"
-            )
+    try:
+        vex_policy.evaluate_report(
+            service=service,
+            image=reference,
+            platform=platform,
+            report=report,
+        )
+    except VexError as exc:
+        raise ProofError(str(exc)) from exc
 
 
 def _verify_attestation(
@@ -258,9 +283,9 @@ def _verify_attestation(
         raise ProofError(f"no GitHub attestation verified for {reference}")
 
 
-def _single_caddy_revision(revisions: set[str]) -> str:
+def _single_image_revision(service: str, revisions: set[str]) -> str:
     if len(revisions) != 1:
-        raise ProofError("Caddy image variants must use one source revision")
+        raise ProofError(f"{service} image variants must use one source revision")
     return next(iter(revisions))
 
 
@@ -274,8 +299,14 @@ def _strict_json_bytes_or_array(value: bytes, subject: str) -> list[Any]:
     return payload
 
 
-def prove(candidate: dict[str, Any], reports_directory: Path) -> None:
-    caddy_revisions: set[str] = set()
+def prove(candidate: dict[str, Any], reports_directory: Path) -> dict[str, str]:
+    try:
+        vex_policy = load_vex_policy(VEX_POLICY_PATH, VEX_SCHEMA_PATH)
+    except VexError as exc:
+        raise ProofError(str(exc)) from exc
+    first_party_revisions: dict[str, set[str]] = {
+        service: set() for service in FIRST_PARTY_IMAGE_WORKFLOWS
+    }
     for service in sorted(candidate["images"]):
         reference = candidate["images"][service]
         _inspect_exact_manifest(reference)
@@ -283,9 +314,20 @@ def prove(candidate: dict[str, Any], reports_directory: Path) -> None:
             config = _image_config(reference, platform)
             revision = _verify_labels(service, reference, config)
             if revision is not None:
-                caddy_revisions.add(revision)
+                first_party_revisions[service].add(revision)
             report_name = f"{service}-{platform.replace('/', '-')}.json"
-            _scan(reference, platform, reports_directory / report_name)
+            _scan(
+                service,
+                reference,
+                platform,
+                reports_directory / report_name,
+                vex_policy,
+            )
+
+    try:
+        vex_policy.assert_all_used()
+    except VexError as exc:
+        raise ProofError(str(exc)) from exc
 
     caddy_reference = candidate["images"]["caddy"]
     for platform in IMAGE_PLATFORMS["caddy"]:
@@ -306,12 +348,16 @@ def prove(candidate: dict[str, Any], reports_directory: Path) -> None:
             raise ProofError(
                 f"Caddy image does not contain dns.providers.ovh on {platform}"
             )
-    caddy_revision = _single_caddy_revision(caddy_revisions)
-    _verify_attestation(
-        caddy_reference,
-        source_revision=caddy_revision,
-        signer_workflow="nclsppr/vps-infra/.github/workflows/caddy-image.yml",
-    )
+    for service, signer_workflow in FIRST_PARTY_IMAGE_WORKFLOWS.items():
+        source_revision = _single_image_revision(
+            service,
+            first_party_revisions[service],
+        )
+        _verify_attestation(
+            candidate["images"][service],
+            source_revision=source_revision,
+            signer_workflow=signer_workflow,
+        )
 
     integration = candidate["integration"]
     integration_manifest = _inspect_exact_manifest(integration["artifact"])
@@ -329,6 +375,7 @@ def prove(candidate: dict[str, Any], reports_directory: Path) -> None:
         source_revision=integration["source_revision"],
         signer_workflow="nclsppr/vps-infra/.github/workflows/platform-integration.yml",
     )
+    return vex_policy.proof_metadata()
 
 
 def _positive_integer(value: str) -> int:
@@ -449,13 +496,14 @@ def main() -> int:
             raise ProofError(f"output filename must be {expected_name}")
         with tempfile.TemporaryDirectory(prefix="vps-platform-proof-") as temporary:
             reports_directory = Path(temporary)
-            prove(candidate, reports_directory)
+            vulnerability_policy = prove(candidate, reports_directory)
         proof = build_platform_proof(
             candidate,
             source_revision=args.source_revision,
             run_id=args.run_id,
             run_attempt=args.run_attempt,
             verified_gates=sorted(PLATFORM_PROOF_BASELINE_GATES),
+            vulnerability_policy=vulnerability_policy,
         )
         proof_schema = strict_json_loads(
             (REPOSITORY_ROOT / "schemas/platform-proof.schema.json").read_text(

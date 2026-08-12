@@ -4,7 +4,7 @@
   "title": "Digest-bound VPS platform proof",
   "type": "object",
   "additionalProperties": false,
-  "required": ["contract", "candidate", "candidate_subject", "source_revision", "run", "artifact_name", "verified_gates", "controls"],
+  "required": ["contract", "candidate", "candidate_subject", "source_revision", "run", "artifact_name", "vulnerability_policy", "verified_gates", "controls"],
   "$defs": {
     "sha40": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
@@ -22,7 +22,7 @@
     }
   },
   "properties": {
-    "contract": { "const": "vps-infra.platform-proof.v1" },
+    "contract": { "const": "vps-infra.platform-proof.v2" },
     "candidate": { "$ref": "platform-candidate.schema.json" },
     "candidate_subject": { "$ref": "#/$defs/sha256" },
     "source_revision": { "$ref": "#/$defs/sha40" },
@@ -40,6 +40,16 @@
     "artifact_name": {
       "type": "string",
       "pattern": "^platform-candidate-proof-[0-9a-f]{64}-[1-9][0-9]*-[1-9][0-9]*\\.json$"
+    },
+    "vulnerability_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "digest", "valid_until"],
+      "properties": {
+        "contract": { "const": "vps-infra.platform-vex.v1" },
+        "digest": { "$ref": "#/$defs/sha256" },
+        "valid_until": { "type": "string", "format": "date" }
+      }
     },
     "verified_gates": {
       "type": "array",

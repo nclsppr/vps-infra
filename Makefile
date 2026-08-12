@@ -70,6 +70,10 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 		platform/observability/grafana/dashboards/platform/overview.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
 		schemas/static-route-inventory-v1.schema.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		schemas/platform-vex-v1.schema.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		policies/platform-vex-v1.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool renovate.json >/dev/null
 
 check-platform: check-platform-config check-public-static-edge check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, and custom images.
