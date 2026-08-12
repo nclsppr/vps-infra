@@ -205,10 +205,27 @@ clean_command() {
     "$@"
 }
 
+install_locked_tools() {
+  local attempt
+  local -r maximum_attempts=3
+
+  for ((attempt = 1; attempt <= maximum_attempts; attempt++)); do
+    if clean_command "$mise_executable" install --locked; then
+      return 0
+    fi
+    if ((attempt == maximum_attempts)); then
+      fail "locked mise tool installation failed after $maximum_attempts attempts"
+    fi
+    echo \
+      "converge: locked mise tool installation attempt $attempt of $maximum_attempts failed; retrying with the same isolated cache" \
+      >&2
+  done
+}
+
 (
   cd "$checkout"
   clean_command "$mise_executable" trust "$checkout/mise.toml"
-  clean_command "$mise_executable" install --locked
+  install_locked_tools
   clean_command "$mise_executable" exec -- uv sync --locked
   cd ansible
   clean_command ../.venv/bin/ansible-galaxy collection install \

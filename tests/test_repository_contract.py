@@ -1750,9 +1750,12 @@ class SecurityBoundaryContractTests(unittest.TestCase):
     def test_convergence_explicitly_trusts_the_captured_mise_config(self) -> None:
         converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
         trust = 'clean_command "$mise_executable" trust "$checkout/mise.toml"'
-        install = 'clean_command "$mise_executable" install --locked'
+        locked_install = 'clean_command "$mise_executable" install --locked'
+        install = "install_locked_tools"
         self.assertIn(trust, converge)
-        self.assertLess(converge.index(trust), converge.index(install))
+        self.assertIn(locked_install, converge)
+        bootstrap = converge[converge.index('(\n  cd "$checkout"') :]
+        self.assertLess(bootstrap.index(trust), bootstrap.index(install))
 
     def test_convergence_executes_the_captured_remote_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1930,6 +1933,24 @@ set -eu
 [ -z "${{SSH_AUTH_SOCK+x}}" ]
 [ -z "${{ANSIBLE_SSH_CONTROL_PATH_DIR+x}}" ]
 printf 'mise=%s\\n' "$PWD $*" >>{quoted_log}
+if [ "${{1:-}}" = install ] && [ -e {quoted_root}/retry-mise-install ]; then
+  mkdir -p "$XDG_CACHE_HOME"
+  attempt_file="$XDG_CACHE_HOME/mise-install-attempt"
+  attempt=1
+  if [ -f "$attempt_file" ]; then
+    IFS= read -r previous_attempt < "$attempt_file"
+    attempt=$((previous_attempt + 1))
+  fi
+  printf '%s\\n' "$attempt" > "$attempt_file"
+  printf 'mise_install_attempt=%s home=%s cache=%s\\n' \
+    "$attempt" "$HOME" "$XDG_CACHE_HOME" >>{quoted_log}
+  [ "$attempt" -ge 3 ] || exit 35
+fi
+if [ "${{1:-}}" = install ] && [ -e {quoted_root}/fail-mise-install ]; then
+  printf 'mise_install_permanent_failure home=%s cache=%s\\n' \
+    "$HOME" "$XDG_CACHE_HOME" >>{quoted_log}
+  exit 36
+fi
 if [ "${{1:-}}" = exec ]; then
   mkdir -p .venv/bin
   cp {shlex.quote(str(galaxy_template))} .venv/bin/ansible-galaxy
@@ -2011,6 +2032,97 @@ fi
                 "+refs/heads/main:refs/remotes/origin/main",
                 execution,
             )
+
+            log.unlink()
+            (root / "retry-mise-install").touch()
+            retried_install = subprocess.run(
+                [converge],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(retried_install.returncode, 0, retried_install.stderr)
+            self.assertIn(
+                "attempt 1 of 3 failed; retrying with the same isolated cache",
+                retried_install.stderr,
+            )
+            self.assertIn(
+                "attempt 2 of 3 failed; retrying with the same isolated cache",
+                retried_install.stderr,
+            )
+            retried_execution = log.read_text(encoding="utf-8")
+            retry_records = [
+                line
+                for line in retried_execution.splitlines()
+                if line.startswith("mise_install_attempt=")
+            ]
+            self.assertEqual(len(retry_records), 3)
+            self.assertEqual(
+                [record.split(maxsplit=1)[0] for record in retry_records],
+                [
+                    "mise_install_attempt=1",
+                    "mise_install_attempt=2",
+                    "mise_install_attempt=3",
+                ],
+            )
+            retry_environments = [
+                record.split(maxsplit=1)[1] for record in retry_records
+            ]
+            self.assertEqual(len(set(retry_environments)), 1)
+            retried_mise_calls = [
+                line
+                for line in retried_execution.splitlines()
+                if line.startswith("mise=")
+            ]
+            self.assertEqual(len(retried_mise_calls), 5)
+            self.assertEqual(
+                sum(" install --locked" in line for line in retried_mise_calls),
+                3,
+            )
+            self.assertEqual(
+                sum(" trust " in line for line in retried_mise_calls),
+                1,
+            )
+            self.assertEqual(
+                sum(" exec -- uv sync --locked" in line for line in retried_mise_calls),
+                1,
+            )
+            (root / "retry-mise-install").unlink()
+
+            log.unlink()
+            (root / "fail-mise-install").touch()
+            refused_install = subprocess.run(
+                [converge],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(refused_install.returncode, 0)
+            self.assertIn(
+                "locked mise tool installation failed after 3 attempts",
+                refused_install.stderr,
+            )
+            refused_execution = log.read_text(encoding="utf-8")
+            refused_mise_calls = [
+                line
+                for line in refused_execution.splitlines()
+                if line.startswith("mise=")
+            ]
+            self.assertEqual(len(refused_mise_calls), 4)
+            self.assertEqual(
+                sum(" install --locked" in line for line in refused_mise_calls),
+                3,
+            )
+            self.assertFalse(any(" exec " in line for line in refused_mise_calls))
+            self.assertNotIn("galaxy=", refused_execution)
+            self.assertNotIn("playbook_directory=", refused_execution)
+            (root / "fail-mise-install").unlink()
 
             log.unlink()
             check_result = subprocess.run(
