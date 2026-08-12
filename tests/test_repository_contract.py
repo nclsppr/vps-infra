@@ -43,6 +43,255 @@ APPLICATION_STATE = load_script_module(
 
 
 class SupplyChainContractTests(unittest.TestCase):
+    def test_caddy_build_inputs_are_separate_from_runtime_state(self) -> None:
+        def assignments(path: Path) -> dict[str, str]:
+            values: dict[str, str] = {}
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                key, value = line.split("=", maxsplit=1)
+                self.assertNotIn(key, values)
+                values[key] = value
+            return values
+
+        build_values = assignments(ROOT / "platform/caddy/build.env")
+        self.assertEqual(
+            set(build_values),
+            {
+                "CADDY_BUILDER_IMAGE",
+                "CADDY_RUNTIME_IMAGE",
+                "CADDY_DNS_MODULE",
+            },
+        )
+        image_pattern = re.compile(
+            r"^[a-z0-9./_-]+:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$"
+        )
+        self.assertRegex(build_values["CADDY_BUILDER_IMAGE"], image_pattern)
+        self.assertRegex(build_values["CADDY_RUNTIME_IMAGE"], image_pattern)
+        self.assertTrue(
+            build_values["CADDY_BUILDER_IMAGE"].startswith(
+                "docker.io/library/caddy:"
+            )
+        )
+        self.assertTrue(
+            build_values["CADDY_RUNTIME_IMAGE"].startswith(
+                "docker.io/library/caddy:"
+            )
+        )
+        def image_tag(reference: str) -> str:
+            tagged_reference = reference.split("@", maxsplit=1)[0]
+            return tagged_reference.rsplit(":", maxsplit=1)[1]
+
+        builder_tag = image_tag(build_values["CADDY_BUILDER_IMAGE"])
+        runtime_tag = image_tag(build_values["CADDY_RUNTIME_IMAGE"])
+        builder_version = re.fullmatch(
+            r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-builder-alpine",
+            builder_tag,
+        )
+        runtime_version = re.fullmatch(
+            r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-alpine",
+            runtime_tag,
+        )
+        self.assertIsNotNone(builder_version)
+        self.assertIsNotNone(runtime_version)
+        assert builder_version is not None
+        assert runtime_version is not None
+        self.assertEqual(
+            builder_version.group("version"),
+            runtime_version.group("version"),
+        )
+        self.assertRegex(
+            build_values["CADDY_DNS_MODULE"],
+            r"^github\.com/caddy-dns/ovh@[0-9a-f]{40}$",
+        )
+
+        runtime_values = assignments(ROOT / "platform/.env.example")
+        self.assertIn("CADDY_PLATFORM_IMAGE", runtime_values)
+        self.assertNotIn("CADDY_BUILDER_IMAGE", runtime_values)
+        self.assertNotIn("CADDY_RUNTIME_IMAGE", runtime_values)
+        self.assertNotIn("CADDY_DNS_MODULE", runtime_values)
+
+    def test_caddy_build_input_validator_enforces_publication_contract(self) -> None:
+        validator = ROOT / "scripts/validate-caddy-build-inputs"
+        build_env = ROOT / "platform/caddy/build.env"
+        self.assertTrue(os.access(validator, os.X_OK))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            github_output = root / "github-output"
+            github_output.touch()
+            valid = subprocess.run(
+                [
+                    str(validator),
+                    "--github-output",
+                    str(github_output),
+                    str(build_env),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            output_lines = github_output.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(output_lines), 3)
+            self.assertTrue(output_lines[0].startswith("builder="))
+            self.assertTrue(output_lines[1].startswith("runtime="))
+            self.assertTrue(output_lines[2].startswith("module="))
+
+            source = build_env.read_text(encoding="utf-8")
+            invalid_cases = {
+                "wrong-repository.env": source.replace(
+                    "CADDY_BUILDER_IMAGE=docker.io/library/caddy:",
+                    "CADDY_BUILDER_IMAGE=registry.example/caddy:",
+                ),
+                "version-mismatch.env": source.replace(
+                    "CADDY_RUNTIME_IMAGE=docker.io/library/caddy:2.11.4-alpine",
+                    "CADDY_RUNTIME_IMAGE=docker.io/library/caddy:2.11.5-alpine",
+                ),
+            }
+            for name, content in invalid_cases.items():
+                candidate = root / name
+                candidate.write_text(content, encoding="utf-8")
+                rejected = subprocess.run(
+                    [str(validator), str(candidate)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(rejected.returncode, 0, name)
+
+    def test_caddy_workflow_uses_only_build_inputs(self) -> None:
+        workflow_text = (ROOT / ".github/workflows/caddy-image.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
+        self.assertEqual(
+            workflow["env"]["CADDY_BUILD_ENV"],
+            "platform/caddy/build.env",
+        )
+        for event in ("pull_request", "push"):
+            paths = workflow["on"][event]["paths"]
+            self.assertEqual(
+                paths,
+                [
+                    ".github/workflows/caddy-image.yml",
+                    "platform/caddy/.dockerignore",
+                    "platform/caddy/Dockerfile",
+                    "platform/caddy/build.env",
+                    "platform/caddy/entrypoint.sh",
+                    "scripts/validate-caddy-build-inputs",
+                ],
+            )
+
+        self.assertEqual(
+            (ROOT / "platform/caddy/.dockerignore")
+            .read_text(encoding="utf-8")
+            .splitlines(),
+            ["**", "!Dockerfile", "!entrypoint.sh"],
+        )
+
+        input_steps = [
+            step
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+            if step.get("name") == "Read and validate the pinned build inputs"
+        ]
+        self.assertEqual(len(input_steps), 2)
+        for step in input_steps:
+            command = step["run"]
+            self.assertIn("./scripts/validate-caddy-build-inputs", command)
+            self.assertIn('--github-output "${GITHUB_OUTPUT}"', command)
+            self.assertEqual(command.count('"${CADDY_BUILD_ENV}"'), 1)
+            self.assertNotIn("platform/.env.example", command)
+
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("CADDY_BUILD_ENV ?= platform/caddy/build.env", makefile)
+        check_caddy = makefile.split("check-caddy:", maxsplit=1)[1].split(
+            "\nbootstrap:", maxsplit=1
+        )[0]
+        validator_position = check_caddy.index("./scripts/validate-caddy-build-inputs")
+        builder_position = check_caddy.index("CADDY_BUILDER_IMAGE")
+        self.assertLess(validator_position, builder_position)
+        self.assertEqual(check_caddy.count('"$(CADDY_BUILD_ENV)"'), 4)
+        self.assertNotIn("$(PLATFORM_ENV)", check_caddy)
+
+    def test_renovate_never_promotes_the_custom_caddy_image(self) -> None:
+        config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
+        managers = config["customManagers"]
+        self.assertEqual(len(managers), 2)
+        self.assertEqual(
+            managers[0]["managerFilePatterns"],
+            [r"/^platform\/\.env\.example$/"],
+        )
+        self.assertEqual(
+            managers[1]["managerFilePatterns"],
+            [r"/^platform\/caddy\/build\.env$/"],
+        )
+
+        matchers = [
+            re.compile(pattern.replace("(?<", "(?P<"))
+            for manager in managers
+            for pattern in manager["matchStrings"]
+        ]
+
+        def is_managed(line: str) -> bool:
+            return any(pattern.fullmatch(line) for pattern in matchers)
+
+        digest = "a" * 64
+        for env_name in (
+            "POSTGRES_IMAGE",
+            "PROMETHEUS_IMAGE",
+            "GRAFANA_IMAGE",
+            "NODE_EXPORTER_IMAGE",
+            "POSTGRES_EXPORTER_IMAGE",
+        ):
+            self.assertTrue(
+                is_managed(
+                    f"{env_name}=docker.io/library/example:1.2.3@sha256:{digest}"
+                ),
+                env_name,
+            )
+        for env_name in ("CADDY_BUILDER_IMAGE", "CADDY_RUNTIME_IMAGE"):
+            self.assertTrue(
+                is_managed(
+                    f"{env_name}=docker.io/library/caddy:1.2.3-alpine@sha256:{digest}"
+                ),
+                env_name,
+            )
+        self.assertFalse(
+            is_managed(
+                "CADDY_RUNTIME_IMAGE="
+                f"docker.io/library/example:1.2.3-alpine@sha256:{digest}"
+            )
+        )
+        self.assertFalse(
+            is_managed(
+                "CADDY_PLATFORM_IMAGE="
+                f"ghcr.io/nclsppr/vps-infra/caddy:sha-test@sha256:{digest}"
+            )
+        )
+
+        package_rules = config["packageRules"]
+        caddy_inputs = next(
+            rule
+            for rule in package_rules
+            if rule.get("groupName") == "Caddy build inputs"
+        )
+        self.assertIs(caddy_inputs["dependencyDashboardApproval"], True)
+        self.assertEqual(caddy_inputs["matchFileNames"], ["platform/caddy/build.env"])
+        self.assertEqual(
+            caddy_inputs["matchPackageNames"],
+            ["docker.io/library/caddy"],
+        )
+        self.assertEqual(caddy_inputs["minimumGroupSize"], 2)
+        custom_image = next(
+            rule
+            for rule in package_rules
+            if "ghcr.io/nclsppr/vps-infra/caddy"
+            in rule.get("matchPackageNames", [])
+        )
+        self.assertIs(custom_image["enabled"], False)
+
     def test_engine_pin_is_fixed_and_held_packages_can_change(self) -> None:
         variables = yaml.safe_load(
             (ROOT / "ansible/inventories/production/group_vars/all.yml").read_text(

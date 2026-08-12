@@ -20,8 +20,15 @@ The platform uses the following service versions:
 Each Compose image reference contains a readable tag and an immutable digest.
 The upstream Caddy image does not contain an OVH DNS provider. CI builds one
 Caddy image with `caddy-dns/ovh` v1.1.0 at commit
-`17fd665136b593153167bf9dfee9a3c0bd2c7ac0`. Production must use the published
-image by digest in `CADDY_PLATFORM_IMAGE`.
+`17fd665136b593153167bf9dfee9a3c0bd2c7ac0`.
+
+`platform/caddy/build.env` defines the immutable upstream images and module
+commit used to build that custom image. `CADDY_PLATFORM_IMAGE` in
+`platform/.env.example` is the promotion point for an already published and
+attested output. It remains an upstream structural-validation placeholder in
+this locked baseline. Promote a verified custom-image digest in a separate
+pull request. A promotion does not rebuild the image. Production must use the
+custom image by digest.
 
 ## Application state
 
