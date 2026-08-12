@@ -138,6 +138,18 @@ The controller files are installed under `/usr/local/libexec/vps`. The marker
 `/etc/vps/production-enabled` and the executable `apply-release` are absent.
 The current controller can validate and plan. It cannot activate production.
 
+The deploy role also installs ORAS 1.3.0 from the official release archive. It
+selects `amd64` or `arm64`, verifies the archive SHA-256, extracts only the
+`oras` executable, verifies its second SHA-256, and confirms its version. The
+role then installs `/usr/local/libexec/vps/deploy-static`. Current Personal and
+Papers Empire packages are public, so this path does not install a registry
+credential.
+
+`deploy-static` is not an SSH command and is not allowed by the deploy sudo
+rule. A future reviewed applicator must supply its five immutable inputs. The
+script extracts through the `vps-static` account, but each final release and
+each release root becomes root-owned before activation.
+
 The deploy role initializes the root-owned mirror at `/srv/vps/repository` from
 the single allowed public origin:
 

@@ -9,6 +9,7 @@ conteneur.
 Ansible installe, root-owned et non modifiables par le groupe ou les autres :
 
 - `/usr/local/libexec/vps/deploy`
+- `/usr/local/libexec/vps/deploy-static`
 - `/usr/local/libexec/vps/forced-command`
 - `/usr/local/libexec/vps/parse-forced-command`
 - `/usr/local/libexec/vps/plan-digests`
@@ -21,6 +22,9 @@ Ansible installe, root-owned et non modifiables par le groupe ou les autres :
 - `/usr/local/libexec/vps/lib/platform_proof.py`
 - `/usr/local/share/vps-infra/schemas/production-release.schema.json`
 
+Ansible also installs the checksum-verified ORAS executable at
+`/usr/local/bin/oras`.
+
 `check`, `check-public-safe` et `doctor` sont des outils d'audit à installer si
 le rôle d'exploitation doit les exécuter sur le VPS. `apply-release` est
 volontairement absent : aucun chemin de mutation n'est livré dans cette tranche.
@@ -30,6 +34,66 @@ production refuse de continuer sans ce validateur.
 Le miroir autorisé est `/srv/vps/repository`, avec l'origine exacte
 `https://github.com/nclsppr/vps-infra.git`. Le contrôleur ne récupère que
 `refs/heads/main` et n'accepte depuis SSH que `deploy <sha40>`.
+
+## Static OCI materializer
+
+`deploy-static` accepts only this bounded interface:
+
+```text
+deploy-static <personal|papersempire> <source-sha40> \
+  <site-ref@sha256> <routes-ref@sha256> <caddy-image@sha256>
+```
+
+The two artifact references must use the exact public GHCR repositories in the
+application profile. The Caddy reference must use
+`ghcr.io/nclsppr/vps-infra/caddy` and must equal `CADDY_PLATFORM_IMAGE` in the
+protected infrastructure mirror. This binds the probe to the promoted platform
+image even when the platform is not active. Tags cannot replace a digest. ORAS
+uses an empty registry configuration and does not read an operator Docker
+credential.
+
+The materializer verifies both OCI manifest digests, exact media types, the
+embedded empty config, one exact layer, source and revision annotations, and a
+common creation timestamp. It then verifies the canonical route inventory,
+the site layer checksum, every regular-file checksum, and a strict bijection
+between archive files and routes.
+
+`schemas/static-route-inventory-v1.schema.json` publishes the common JSON
+shape. The dependency-free runtime validator adds application limits, canonical
+encoding, route derivation, checksum totals, and the archive bijection that the
+JSON Schema cannot express alone.
+
+The consumer limits are profile-specific:
+
+| Application | Compressed | File payload | Files | Tar members |
+|---|---:|---:|---:|---:|
+| `personal` | 50 MiB | 100 MiB | 2,000 | 4,001 |
+| `papersempire` | 75 MiB | 150 MiB | 5,000 | 10,001 |
+
+Each OCI manifest is limited to 64 KiB and the inventory layer is limited to
+2 MiB. The complete route probe has a five-minute Personal budget and a
+ten-minute Papers Empire budget. Lock acquisition stops after one minute.
+
+The Personal profile accepts the one Git archive PAX comment that contains the
+source SHA. The Papers Empire profile requires its GNU tar normalization. This
+validation does not claim that a complete Papers Empire source rebuild is
+byte-reproducible.
+
+The script rejects absolute paths, traversal, ambiguous components, duplicate
+members, links, devices, FIFOs, sparse files, unknown tar extensions,
+concatenated gzip streams, and each limit overrun. It writes with `openat`,
+`O_NOFOLLOW`, and `O_EXCL` as `vps-static`. It normalizes final files to `0644`
+and directories to `0755`, then transfers the complete release to root.
+
+A temporary container from the exact Caddy digest serves the candidate root.
+The probe requests every inventory route and compares the HTTP body SHA-256.
+Only then does the script replace `current` with one atomic relative symlink.
+The release directory is `releases/sha256-<site-manifest-digest>`.
+
+This primitive is not wired to `deploy`. The current policy stays locked and
+the live applicator stays absent. Public TLS probes, automatic rollback after a
+public failure, quarantine recording, and release garbage collection remain
+future applicator responsibilities.
 
 ## États séparés
 

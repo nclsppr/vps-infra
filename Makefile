@@ -56,6 +56,8 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 		releases/production.yaml
 	$(MISE_EXEC) uv run python -m json.tool \
 		platform/observability/grafana/dashboards/platform/overview.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		schemas/static-route-inventory-v1.schema.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool renovate.json >/dev/null
 
 check-platform: check-platform-config check-prometheus check-caddy ## Validate the shared platform and its Caddy image.

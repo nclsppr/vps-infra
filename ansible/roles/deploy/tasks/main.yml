@@ -15,12 +15,26 @@
       - vps_deploy_production_marker == '/etc/vps/production-enabled'
       - vps_deploy_git_sha_length | int == 40
       - vps_infra_revision is match('^[0-9a-f]{40}$')
+      - vps_oras_version == '1.3.0'
+      - vps_oras_install_path == '/usr/local/bin/oras'
+      - vps_oras_cache_root == '/var/cache/vps-infra/oras'
+      - vps_oras_archives.keys() | list | sort == ['aarch64', 'x86_64']
+      - ansible_architecture in vps_oras_archives
+      - >-
+        vps_oras_archives[ansible_architecture].release_architecture in
+        ['amd64', 'arm64']
+      - >-
+        vps_oras_archives[ansible_architecture].archive_sha256 is
+        match('^[0-9a-f]{64}$')
+      - >-
+        vps_oras_archives[ansible_architecture].binary_sha256 is
+        match('^[0-9a-f]{64}$')
       - >-
         vps_deploy_executables | list | sort ==
-        ['check-public-safe', 'deploy', 'doctor', 'forced-command',
-         'parse-forced-command', 'plan-digests', 'reconcile',
-         'validate-compose', 'validate-release', 'verify-github-evidence',
-         'verify-state']
+        ['check-public-safe', 'deploy', 'deploy-static', 'doctor',
+         'forced-command', 'parse-forced-command', 'plan-digests',
+         'reconcile', 'validate-compose', 'validate-release',
+         'verify-github-evidence', 'verify-state']
       - not (vps_live_apply_enabled | bool)
     fail_msg: "Le contrat du compte ou de la commande de déploiement a dérivé."
 
@@ -97,8 +111,104 @@
       mode: "0700"
     - path: "{{ vps_deploy_state_dir }}"
       mode: "0700"
+    - path: "{{ vps_oras_cache_root }}"
+      mode: "0755"
   loop_control:
     label: "{{ item.path }}"
+
+- name: Select the pinned ORAS archive for this architecture
+  ansible.builtin.set_fact:
+    vps_oras_archive: "{{ vps_oras_archives[ansible_architecture] }}"
+    vps_oras_extraction_dir: >-
+      {{ vps_oras_cache_root ~ '/' ~ vps_oras_version ~ '-' ~
+         vps_oras_archives[ansible_architecture].release_architecture }}
+    vps_oras_archive_path: >-
+      {{ vps_oras_cache_root ~ '/oras_' ~ vps_oras_version ~ '_linux_' ~
+         vps_oras_archives[ansible_architecture].release_architecture ~ '.tar.gz' }}
+    vps_oras_download_url: >-
+      {{ 'https://github.com/oras-project/oras/releases/download/v' ~
+         vps_oras_version ~ '/oras_' ~ vps_oras_version ~ '_linux_' ~
+         vps_oras_archives[ansible_architecture].release_architecture ~ '.tar.gz' }}
+
+- name: Create the versioned ORAS extraction directory
+  ansible.builtin.file:
+    path: "{{ vps_oras_extraction_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download the pinned ORAS release archive
+  ansible.builtin.get_url:
+    url: "{{ vps_oras_download_url }}"
+    dest: "{{ vps_oras_archive_path }}"
+    checksum: "sha256:{{ vps_oras_archive.archive_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+
+- name: Extract only the ORAS executable from the verified archive
+  ansible.builtin.unarchive:
+    src: "{{ vps_oras_archive_path }}"
+    dest: "{{ vps_oras_extraction_dir }}"
+    include:
+      - oras
+    owner: root
+    group: root
+    mode: "0755"
+    remote_src: true
+    creates: "{{ vps_oras_extraction_dir }}/oras"
+
+- name: Inspect the extracted ORAS executable
+  ansible.builtin.stat:
+    path: "{{ vps_oras_extraction_dir }}/oras"
+    follow: false
+    checksum_algorithm: sha256
+  register: vps_oras_extracted
+  when: not ansible_check_mode
+
+- name: Verify the extracted ORAS executable checksum
+  ansible.builtin.assert:
+    that:
+      - vps_oras_extracted.stat.exists
+      - vps_oras_extracted.stat.isreg
+      - not vps_oras_extracted.stat.islnk
+      - vps_oras_extracted.stat.uid == 0
+      - vps_oras_extracted.stat.gid == 0
+      - not vps_oras_extracted.stat.wgrp
+      - not vps_oras_extracted.stat.woth
+      - vps_oras_extracted.stat.checksum == vps_oras_archive.binary_sha256
+    fail_msg: "The extracted ORAS executable does not match the approved checksum."
+  when: not ansible_check_mode
+
+- name: Install the verified ORAS executable
+  ansible.builtin.copy:
+    src: "{{ vps_oras_extraction_dir }}/oras"
+    dest: "{{ vps_oras_install_path }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  when: not ansible_check_mode
+
+- name: Read the installed ORAS version
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_oras_install_path }}"
+      - version
+  register: vps_oras_version_output
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Prove the installed ORAS version
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_oras_version_output.stdout is
+        regex('(?m)^Version:\\s+' ~ (vps_oras_version | regex_escape) ~ '$')
+    fail_msg: "The installed ORAS version differs from the approved version."
+  when: not ansible_check_mode
 
 - name: Initialise the fixed public infrastructure mirror at the requested commit
   ansible.builtin.git:

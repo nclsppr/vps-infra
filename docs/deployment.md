@@ -416,10 +416,11 @@ publics voulus. Il exclut notamment :
 - `infos/` et toute source éditoriale interne ;
 - scripts de génération et fichiers temporaires.
 
-Avant publication, l’allowlist génère la liste des routes attendues. La CI sonde
-toutes les pages publiques : EN/FR, Work, CV, Blog et articles, Dashboard,
-Claude, archive, pages d’erreur, assets essentiels et redirections, dont
-`nicolas.pieper.fr`.
+Before publication, the allowlist generates one inventory entry for every
+regular file. The producer workflow does not start an HTTP server. The VPS
+materializer probes each resulting file route through temporary Caddy.
+Host-based redirects, including `nicolas.pieper.fr`, are not file routes. They
+remain part of the future public smoke gate.
 
 ### Papers Empire
 
@@ -430,7 +431,10 @@ Le workflow conserve sa vraie construction :
 3. assemblage de `site/` ;
 4. génération des pages `/en/`, `/de/` et `/lb/` ;
 5. cache-busting par SHA ;
-6. sondes sur `/`, les trois langues, `/dashboard/` et `/docs/`.
+6. route inventory generation for the complete assembled tree.
+
+The producer workflow does not perform an HTTP smoke. The VPS materializer
+provides the first Caddy HTTP proof for every inventory route.
 
 L’archive contient exactement le même `site/` que l’artefact Pages, pas la
 racine du dépôt. `papersempire.com` reste l’apex canonique ; aucune redirection
@@ -438,18 +442,28 @@ vers `www` ne doit changer l’origine de son `localStorage`.
 
 ### Activation
 
-Le serveur extrait sans privilège dans un nouveau répertoire nommé par digest,
-après avoir rejeté traversées, liens, devices et archives dépassant les bornes.
-Il teste la nouvelle racine avec un Caddy temporaire utilisant l’image plateforme
-exacte ; le Caddy principal servirait encore `current` et ne constitue donc pas
-un probe de préactivation. Il remplace ensuite atomiquement `current`. Les
-fichiers HTML conservent un cache court ; les assets non hashés ne reçoivent pas
-de cache immuable.
+Ansible installs ORAS 1.3.0 after two checksum checks. `deploy-static` pulls
+each public GHCR artifact by digest through an empty registry configuration.
+It does not use a build tool or an application checkout on the VPS.
 
-Si la sonde publique échoue après bascule, le script restaure le symlink
-précédent, marque le digest en quarantaine et le déploiement en échec. Le
-workflow ouvre ou exige alors un revert du manifeste ; aucune réconciliation ne
-retente le même digest avant une action explicite.
+The server validates both OCI manifests and all archive bytes before
+extraction. It extracts as `vps-static`, rejects traversal and special files,
+and then makes the release root-owned. The final directory name contains the
+site OCI manifest digest, not the source SHA or the archive layer digest.
+
+The pre-activation probe uses the exact platform Caddy image by digest. It
+serves the candidate directory directly, requests every inventory route, and
+compares each response checksum. The main Caddy would still serve `current`, so
+it cannot provide this proof. After a successful probe, the script replaces
+`current` atomically. HTML cache policy remains a Caddy route concern.
+
+The current materializer does not run a public TLS probe after activation. The
+future live applicator must restore the previous symlink and quarantine the
+digest if that public probe fails. No current reconciliation path can invoke
+the materializer because the production policy stays locked and
+`apply-release` is absent. A future workflow will require a manifest revert;
+no reconciliation may retry the same digest before an explicit operator
+action.
 
 ## Déployer une application Compose
 

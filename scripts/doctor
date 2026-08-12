@@ -94,7 +94,7 @@ else
   revision_file=/usr/local/share/vps-infra/controller-revision
 fi
 
-for executable in validate-release validate-compose check-public-safe reconcile plan-digests verify-state verify-github-evidence parse-forced-command forced-command deploy; do
+for executable in validate-release validate-compose check-public-safe reconcile plan-digests verify-state verify-github-evidence parse-forced-command forced-command deploy deploy-static; do
   if [[ -x $SCRIPT_DIR/$executable ]]; then
     pass "executable script: scripts/$executable"
   else
@@ -126,6 +126,18 @@ else
 fi
 
 if [[ $mode == production ]]; then
+  if [[ -x /usr/local/bin/oras ]] && \
+    /usr/local/bin/oras version 2>/dev/null | grep -Eq '^Version:[[:space:]]+1\.3\.0$'; then
+    oras_metadata=$(stat -c '%u %g %a' -- /usr/local/bin/oras 2>/dev/null || true)
+    if [[ $oras_metadata =~ ^0\ 0\ ([0-7]+)$ ]] && \
+      (( (8#${BASH_REMATCH[1]} & 8#022) == 0 )); then
+      pass "ORAS 1.3.0 is root-owned and protected"
+    else
+      fail "ORAS is writable by a non-root identity"
+    fi
+  else
+    fail "verified ORAS 1.3.0 is unavailable"
+  fi
   if [[ -d $state_dir ]]; then
     pass "controller state directory exists: $state_dir"
   else
