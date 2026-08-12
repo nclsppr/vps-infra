@@ -1,0 +1,18 @@
+[Unit]
+Description=VPS internal PostgreSQL and observability platform
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{ vps_internal_platform_runtime_dir }}
+ExecStartPre=/usr/bin/docker compose --project-directory {{ vps_internal_platform_runtime_dir }} --env-file {{ vps_internal_platform_runtime_dir }}/.env.example --file {{ vps_internal_platform_runtime_dir }}/compose.yaml config --quiet
+ExecStart=/usr/bin/docker compose --project-directory {{ vps_internal_platform_runtime_dir }} --env-file {{ vps_internal_platform_runtime_dir }}/.env.example --file {{ vps_internal_platform_runtime_dir }}/compose.yaml up --detach --wait --no-build --remove-orphans postgresql prometheus grafana node-exporter postgres-exporter
+ExecStop=/usr/bin/docker compose --project-directory {{ vps_internal_platform_runtime_dir }} --env-file {{ vps_internal_platform_runtime_dir }}/.env.example --file {{ vps_internal_platform_runtime_dir }}/compose.yaml stop --timeout 60 postgres-exporter node-exporter grafana prometheus postgresql
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

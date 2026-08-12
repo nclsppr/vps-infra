@@ -204,6 +204,13 @@ The internal platform remains necessary for the application stacks. Its later
 activation keeps Grafana on loopback and every database or metrics endpoint off
 the public host interfaces.
 
+Use `make start-internal-platform` to activate only PostgreSQL, Prometheus,
+Grafana, Node Exporter, and PostgreSQL Exporter from one immutable release.
+Use `make stop-internal-platform` to stop the same service set. The dedicated
+systemd unit never names Caddy. Both operations preserve named volumes and
+secrets. The start role refuses any unselected container in the shared Compose
+project before it can reconcile with `--remove-orphans`.
+
 ## Prepared Docker networks
 
 Ansible creates seven external Docker networks with fixed properties. The

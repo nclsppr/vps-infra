@@ -38,6 +38,14 @@ case $# in
         playbook=playbooks/public-static-edge.yml
         ansible_extra_options=(--extra-vars vps_public_static_edge_state=stopped)
         ;;
+      --start-internal-platform)
+        playbook=playbooks/internal-platform.yml
+        ansible_extra_options=(--extra-vars vps_internal_platform_state=started)
+        ;;
+      --stop-internal-platform)
+        playbook=playbooks/internal-platform.yml
+        ansible_extra_options=(--extra-vars vps_internal_platform_state=stopped)
+        ;;
       *)
         fail "unsupported deployment mode" "$EX_USAGE"
         ;;

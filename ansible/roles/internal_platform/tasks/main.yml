@@ -1,0 +1,632 @@
+---
+- name: Validate the bounded internal platform contract
+  ansible.builtin.assert:
+    that:
+      - vps_internal_platform_state in ['started', 'stopped']
+      - vps_internal_platform_project == 'vps-platform'
+      - vps_internal_platform_release_root == '/srv/vps/releases/internal-platform'
+      - vps_internal_platform_runtime_link == '/srv/vps/runtime/internal-platform'
+      - >-
+        vps_internal_platform_runtime_dir ==
+        '/srv/vps/runtime/internal-platform/platform'
+      - vps_internal_platform_unit == 'vps-internal-platform.service'
+      - >-
+        vps_internal_platform_services | sort ==
+        ['grafana', 'node-exporter', 'postgres-exporter', 'postgresql',
+         'prometheus']
+      - >-
+        vps_internal_platform_all_image_services | sort ==
+        ['caddy', 'grafana', 'node-exporter', 'postgres-exporter',
+         'postgresql', 'prometheus']
+      - >-
+        vps_internal_platform_network_contract ==
+        {'postgresql': ['db_monitoring'], 'prometheus': ['ops'],
+         'grafana': ['ops'], 'node-exporter': ['ops'],
+         'postgres-exporter': ['db_monitoring', 'ops']}
+      - >-
+        vps_internal_platform_protected_file_contract ==
+        [{'name': 'postgres-superuser-password', 'gid': 70},
+         {'name': 'postgres-exporter-password', 'gid': 70},
+         {'name': 'grafana-admin-password', 'gid': 472},
+         {'name': 'grafana-secret-key', 'gid': 472}]
+    fail_msg: The internal platform inputs differ from the reviewed contract.
+
+- name: Inspect the internal platform unit
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ vps_internal_platform_unit }}"
+    follow: false
+  register: vps_internal_platform_unit_file
+
+- name: Stop and prove only the bounded internal services are absent
+  when: vps_internal_platform_state == 'stopped'
+  block:
+    - name: Disable the internal platform unit when installed
+      ansible.builtin.systemd_service:
+        name: "{{ vps_internal_platform_unit }}"
+        enabled: false
+        daemon_reload: true
+      failed_when: false
+      when: vps_internal_platform_unit_file.stat.exists
+
+    - name: Stop the internal platform unit on a best-effort basis
+      ansible.builtin.systemd_service:
+        name: "{{ vps_internal_platform_unit }}"
+        state: stopped
+      failed_when: false
+      when: vps_internal_platform_unit_file.stat.exists
+
+    - name: Find each residual selected service container
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --all
+          - --quiet
+          - --filter
+          - label=com.docker.compose.project={{ vps_internal_platform_project }}
+          - --filter
+          - label=com.docker.compose.service={{ item }}
+      register: vps_internal_platform_residual_service_containers
+      changed_when: false
+      loop: "{{ vps_internal_platform_services }}"
+
+    - name: Stop each residual selected service container
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - stop
+          - --time
+          - "60"
+          - "{{ item.1 }}"
+      loop: >-
+        {{ query('subelements',
+                 vps_internal_platform_residual_service_containers.results,
+                 'stdout_lines') }}
+      changed_when: true
+      loop_control:
+        label: "{{ item.0.item }}"
+
+    - name: List running selected service containers after stop
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --quiet
+          - --filter
+          - label=com.docker.compose.project={{ vps_internal_platform_project }}
+          - --filter
+          - label=com.docker.compose.service={{ item }}
+      register: vps_internal_platform_running_after_stop
+      changed_when: false
+      loop: "{{ vps_internal_platform_services }}"
+
+    - name: Read internal platform unit enablement after stop
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-enabled
+          - "{{ vps_internal_platform_unit }}"
+      register: vps_internal_platform_enablement_after_stop
+      changed_when: false
+      failed_when: false
+      when: vps_internal_platform_unit_file.stat.exists
+
+    - name: Prove selected services are stopped without deleting state
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_internal_platform_running_after_stop.results |
+            map(attribute='stdout_lines') | map('length') | sum == 0
+          - >-
+            not vps_internal_platform_unit_file.stat.exists or
+            vps_internal_platform_enablement_after_stop.stdout != 'enabled'
+        fail_msg: A bounded internal service is still running after stop.
+
+- name: Stage, switch, and verify the bounded internal platform
+  when: vps_internal_platform_state == 'started'
+  block:
+    - name: Derive the immutable internal platform release paths
+      ansible.builtin.set_fact:
+        vps_internal_platform_release_dir: >-
+          {{ vps_internal_platform_release_root ~ '/' ~ vps_infra_revision }}
+        vps_internal_platform_staging_dir: >-
+          {{ vps_internal_platform_release_root ~ '/.' ~ vps_infra_revision ~
+             '.staging' }}
+        vps_internal_platform_switch_link: >-
+          {{ '/srv/vps/runtime/.internal-platform-' ~ vps_infra_revision }}
+
+    - name: Read converged Docker service state
+      ansible.builtin.service_facts:
+
+    - name: Require the converged Docker service
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.services['docker.service'].state == 'running'
+        fail_msg: Run host convergence before starting the internal platform.
+
+    - name: Inspect each required internal Docker network
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - network
+          - inspect
+          - "{{ item }}"
+      register: vps_internal_platform_network_inspections
+      changed_when: false
+      failed_when: false
+      loop:
+        - ops
+        - db_monitoring
+
+    - name: Require the managed internal Docker networks
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - ((item.stdout | from_json) | first).Name == item.item
+          - ((item.stdout | from_json) | first).Driver == 'bridge'
+          - >-
+            ((item.stdout | from_json) |
+             first).Labels['com.nclsppr.vps-infra.managed'] | default('') ==
+            'true'
+          - >-
+            item.item != 'ops' or
+            (not (((item.stdout | from_json) | first).Internal | bool) and
+             ((item.stdout | from_json) | first).IPAM.Config |
+             map(attribute='Subnet') | list == ['172.30.30.0/24'])
+          - >-
+            item.item != 'db_monitoring' or
+            (((item.stdout | from_json) | first).Internal | bool and
+             ((item.stdout | from_json) | first).IPAM.Config |
+             map(attribute='Subnet') | list == ['172.30.31.0/24'])
+        fail_msg: A required internal Docker network differs from the host contract.
+      loop: "{{ vps_internal_platform_network_inspections.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: List every shared-project container service before mutation
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --all
+          - --filter
+          - label=com.docker.compose.project={{ vps_internal_platform_project }}
+          - --format
+          - >-
+            {{ '{{' }}.Label "com.docker.compose.service"{{ '}}' }}
+      register: vps_internal_platform_preexisting_services
+      changed_when: false
+
+    - name: Refuse to remove an unselected shared-project container
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_internal_platform_preexisting_services.stdout_lines |
+            reject('equalto', '') | list | length ==
+            vps_internal_platform_preexisting_services.stdout_lines | length
+          - >-
+            vps_internal_platform_preexisting_services.stdout_lines |
+            difference(vps_internal_platform_services) | length == 0
+        fail_msg: >-
+          The vps-platform project owns Caddy or another unselected service.
+          Stop and migrate that service explicitly before the bounded internal
+          controller can run with --remove-orphans.
+
+    - name: Create protected internal platform release parents
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - path: "{{ vps_internal_platform_release_root }}"
+          mode: "0755"
+        - path: /srv/vps/runtime
+          mode: "0755"
+
+    - name: Create the controller executable parent
+      ansible.builtin.file:
+        path: /usr/local/libexec/vps
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the secret materialization helper
+      ansible.builtin.copy:
+        src: >-
+          {{ playbook_dir ~
+             '/../../scripts/materialize-internal-platform-secrets' }}
+        dest: /usr/local/libexec/vps/materialize-internal-platform-secrets
+        owner: root
+        group: root
+        mode: "0500"
+
+    - name: Materialize the four platform secrets without logging their values
+      ansible.builtin.command:
+        argv:
+          - /usr/local/libexec/vps/materialize-internal-platform-secrets
+      changed_when: false
+      no_log: true
+
+    - name: Inspect each materialized internal platform secret
+      ansible.builtin.stat:
+        path: "/etc/vps/secrets/platform/{{ item.name }}"
+        follow: false
+      register: vps_internal_platform_secret_stats
+      no_log: true
+      loop: "{{ vps_internal_platform_protected_file_contract }}"
+
+    - name: Prove the exact internal secret metadata
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - not item.stat.islnk
+          - item.stat.nlink == 1
+          - item.stat.uid == 0
+          - item.stat.gid == item.item.gid
+          - item.stat.mode == '0440'
+          - item.stat.size == 65
+        fail_msg: A materialized internal platform secret is outside its contract.
+        quiet: true
+      no_log: true
+      loop: "{{ vps_internal_platform_secret_stats.results }}"
+
+    - name: Inspect the immutable internal platform release
+      ansible.builtin.stat:
+        path: "{{ vps_internal_platform_release_dir }}"
+        follow: false
+      register: vps_internal_platform_release
+
+    - name: Refuse a non-directory immutable release path
+      ansible.builtin.assert:
+        that:
+          - >-
+            not vps_internal_platform_release.stat.exists or
+            (vps_internal_platform_release.stat.isdir and
+             not vps_internal_platform_release.stat.islnk)
+        fail_msg: The immutable internal platform release path is not a directory.
+
+    - name: Create a new immutable internal platform release tree
+      when: not vps_internal_platform_release.stat.exists
+      block:
+        - name: Remove an interrupted internal platform staging tree
+          ansible.builtin.file:
+            path: "{{ vps_internal_platform_staging_dir }}"
+            state: absent
+
+        - name: Create every internal platform staging directory
+          ansible.builtin.file:
+            path: "{{ vps_internal_platform_staging_dir }}/{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+          loop: "{{ [''] + vps_internal_platform_directories }}"
+
+        - name: Copy the exact internal platform runtime files
+          ansible.builtin.copy:
+            src: "{{ playbook_dir ~ '/../../' ~ item }}"
+            dest: "{{ vps_internal_platform_staging_dir }}/{{ item }}"
+            owner: root
+            group: root
+            mode: >-
+              {{ '0555' if item.endswith('.sh') else '0444' }}
+          loop: "{{ vps_internal_platform_files }}"
+
+        - name: Copy the Compose policy validator into the release
+          ansible.builtin.copy:
+            src: "{{ playbook_dir ~ '/../../scripts/validate-compose' }}"
+            dest: >-
+              {{ vps_internal_platform_staging_dir ~ '/' ~
+                 vps_internal_platform_validator_file }}
+            owner: root
+            group: root
+            mode: "0555"
+
+        - name: Record the exact internal platform source revision
+          ansible.builtin.copy:
+            content: "{{ vps_infra_revision }}\n"
+            dest: "{{ vps_internal_platform_staging_dir }}/source-revision"
+            owner: root
+            group: root
+            mode: "0444"
+
+        - name: Seal every internal platform release directory
+          ansible.builtin.file:
+            path: "{{ vps_internal_platform_staging_dir }}/{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0555"
+          loop: "{{ vps_internal_platform_directories | reverse | list + [''] }}"
+
+        - name: Atomically install the immutable internal platform release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/mv
+              - --no-target-directory
+              - "{{ vps_internal_platform_staging_dir }}"
+              - "{{ vps_internal_platform_release_dir }}"
+          changed_when: true
+
+    - name: Audit the immutable runtime files against this checkout
+      ansible.builtin.copy:
+        src: "{{ playbook_dir ~ '/../../' ~ item }}"
+        dest: "{{ vps_internal_platform_release_dir }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "{{ '0555' if item.endswith('.sh') else '0444' }}"
+      check_mode: true
+      register: vps_internal_platform_runtime_file_audit
+      loop: "{{ vps_internal_platform_files }}"
+
+    - name: Audit the immutable Compose validator against this checkout
+      ansible.builtin.copy:
+        src: "{{ playbook_dir ~ '/../../scripts/validate-compose' }}"
+        dest: >-
+          {{ vps_internal_platform_release_dir ~ '/' ~
+             vps_internal_platform_validator_file }}
+        owner: root
+        group: root
+        mode: "0555"
+      check_mode: true
+      register: vps_internal_platform_validator_audit
+
+    - name: Read immutable internal release provenance
+      ansible.builtin.slurp:
+        src: "{{ vps_internal_platform_release_dir }}/source-revision"
+      register: vps_internal_platform_provenance
+
+    - name: Enumerate all immutable internal release entries
+      ansible.builtin.find:
+        paths: "{{ vps_internal_platform_release_dir }}"
+        recurse: true
+        hidden: true
+        file_type: any
+      register: vps_internal_platform_release_entries
+
+    - name: Derive the expected immutable internal release entries
+      ansible.builtin.set_fact:
+        vps_internal_platform_expected_release_entries: >-
+          {{ (vps_internal_platform_directories +
+              vps_internal_platform_files +
+              [vps_internal_platform_validator_file, 'source-revision']) |
+             sort }}
+        vps_internal_platform_observed_release_entries: >-
+          {{ vps_internal_platform_release_entries.files |
+             map(attribute='path') |
+             map('regex_replace',
+                 '^' ~ vps_internal_platform_release_dir ~ '/', '') |
+             list | sort }}
+
+    - name: Prove the immutable internal release matches this checkout
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_internal_platform_runtime_file_audit.results |
+            selectattr('changed', 'equalto', true) | list | length == 0
+          - not vps_internal_platform_validator_audit.changed
+          - >-
+            (vps_internal_platform_provenance.content | b64decode | trim) ==
+            vps_infra_revision
+          - >-
+            vps_internal_platform_observed_release_entries ==
+            vps_internal_platform_expected_release_entries
+          - >-
+            vps_internal_platform_release_entries.files |
+            selectattr('islnk', 'equalto', true) | list | length == 0
+        fail_msg: The immutable internal platform release differs from this checkout.
+
+    - name: Read the staged internal platform image contract
+      ansible.builtin.slurp:
+        src: >-
+          {{ vps_internal_platform_release_dir ~ '/' ~
+             vps_internal_platform_expected_images_file }}
+      register: vps_internal_platform_staged_image_contract
+
+    - name: Parse the staged internal platform image contract
+      ansible.builtin.set_fact:
+        vps_internal_platform_expected_images: >-
+          {{ vps_internal_platform_staged_image_contract.content |
+             b64decode | from_json }}
+
+    - name: Prove the staged image contract is complete and immutable
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_internal_platform_expected_images.keys() | list | sort ==
+            vps_internal_platform_all_image_services | sort
+          - >-
+            vps_internal_platform_expected_images.values() |
+            select('match',
+              '^[a-z0-9./_-]+:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$') |
+            list | length == vps_internal_platform_all_image_services | length
+        fail_msg: The staged expected-image contract is incomplete or mutable.
+
+    - name: Render normalized internal platform Compose JSON
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - compose
+          - --project-directory
+          - "{{ vps_internal_platform_release_dir }}/platform"
+          - --env-file
+          - "{{ vps_internal_platform_release_dir }}/platform/.env.example"
+          - --file
+          - "{{ vps_internal_platform_release_dir }}/platform/compose.yaml"
+          - config
+          - --format
+          - json
+          - --output
+          - /run/vps-internal-platform-compose.json
+      changed_when: false
+
+    - name: Bind rendered Compose to the exact image contract
+      ansible.builtin.command:
+        argv:
+          - >-
+            {{ vps_internal_platform_release_dir ~ '/' ~
+               vps_internal_platform_validator_file }}
+          - --expected-images
+          - >-
+            {{ vps_internal_platform_release_dir ~ '/' ~
+               vps_internal_platform_expected_images_file }}
+          - --repository-root
+          - "{{ vps_internal_platform_release_dir }}"
+          - "{{ vps_internal_platform_project }}"
+          - /run/vps-internal-platform-compose.json
+      changed_when: false
+
+    - name: Remove the transient rendered Compose document
+      ansible.builtin.file:
+        path: /run/vps-internal-platform-compose.json
+        state: absent
+
+    - name: Pull exactly the five selected internal service images
+      ansible.builtin.command:
+        argv: >-
+          {{ ['/usr/bin/docker', 'compose', '--project-directory',
+              vps_internal_platform_release_dir ~ '/platform', '--env-file',
+              vps_internal_platform_release_dir ~ '/platform/.env.example',
+              '--file',
+              vps_internal_platform_release_dir ~ '/platform/compose.yaml',
+              'pull', '--policy', 'always'] +
+             vps_internal_platform_services }}
+      changed_when: true
+
+    - name: Inspect each pulled internal service image
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - image
+          - inspect
+          - "{{ vps_internal_platform_expected_images[item] }}"
+      register: vps_internal_platform_image_inspections
+      changed_when: false
+      loop: "{{ vps_internal_platform_services }}"
+
+    - name: Prove each selected image has the exact registry digest
+      ansible.builtin.assert:
+        that:
+          - (item.stdout | from_json) | length == 1
+          - >-
+            (vps_internal_platform_expected_images[item.item] |
+             regex_replace(':[^/@]+@sha256:', '@sha256:') |
+             regex_replace('^docker\\.io/', '')) in
+            ((item.stdout | from_json) | first).RepoDigests
+        fail_msg: Docker did not materialize an exact reviewed service digest.
+      loop: "{{ vps_internal_platform_image_inspections.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Install the bounded internal platform systemd unit
+      ansible.builtin.template:
+        src: vps-internal-platform.service.j2
+        dest: "/etc/systemd/system/{{ vps_internal_platform_unit }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Inspect the active internal platform release link
+      ansible.builtin.stat:
+        path: "{{ vps_internal_platform_runtime_link }}"
+        follow: false
+      register: vps_internal_platform_runtime_link_state
+
+    - name: Require the active internal release path to be absent or a symlink
+      ansible.builtin.assert:
+        that:
+          - >-
+            not vps_internal_platform_runtime_link_state.stat.exists or
+            vps_internal_platform_runtime_link_state.stat.islnk
+        fail_msg: The internal platform runtime path is not an atomic release link.
+
+    - name: Remember the previous active internal platform release
+      ansible.builtin.set_fact:
+        vps_internal_platform_previous_release: >-
+          {{ vps_internal_platform_runtime_link_state.stat.lnk_source |
+             default('') }}
+
+    - name: Switch and reconcile the bounded internal platform
+      block:
+        - name: Create the next internal platform release link
+          ansible.builtin.file:
+            src: "{{ vps_internal_platform_release_dir }}"
+            dest: "{{ vps_internal_platform_switch_link }}"
+            state: link
+            owner: root
+            group: root
+            force: true
+
+        - name: Atomically activate the staged internal platform release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/mv
+              - --force
+              - --no-target-directory
+              - "{{ vps_internal_platform_switch_link }}"
+              - "{{ vps_internal_platform_runtime_link }}"
+          changed_when: true
+
+        - name: Reconcile exactly the five internal services
+          ansible.builtin.systemd_service:
+            name: "{{ vps_internal_platform_unit }}"
+            enabled: true
+            state: restarted
+            daemon_reload: true
+
+        - name: Verify the switched internal platform boundaries
+          ansible.builtin.include_tasks: verify-runtime.yml
+
+      rescue:
+        - name: Create the previous internal release link for rollback
+          ansible.builtin.file:
+            src: "{{ vps_internal_platform_previous_release }}"
+            dest: "{{ vps_internal_platform_switch_link }}"
+            state: link
+            owner: root
+            group: root
+            force: true
+          when: vps_internal_platform_previous_release | length > 0
+
+        - name: Atomically restore the previous internal platform release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/mv
+              - --force
+              - --no-target-directory
+              - "{{ vps_internal_platform_switch_link }}"
+              - "{{ vps_internal_platform_runtime_link }}"
+          changed_when: true
+          when: vps_internal_platform_previous_release | length > 0
+
+        - name: Reconcile the restored bounded internal platform
+          ansible.builtin.systemd_service:
+            name: "{{ vps_internal_platform_unit }}"
+            enabled: true
+            state: restarted
+            daemon_reload: true
+          when: vps_internal_platform_previous_release | length > 0
+
+        - name: Stop a first failed internal platform activation
+          ansible.builtin.systemd_service:
+            name: "{{ vps_internal_platform_unit }}"
+            enabled: false
+            state: stopped
+            daemon_reload: true
+          when: vps_internal_platform_previous_release | length == 0
+
+        - name: Remove the failed first active internal release link
+          ansible.builtin.file:
+            path: "{{ vps_internal_platform_runtime_link }}"
+            state: absent
+          when: vps_internal_platform_previous_release | length == 0
+
+        - name: Refuse the failed internal platform reconciliation
+          ansible.builtin.fail:
+            msg: >-
+              Internal platform reconciliation failed and the previous release
+              was restored when one existed. Named data volumes were preserved.

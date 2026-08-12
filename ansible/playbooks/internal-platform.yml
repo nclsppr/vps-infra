@@ -1,0 +1,39 @@
+---
+- name: Reconcile the bounded internal platform
+  hosts: vps
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+
+  pre_tasks:
+    - name: Prove the administrator and host boundary
+      ansible.builtin.assert:
+        that:
+          - (ansible_user | default('')) == vps_admin_user
+          - (ansible_user | default('')) not in ['root', vps_deploy_user]
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version in vps_supported_ubuntu_releases
+          - ansible_port | int == vps_ssh_port | int
+          - vps_ssh_port | int == 22
+          - vps_admin_authorized_keys | length > 0
+          - vps_infra_revision is match('^[0-9a-f]{40}$')
+          - vps_internal_platform_state in ['started', 'stopped']
+        fail_msg: >-
+          The internal platform requires the converged Atlas administrator
+          boundary and one exact infrastructure revision.
+
+    - name: Confirm the current connection is still responsive
+      ansible.builtin.wait_for_connection:
+        timeout: 20
+
+  roles:
+    - role: internal_platform
+
+  post_tasks:
+    - name: Report the bounded internal platform state
+      ansible.builtin.debug:
+        msg: >-
+          Internal platform state is {{ vps_internal_platform_state }}.
+          Caddy, the public static edge, DNS, Surplasse, and Parkventory were
+          not started, stopped, or changed.

@@ -16,14 +16,20 @@ Les fichiers déchiffrés seront matérialisés sous
 | `ovh-application-key` | `root:root 0400` |
 | `ovh-application-secret` | `root:root 0400` |
 | `ovh-consumer-key` | `root:root 0400` |
-| `postgres-superuser-password` | `root:root 0400` |
-| `postgres-exporter-password` | `root:999 0440` |
-| `grafana-admin-password` | `472:472 0400` |
-| `grafana-secret-key` | `472:472 0400` |
+| `postgres-superuser-password` | `root:70 0440` |
+| `postgres-exporter-password` | `root:70 0440` |
+| `grafana-admin-password` | `root:472 0440` |
+| `grafana-secret-key` | `root:472 0440` |
 
-Le parent `/etc/vps/secrets/platform` reste `root:root 0700`. Le groupe `999`
-du mot de passe exporteur permet sa lecture par l’init PostgreSQL (`999:999`)
-et par PostgreSQL Exporter (`65534:999`) sans rendre le fichier public.
+Le parent `/etc/vps/secrets/platform` reste `root:root 0700`. Le groupe `70`
+permet la lecture des deux mots de passe par PostgreSQL (`70:70`) et du seul
+mot de passe exporteur par PostgreSQL Exporter (`65534:70`). Le groupe `472`
+permet à Grafana (`472:472`) de lire ses deux fichiers sans les rendre publics.
+
+Le contrôleur interne crée ces quatre valeurs une seule fois. Il refuse les
+liens symboliques, les liens physiques supplémentaires, un format divergent ou
+des permissions existantes différentes. Il ne remplace jamais une valeur déjà
+valide et ne l'écrit pas dans les sorties Ansible.
 
 ## Règles
 

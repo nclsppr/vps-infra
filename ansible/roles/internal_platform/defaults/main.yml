@@ -1,0 +1,84 @@
+---
+vps_internal_platform_state: started
+vps_internal_platform_project: vps-platform
+vps_internal_platform_release_root: /srv/vps/releases/internal-platform
+vps_internal_platform_runtime_link: /srv/vps/runtime/internal-platform
+vps_internal_platform_runtime_dir: /srv/vps/runtime/internal-platform/platform
+vps_internal_platform_unit: vps-internal-platform.service
+vps_internal_platform_compose_file: platform/compose.yaml
+vps_internal_platform_env_file: platform/.env.example
+vps_internal_platform_expected_images_file: platform/expected-images.json
+vps_internal_platform_validator_file: validate-compose
+vps_internal_platform_secret_helper_file: materialize-internal-platform-secrets
+vps_internal_platform_services:
+  - postgresql
+  - prometheus
+  - grafana
+  - node-exporter
+  - postgres-exporter
+vps_internal_platform_all_image_services:
+  - caddy
+  - postgresql
+  - prometheus
+  - grafana
+  - node-exporter
+  - postgres-exporter
+vps_internal_platform_network_contract:
+  postgresql:
+    - db_monitoring
+  prometheus:
+    - ops
+  grafana:
+    - ops
+  node-exporter:
+    - ops
+  postgres-exporter:
+    - db_monitoring
+    - ops
+vps_internal_platform_files:
+  - platform/.env.example
+  - platform/compose.yaml
+  - platform/expected-images.json
+  - platform/caddy/Caddyfile
+  - platform/caddy/routes/papersempire.caddy.disabled
+  - platform/caddy/routes/parkventory.caddy.disabled
+  - platform/caddy/routes/personal.caddy.disabled
+  - platform/caddy/routes/surplasse.caddy.disabled
+  - platform/observability/grafana/dashboards/platform/overview.json
+  - platform/observability/grafana/provisioning/dashboards/dashboards.yml
+  - platform/observability/grafana/provisioning/datasources/prometheus.yml
+  - platform/observability/prometheus/prometheus.yml
+  - platform/observability/prometheus/rules/platform.yml
+  - platform/observability/prometheus/rules/surplasse.yml.disabled
+  - platform/observability/prometheus/targets/caddy.yml
+  - platform/observability/prometheus/targets/node-exporter.yml
+  - platform/observability/prometheus/targets/postgres-exporter.yml
+  - platform/observability/prometheus/targets/surplasse.yml.disabled
+  - platform/postgres/initdb/10-platform-exporter.sh
+  - platform/postgres/pg_hba.conf
+  - platform/postgres/postgresql.conf
+vps_internal_platform_directories:
+  - platform
+  - platform/caddy
+  - platform/caddy/routes
+  - platform/observability
+  - platform/observability/grafana
+  - platform/observability/grafana/dashboards
+  - platform/observability/grafana/dashboards/platform
+  - platform/observability/grafana/provisioning
+  - platform/observability/grafana/provisioning/dashboards
+  - platform/observability/grafana/provisioning/datasources
+  - platform/observability/prometheus
+  - platform/observability/prometheus/rules
+  - platform/observability/prometheus/targets
+  - platform/postgres
+  - platform/postgres/initdb
+vps_internal_platform_protected_file_contract:
+  - name: postgres-superuser-password
+    gid: 70
+  - name: postgres-exporter-password
+    gid: 70
+  - name: grafana-admin-password
+    gid: 472
+  - name: grafana-secret-key
+    gid: 472

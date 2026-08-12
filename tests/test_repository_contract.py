@@ -10,6 +10,7 @@ import re
 import shutil
 import shlex
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -955,6 +956,201 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn(" stop --timeout 30 caddy", unit)
         self.assertNotIn("--volumes", unit)
 
+    def test_internal_platform_controller_is_bounded_and_reversible(self) -> None:
+        playbook = yaml.safe_load(
+            (ROOT / "ansible/playbooks/internal-platform.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            [entry["role"] for entry in playbook[0]["roles"]],
+            ["internal_platform"],
+        )
+        defaults = yaml.safe_load(
+            (
+                ROOT / "ansible/roles/internal_platform/defaults/main.yml"
+            ).read_text(encoding="utf-8")
+        )
+        selected_services = {
+            "postgresql",
+            "prometheus",
+            "grafana",
+            "node-exporter",
+            "postgres-exporter",
+        }
+        self.assertEqual(
+            set(defaults["vps_internal_platform_services"]),
+            selected_services,
+        )
+        self.assertNotIn("caddy", defaults["vps_internal_platform_services"])
+        self.assertEqual(
+            defaults["vps_internal_platform_runtime_dir"],
+            "/srv/vps/runtime/internal-platform/platform",
+        )
+
+        role = (
+            ROOT / "ansible/roles/internal_platform/tasks/main.yml"
+        ).read_text(encoding="utf-8")
+        unit = (
+            ROOT
+            / "ansible/roles/internal_platform/templates/vps-internal-platform.service.j2"
+        ).read_text(encoding="utf-8")
+        runtime = (
+            ROOT / "ansible/roles/internal_platform/tasks/verify-runtime.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Refuse to remove an unselected shared-project container", role)
+        self.assertIn("difference(vps_internal_platform_services)", role)
+        orphan_guard = role.index(
+            "Refuse to remove an unselected shared-project container"
+        )
+        systemd_restart = role.index("Reconcile exactly the five internal services")
+        self.assertLess(orphan_guard, systemd_restart)
+        self.assertIn("Pull exactly the five selected internal service images", role)
+        self.assertIn("Atomically install the immutable internal platform release", role)
+        self.assertIn("Atomically activate the staged internal platform release", role)
+        self.assertIn("Atomically restore the previous internal platform release", role)
+        self.assertIn("Named data volumes were preserved", role)
+        self.assertNotIn("docker compose down", role)
+        self.assertNotIn("--volumes", role)
+        self.assertNotIn("prune", role)
+        self.assertNotIn(" OVH_", role)
+        self.assertNotIn("production-enabled", role)
+        self.assertEqual(
+            defaults["vps_internal_platform_expected_images_file"],
+            "platform/expected-images.json",
+        )
+        self.assertIn("--expected-images", role)
+        self.assertIn("regex_replace('^docker\\\\.io/', '')", role)
+        self.assertNotIn(" caddy", unit)
+        self.assertNotIn("caddy ", unit)
+        self.assertIn("--remove-orphans", unit)
+        for service in selected_services:
+            self.assertIn(service, unit)
+        self.assertNotIn(" down ", unit)
+        self.assertNotIn("--volumes", unit)
+        self.assertIn("127\\\\.0\\\\.0\\\\.1:3000", runtime)
+        self.assertIn("pg_up 1", runtime)
+        self.assertIn("node_uname_info", runtime)
+        self.assertIn("labels.job', 'equalto', 'caddy'", runtime)
+        self.assertIn("RepoDigests", runtime)
+        self.assertIn("regex_replace('^docker\\\\.io/', '')", runtime)
+
+        materializer_helper = ROOT / "scripts/materialize-internal-platform-secrets"
+        helper_text = materializer_helper.read_text(encoding="utf-8")
+        self.assertTrue(os.access(materializer_helper, os.X_OK))
+        self.assertIn("os.O_EXCL", helper_text)
+        self.assertIn("os.O_NOFOLLOW", helper_text)
+        self.assertIn("validate_secret(descriptor, spec, owner)", helper_text)
+        self.assertIn('SecretSpec("postgres-superuser-password", 70)', helper_text)
+        self.assertIn('SecretSpec("grafana-secret-key", 472)', helper_text)
+
+    def test_internal_platform_secret_materialization_is_idempotent(self) -> None:
+        helper = ROOT / "scripts/materialize-internal-platform-secrets"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "secrets"
+            root.mkdir(mode=0o700)
+            environment = os.environ.copy()
+            environment["VPS_INTERNAL_SECRET_TESTING"] = "1"
+            first = subprocess.run(
+                [str(helper), "--test-root", str(root)],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            expected_names = {
+                "postgres-superuser-password",
+                "postgres-exporter-password",
+                "grafana-admin-password",
+                "grafana-secret-key",
+            }
+            self.assertEqual({path.name for path in root.iterdir()}, expected_names)
+            before = {
+                path.name: (path.read_bytes(), path.stat().st_ino)
+                for path in root.iterdir()
+            }
+            for path in root.iterdir():
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o440)
+                self.assertEqual(path.stat().st_nlink, 1)
+                self.assertRegex(path.read_bytes(), rb"[A-Za-z0-9_-]{64}\n")
+
+            second = subprocess.run(
+                [str(helper), "--test-root", str(root)],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            after = {
+                path.name: (path.read_bytes(), path.stat().st_ino)
+                for path in root.iterdir()
+            }
+            self.assertEqual(before, after)
+
+            victim = root / "grafana-secret-key"
+            victim.unlink()
+            outside = Path(temporary_directory) / "outside"
+            outside.write_text("unchanged\n", encoding="utf-8")
+            victim.symlink_to(outside)
+            refused = subprocess.run(
+                [str(helper), "--test-root", str(root)],
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "unchanged\n")
+
+    def test_internal_secret_materialization_rejects_invalid_existing_files(self) -> None:
+        helper = ROOT / "scripts/materialize-internal-platform-secrets"
+        environment = os.environ.copy()
+        environment["VPS_INTERNAL_SECRET_TESTING"] = "1"
+        invalid_cases = {
+            "hardlink": None,
+            "empty": b"",
+            "wrong-mode": b"A" * 64 + b"\n",
+            "wrong-format": b"!" * 64 + b"\n",
+            "too-long": b"A" * 65 + b"\n",
+        }
+        for case_name, content in invalid_cases.items():
+            with self.subTest(case_name=case_name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "secrets"
+                root.mkdir(mode=0o700)
+                valid = subprocess.run(
+                    [str(helper), "--test-root", str(root)],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(valid.returncode, 0, valid.stderr)
+                control = root / "postgres-superuser-password"
+                control_before = control.read_bytes()
+                victim = root / "grafana-secret-key"
+                victim.unlink()
+                if case_name == "hardlink":
+                    source = Path(temporary) / "hardlink-source"
+                    source.write_bytes(b"A" * 64 + b"\n")
+                    source.chmod(0o440)
+                    os.link(source, victim)
+                else:
+                    assert content is not None
+                    victim.write_bytes(content)
+                    victim.chmod(0o400 if case_name == "wrong-mode" else 0o440)
+
+                refused = subprocess.run(
+                    [str(helper), "--test-root", str(root)],
+                    env=environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertEqual(control.read_bytes(), control_before)
+
     def test_public_static_edge_network_is_a_managed_host_boundary(self) -> None:
         variables = yaml.safe_load(
             (ROOT / "ansible/inventories/production/group_vars/all.yml").read_text(
@@ -1843,6 +2039,29 @@ fi
                     rf"(?m)^arguments=.*vps_infra_revision={remote_sha} "
                     rf"--extra-vars vps_public_static_edge_state={state} "
                     r"playbooks/public-static-edge\.yml$",
+                )
+
+            for mode, state in (
+                ("--start-internal-platform", "started"),
+                ("--stop-internal-platform", "stopped"),
+            ):
+                log.unlink()
+                internal_result = subprocess.run(
+                    [converge, mode],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(internal_result.returncode, 0, internal_result.stderr)
+                internal_execution = log.read_text(encoding="utf-8")
+                self.assertRegex(
+                    internal_execution,
+                    rf"(?m)^arguments=.*vps_infra_revision={remote_sha} "
+                    rf"--extra-vars vps_internal_platform_state={state} "
+                    r"playbooks/internal-platform\.yml$",
                 )
 
             log.unlink()
