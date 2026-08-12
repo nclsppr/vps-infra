@@ -1,0 +1,25 @@
+[Unit]
+Description=Surplasse application services
+Wants=network-online.target vps-public-static-edge.service
+After=network-online.target docker.service vps-internal-platform.service vps-public-static-edge.service
+Requires=docker.service vps-internal-platform.service
+BindsTo=docker.service
+PartOf=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+KillMode=control-group
+WorkingDirectory=/srv/vps/runtime/surplasse/applications/surplasse
+ExecStart=/srv/vps/runtime/surplasse/scripts/activate-surplasse-runtime --start-application
+ExecStopPost=/usr/local/libexec/vps/activate-surplasse-runtime --stop-application
+Restart=on-failure
+RestartSec=10
+WatchdogSec=30
+TimeoutStartSec=600
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target docker.service

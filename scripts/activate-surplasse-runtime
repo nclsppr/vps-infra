@@ -1,0 +1,2192 @@
+#!/usr/bin/env python3
+"""Activate one prepared Surplasse release as a fail-closed transaction."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import socket
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, ContextManager, Protocol, Sequence
+
+EX_CONFIG = 78
+SHA40 = re.compile(r"[0-9a-f]{40}")
+CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}")
+OPERATOR_MANIFEST = "surplasse-operator-bundle-manifest.json"
+OPERATOR_LOCK = ".surplasse-operator-bundle.lock"
+OPERATOR_CONTRACT = "surplasse-operator-bundle"
+ACTIVATION_LOCK = "surplasse-activation.lock"
+ACTIVATION_STATE = "surplasse-activation.json"
+ACTIVATION_STATE_CONTRACT = "surplasse-activation"
+ACTIVATION_AUTHORIZATION_ENV = "VPS_SURPLASSE_ACTIVATION_TOKEN"
+ACTIVATION_AUTHORIZATION_RE = re.compile(r"[0-9a-f]{64}")
+ACTIVATION_LEASE_ROOT = Path("/run/vps-surplasse-activation")
+ACTIVATION_IMPLEMENTATION_BLOCKERS = (
+    "activation-controller-implementation",
+    "application-release-evidence",
+    "integration-artifact-materialization",
+    "platform-runtime-provenance",
+    "runtime-crash-safety",
+)
+RUNTIME_SERVICES = ("backend", "commande", "dashboard", "docs", "onboarding")
+OPERATOR_FILES = (
+    "ovh-application-key",
+    "ovh-application-secret",
+    "ovh-consumer-key",
+    "surplasse-jwt-jwks",
+    "surplasse-jwt-key-id",
+    "surplasse-jwt-private-key",
+    "surplasse-smtp-host",
+    "surplasse-smtp-password",
+    "surplasse-smtp-port",
+    "surplasse-smtp-username",
+    "surplasse-stripe-account-webhook-secret",
+    "surplasse-stripe-payment-webhook-secret",
+    "surplasse-stripe-secret-key",
+)
+GENERATED_FILES = (
+    "surplasse-postgres-migrator-password",
+    "surplasse-postgres-runtime-password",
+)
+REQUIRED_EVIDENCE_GATES = frozenset(
+    {
+        "activation-controller-implementation",
+        "application-release-evidence",
+        "domain-and-dns",
+        "integration-artifact-materialization",
+        "ovh-zone-scoped-dns-credentials",
+        "platform-extraction",
+        "platform-runtime-provenance",
+        "postgres-compatibility",
+        "postgres-role-provisioning",
+        "production-digests",
+        "protected-main",
+        "public-smoke",
+        "restore-proof",
+        "runtime-crash-safety",
+        "separated-migrations",
+        "stripe-connect-production-adapter",
+        "vps-integration-bundle",
+    }
+)
+
+
+class ActivationError(RuntimeError):
+    """Raised when activation or its rollback cannot satisfy the contract."""
+
+
+class Backend(Protocol):
+    def activation_lock(self) -> ContextManager[None]: ...
+
+    def recover_interrupted_activation(self) -> None: ...
+
+    def preflight(self) -> None: ...
+
+    def bundle_lock(self) -> ContextManager[None]: ...
+
+    def revalidate_bundle(self) -> None: ...
+
+    def prove_restore(self) -> None: ...
+
+    def quiesce_supervision(self) -> None: ...
+
+    def write_runtime_environment(self) -> None: ...
+
+    def switch_runtime_link(self) -> None: ...
+
+    def attach_postgresql(self) -> None: ...
+
+    def migrate(self) -> None: ...
+
+    def start_runtime_services(self) -> None: ...
+
+    def attach_observability_and_edge(self) -> None: ...
+
+    def arm_supervision(self) -> None: ...
+
+    def verify_activation(self) -> None: ...
+
+    def adopt_supervision(self) -> None: ...
+
+    def rollback(self) -> None: ...
+
+
+def activate(backend: Backend) -> None:
+    """Run the reviewed order and roll back every reversible mutation."""
+
+    with backend.activation_lock():
+        backend.recover_interrupted_activation()
+        backend.preflight()
+        with backend.bundle_lock():
+            backend.revalidate_bundle()
+            backend.prove_restore()
+            try:
+                backend.quiesce_supervision()
+                backend.write_runtime_environment()
+                backend.switch_runtime_link()
+                backend.attach_postgresql()
+                backend.migrate()
+                backend.start_runtime_services()
+                backend.attach_observability_and_edge()
+                backend.arm_supervision()
+            except Exception as operation_error:
+                try:
+                    backend.rollback()
+                except Exception as rollback_error:
+                    raise ActivationError(
+                        f"activation failed: {operation_error}; rollback also failed: "
+                        f"{rollback_error}"
+                    ) from operation_error
+                raise ActivationError(
+                    "activation failed and reversible state was restored: "
+                    f"{operation_error}"
+                ) from operation_error
+        try:
+            backend.adopt_supervision()
+        except Exception as operation_error:
+            try:
+                backend.rollback()
+            except Exception as rollback_error:
+                raise ActivationError(
+                    f"supervision adoption failed: {operation_error}; "
+                    "rollback also failed: "
+                    f"{rollback_error}"
+                ) from operation_error
+            raise ActivationError(
+                "supervision adoption failed and reversible state was restored: "
+                f"{operation_error}"
+            ) from operation_error
+
+
+def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, member in pairs:
+        if key in value:
+            raise ActivationError(f"duplicate JSON key {key!r}")
+        value[key] = member
+    return value
+
+
+def load_json(path: Path, subject: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=strict_object,
+            parse_constant=lambda member: (_ for _ in ()).throw(
+                ActivationError(f"invalid JSON constant {member!r}")
+            ),
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ActivationError(f"{subject} is not strict UTF-8 JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ActivationError(f"{subject} must be an object")
+    return value
+
+
+def validate_activation_metadata(release_root: Path) -> None:
+    """Require future reviewed release, Stripe, restore, and DNS evidence."""
+
+    adapter = load_json(
+        release_root / "applications/surplasse/adapter.json", "Surplasse adapter"
+    )
+    release = load_json(release_root / "releases/production.yaml", "production release")
+    applications = release.get("applications")
+    application = (
+        applications.get("surplasse") if isinstance(applications, dict) else None
+    )
+    if adapter.get("activation_policy") != "ready" or adapter.get("blocked_by") != []:
+        raise ActivationError("the reviewed Surplasse adapter is not ready")
+    if release.get("activation_policy") != "ready":
+        raise ActivationError("the production release activation policy is not ready")
+    if not isinstance(application, dict) or application.get("enabled") is not True:
+        raise ActivationError("the production release does not enable Surplasse")
+    if application.get("blocked_by") != []:
+        raise ActivationError("the production release retains Surplasse blockers")
+    migrations = application.get("migrations")
+    if migrations != {
+        **(migrations if isinstance(migrations, dict) else {}),
+        "strategy": "dedicated",
+        "runtime_auto_migrate": False,
+        "proven": True,
+    }:
+        raise ActivationError("the production release lacks dedicated migration proof")
+    evidence = application.get("readiness_evidence")
+    if not isinstance(evidence, dict) or not REQUIRED_EVIDENCE_GATES.issubset(evidence):
+        missing = sorted(
+            REQUIRED_EVIDENCE_GATES
+            - (set(evidence) if isinstance(evidence, dict) else set())
+        )
+        raise ActivationError(
+            "the production release lacks required evidence gates: "
+            + ", ".join(missing)
+        )
+    adapter_migration = adapter.get("migration")
+    if (
+        not isinstance(adapter_migration, dict)
+        or adapter_migration.get("published_in_backend_image") is not True
+    ):
+        raise ActivationError("the adapter lacks the verified migration entrypoint")
+
+
+@dataclass(frozen=True)
+class RuntimePaths:
+    revision: str
+    release_root: Path
+    runtime_link: Path
+    secret_root_path: Path
+    systemd_root: Path
+    runtime_environment: Path
+    internal_platform: Path
+    public_edge: Path
+    controller_state_root: Path
+
+    @classmethod
+    def production(cls, revision: str) -> RuntimePaths:
+        return cls(
+            revision=revision,
+            release_root=Path("/srv/vps/releases/surplasse") / revision,
+            runtime_link=Path("/srv/vps/runtime/surplasse"),
+            secret_root_path=Path("/etc/vps/secrets/surplasse"),
+            systemd_root=Path("/etc/systemd/system"),
+            runtime_environment=Path("/etc/vps/runtime/surplasse.env"),
+            internal_platform=Path("/srv/vps/runtime/internal-platform/platform"),
+            public_edge=Path("/srv/vps/runtime/public-static-edge"),
+            controller_state_root=Path("/var/lib/vps-controller"),
+        )
+
+    @classmethod
+    def active(cls) -> RuntimePaths:
+        runtime_link = Path("/srv/vps/runtime/surplasse")
+        try:
+            metadata = runtime_link.lstat()
+            target = runtime_link.resolve(strict=True)
+        except OSError as exc:
+            raise ActivationError(
+                "the active Surplasse release is unavailable"
+            ) from exc
+        if not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0:
+            raise ActivationError("the active Surplasse release link is unsafe")
+        release_root = Path("/srv/vps/releases/surplasse")
+        try:
+            revision = target.relative_to(release_root).as_posix()
+        except ValueError as exc:
+            raise ActivationError(
+                "the active Surplasse release escapes its root"
+            ) from exc
+        if SHA40.fullmatch(revision) is None or target != release_root / revision:
+            raise ActivationError("the active Surplasse release target is invalid")
+        return cls.production(revision)
+
+    @property
+    def application(self) -> Path:
+        return self.release_root / "applications/surplasse"
+
+    @property
+    def integration(self) -> Path:
+        return self.release_root / "integration"
+
+    @property
+    def internal_dropin(self) -> Path:
+        return (
+            self.systemd_root / "vps-internal-platform.service.d" / "50-surplasse.conf"
+        )
+
+    @property
+    def edge_dropin(self) -> Path:
+        return (
+            self.systemd_root / "vps-public-static-edge.service.d" / "50-surplasse.conf"
+        )
+
+    @property
+    def application_unit(self) -> Path:
+        return self.systemd_root / "vps-surplasse.service"
+
+    @property
+    def activation_lock(self) -> Path:
+        return self.controller_state_root / ACTIVATION_LOCK
+
+    @property
+    def activation_state(self) -> Path:
+        return self.controller_state_root / ACTIVATION_STATE
+
+
+class Runner:
+    def __init__(self) -> None:
+        self.environment = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LC_ALL": "C.UTF-8",
+        }
+
+    def run(
+        self,
+        arguments: Sequence[str],
+        label: str,
+        *,
+        capture: bool = False,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            list(arguments),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=600,
+            env=self.environment,
+        )
+        if check and result.returncode != 0:
+            detail = result.stderr.strip()
+            suffix = f": {detail}" if detail else ""
+            raise ActivationError(f"{label} failed{suffix}")
+        return result
+
+
+class ProductionBackend:
+    def __init__(self, paths: RuntimePaths, runner: Runner | None = None) -> None:
+        self.paths = paths
+        self.runner = runner or Runner()
+        self.lock_descriptor: int | None = None
+        self.activation_lock_descriptor: int | None = None
+        self.runtime_link_switched = False
+        self.runtime_environment_installed = False
+        self.internal_dropin_installed = False
+        self.edge_dropin_installed = False
+        self.application_unit_installed = False
+        self.reconciling_existing = False
+        self.transaction_token: str | None = None
+        self.transaction_lease_descriptor: int | None = None
+
+    def app_compose(
+        self,
+        *,
+        runtime: bool = False,
+        include_runtime_environment: bool | None = None,
+    ) -> list[str]:
+        if include_runtime_environment is None:
+            include_runtime_environment = runtime
+        application = (
+            str(self.paths.runtime_link / "applications/surplasse")
+            if runtime
+            else str(self.paths.application)
+        )
+        command = [
+            "/usr/bin/docker",
+            "compose",
+            "--project-name",
+            "surplasse",
+            "--project-directory",
+            application,
+            "--env-file",
+            f"{application}/.env.example",
+        ]
+        if include_runtime_environment:
+            command.extend(["--env-file", str(self.paths.runtime_environment)])
+        command.extend(["--file", f"{application}/compose.yaml"])
+        return command
+
+    def internal_compose(self, *, integrated: bool) -> list[str]:
+        platform = str(self.paths.internal_platform)
+        command = [
+            "/usr/bin/docker",
+            "compose",
+            "--project-name",
+            "vps-platform",
+            "--project-directory",
+            platform,
+            "--env-file",
+            f"{platform}/.env.example",
+            "--file",
+            f"{platform}/compose.yaml",
+        ]
+        if integrated:
+            command.extend(
+                ["--file", f"{self.paths.integration}/internal-platform.override.yaml"]
+            )
+        return command
+
+    def edge_compose(self, *, integrated: bool) -> list[str]:
+        edge = str(self.paths.public_edge)
+        command = [
+            "/usr/bin/docker",
+            "compose",
+            "--project-name",
+            "vps-public-static-edge",
+            "--project-directory",
+            edge,
+            "--file",
+            f"{edge}/compose.yaml",
+        ]
+        if integrated:
+            command.extend(
+                ["--file", f"{self.paths.integration}/public-edge.override.yaml"]
+            )
+        return command
+
+    def require_safe_path(self, path: Path, *, directory: bool = False) -> None:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise ActivationError(
+                f"required trusted path is unavailable: {path}"
+            ) from exc
+        expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+        if (
+            path.is_symlink()
+            or not expected_type(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise ActivationError(f"trusted path has unsafe metadata: {path}")
+
+    def service_container(self, project: str, service: str) -> str:
+        result = self.runner.run(
+            [
+                "/usr/bin/docker",
+                "ps",
+                "--quiet",
+                "--filter",
+                f"label=com.docker.compose.project={project}",
+                "--filter",
+                f"label=com.docker.compose.service={service}",
+            ],
+            f"{project}/{service} container discovery",
+            capture=True,
+        )
+        containers = [line for line in result.stdout.splitlines() if line]
+        if len(containers) != 1 or CONTAINER_ID.fullmatch(containers[0]) is None:
+            raise ActivationError(
+                f"{project}/{service} does not have one running container"
+            )
+        return containers[0]
+
+    def inspect_container(self, container: str) -> dict[str, Any]:
+        result = self.runner.run(
+            ["/usr/bin/docker", "inspect", container],
+            "container inspection",
+            capture=True,
+        )
+        try:
+            documents = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ActivationError(
+                "Docker returned invalid container inspection JSON"
+            ) from exc
+        if not isinstance(documents, list) or len(documents) != 1:
+            raise ActivationError("Docker returned an ambiguous container inspection")
+        document = documents[0]
+        if not isinstance(document, dict):
+            raise ActivationError("Docker returned an invalid container inspection")
+        return document
+
+    def require_healthy(self, project: str, service: str) -> dict[str, Any]:
+        document = self.inspect_container(self.service_container(project, service))
+        state = document.get("State")
+        if not isinstance(state, dict) or state.get("Status") != "running":
+            raise ActivationError(f"{project}/{service} is not running")
+        health = state.get("Health")
+        if not isinstance(health, dict) or health.get("Status") != "healthy":
+            raise ActivationError(f"{project}/{service} is not healthy")
+        return document
+
+    def require_supervised_container(
+        self,
+        project: str,
+        service: str,
+        *,
+        expected_id: str | None = None,
+    ) -> str:
+        container = self.service_container(project, service)
+        if expected_id is not None and container != expected_id:
+            raise ActivationError(
+                f"{project}/{service} changed container identity outside its guard"
+            )
+        document = self.inspect_container(container)
+        state = document.get("State")
+        if not isinstance(state, dict) or state.get("Status") != "running":
+            raise ActivationError(f"{project}/{service} is not running")
+        health = state.get("Health")
+        if not isinstance(health, dict) or health.get("Status") != "healthy":
+            raise ActivationError(f"{project}/{service} is not healthy")
+        host_config = document.get("HostConfig")
+        restart_policy = (
+            host_config.get("RestartPolicy") if isinstance(host_config, dict) else None
+        )
+        if not isinstance(restart_policy, dict) or restart_policy.get("Name") != "no":
+            raise ActivationError(
+                f"{project}/{service} can restart outside systemd supervision"
+            )
+        return container
+
+    def require_network(
+        self,
+        project: str,
+        service: str,
+        network: str,
+        *,
+        present: bool,
+        address: str | None = None,
+    ) -> None:
+        document = self.require_healthy(project, service)
+        settings = document.get("NetworkSettings")
+        networks = settings.get("Networks") if isinstance(settings, dict) else None
+        if not isinstance(networks, dict) or (network in networks) is not present:
+            state = "present" if present else "absent"
+            raise ActivationError(
+                f"{project}/{service} network {network} is not {state}"
+            )
+        if present and address is not None:
+            member = networks.get(network)
+            if not isinstance(member, dict) or member.get("IPAddress") != address:
+                raise ActivationError(
+                    f"{project}/{service} does not use {address} on {network}"
+                )
+
+    def require_application_network_contract(self) -> None:
+        for name, subnet, internal in (
+            ("app_surplasse", "172.30.10.0/24", False),
+            ("db_surplasse", "172.30.11.0/24", True),
+        ):
+            result = self.runner.run(
+                ["/usr/bin/docker", "network", "inspect", name],
+                f"{name} network contract inspection",
+                capture=True,
+            )
+            try:
+                documents = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise ActivationError(f"{name} returned invalid network JSON") from exc
+            if not isinstance(documents, list) or len(documents) != 1:
+                raise ActivationError(f"{name} network identity is ambiguous")
+            network = documents[0]
+            ipam = network.get("IPAM") if isinstance(network, dict) else None
+            configurations = ipam.get("Config") if isinstance(ipam, dict) else None
+            labels = network.get("Labels") if isinstance(network, dict) else None
+            subnets = (
+                [item.get("Subnet") for item in configurations]
+                if isinstance(configurations, list)
+                and all(isinstance(item, dict) for item in configurations)
+                else None
+            )
+            if (
+                network.get("Name") != name
+                or network.get("Driver") != "bridge"
+                or network.get("Internal") is not internal
+                or subnets != [subnet]
+                or not isinstance(labels, dict)
+                or labels.get("com.nclsppr.vps-infra.managed") != "true"
+            ):
+                raise ActivationError(f"{name} differs from the reviewed network contract")
+
+    def render_and_validate(
+        self,
+        *,
+        runtime: bool = False,
+        include_runtime_environment: bool | None = None,
+    ) -> None:
+        rendered = self.runner.run(
+            self.app_compose(
+                runtime=runtime,
+                include_runtime_environment=include_runtime_environment,
+            )
+            + ["--profile", "migration", "config", "--format", "json"],
+            "Surplasse Compose rendering",
+            capture=True,
+        ).stdout.encode("utf-8")
+        if not rendered:
+            raise ActivationError("Surplasse Compose rendered an empty document")
+        if not hasattr(os, "memfd_create"):
+            raise ActivationError(
+                "Linux memfd support is required for non-mutating validation"
+            )
+        descriptor = os.memfd_create("vps-surplasse-compose", os.MFD_CLOEXEC)
+        try:
+            os.write(descriptor, rendered)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            rendered_path = f"/proc/{os.getpid()}/fd/{descriptor}"
+            self.runner.run(
+                [
+                    str(self.paths.release_root / "scripts/validate-compose"),
+                    "--expected-images",
+                    str(self.paths.application / "expected-images.json"),
+                    "surplasse",
+                    rendered_path,
+                ],
+                "shared Compose policy validation",
+            )
+            self.runner.run(
+                [
+                    str(
+                        self.paths.release_root
+                        / "scripts/validate-surplasse-controller"
+                    ),
+                    "--root",
+                    str(self.paths.release_root),
+                    "--mode",
+                    "activate",
+                    rendered_path,
+                ],
+                "Surplasse activation policy validation",
+            )
+        finally:
+            os.close(descriptor)
+
+    @contextlib.contextmanager
+    def activation_lock(self) -> ContextManager[None]:
+        self.require_safe_path(self.paths.controller_state_root, directory=True)
+        created = False
+        try:
+            descriptor = os.open(
+                self.paths.activation_lock,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(
+                self.paths.activation_lock,
+                os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+            )
+        try:
+            if created:
+                os.fchown(descriptor, 0, 0)
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ActivationError("the activation lock has unsafe metadata")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ActivationError(
+                    "another Surplasse activation transaction is active"
+                ) from exc
+            self.activation_lock_descriptor = descriptor
+            yield
+        finally:
+            self.activation_lock_descriptor = None
+            os.close(descriptor)
+
+    def read_activation_state(self, *, required: bool = True) -> dict[str, Any] | None:
+        path = self.paths.activation_state
+        if not (path.exists() or path.is_symlink()):
+            if required:
+                raise ActivationError("the activation transaction state is missing")
+            return None
+        self.require_safe_path(path)
+        metadata = path.stat()
+        if (
+            metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ActivationError("the activation transaction state is unsafe")
+        document = load_json(path, "activation transaction state")
+        if set(document) != {
+            "bundle_generation",
+            "contract",
+            "phase",
+            "revision",
+            "transaction_token_sha256",
+            "version",
+        }:
+            raise ActivationError("the activation transaction state has unexpected keys")
+        if (
+            document.get("contract") != ACTIVATION_STATE_CONTRACT
+            or document.get("version") != 1
+            or document.get("phase") not in {"starting", "active"}
+            or not isinstance(document.get("revision"), str)
+            or SHA40.fullmatch(document["revision"]) is None
+            or not isinstance(document.get("bundle_generation"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", document["bundle_generation"]) is None
+            or not isinstance(document.get("transaction_token_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}", document["transaction_token_sha256"]
+            )
+            is None
+        ):
+            raise ActivationError("the activation transaction state is invalid")
+        return document
+
+    def write_activation_state(self, phase: str) -> None:
+        if self.activation_lock_descriptor is None or self.lock_descriptor is None:
+            raise ActivationError(
+                "transaction state publication requires both activation locks"
+            )
+        if phase not in {"starting", "active"}:
+            raise ActivationError("invalid activation transaction phase")
+        if phase == "starting":
+            self.transaction_token = os.urandom(32).hex()
+            ACTIVATION_LEASE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lease_root = ACTIVATION_LEASE_ROOT.lstat()
+            if (
+                not stat.S_ISDIR(lease_root.st_mode)
+                or lease_root.st_uid != 0
+                or lease_root.st_gid != 0
+                or stat.S_IMODE(lease_root.st_mode) != 0o700
+            ):
+                raise ActivationError("the activation lease root is unsafe")
+            lease = ACTIVATION_LEASE_ROOT / self.transaction_token
+            descriptor = os.open(
+                lease,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            os.fchown(descriptor, 0, 0)
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.transaction_lease_descriptor = descriptor
+        if self.transaction_token is None:
+            current = self.read_activation_state()
+            self.transaction_token = os.environ.get(ACTIVATION_AUTHORIZATION_ENV)
+            if (
+                self.transaction_token is None
+                or ACTIVATION_AUTHORIZATION_RE.fullmatch(self.transaction_token) is None
+                or hashlib.sha256(self.transaction_token.encode("ascii")).hexdigest()
+                != current["transaction_token_sha256"]
+            ):
+                raise ActivationError("the activation transaction token is unavailable")
+        content = (
+            json.dumps(
+                {
+                    "bundle_generation": self.bundle_generation(),
+                    "contract": ACTIVATION_STATE_CONTRACT,
+                    "phase": phase,
+                    "revision": self.paths.revision,
+                    "transaction_token_sha256": hashlib.sha256(
+                        self.transaction_token.encode("ascii")
+                    ).hexdigest(),
+                    "version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
+        destination = self.paths.activation_state
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.pending")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.write(descriptor, content)
+            os.fchown(descriptor, 0, 0)
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, destination)
+        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    def recover_interrupted_activation(self) -> None:
+        if self.activation_lock_descriptor is None:
+            raise ActivationError("recovery requires the activation transaction lock")
+        state = self.read_activation_state(required=False)
+        managed_paths = (
+            self.paths.runtime_environment,
+            self.paths.application_unit,
+            self.paths.internal_dropin,
+            self.paths.edge_dropin,
+            self.paths.runtime_link,
+        )
+        present = {
+            path: path.exists() or path.is_symlink() for path in managed_paths
+        }
+        complete = all(present.values())
+        if state is not None and state["phase"] == "active" and complete:
+            return
+        residual = self.runner.run(
+            [
+                "/usr/bin/docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                "label=com.docker.compose.project=surplasse",
+            ],
+            "interrupted Surplasse container discovery",
+            capture=True,
+        ).stdout.strip()
+        if state is None and not any(present.values()) and not residual:
+            return
+        self.runtime_environment_installed = present[self.paths.runtime_environment]
+        self.application_unit_installed = present[self.paths.application_unit]
+        self.internal_dropin_installed = present[self.paths.internal_dropin]
+        self.edge_dropin_installed = present[self.paths.edge_dropin]
+        self.runtime_link_switched = present[self.paths.runtime_link]
+        self.rollback()
+
+    def remove_transaction_temporaries(self) -> None:
+        candidates = [
+            self.paths.runtime_link.parent / f".surplasse-{self.paths.revision}",
+        ]
+        for parent, destination in (
+            (self.paths.runtime_environment.parent, self.paths.runtime_environment),
+            (self.paths.application_unit.parent, self.paths.application_unit),
+            (self.paths.internal_dropin.parent, self.paths.internal_dropin),
+            (self.paths.edge_dropin.parent, self.paths.edge_dropin),
+            (self.paths.activation_state.parent, self.paths.activation_state),
+        ):
+            if parent.exists() and parent.is_dir() and not parent.is_symlink():
+                candidates.extend(parent.glob(f".{destination.name}.*.pending"))
+        for candidate in candidates:
+            if candidate.exists() or candidate.is_symlink():
+                candidate.unlink()
+
+    def preflight(self) -> None:
+        if self.activation_lock_descriptor is None:
+            raise ActivationError("preflight requires the activation transaction lock")
+        self.reconciling_existing = False
+        self.remove_transaction_temporaries()
+        if os.geteuid() != 0:
+            raise ActivationError("production activation requires root")
+        self.require_safe_path(self.paths.release_root, directory=True)
+        for relative in (
+            "applications/surplasse/adapter.json",
+            "applications/surplasse/compose.yaml",
+            "applications/surplasse/.env.example",
+            "applications/surplasse/expected-images.json",
+            "releases/production.yaml",
+            "scripts/validate-compose",
+            "scripts/validate-surplasse-controller",
+        ):
+            self.require_safe_path(self.paths.release_root / relative)
+        runtime_link_present = (
+            self.paths.runtime_link.exists() or self.paths.runtime_link.is_symlink()
+        )
+        if runtime_link_present:
+            try:
+                metadata = self.paths.runtime_link.lstat()
+                target = self.paths.runtime_link.resolve(strict=True)
+            except OSError as exc:
+                raise ActivationError("the Surplasse runtime link is broken") from exc
+            if (
+                not stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != 0
+                or target != self.paths.release_root
+            ):
+                raise ActivationError(
+                    "activation cannot replace a different or unsafe runtime release"
+                )
+            self.reconciling_existing = True
+        managed_paths = (
+            self.paths.runtime_environment,
+            self.paths.application_unit,
+            self.paths.internal_dropin,
+            self.paths.edge_dropin,
+        )
+        for path in managed_paths:
+            present = path.exists() or path.is_symlink()
+            if present != self.reconciling_existing:
+                raise ActivationError(
+                    f"the Surplasse managed runtime state is incomplete: {path}"
+                )
+            if present:
+                self.require_safe_path(path)
+        if self.reconciling_existing:
+            state = self.read_activation_state()
+            if (
+                state["phase"] != "active"
+                or state["revision"] != self.paths.revision
+            ):
+                raise ActivationError(
+                    "reconciliation requires the active transaction state"
+                )
+            self.runtime_link_switched = True
+            self.runtime_environment_installed = True
+            self.application_unit_installed = True
+            self.internal_dropin_installed = True
+            self.edge_dropin_installed = True
+        elif self.read_activation_state(required=False) is not None:
+            raise ActivationError("first activation found unexpected transaction state")
+        self.runner.run(
+            [
+                "/usr/local/libexec/vps/materialize-surplasse-secrets",
+                "--operator-only",
+            ],
+            "complete operator bundle validation",
+        )
+        self.runner.run(
+            [
+                "/usr/local/libexec/vps/validate-release",
+                "--require-json-schema",
+                str(self.paths.release_root / "releases/production.yaml"),
+            ],
+            "production release validation",
+        )
+        self.runner.run(
+            [
+                "/usr/local/libexec/vps/verify-github-evidence",
+                str(self.paths.release_root / "releases/production.yaml"),
+            ],
+            "independent release evidence validation",
+        )
+        validate_activation_metadata(self.paths.release_root)
+        self.render_and_validate()
+        self.require_application_network_contract()
+        for unit in ("vps-internal-platform.service", "vps-public-static-edge.service"):
+            active = self.runner.run(
+                ["/usr/bin/systemctl", "is-active", unit],
+                f"{unit} activity",
+                capture=True,
+                check=False,
+            )
+            enabled = self.runner.run(
+                ["/usr/bin/systemctl", "is-enabled", unit],
+                f"{unit} enablement",
+                capture=True,
+            )
+            expected_activity = {"active"}
+            if self.reconciling_existing and unit == "vps-public-static-edge.service":
+                expected_activity.add("failed")
+            if (
+                active.stdout.strip() not in expected_activity
+                or enabled.stdout.strip() != "enabled"
+            ):
+                raise ActivationError(f"{unit} is not in its required systemd state")
+        if not self.reconciling_existing:
+            self.require_network(
+                "vps-platform", "postgresql", "db_surplasse", present=False
+            )
+            self.require_network(
+                "vps-platform", "prometheus", "app_surplasse", present=False
+            )
+            self.require_network(
+                "vps-public-static-edge", "caddy", "app_surplasse", present=False
+            )
+        residual = self.runner.run(
+            [
+                "/usr/bin/docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                "label=com.docker.compose.project=surplasse",
+            ],
+            "residual Surplasse container discovery",
+            capture=True,
+        )
+        residual_containers = residual.stdout.splitlines()
+        if residual_containers and not self.reconciling_existing:
+            raise ActivationError(
+                "first activation found a residual Surplasse container"
+            )
+        for container in residual_containers:
+            service = self.runner.run(
+                [
+                    "/usr/bin/docker",
+                    "inspect",
+                    "--format",
+                    '{{ index .Config.Labels "com.docker.compose.service" }}',
+                    container,
+                ],
+                "residual Surplasse service inspection",
+                capture=True,
+            ).stdout.strip()
+            if service not in RUNTIME_SERVICES:
+                raise ActivationError(
+                    "the existing Surplasse project contains an unexpected service"
+                )
+
+    @contextlib.contextmanager
+    def bundle_lock(self) -> ContextManager[None]:
+        lock = self.paths.secret_root_path / OPERATOR_LOCK
+        self.require_safe_path(lock)
+        descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ActivationError("the operator bundle lock has unsafe metadata")
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise ActivationError(
+                            "another operator bundle operation remained active"
+                        ) from exc
+                    time.sleep(0.05)
+            self.lock_descriptor = descriptor
+            yield
+        finally:
+            self.lock_descriptor = None
+            os.close(descriptor)
+
+    def revalidate_bundle(self) -> None:
+        if self.lock_descriptor is None:
+            raise ActivationError("operator bundle validation requires its held lock")
+        manifest_path = self.paths.secret_root_path / OPERATOR_MANIFEST
+        self.require_safe_path(manifest_path)
+        manifest = load_json(manifest_path, "operator bundle manifest")
+        if set(manifest) != {"contract", "sha256", "version"}:
+            raise ActivationError("operator bundle manifest has unexpected keys")
+        if (
+            manifest.get("contract") != OPERATOR_CONTRACT
+            or manifest.get("version") != 1
+        ):
+            raise ActivationError("operator bundle manifest identity is invalid")
+        hashes = manifest.get("sha256")
+        if not isinstance(hashes, dict) or set(hashes) != set(OPERATOR_FILES):
+            raise ActivationError("operator bundle manifest inventory is not exact")
+        for name in OPERATOR_FILES:
+            digest = hashes.get(name)
+            if (
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise ActivationError("operator bundle manifest digest is invalid")
+            path = self.paths.secret_root_path / name
+            self.require_safe_path(path)
+            metadata = path.stat()
+            application_readable = name in {
+                "surplasse-jwt-jwks",
+                "surplasse-jwt-private-key",
+                "surplasse-smtp-password",
+                "surplasse-smtp-username",
+                "surplasse-stripe-account-webhook-secret",
+                "surplasse-stripe-payment-webhook-secret",
+                "surplasse-stripe-secret-key",
+            }
+            expected_group = 10001 if application_readable else 0
+            expected_mode = 0o440 if application_readable else 0o400
+            if (
+                metadata.st_nlink != 1
+                or metadata.st_uid != 0
+                or metadata.st_gid != expected_group
+                or stat.S_IMODE(metadata.st_mode) != expected_mode
+            ):
+                raise ActivationError(
+                    f"operator bundle input metadata changed: {name}"
+                )
+            content = path.read_bytes()
+            if not content or len(content) > 1_048_576:
+                raise ActivationError("operator bundle input size is invalid")
+            if hashlib.sha256(content).hexdigest() != digest:
+                raise ActivationError("operator bundle changed after preflight")
+        generated_values: list[bytes] = []
+        for name in GENERATED_FILES:
+            path = self.paths.secret_root_path / name
+            self.require_safe_path(path)
+            metadata = path.stat()
+            content = path.read_bytes()
+            if (
+                metadata.st_uid != 0
+                or metadata.st_gid != 10001
+                or stat.S_IMODE(metadata.st_mode) != 0o440
+                or re.fullmatch(rb"[A-Za-z0-9_-]{64}\n", content) is None
+            ):
+                raise ActivationError(
+                    "generated database secret is outside its contract"
+                )
+            generated_values.append(content)
+        if len(set(generated_values)) != len(generated_values):
+            raise ActivationError("generated database passwords must be distinct")
+
+    def prove_restore(self) -> None:
+        self.runner.run(
+            [
+                "/usr/local/libexec/vps/postgres-backup",
+                "create",
+                "--retention-count",
+                "7",
+            ],
+            "immediate pre-migration PostgreSQL backup",
+        )
+        self.runner.run(
+            ["/usr/local/libexec/vps/postgres-backup", "rehearse", "--latest"],
+            "immediate pre-migration PostgreSQL restore rehearsal",
+        )
+
+    def quiesce_supervision(self) -> None:
+        if not self.reconciling_existing:
+            return
+        for unit in (
+            "vps-surplasse.service",
+            "vps-public-static-edge.service",
+        ):
+            self.runner.run(
+                ["/usr/bin/systemctl", "stop", unit],
+                f"{unit} guarded reconciliation quiescence",
+            )
+
+    def bundle_generation(self) -> str:
+        manifest_path = self.paths.secret_root_path / OPERATOR_MANIFEST
+        self.require_safe_path(manifest_path)
+        digest = hashlib.sha256()
+        digest.update(manifest_path.read_bytes())
+        for name in GENERATED_FILES:
+            path = self.paths.secret_root_path / name
+            self.require_safe_path(path)
+            digest.update(name.encode("ascii") + b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+        return digest.hexdigest()
+
+    def expected_runtime_environment(self) -> bytes:
+        if self.lock_descriptor is None:
+            raise ActivationError(
+                "runtime environment derivation requires the bundle lock"
+            )
+        immutable_environment = self.paths.application / ".env.example"
+        self.require_safe_path(immutable_environment)
+        immutable_values: dict[str, str] = {}
+        for line in immutable_environment.read_text(encoding="ascii").splitlines():
+            if "=" not in line:
+                raise ActivationError("the immutable Surplasse environment is invalid")
+            key, value = line.split("=", 1)
+            if key.endswith("_IMAGE"):
+                immutable_values[key] = value
+        if set(immutable_values) != {
+            "SURPLASSE_BACKEND_IMAGE",
+            "SURPLASSE_COMMANDE_IMAGE",
+            "SURPLASSE_DASHBOARD_IMAGE",
+            "SURPLASSE_DOCS_IMAGE",
+            "SURPLASSE_ONBOARDING_IMAGE",
+        }:
+            raise ActivationError("the immutable Surplasse image set is incomplete")
+
+        def operator_value(name: str) -> str:
+            path = self.paths.secret_root_path / name
+            self.require_safe_path(path)
+            content = path.read_bytes()
+            if not content.endswith(b"\n") or content.count(b"\n") != 1:
+                raise ActivationError(f"operator input {name} is not one line")
+            try:
+                value = content[:-1].decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise ActivationError(f"operator input {name} is not ASCII") from exc
+            if not value or any(character in value for character in "\r\n"):
+                raise ActivationError(
+                    f"operator input {name} is unsafe for an env file"
+                )
+            return value
+
+        runtime_values = {
+            **immutable_values,
+            "SURPLASSE_AUTH_JWT_KEY_ID": operator_value("surplasse-jwt-key-id"),
+            "SURPLASSE_BUNDLE_GENERATION": self.bundle_generation(),
+            "SURPLASSE_SMTP_HOST": operator_value("surplasse-smtp-host"),
+            "SURPLASSE_SMTP_PORT": operator_value("surplasse-smtp-port"),
+        }
+        return "".join(
+            f"{key}={runtime_values[key]}\n" for key in sorted(runtime_values)
+        ).encode("ascii")
+
+    def write_runtime_environment(self) -> None:
+        content = self.expected_runtime_environment()
+        destination = self.paths.runtime_environment
+        destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        parent = destination.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != 0
+            or parent.st_gid != 0
+            or stat.S_IMODE(parent.st_mode) != 0o755
+        ):
+            raise ActivationError("the runtime environment parent has unsafe metadata")
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.pending")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        self.runtime_environment_installed = True
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise ActivationError("cannot write the runtime environment")
+                view = view[written:]
+            os.fchown(descriptor, 0, 0)
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, destination)
+        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        # The first activation has no runtime symlink yet. Validate the pending
+        # environment against the immutable prepared release, then publish the
+        # symlink as the next transaction step.
+        self.render_and_validate(include_runtime_environment=True)
+
+    def verify_runtime_environment(self, *, render: bool = True) -> None:
+        destination = self.paths.runtime_environment
+        self.require_safe_path(destination)
+        metadata = destination.stat()
+        expected = self.expected_runtime_environment()
+        state = self.read_activation_state()
+        if (
+            metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or destination.read_bytes() != expected
+            or state["revision"] != self.paths.revision
+            or state["bundle_generation"] != self.bundle_generation()
+        ):
+            raise ActivationError(
+                "the runtime environment does not match the locked operator bundle"
+            )
+        if render:
+            self.render_and_validate(runtime=True)
+
+    def atomic_install(self, source: Path, destination: Path) -> None:
+        self.require_safe_path(source)
+        destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        parent_metadata = destination.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != 0
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+        ):
+            raise ActivationError(
+                f"systemd parent has unsafe metadata: {destination.parent}"
+            )
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.pending")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            content = source.read_bytes()
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise ActivationError(f"cannot install systemd file: {destination}")
+                view = view[written:]
+            os.fchown(descriptor, 0, 0)
+            os.fchmod(descriptor, 0o644)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, destination)
+        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    def switch_runtime_link(self) -> None:
+        if self.reconciling_existing:
+            self.runtime_link_switched = True
+            return
+        switch = self.paths.runtime_link.parent / f".surplasse-{self.paths.revision}"
+        if switch.exists() or switch.is_symlink():
+            raise ActivationError("temporary Surplasse release link already exists")
+        os.symlink(self.paths.release_root, switch)
+        os.replace(switch, self.paths.runtime_link)
+        self.runtime_link_switched = True
+        parent_fd = os.open(
+            self.paths.runtime_link.parent, os.O_RDONLY | os.O_DIRECTORY
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    def install_systemd_file(self, source_name: str, destination: Path) -> None:
+        source = self.paths.application / "systemd" / source_name
+        self.atomic_install(source, destination)
+
+    def daemon_reload(self) -> None:
+        self.runner.run(
+            ["/usr/bin/systemctl", "daemon-reload"], "systemd daemon reload"
+        )
+
+    def attach_postgresql(self) -> None:
+        self.internal_dropin_installed = True
+        self.install_systemd_file(
+            "vps-internal-platform-surplasse.conf", self.paths.internal_dropin
+        )
+        self.daemon_reload()
+        self.runner.run(
+            ["/usr/bin/systemctl", "restart", "vps-internal-platform.service"],
+            "internal platform owner reconciliation for PostgreSQL attachment",
+        )
+        self.require_network("vps-platform", "postgresql", "db_surplasse", present=True)
+
+    def migrate(self) -> None:
+        self.runner.run(
+            self.app_compose(runtime=True)
+            + ["--profile", "migration", "run", "--rm", "--no-deps", "migrator"],
+            "one-shot Surplasse migration",
+        )
+        residual = self.runner.run(
+            [
+                "/usr/bin/docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                "label=com.docker.compose.project=surplasse",
+                "--filter",
+                "label=com.docker.compose.service=migrator",
+            ],
+            "migration container cleanup proof",
+            capture=True,
+        )
+        if residual.stdout.strip():
+            raise ActivationError("the one-shot migration container was not removed")
+
+    def start_runtime_services(self) -> None:
+        self.application_unit_installed = True
+        self.install_systemd_file("vps-surplasse.service", self.paths.application_unit)
+        self.daemon_reload()
+        self.runner.run(
+            ["/usr/bin/systemctl", "enable", "vps-surplasse.service"],
+            "Surplasse runtime unit enablement",
+        )
+
+    def remove_runtime_containers(self) -> None:
+        result = self.runner.run(
+            [
+                "/usr/bin/docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                "label=com.docker.compose.project=surplasse",
+            ],
+            "Surplasse rollback container discovery",
+            capture=True,
+        )
+        containers = result.stdout.splitlines()
+        removable: list[str] = []
+        unexpected: list[str] = []
+        for container in containers:
+            if CONTAINER_ID.fullmatch(container) is None:
+                raise ActivationError(
+                    "rollback found an invalid Surplasse container identity"
+                )
+            service = self.runner.run(
+                [
+                    "/usr/bin/docker",
+                    "inspect",
+                    "--format",
+                    '{{ index .Config.Labels "com.docker.compose.service" }}',
+                    container,
+                ],
+                "Surplasse rollback service inspection",
+                capture=True,
+            ).stdout.strip()
+            if service not in {*RUNTIME_SERVICES, "migrator"}:
+                unexpected.append(service)
+            else:
+                removable.append(container)
+        if removable:
+            self.runner.run(
+                ["/usr/bin/docker", "rm", "--force", *removable],
+                "bounded Surplasse container cleanup",
+            )
+        if unexpected:
+            raise ActivationError(
+                "rollback found unexpected Surplasse project services: "
+                + ", ".join(sorted(set(unexpected)))
+            )
+
+    def attach_observability_and_edge(self) -> None:
+        self.require_network(
+            "vps-platform", "prometheus", "app_surplasse", present=True
+        )
+        self.edge_dropin_installed = True
+        self.install_systemd_file(
+            "vps-public-static-edge-surplasse.conf", self.paths.edge_dropin
+        )
+        self.daemon_reload()
+        self.runner.run(
+            [
+                "/usr/bin/systemctl",
+                "reenable",
+                "vps-public-static-edge.service",
+            ],
+            "public edge Docker restart wiring",
+        )
+
+    def arm_supervision(self) -> None:
+        self.write_activation_state("starting")
+
+    def public_status(self, host: str, path: str) -> str:
+        result = self.runner.run(
+            [
+                "/usr/bin/curl",
+                "--silent",
+                "--show-error",
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                "5",
+                "--output",
+                "/dev/null",
+                "--write-out",
+                "%{http_code}",
+                "--resolve",
+                f"{host}:443:127.0.0.1",
+                f"https://{host}{path}",
+            ],
+            f"direct TLS probe for {host}{path}",
+            capture=True,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def verify_activation(self) -> None:
+        self.require_network("vps-platform", "postgresql", "db_surplasse", present=True)
+        self.require_network(
+            "vps-platform", "prometheus", "app_surplasse", present=True
+        )
+        self.require_network(
+            "vps-public-static-edge",
+            "caddy",
+            "app_surplasse",
+            present=True,
+            address="172.30.10.254",
+        )
+        prometheus = self.service_container("vps-platform", "prometheus")
+        caddy = self.service_container("vps-public-static-edge", "caddy")
+        self.runner.run(
+            [
+                "/usr/bin/docker",
+                "exec",
+                prometheus,
+                "wget",
+                "--quiet",
+                "--timeout=5",
+                "--tries=1",
+                "--spider",
+                "http://surplasse-backend:8080/q/metrics",
+            ],
+            "Prometheus-to-Backend metrics probe",
+        )
+        scrape_deadline = time.monotonic() + 90
+        while True:
+            target_query = self.runner.run(
+                [
+                    "/usr/bin/docker",
+                    "exec",
+                    prometheus,
+                    "wget",
+                    "--quiet",
+                    "--timeout=5",
+                    "--tries=1",
+                    "--output-document=-",
+                    "http://127.0.0.1:9090/api/v1/query?query="
+                    "up%7Bjob%3D%22surplasse-backend%22%7D%20%3D%3D%201",
+                ],
+                "Prometheus successful Surplasse scrape proof",
+                capture=True,
+                check=False,
+            )
+            if target_query.returncode == 0 and self.prometheus_scrape_proven(
+                target_query.stdout
+            ):
+                break
+            if time.monotonic() >= scrape_deadline:
+                raise ActivationError(
+                    "Prometheus did not prove one successful Surplasse scrape"
+                )
+            time.sleep(min(2, max(0, scrape_deadline - time.monotonic())))
+        for target in (
+            "http://surplasse-backend:8080/q/health/ready",
+            "http://surplasse-onboarding:8080/__health",
+            "http://surplasse-commande:8080/healthz",
+            "http://surplasse-dashboard:8080/healthz",
+            "http://surplasse-docs:8080/healthz",
+        ):
+            self.runner.run(
+                [
+                    "/usr/bin/docker",
+                    "exec",
+                    caddy,
+                    "wget",
+                    "--quiet",
+                    "--timeout=5",
+                    "--tries=1",
+                    "--spider",
+                    target,
+                ],
+                f"Caddy private probe for {target}",
+            )
+        expected = (
+            ("surplasse.com", "/.well-known/surplasse-edge", "200"),
+            ("surplasse.com", "/", "200"),
+            ("api.surplasse.com", "/q/health/ready", "404"),
+            ("surplasse.com", "/stripe-connect/config", "503"),
+            ("dashboard.surplasse.com", "/", "200"),
+            ("docs.surplasse.com", "/", "200"),
+        )
+        pending = set(expected)
+        deadline = time.monotonic() + 180
+        while pending and time.monotonic() < deadline:
+            pending = {
+                probe
+                for probe in pending
+                if self.public_status(probe[0], probe[1]) != probe[2]
+            }
+            if not pending:
+                return
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+        failed = ", ".join(
+            f"{host}{path} expected {status}" for host, path, status in pending
+        )
+        raise ActivationError(f"direct public probes did not converge: {failed}")
+
+    @staticmethod
+    def prometheus_scrape_proven(payload: str) -> bool:
+        try:
+            document = json.loads(payload)
+        except json.JSONDecodeError:
+            return False
+        data = document.get("data") if isinstance(document, dict) else None
+        result = data.get("result") if isinstance(data, dict) else None
+        if (
+            document.get("status") != "success"
+            or not isinstance(result, list)
+            or len(result) != 1
+            or not isinstance(result[0], dict)
+        ):
+            return False
+        metric = result[0].get("metric")
+        value = result[0].get("value")
+        return (
+            isinstance(metric, dict)
+            and metric.get("job") == "surplasse-backend"
+            and isinstance(value, list)
+            and len(value) == 2
+            and value[1] == "1"
+        )
+
+    def starting_state_was_committed(self, starting: dict[str, Any]) -> bool:
+        current = self.read_activation_state(required=False)
+        return (
+            isinstance(current, dict)
+            and current.get("phase") == "active"
+            and current.get("revision") == starting.get("revision")
+            and current.get("bundle_generation")
+            == starting.get("bundle_generation")
+            and current.get("transaction_token_sha256")
+            == starting.get("transaction_token_sha256")
+        )
+
+    def require_supervision_authorization(self) -> None:
+        state = self.read_activation_state()
+        if state["revision"] != self.paths.revision:
+            raise ActivationError("supervision state targets a different release")
+        if state["phase"] == "starting":
+            authorization = os.environ.get(ACTIVATION_AUTHORIZATION_ENV)
+            if (
+                authorization is None
+                or ACTIVATION_AUTHORIZATION_RE.fullmatch(authorization) is None
+                or hashlib.sha256(authorization.encode("ascii")).hexdigest()
+                != state["transaction_token_sha256"]
+            ):
+                raise ActivationError(
+                    "an interrupted activation cannot start or retain public services"
+                )
+            lease = ACTIVATION_LEASE_ROOT / authorization
+            try:
+                self.require_safe_path(lease)
+            except ActivationError:
+                if self.starting_state_was_committed(state):
+                    return
+                raise
+            descriptor = os.open(lease, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    metadata.st_nlink != 1
+                    or metadata.st_uid != 0
+                    or metadata.st_gid != 0
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                ):
+                    raise ActivationError("the activation transaction lease is unsafe")
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+            if self.starting_state_was_committed(state):
+                return
+            raise ActivationError("the activation transaction lease expired")
+
+    def verify_current_bundle_if_available(self) -> None:
+        lock = self.paths.secret_root_path / OPERATOR_LOCK
+        self.require_safe_path(lock)
+        descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ActivationError("the operator bundle lock has unsafe metadata")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            self.lock_descriptor = descriptor
+            self.revalidate_bundle()
+            self.verify_runtime_environment(render=False)
+        finally:
+            self.lock_descriptor = None
+            os.close(descriptor)
+
+    def guarded_start_preflight(self) -> None:
+        if os.geteuid() != 0:
+            raise ActivationError("guarded service startup requires root")
+        self.require_supervision_authorization()
+        self.require_safe_path(self.paths.release_root, directory=True)
+        try:
+            if self.paths.runtime_link.resolve(strict=True) != self.paths.release_root:
+                raise ActivationError("the active runtime link changed unexpectedly")
+        except OSError as exc:
+            raise ActivationError("the active runtime link is unavailable") from exc
+        revision_file = self.paths.release_root / "source-revision"
+        self.require_safe_path(revision_file)
+        if revision_file.read_text(encoding="ascii") != f"{self.paths.revision}\n":
+            raise ActivationError("the active release revision proof is invalid")
+        for relative in (
+            "applications/surplasse/adapter.json",
+            "applications/surplasse/compose.yaml",
+            "applications/surplasse/.env.example",
+            "applications/surplasse/expected-images.json",
+            "integration/public-edge.override.yaml",
+            "releases/production.yaml",
+            "scripts/validate-compose",
+            "scripts/validate-surplasse-controller",
+        ):
+            self.require_safe_path(self.paths.release_root / relative)
+        for source_name, destination in (
+            ("vps-surplasse.service", self.paths.application_unit),
+            ("vps-internal-platform-surplasse.conf", self.paths.internal_dropin),
+            ("vps-public-static-edge-surplasse.conf", self.paths.edge_dropin),
+        ):
+            source = self.paths.application / "systemd" / source_name
+            self.require_safe_path(source)
+            self.require_safe_path(destination)
+            if source.read_bytes() != destination.read_bytes():
+                raise ActivationError(
+                    f"installed systemd contract differs: {destination}"
+                )
+        validate_activation_metadata(self.paths.release_root)
+        self.require_application_network_contract()
+
+    def guarded_start_application(self) -> dict[str, str]:
+        self.guarded_start_preflight()
+        with self.bundle_lock():
+            self.revalidate_bundle()
+            self.verify_runtime_environment()
+            self.require_network(
+                "vps-platform", "postgresql", "db_surplasse", present=True
+            )
+            self.runner.run(
+                self.app_compose(runtime=True)
+                + [
+                    "up",
+                    "--detach",
+                    "--wait",
+                    "--no-build",
+                    "--force-recreate",
+                    *RUNTIME_SERVICES,
+                ],
+                "guarded Surplasse runtime service recreation",
+            )
+            containers = {
+                service: self.require_supervised_container("surplasse", service)
+                for service in RUNTIME_SERVICES
+            }
+            self.verify_activation()
+            return containers
+
+    def guarded_start_edge(self) -> str:
+        self.guarded_start_preflight()
+        with self.bundle_lock():
+            self.revalidate_bundle()
+            self.verify_runtime_environment()
+            self.runner.run(
+                self.edge_compose(integrated=True)
+                + [
+                    "up",
+                    "--detach",
+                    "--wait",
+                    "--no-build",
+                    "--force-recreate",
+                    "caddy",
+                ],
+                "guarded Caddy recreation",
+            )
+            self.require_network(
+                "vps-public-static-edge",
+                "caddy",
+                "app_surplasse",
+                present=True,
+                address="172.30.10.254",
+            )
+            return self.require_supervised_container("vps-public-static-edge", "caddy")
+
+    def notify_systemd(self, payload: str) -> None:
+        notify_socket = os.environ.get("NOTIFY_SOCKET")
+        if not notify_socket:
+            raise ActivationError("guarded supervision requires systemd notify")
+        address = (
+            "\0" + notify_socket[1:] if notify_socket.startswith("@") else notify_socket
+        )
+        notifier = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            notifier.connect(address)
+            notifier.sendall(payload.encode("utf-8"))
+        except OSError as exc:
+            raise ActivationError("cannot notify systemd supervision state") from exc
+        finally:
+            notifier.close()
+
+    def notify_systemd_ready(self, subject: str) -> None:
+        self.notify_systemd(f"READY=1\nSTATUS={subject} healthy and guarded")
+
+    def notify_systemd_watchdog(self) -> None:
+        self.notify_systemd("WATCHDOG=1")
+
+    def monitor_application(self, containers: dict[str, str]) -> None:
+        while True:
+            self.require_supervision_authorization()
+            self.verify_current_bundle_if_available()
+            for service in RUNTIME_SERVICES:
+                self.require_supervised_container(
+                    "surplasse", service, expected_id=containers[service]
+                )
+            self.notify_systemd_watchdog()
+            time.sleep(5)
+
+    def monitor_edge(self, container: str) -> None:
+        while True:
+            self.require_supervision_authorization()
+            self.verify_current_bundle_if_available()
+            self.require_network(
+                "vps-public-static-edge",
+                "caddy",
+                "app_surplasse",
+                present=True,
+                address="172.30.10.254",
+            )
+            self.require_supervised_container(
+                "vps-public-static-edge", "caddy", expected_id=container
+            )
+            self.notify_systemd_watchdog()
+            time.sleep(5)
+
+    def adopt_supervision(self) -> None:
+        if self.activation_lock_descriptor is None:
+            raise ActivationError("supervision adoption requires the activation lock")
+        for unit in (
+            "vps-public-static-edge.service",
+            "vps-surplasse.service",
+        ):
+            self.runner.run(
+                ["/usr/bin/systemctl", "reset-failed", unit],
+                f"{unit} restart budget reset",
+                check=False,
+            )
+        if self.transaction_token is None:
+            raise ActivationError("supervision adoption lacks its transaction token")
+        self.runner.run(
+            [
+                "/usr/bin/systemctl",
+                "set-environment",
+                f"{ACTIVATION_AUTHORIZATION_ENV}={self.transaction_token}",
+            ],
+            "activation transaction authorization publication",
+        )
+        try:
+            self.runner.run(
+                ["/usr/bin/systemctl", "restart", "vps-public-static-edge.service"],
+                "guarded public edge adoption",
+            )
+            self.runner.run(
+                ["/usr/bin/systemctl", "restart", "vps-surplasse.service"],
+                "guarded Surplasse application adoption",
+            )
+        finally:
+            self.runner.run(
+                [
+                    "/usr/bin/systemctl",
+                    "unset-environment",
+                    ACTIVATION_AUTHORIZATION_ENV,
+                ],
+                "activation transaction authorization removal",
+                check=False,
+            )
+        for unit in (
+            "vps-public-static-edge.service",
+            "vps-surplasse.service",
+        ):
+            state = self.runner.run(
+                ["/usr/bin/systemctl", "is-active", unit],
+                f"{unit} active supervision proof",
+                capture=True,
+            ).stdout.strip()
+            if state != "active":
+                raise ActivationError(f"{unit} did not enter active supervision")
+            properties = self.runner.run(
+                [
+                    "/usr/bin/systemctl",
+                    "show",
+                    "--property=ActiveState,SubState,MainPID",
+                    unit,
+                ],
+                f"{unit} main process supervision proof",
+                capture=True,
+            ).stdout.splitlines()
+            values = dict(line.split("=", 1) for line in properties if "=" in line)
+            if (
+                values.get("ActiveState") != "active"
+                or values.get("SubState") != "running"
+                or not values.get("MainPID", "").isdigit()
+                or int(values["MainPID"]) <= 0
+            ):
+                raise ActivationError(f"{unit} lacks a running supervised main process")
+        with self.bundle_lock():
+            self.revalidate_bundle()
+            self.verify_runtime_environment()
+            self.verify_activation()
+            self.write_activation_state("active")
+        if self.transaction_token is not None:
+            self.remove_path(ACTIVATION_LEASE_ROOT / self.transaction_token)
+        if self.transaction_lease_descriptor is not None:
+            os.close(self.transaction_lease_descriptor)
+            self.transaction_lease_descriptor = None
+
+    def remove_path(self, path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+
+    def rollback(self) -> None:
+        failures: list[str] = []
+
+        def attempt(label: str, operation: Any) -> None:
+            try:
+                operation()
+            except Exception:
+                failures.append(label)
+
+        if self.application_unit_installed and (
+            self.paths.application_unit.exists()
+            or self.paths.application_unit.is_symlink()
+        ):
+            attempt(
+                "Surplasse unit stop",
+                lambda: self.runner.run(
+                    [
+                        "/usr/bin/systemctl",
+                        "disable",
+                        "--now",
+                        "vps-surplasse.service",
+                    ],
+                    "Surplasse unit stop",
+                ),
+            )
+        if self.runtime_link_switched:
+            self.remove_path(self.paths.runtime_link)
+        attempt(
+            "Surplasse container cleanup",
+            self.remove_runtime_containers,
+        )
+        if self.edge_dropin_installed and (
+            self.paths.edge_dropin.exists() or self.paths.edge_dropin.is_symlink()
+        ):
+            attempt(
+                "guarded public edge stop",
+                lambda: self.runner.run(
+                    [
+                        "/usr/bin/systemctl",
+                        "stop",
+                        "vps-public-static-edge.service",
+                    ],
+                    "guarded public edge stop",
+                ),
+            )
+        if self.edge_dropin_installed:
+            attempt(
+                "public edge drop-in removal",
+                lambda: self.remove_path(self.paths.edge_dropin),
+            )
+        if self.internal_dropin_installed:
+            attempt(
+                "internal platform drop-in removal",
+                lambda: self.remove_path(self.paths.internal_dropin),
+            )
+        if self.application_unit_installed:
+            attempt(
+                "Surplasse unit removal",
+                lambda: self.remove_path(self.paths.application_unit),
+            )
+        attempt("systemd rollback reload", self.daemon_reload)
+        if self.edge_dropin_installed:
+            attempt(
+                "public edge base enablement restoration",
+                lambda: self.runner.run(
+                    [
+                        "/usr/bin/systemctl",
+                        "reenable",
+                        "vps-public-static-edge.service",
+                    ],
+                    "public edge base enablement restoration",
+                ),
+            )
+            attempt(
+                "public edge systemd restoration",
+                lambda: self.runner.run(
+                    [
+                        "/usr/bin/systemctl",
+                        "reset-failed",
+                        "vps-public-static-edge.service",
+                    ],
+                    "public edge restart budget reset",
+                    check=False,
+                ),
+            )
+            attempt(
+                "public edge systemd start",
+                lambda: self.runner.run(
+                    [
+                        "/usr/bin/systemctl",
+                        "start",
+                        "vps-public-static-edge.service",
+                    ],
+                    "base public edge systemd start",
+                ),
+            )
+        if self.internal_dropin_installed:
+            attempt(
+                "internal platform attachment rollback",
+                lambda: self.runner.run(
+                    [
+                        "/usr/bin/systemctl",
+                        "restart",
+                        "vps-internal-platform.service",
+                    ],
+                    "internal platform attachment rollback",
+                ),
+            )
+        if self.runtime_environment_installed:
+            attempt(
+                "runtime environment removal",
+                lambda: self.remove_path(self.paths.runtime_environment),
+            )
+        attempt(
+            "activation transaction state removal",
+            lambda: self.remove_path(self.paths.activation_state),
+        )
+        if self.transaction_token is not None:
+            attempt(
+                "activation transaction lease removal",
+                lambda: self.remove_path(ACTIVATION_LEASE_ROOT / self.transaction_token),
+            )
+        if self.transaction_lease_descriptor is not None:
+            os.close(self.transaction_lease_descriptor)
+            self.transaction_lease_descriptor = None
+        attempt("rollback state verification", self.verify_rollback_state)
+        if failures:
+            raise ActivationError("rollback steps failed: " + ", ".join(failures))
+
+    def verify_rollback_state(self) -> None:
+        for path in (
+            self.paths.runtime_environment,
+            self.paths.application_unit,
+            self.paths.internal_dropin,
+            self.paths.edge_dropin,
+            self.paths.runtime_link,
+            self.paths.activation_state,
+        ):
+            if path.exists() or path.is_symlink():
+                raise ActivationError(f"rollback retained managed state: {path}")
+        residual = self.runner.run(
+            [
+                "/usr/bin/docker",
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                "label=com.docker.compose.project=surplasse",
+            ],
+            "rollback Surplasse container verification",
+            capture=True,
+        )
+        if residual.stdout.strip():
+            raise ActivationError("rollback retained a Surplasse container")
+        if self.edge_dropin_installed:
+            self.require_network(
+                "vps-public-static-edge", "caddy", "app_surplasse", present=False
+            )
+        if self.internal_dropin_installed:
+            self.require_network(
+                "vps-platform", "postgresql", "db_surplasse", present=False
+            )
+            self.require_network(
+                "vps-platform", "prometheus", "app_surplasse", present=False
+            )
+
+
+def stop_bounded_project(
+    runner: Runner,
+    project: str,
+    allowed_services: frozenset[str],
+    timeout: int,
+) -> None:
+    """Stop only running allowlisted containers without reading runtime secrets."""
+
+    result = runner.run(
+        [
+            "/usr/bin/docker",
+            "ps",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={project}",
+        ],
+        f"{project} guarded stop discovery",
+        capture=True,
+    )
+    containers = result.stdout.splitlines()
+    stoppable: list[str] = []
+    unexpected: list[str] = []
+    for container in containers:
+        if CONTAINER_ID.fullmatch(container) is None:
+            raise ActivationError(f"{project} returned an invalid container identity")
+        service = runner.run(
+            [
+                "/usr/bin/docker",
+                "inspect",
+                "--format",
+                '{{ index .Config.Labels "com.docker.compose.service" }}',
+                container,
+            ],
+            f"{project} guarded stop service inspection",
+            capture=True,
+        ).stdout.strip()
+        if service not in allowed_services:
+            unexpected.append(service)
+        else:
+            stoppable.append(container)
+    if stoppable:
+        runner.run(
+            [
+                "/usr/bin/docker",
+                "stop",
+                "--time",
+                str(timeout),
+                *stoppable,
+            ],
+            f"{project} bounded container stop",
+        )
+    if unexpected:
+        raise ActivationError(
+            f"{project} guarded stop found unexpected services: "
+            + ", ".join(sorted(set(unexpected)))
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("revision", nargs="?")
+    operation_mode = parser.add_mutually_exclusive_group()
+    operation_mode.add_argument("--start-application", action="store_true")
+    operation_mode.add_argument("--start-edge", action="store_true")
+    operation_mode.add_argument("--stop-application", action="store_true")
+    operation_mode.add_argument("--stop-edge", action="store_true")
+    args = parser.parse_args()
+    service_operation = any(
+        (
+            args.start_application,
+            args.start_edge,
+            args.stop_application,
+            args.stop_edge,
+        )
+    )
+    if service_operation and args.revision is not None:
+        parser.error("guarded service modes do not accept a revision")
+    if not service_operation and args.revision is None:
+        parser.error("activation requires one full lowercase Git SHA")
+    if args.revision is not None and SHA40.fullmatch(args.revision) is None:
+        parser.error("revision must be one full lowercase Git SHA")
+    try:
+        if args.stop_application:
+            stop_bounded_project(
+                Runner(), "surplasse", frozenset(RUNTIME_SERVICES), 120
+            )
+            print("Surplasse guarded stop succeeded: application services")
+            return 0
+        if args.stop_edge:
+            stop_bounded_project(
+                Runner(), "vps-public-static-edge", frozenset({"caddy"}), 30
+            )
+            print("Surplasse guarded stop succeeded: public edge")
+            return 0
+        if ACTIVATION_IMPLEMENTATION_BLOCKERS:
+            raise ActivationError(
+                "activation implementation remains locked before host access: "
+                + ", ".join(ACTIVATION_IMPLEMENTATION_BLOCKERS)
+            )
+        if args.start_application or args.start_edge:
+            backend = ProductionBackend(RuntimePaths.active())
+            if args.start_application:
+                containers = backend.guarded_start_application()
+                subject = "application services"
+                backend.notify_systemd_ready(subject)
+                backend.monitor_application(containers)
+            else:
+                container = backend.guarded_start_edge()
+                subject = "public edge"
+                backend.notify_systemd_ready(subject)
+                backend.monitor_edge(container)
+            raise ActivationError("guarded supervisor returned unexpectedly")
+        activate(ProductionBackend(RuntimePaths.production(args.revision)))
+    except (ActivationError, OSError, subprocess.SubprocessError) as exc:
+        print(f"Surplasse operation refused: {exc}", file=sys.stderr)
+        return EX_CONFIG
+    print(f"Surplasse activation succeeded: {args.revision}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

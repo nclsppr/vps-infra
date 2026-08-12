@@ -78,13 +78,20 @@ INTEGRATION_REPOSITORIES = {
 
 SURPLASSE_READINESS_GATES = frozenset(
     {
+        "activation-controller-implementation",
+        "application-release-evidence",
+        "domain-and-dns",
+        "integration-artifact-materialization",
+        "ovh-zone-scoped-dns-credentials",
         "platform-extraction",
+        "platform-runtime-provenance",
         "postgres-compatibility",
         "postgres-role-provisioning",
         "production-digests",
         "protected-main",
         "public-smoke",
         "restore-proof",
+        "runtime-crash-safety",
         "separated-migrations",
         "stripe-connect-production-adapter",
         "vps-integration-bundle",

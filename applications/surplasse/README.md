@@ -171,24 +171,60 @@ transient migration profile. It applies the shared Compose policy, then checks
 the Surplasse-specific roles, secrets, health probes, aliases, migration
 command, disabled integration candidates, and locked blockers.
 
-## Activation sequence
+The privileged lifecycle fixture is separate because it boots systemd in a
+disposable container:
 
-A later reviewed slice must remove every blocker atomically. The applicator
-must use this order:
+```bash
+make check-surplasse-systemd
+```
 
-1. verify the exact Backend image and its migration command;
-2. prove a restorable PostgreSQL backup;
-3. provision the database and the three roles;
-4. run the transient migration job and require a successful exit;
-5. start the five long-running services without host ports;
-6. activate the Caddy route and Prometheus configuration with the required
-   platform network attachments;
-7. complete strict internal and public probes;
-8. change DNS only after the direct Atlas probe succeeds.
+It uses a digest-pinned Ubuntu 26.04 base and fake Docker/guard processes. It
+proves unit syntax, ordered stop/start on an explicit Docker restart, and
+bounded supervisor restart after SIGKILL. It does not simulate the real Docker
+API or `live-restore`.
 
-The verified Backend digest satisfies the migration-entrypoint image gate. The
-adapter remains locked by the other release, integration, secret, restore, and
-public-proof gates.
+## Migration-first activation controller
+
+The repository contains a dormant implementation scaffold, not an activation
+authorization. Three independent barriers remain in force:
+
+- `adapter.json` and `releases/production.yaml` keep Surplasse disabled and
+  enumerate every known blocker;
+- the Ansible role rejects `state=activate` from local source data before any
+  Surplasse host read, secret access, or mutation;
+- the runtime CLI rejects activation and guarded start modes before it creates
+  a production backend, reads secrets, recovers state, or mutates the host.
+
+The scaffold records the intended migration-first ordering, exact secret
+metadata, network contracts, owner-unit files, direct Atlas probes, rollback
+boundary, and a durable transaction-journal design. Its unit tests and the
+Ubuntu 26.04 systemd fixture validate these isolated contracts. They do not
+prove that the complete activation is crash-safe or deployable.
+
+The following blockers require separate implementation and adversarial proof:
+
+- a real application release-evidence workflow and verifier, including typed
+  evidence bound to a computed subject. The referenced Surplasse workflow does
+  not exist at the current application revision;
+- immutable materialization of the declared VPS integration artifact, with
+  digests bound to the exact local files that Atlas consumes;
+- provenance checks binding the active internal-platform and public-edge
+  runtime revisions and images to the approved release;
+- authorization that remains continuously valid while Compose starts and
+  probes run, including controller death and the reconciliation race where a
+  supervisor authorizes against the prior `active` journal, waits for the
+  bundle lock, then continues after the controller publishes `starting`;
+- a Docker daemon failure contract. Atlas currently enables Docker
+  `live-restore`, so containers may outlive the daemon and the systemd cleanup
+  path cannot yet prove fail-closed behavior;
+- a same-release secret-rotation design that does not unnecessarily restart
+  shared PostgreSQL, Grafana, Prometheus, and exporters.
+
+No reachable path in this revision changes Docker `live-restore`, activates an
+owner unit, deploys Surplasse, consumes OVH credentials, requests a
+certificate, or changes DNS. The direct TLS and DNS-01 behavior in the dormant
+scaffold is therefore a future contract only. Public A, AAAA, and CNAME cutover
+remains a separate reviewed operator action.
 
 ## Fail-closed Atlas preparation
 
@@ -216,15 +252,15 @@ application container. It does not change the persistent platform network
 membership, public Caddy, Prometheus, DNS, or operator-supplied application
 secrets.
 
-`make activate-surplasse` is an intentional refusal while `adapter.json` is
-locked. The refusal occurs before a database, application, shared platform, or
-public edge mutation. The next release slice must complete image provenance,
-persistent platform attachments, operator secrets, migration-first
-orchestration, rollback, and public proof, then change the adapter through
-review before activation code can be enabled.
+`make activate-surplasse` is an unconditional implementation refusal in this
+revision, in addition to the locked adapter and release gates. Removing only
+one barrier is insufficient. A later audited slice must close every encoded
+blocker and add the missing crash tests before any unlock or deployment.
 
-The files under `integration/` are inactive attachment candidates. They show
-the bounded target memberships: PostgreSQL joins only `db_surplasse`,
-Prometheus joins only `ops` and `app_surplasse`, and public Caddy keeps `edge`
-plus the fixed `172.30.10.254` address on `app_surplasse`. The preparation
-controller stages these candidates but never applies them.
+The files under `integration/` are inactive attachment candidates during
+preparation. They show the bounded target memberships: PostgreSQL joins only
+`db_surplasse`, Prometheus joins only `ops` and `app_surplasse`, and public
+Caddy keeps `edge` plus the fixed `172.30.10.254` address on
+`app_surplasse`. Preparation stages these candidates but never applies them.
+Only a fully authorized activation can install them as persistent owner-unit
+overrides.

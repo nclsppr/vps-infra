@@ -18,6 +18,12 @@ vps_surplasse_release_files:
     dest: applications/surplasse/expected-images.json
   - src: applications/surplasse/migrations.json
     dest: applications/surplasse/migrations.json
+  - src: applications/surplasse/systemd/vps-surplasse.service
+    dest: applications/surplasse/systemd/vps-surplasse.service
+  - src: applications/surplasse/systemd/vps-internal-platform-surplasse.conf
+    dest: applications/surplasse/systemd/vps-internal-platform-surplasse.conf
+  - src: applications/surplasse/systemd/vps-public-static-edge-surplasse.conf
+    dest: applications/surplasse/systemd/vps-public-static-edge-surplasse.conf
   - src: applications/surplasse/integration/internal-platform.override.yaml
     dest: integration/internal-platform.override.yaml
   - src: applications/surplasse/integration/public-edge.override.yaml
@@ -96,3 +102,21 @@ vps_surplasse_operator_inputs:
   - surplasse-stripe-account-webhook-secret
   - surplasse-stripe-payment-webhook-secret
   - surplasse-stripe-secret-key
+vps_surplasse_required_activation_evidence:
+  - activation-controller-implementation
+  - application-release-evidence
+  - domain-and-dns
+  - integration-artifact-materialization
+  - ovh-zone-scoped-dns-credentials
+  - platform-extraction
+  - platform-runtime-provenance
+  - postgres-compatibility
+  - postgres-role-provisioning
+  - production-digests
+  - protected-main
+  - public-smoke
+  - restore-proof
+  - runtime-crash-safety
+  - separated-migrations
+  - stripe-connect-production-adapter
+  - vps-integration-bundle

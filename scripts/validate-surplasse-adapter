@@ -292,14 +292,20 @@ def validate_metadata(
     if not isinstance(blockers, list) or blockers != sorted(set(blockers)):
         fail("adapter.blocked_by: must be a sorted unique array")
     required_blockers = {
+        "activation-controller-implementation",
+        "application-release-evidence",
         "application-release-controller",
         "caddy-app-network-and-fixed-address",
+        "domain-and-dns",
+        "integration-artifact-materialization",
         "ovh-zone-scoped-dns-credentials",
         "postgres-app-network",
+        "platform-runtime-provenance",
         "production-image-provenance",
         "production-secrets",
         "prometheus-job-and-app-network",
         "protected-main",
+        "runtime-crash-safety",
         "stripe-connect-production-adapter",
         "vps-integration-bundle",
     }

@@ -60,7 +60,7 @@ services:
       - surplasse_stripe_payment_webhook_secret
       - surplasse_stripe_secret_key
     user: "10001:10001"
-    restart: unless-stopped
+    restart: "no"
     cpus: 1.0
     mem_limit: 768m
     pids_limit: 256
@@ -83,7 +83,7 @@ services:
     <<: *hardened
     image: ${SURPLASSE_ONBOARDING_IMAGE:?SURPLASSE_ONBOARDING_IMAGE is required}
     user: "101:101"
-    restart: unless-stopped
+    restart: "no"
     cpus: 0.25
     mem_limit: 128m
     pids_limit: 64
@@ -108,7 +108,7 @@ services:
     <<: *hardened
     image: ${SURPLASSE_COMMANDE_IMAGE:?SURPLASSE_COMMANDE_IMAGE is required}
     user: "101:101"
-    restart: unless-stopped
+    restart: "no"
     cpus: 0.25
     mem_limit: 128m
     pids_limit: 64
@@ -133,7 +133,7 @@ services:
     <<: *hardened
     image: ${SURPLASSE_DASHBOARD_IMAGE:?SURPLASSE_DASHBOARD_IMAGE is required}
     user: "101:101"
-    restart: unless-stopped
+    restart: "no"
     cpus: 0.25
     mem_limit: 128m
     pids_limit: 64
@@ -158,7 +158,7 @@ services:
     <<: *hardened
     image: ${SURPLASSE_DOCS_IMAGE:?SURPLASSE_DOCS_IMAGE is required}
     user: "101:101"
-    restart: unless-stopped
+    restart: "no"
     cpus: 0.25
     mem_limit: 128m
     pids_limit: 64

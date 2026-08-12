@@ -1,6 +1,7 @@
 ---
 services:
   caddy:
+    restart: "no"
     environment:
       OVH_APPLICATION_KEY_FILE: /run/secrets/surplasse_ovh_application_key
       OVH_APPLICATION_SECRET_FILE: /run/secrets/surplasse_ovh_application_secret

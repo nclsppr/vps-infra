@@ -54,3 +54,22 @@ and generation-manifest rules are in
 The adapter remains locked. A locally valid OVH token shape does not prove its
 IAM scope, and valid Stripe values do not prove the reviewed Connect release
 gate. Do not activate from the presence of files alone.
+
+The operator manifest is the commit marker for the complete installed bundle.
+The materializer publishes it last and serializes validation and replacement
+with the bundle lock. This makes preparation atomic. It does not make runtime
+rotation safe by itself: an atomic host rename does not update an existing
+Docker file bind mount.
+
+The dormant activation scaffold uses a global activation lock, a durable
+`starting` or `active` journal, a transaction lease, and shorter bundle-lock
+sections around validation and guarded recreation. It deliberately does not
+claim that one bundle flock spans the whole transaction. Continuous lease
+enforcement during long Compose and probe operations, Docker daemon crash
+behavior, and non-disruptive same-release rotation remain explicit blockers.
+
+The flat destination does not retain an immutable previous secret generation.
+No operator should rotate an active Surplasse bundle until the later runtime
+design is implemented and proved. This revision prepares secrets and database
+roles only; activation and guarded starts are implementation-locked before host
+access.

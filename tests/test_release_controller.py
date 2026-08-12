@@ -402,6 +402,24 @@ class ReleasePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "protected-main"):
             RELEASE_POLICY.validate_manifest(manifest)
 
+    def test_surplasse_requires_pre_cutover_domain_contract_evidence(self) -> None:
+        manifest = sample_manifest()
+        enable_surplasse(manifest)
+        del manifest["applications"]["surplasse"]["readiness_evidence"]["domain-and-dns"]
+        with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "domain-and-dns"):
+            RELEASE_POLICY.validate_manifest(manifest)
+
+    def test_surplasse_requires_scoped_ovh_zone_iam_evidence(self) -> None:
+        manifest = sample_manifest()
+        enable_surplasse(manifest)
+        del manifest["applications"]["surplasse"]["readiness_evidence"][
+            "ovh-zone-scoped-dns-credentials"
+        ]
+        with self.assertRaisesRegex(
+            RELEASE_POLICY.PolicyError, "ovh-zone-scoped-dns-credentials"
+        ):
+            RELEASE_POLICY.validate_manifest(manifest)
+
     def test_complete_parkventory_evidence_is_valid(self) -> None:
         manifest = sample_manifest()
         enable_parkventory(manifest)
@@ -577,6 +595,10 @@ def app_document(project: str = "surplasse") -> dict:
             image(f"ghcr.io/nclsppr/{project}/{component}"),
             networks,
         )
+        if component in COMPOSE_POLICY.SYSTEMD_SUPERVISED_APPLICATION_SERVICES.get(
+            project, frozenset()
+        ):
+            services[component]["restart"] = "no"
         services[component]["networks"][f"app_{project}"] = {
             "aliases": [f"{project}-{component}"]
         }
@@ -952,6 +974,30 @@ class ComposePolicyTests(unittest.TestCase):
     def test_application_without_host_ports_is_valid(self) -> None:
         document = app_document()
         validate_app_document(document)
+
+    def test_restart_no_is_bounded_to_systemd_supervised_surplasse_services(
+        self,
+    ) -> None:
+        surplasse = app_document("surplasse")
+        validate_app_document(surplasse)
+        for service_name in COMPOSE_POLICY.APPLICATION_COMPONENTS["surplasse"]:
+            self.assertEqual(surplasse["services"][service_name]["restart"], "no")
+
+        parkventory = app_document("parkventory")
+        parkventory["services"]["backend"]["restart"] = "no"
+        with self.assertRaisesRegex(
+            COMPOSE_POLICY.ComposePolicyError,
+            r"services\.backend\.restart: expected 'unless-stopped'",
+        ):
+            validate_app_document(parkventory)
+
+        platform = platform_document()
+        platform["services"]["prometheus"]["restart"] = "no"
+        with self.assertRaisesRegex(
+            COMPOSE_POLICY.ComposePolicyError,
+            r"services\.prometheus\.restart: expected 'unless-stopped'",
+        ):
+            validate_platform_document(platform)
 
     def test_surplasse_adapter_enforces_the_one_shot_migration_boundary(self) -> None:
         document = surplasse_adapter_document()

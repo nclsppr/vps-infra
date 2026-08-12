@@ -54,6 +54,136 @@ def load_json(path: Path, subject: str) -> dict[str, Any]:
     return value
 
 
+def validate_ready_adapter(
+    root: Path,
+    adapter: dict[str, Any],
+    migrations: dict[str, Any],
+    expected: dict[str, Any],
+    adapter_module: Any,
+    release: dict[str, Any],
+) -> None:
+    """Validate a future reviewed ready adapter without the locked-only policy."""
+
+    adapter_module.require_keys(
+        adapter,
+        {
+            "activation_policy",
+            "blocked_by",
+            "integration",
+            "migration",
+            "runtime_services",
+            "schema",
+            "source_repository",
+            "source_revision",
+            "transient_services",
+        },
+        "adapter",
+    )
+    if adapter.get("schema") != 1:
+        fail("activation requires adapter schema 1")
+    if adapter.get("activation_policy") != "ready":
+        fail("activation requires adapter.activation_policy=ready")
+    if adapter.get("blocked_by") != []:
+        fail("activation requires an empty adapter blocker set")
+    if adapter.get("runtime_services") != [
+        "backend",
+        "commande",
+        "dashboard",
+        "docs",
+        "onboarding",
+    ] or adapter.get("transient_services") != ["migrator"]:
+        fail("activation adapter service inventory differs from the contract")
+    source_revision = adapter.get("source_revision")
+    if (
+        adapter.get("source_repository") != "nclsppr/surplasse"
+        or not isinstance(source_revision, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_revision) is None
+    ):
+        fail("activation requires one exact Surplasse source revision")
+    adapter_module.validate_image_contract(expected, source_revision)
+    applications = release.get("applications")
+    release_application = (
+        applications.get("surplasse") if isinstance(applications, dict) else None
+    )
+    components = (
+        release_application.get("components")
+        if isinstance(release_application, dict)
+        else None
+    )
+    if not isinstance(components, dict) or set(components) != set(
+        adapter["runtime_services"]
+    ):
+        fail("activation release components do not match the adapter inventory")
+    for component_name in adapter["runtime_services"]:
+        component = components.get(component_name)
+        if component != {
+            "image": expected[component_name],
+            "source_revision": source_revision,
+        }:
+            fail(
+                f"activation release component {component_name} differs from "
+                "the adapter image and revision"
+            )
+    # Reuse the exact migration record validator even for the future ready
+    # shape; only its locked-policy checks are intentionally replaced here.
+    locked_adapter = dict(adapter)
+    locked_adapter["activation_policy"] = "locked"
+    locked_adapter["blocked_by"] = sorted(
+        {
+            "activation-controller-implementation",
+            "application-release-evidence",
+            "application-release-controller",
+            "caddy-app-network-and-fixed-address",
+            "domain-and-dns",
+            "integration-artifact-materialization",
+            "ovh-zone-scoped-dns-credentials",
+            "postgres-app-network",
+            "platform-runtime-provenance",
+            "production-image-provenance",
+            "production-secrets",
+            "prometheus-job-and-app-network",
+            "protected-main",
+            "runtime-crash-safety",
+            "stripe-connect-production-adapter",
+            "vps-integration-bundle",
+        }
+    )
+    adapter_module.validate_metadata(root, locked_adapter, migrations, expected)
+    if adapter.get("migration") != {
+        "entrypoint": "/opt/surplasse/scripts/backend-migrate.sh",
+        "published_in_backend_image": True,
+        "role": "surplasse_migrator",
+        "runtime_auto_migrate": False,
+    }:
+        fail("activation adapter migration differs from the reviewed contract")
+    if (
+        migrations.get("schema") != 1
+        or migrations.get("database") != "surplasse"
+        or migrations.get("source_repository") != "nclsppr/surplasse"
+        or migrations.get("source_revision") != source_revision
+    ):
+        fail("activation migration inventory is not bound to the source revision")
+    entries = migrations.get("migrations")
+    if not isinstance(entries, list) or [
+        entry.get("version") for entry in entries if isinstance(entry, dict)
+    ] != list(range(1, 15)):
+        fail(
+            "activation migration inventory must contain ordered versions 1 through 14"
+        )
+    integration = adapter.get("integration")
+    expected_integration = {
+        "caddy_route": "platform/caddy/routes/surplasse.caddy.disabled",
+        "prometheus_rules": "platform/observability/prometheus/rules/surplasse.yml.disabled",
+        "prometheus_targets": "platform/observability/prometheus/targets/surplasse.yml.disabled",
+    }
+    if integration != expected_integration:
+        fail("activation adapter integration differs from the reviewed candidates")
+    for relative in expected_integration.values():
+        candidate = root / relative
+        if not candidate.is_file() or candidate.is_symlink():
+            fail(f"activation adapter integration candidate is unavailable: {relative}")
+
+
 def validate(root: Path, mode: str, rendered: Path) -> None:
     application = root / "applications" / "surplasse"
     adapter_module = load_module(root / "scripts" / "validate-surplasse-adapter")
@@ -61,9 +191,15 @@ def validate(root: Path, mode: str, rendered: Path) -> None:
     expected = load_json(application / "expected-images.json", "expected images")
     adapter = load_json(application / "adapter.json", "adapter")
     migrations = load_json(application / "migrations.json", "migrations")
+    release = load_json(root / "releases/production.yaml", "production release")
     try:
         adapter_module.validate_compose(compose, expected)
-        adapter_module.validate_metadata(root, adapter, migrations, expected)
+        if mode == "prepare":
+            adapter_module.validate_metadata(root, adapter, migrations, expected)
+        else:
+            validate_ready_adapter(
+                root, adapter, migrations, expected, adapter_module, release
+            )
     except adapter_module.AdapterError as exc:
         fail(str(exc))
 
@@ -72,21 +208,14 @@ def validate(root: Path, mode: str, rendered: Path) -> None:
             fail("prepare mode requires the reviewed locked adapter")
         return
 
-    if adapter.get("activation_policy") != "ready":
-        fail("activation requires adapter.activation_policy=ready")
-    if adapter.get("blocked_by") != []:
-        fail("activation requires an empty adapter blocker set")
-    migration = adapter.get("migration")
-    if not isinstance(migration, dict) or migration.get("published_in_backend_image") is not True:
-        fail("activation requires the verified Backend migration entrypoint")
-    source_revision = adapter.get("source_revision")
-    if not isinstance(source_revision, str) or re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
-        fail("activation requires one exact source revision")
+    return
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument(
+        "--root", type=Path, default=Path(__file__).resolve().parent.parent
+    )
     parser.add_argument("--mode", choices=("prepare", "activate"), required=True)
     parser.add_argument("rendered_compose", type=Path)
     args = parser.parse_args()

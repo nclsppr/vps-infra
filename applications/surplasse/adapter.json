@@ -1,10 +1,15 @@
 {
   "activation_policy": "locked",
   "blocked_by": [
+    "activation-controller-implementation",
     "application-release-controller",
+    "application-release-evidence",
     "caddy-app-network-and-fixed-address",
     "dns-cutover",
+    "domain-and-dns",
+    "integration-artifact-materialization",
     "ovh-zone-scoped-dns-credentials",
+    "platform-runtime-provenance",
     "postgres-app-network",
     "production-image-provenance",
     "production-secrets",
@@ -12,6 +17,7 @@
     "protected-main",
     "public-smoke",
     "restore-proof",
+    "runtime-crash-safety",
     "stripe-connect-production-adapter",
     "vps-integration-bundle"
   ],

@@ -31,7 +31,91 @@
         vps_surplasse_network_contract ==
         {'app_surplasse': {'subnet': '172.30.10.0/24', 'internal': false},
          'db_surplasse': {'subnet': '172.30.11.0/24', 'internal': true}}
+      - >-
+        vps_surplasse_required_activation_evidence | sort ==
+        ['activation-controller-implementation',
+         'application-release-evidence', 'domain-and-dns',
+         'integration-artifact-materialization',
+         'ovh-zone-scoped-dns-credentials', 'platform-extraction',
+         'platform-runtime-provenance', 'postgres-compatibility',
+         'postgres-role-provisioning', 'production-digests', 'protected-main',
+         'public-smoke', 'restore-proof', 'runtime-crash-safety',
+         'separated-migrations',
+         'stripe-connect-production-adapter', 'vps-integration-bundle']
     fail_msg: The Surplasse inputs differ from the reviewed controller contract.
+
+- name: Read the source Surplasse activation gates without host mutation
+  ansible.builtin.set_fact:
+    vps_surplasse_source_adapter: >-
+      {{ lookup('ansible.builtin.file',
+                playbook_dir ~ '/../../applications/surplasse/adapter.json') |
+         from_json }}
+    vps_surplasse_source_release: >-
+      {{ lookup('ansible.builtin.file',
+                playbook_dir ~ '/../../releases/production.yaml') |
+         from_json }}
+
+- name: Refuse the dormant activation implementation before Surplasse host operations
+  ansible.builtin.assert:
+    that:
+      - vps_surplasse_state != 'activate'
+    fail_msg: >-
+      Surplasse activation remains implementation-locked. Application release
+      evidence, integration artifact materialization, platform runtime
+      provenance, and crash-safe supervision are not yet proved. No host state
+      changed.
+
+- name: Refuse incomplete activation gates before any host mutation
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_surplasse_state != 'activate' or
+        (vps_surplasse_source_adapter.activation_policy == 'ready' and
+         vps_surplasse_source_adapter.blocked_by == [] and
+         vps_surplasse_source_release.activation_policy == 'ready' and
+         vps_surplasse_source_release.applications.surplasse.enabled | bool and
+         vps_surplasse_source_release.applications.surplasse.blocked_by == [] and
+         vps_surplasse_source_release.applications.surplasse.migrations.strategy
+         == 'dedicated' and
+         not (vps_surplasse_source_release.applications.surplasse.migrations
+              .runtime_auto_migrate | bool) and
+         vps_surplasse_source_release.applications.surplasse.migrations.proven |
+         bool and
+         vps_surplasse_required_activation_evidence |
+         difference(vps_surplasse_source_release.applications.surplasse
+                    .readiness_evidence.keys() | list) | length == 0)
+    fail_msg: >-
+      Surplasse activation requires a separately reviewed ready adapter and
+      release with release, migration, restore, Stripe, public, and DNS
+      evidence. No host state changed.
+
+- name: Inspect the installed operator bundle helper before activation
+  ansible.builtin.stat:
+    path: /usr/local/libexec/vps/materialize-surplasse-secrets
+    follow: false
+  register: vps_surplasse_activation_secret_helper
+  when: vps_surplasse_state == 'activate'
+
+- name: Require the prepared root-owned operator bundle helper
+  ansible.builtin.assert:
+    that:
+      - vps_surplasse_activation_secret_helper.stat.exists
+      - vps_surplasse_activation_secret_helper.stat.isreg
+      - not vps_surplasse_activation_secret_helper.stat.islnk
+      - vps_surplasse_activation_secret_helper.stat.uid == 0
+      - vps_surplasse_activation_secret_helper.stat.gid == 0
+      - vps_surplasse_activation_secret_helper.stat.mode == '0500'
+    fail_msg: Prepare the exact Surplasse release before activation.
+  when: vps_surplasse_state == 'activate'
+
+- name: Validate the complete atomic operator bundle before host mutation
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/vps/materialize-surplasse-secrets
+      - --operator-only
+  changed_when: false
+  no_log: true
+  when: vps_surplasse_state == 'activate'
 
 - name: Inspect the Surplasse unit
   ansible.builtin.stat:
@@ -216,8 +300,19 @@
              not vps_surplasse_release.stat.islnk)
         fail_msg: The immutable Surplasse release path is not a directory.
 
+    - name: Require exact preparation before activation
+      ansible.builtin.assert:
+        that:
+          - vps_surplasse_release.stat.exists
+          - vps_surplasse_release.stat.isdir
+          - not vps_surplasse_release.stat.islnk
+        fail_msg: Prepare this exact Surplasse controller revision first.
+      when: vps_surplasse_state == 'activate'
+
     - name: Create a new immutable Surplasse release tree
-      when: not vps_surplasse_release.stat.exists
+      when:
+        - vps_surplasse_state == 'prepare'
+        - not vps_surplasse_release.stat.exists
       block:
         - name: Remove an interrupted Surplasse staging tree
           ansible.builtin.file:
@@ -235,6 +330,7 @@
             - ""
             - applications
             - applications/surplasse
+            - applications/surplasse/systemd
             - integration
             - integration/caddy
             - integration/prometheus
@@ -267,6 +363,7 @@
             group: root
             mode: "0555"
           loop:
+            - activate-surplasse-runtime
             - validate-compose
             - validate-surplasse-adapter
             - validate-surplasse-controller
@@ -287,6 +384,7 @@
             group: root
             mode: "0555"
           loop:
+            - applications/surplasse/systemd
             - scripts
             - releases
             - platform/observability/prometheus/targets
@@ -335,6 +433,7 @@
       check_mode: true
       register: vps_surplasse_validator_audit
       loop:
+        - activate-surplasse-runtime
         - validate-compose
         - validate-surplasse-adapter
         - validate-surplasse-controller
@@ -401,15 +500,6 @@
           - /run/vps-surplasse-compose.json
       changed_when: false
 
-    - name: Refuse application activation while the adapter remains locked
-      ansible.builtin.assert:
-        that:
-          - vps_surplasse_state != 'activate'
-        fail_msg: >-
-          The Surplasse adapter is locked. Complete the platform integration,
-          release evidence, rollback proof, and operator secrets before
-          activation.
-
     - name: Install the root-only Surplasse preparation helpers
       ansible.builtin.copy:
         src: "{{ playbook_dir ~ '/../../scripts/' ~ item }}"
@@ -418,6 +508,7 @@
         group: root
         mode: "0500"
       loop:
+        - activate-surplasse-runtime
         - materialize-surplasse-secrets
         - provision-surplasse-postgres
 
@@ -428,6 +519,7 @@
           - --database-only
       changed_when: false
       no_log: true
+      when: vps_surplasse_state == 'prepare'
 
     - name: Resolve the healthy shared PostgreSQL container
       ansible.builtin.command:
@@ -441,12 +533,14 @@
           - label=com.docker.compose.service=postgresql
       register: vps_surplasse_postgres_container
       changed_when: false
+      when: vps_surplasse_state == 'prepare'
 
     - name: Require exactly one shared PostgreSQL container
       ansible.builtin.assert:
         that:
           - vps_surplasse_postgres_container.stdout_lines | length == 1
         fail_msg: The shared PostgreSQL container boundary is ambiguous.
+      when: vps_surplasse_state == 'prepare'
 
     - name: Inspect the current shared PostgreSQL networks
       ansible.builtin.command:
@@ -456,6 +550,7 @@
           - "{{ vps_surplasse_postgres_container.stdout }}"
       register: vps_surplasse_postgres_before
       changed_when: false
+      when: vps_surplasse_state == 'prepare'
 
     - name: Remember whether PostgreSQL already joined db_surplasse
       ansible.builtin.set_fact:
@@ -463,8 +558,10 @@
           {{ 'db_surplasse' in
              (((vps_surplasse_postgres_before.stdout | from_json) |
                first).NetworkSettings.Networks.keys() | list) }}
+      when: vps_surplasse_state == 'prepare'
 
     - name: Provision the database through a temporary private attachment
+      when: vps_surplasse_state == 'prepare'
       block:
         - name: Attach PostgreSQL temporarily to the private application database network
           ansible.builtin.command:
@@ -525,6 +622,15 @@
         path: /run/vps-surplasse-compose.json
         state: absent
 
+    - name: Run the migration-first fail-closed activation transaction
+      ansible.builtin.command:
+        argv:
+          - /usr/local/libexec/vps/activate-surplasse-runtime
+          - "{{ vps_infra_revision }}"
+      changed_when: true
+      no_log: true
+      when: vps_surplasse_state == 'activate'
+
     - name: Report successful bounded preparation
       ansible.builtin.debug:
         msg: >-
@@ -532,3 +638,12 @@
           are prepared. The isolated database and roles match their contract.
           No application container, lasting platform attachment, public route,
           or DNS record changed.
+      when: vps_surplasse_state == 'prepare'
+
+    - name: Report successful migration-first activation
+      ansible.builtin.debug:
+        msg: >-
+          Surplasse passed migration, runtime health, private integration, and
+          direct TLS probes. This controller did not cut over a public traffic
+          record. Caddy may have written scoped ACME DNS-01 TXT records.
+      when: vps_surplasse_state == 'activate'

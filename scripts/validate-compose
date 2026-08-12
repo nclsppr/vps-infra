@@ -26,6 +26,9 @@ APPLICATION_COMPONENTS = {
     "surplasse": frozenset({"backend", "onboarding", "commande", "dashboard", "docs"}),
     "parkventory": frozenset({"backend", "frontend"}),
 }
+SYSTEMD_SUPERVISED_APPLICATION_SERVICES = {
+    "surplasse": APPLICATION_COMPONENTS["surplasse"],
+}
 PUBLIC_CADDY_PORTS = frozenset({(80, 80, "tcp"), (443, 443, "tcp"), (443, 443, "udp")})
 LOOPBACK_GRAFANA_PORT = (3000, 3000, "tcp")
 DANGEROUS_CAPABILITIES = frozenset({"ALL", "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"})
@@ -599,7 +602,10 @@ def validate_security(project: str, service_name: str, service: dict[str, Any]) 
     if devices not in (None, False) and devices != []:
         fail(f"{path}.devices: device passthrough is forbidden")
     is_migrator = service_name == "migrator" or service_name.endswith("_migrator")
-    expected_restart = "no" if is_migrator else "unless-stopped"
+    systemd_supervised = service_name in SYSTEMD_SUPERVISED_APPLICATION_SERVICES.get(
+        project, frozenset()
+    )
+    expected_restart = "no" if is_migrator or systemd_supervised else "unless-stopped"
     if service.get("restart") != expected_restart:
         fail(f"{path}.restart: expected {expected_restart!r}")
     pids_limit = service.get("pids_limit")

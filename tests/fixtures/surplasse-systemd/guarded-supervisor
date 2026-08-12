@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+events=/run/surplasse-systemd-events
+mode=${1:-unknown}
+
+record() {
+  /usr/bin/date +%s%N | /usr/bin/tr -d '\n' >> "$events"
+  printf ' %s\n' "$1" >> "$events"
+}
+
+case "$mode" in
+  --stop-application|--stop-edge)
+    record "$mode:cleanup"
+    ;;
+  --start-application|--start-edge)
+    record "$mode:start"
+    trap 'record "$mode:stop"; exit 0' TERM INT
+    /usr/bin/systemd-notify --pid="$$" --ready --status="$mode ready"
+    while :; do
+      /usr/bin/systemd-notify --pid="$$" WATCHDOG=1
+      /usr/bin/sleep 1
+    done
+    ;;
+  docker)
+    record "docker:start"
+    trap 'record "docker:stop"; exit 0' TERM INT
+    while :; do
+      /usr/bin/sleep 1
+    done
+    ;;
+  *)
+    record "$mode:unexpected"
+    exit 64
+    ;;
+esac

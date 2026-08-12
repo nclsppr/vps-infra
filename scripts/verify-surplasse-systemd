@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+fixture_root="$repository_root/tests/fixtures/surplasse-systemd"
+image="vps-infra/surplasse-systemd-test:ubuntu26.04"
+container="vps-surplasse-systemd-$$"
+
+cleanup() {
+  docker rm --force "$container" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+wait_for_units() {
+  local unit
+  local ready
+  for _ in $(seq 1 60); do
+    ready=true
+    for unit in "$@"; do
+      if ! docker exec "$container" systemctl is-active --quiet "$unit"; then
+        ready=false
+      fi
+    done
+    if "$ready"; then
+      return 0
+    fi
+    sleep 1
+  done
+  docker exec "$container" systemctl --no-pager status "$@" || true
+  return 1
+}
+
+event_line() {
+  local event="$1"
+  docker exec "$container" awk -v event="$event" \
+    'index($0, event) { print NR; exit }' /run/surplasse-systemd-events
+}
+
+require_ordered_events() {
+  local previous=0
+  local event
+  local current
+  for event in "$@"; do
+    current="$(event_line "$event")"
+    if [[ ! "$current" =~ ^[1-9][0-9]*$ ]] || (( current <= previous )); then
+      docker exec "$container" cat /run/surplasse-systemd-events >&2 || true
+      echo "systemd lifecycle event missing or out of order: $event" >&2
+      return 1
+    fi
+    previous="$current"
+  done
+}
+
+docker build \
+  --file "$fixture_root/Dockerfile" \
+  --tag "$image" \
+  "$repository_root"
+
+docker run \
+  --detach \
+  --name "$container" \
+  --privileged \
+  --tmpfs /run \
+  --tmpfs /run/lock \
+  "$image" >/dev/null
+
+units=(
+  docker.service
+  vps-internal-platform.service
+  vps-public-static-edge.service
+  vps-surplasse.service
+)
+wait_for_units "${units[@]}"
+docker exec "$container" systemd-analyze verify \
+  /etc/systemd/system/docker.service \
+  /etc/systemd/system/vps-docker-ingress-firewall.service \
+  /etc/systemd/system/vps-internal-platform.service \
+  /etc/systemd/system/vps-public-static-edge.service \
+  /etc/systemd/system/vps-surplasse.service
+
+docker exec "$container" truncate -s 0 /run/surplasse-systemd-events
+docker exec "$container" systemctl restart docker.service
+wait_for_units "${units[@]}"
+require_ordered_events \
+  --start-application:stop \
+  --stop-application:cleanup \
+  --start-edge:stop \
+  --stop-edge:cleanup \
+  docker:stop \
+  docker:start \
+  --start-edge:start \
+  --start-application:start
+
+old_application_pid="$(docker exec "$container" systemctl show \
+  --property=MainPID --value vps-surplasse.service)"
+edge_pid="$(docker exec "$container" systemctl show \
+  --property=MainPID --value vps-public-static-edge.service)"
+if [[ ! "$old_application_pid" =~ ^[1-9][0-9]*$ ]] \
+  || [[ ! "$edge_pid" =~ ^[1-9][0-9]*$ ]]; then
+  echo "systemd did not expose supervised main processes" >&2
+  exit 1
+fi
+
+docker exec "$container" truncate -s 0 /run/surplasse-systemd-events
+docker exec "$container" kill -KILL "$old_application_pid"
+for _ in $(seq 1 30); do
+  new_application_pid="$(docker exec "$container" systemctl show \
+    --property=MainPID --value vps-surplasse.service)"
+  if [[ "$new_application_pid" =~ ^[1-9][0-9]*$ ]] \
+    && [[ "$new_application_pid" != "$old_application_pid" ]] \
+    && docker exec "$container" systemctl is-active --quiet vps-surplasse.service; then
+    break
+  fi
+  sleep 1
+done
+if [[ ! "$new_application_pid" =~ ^[1-9][0-9]*$ ]] \
+  || [[ "$new_application_pid" == "$old_application_pid" ]]; then
+  docker exec "$container" systemctl --no-pager status vps-surplasse.service >&2 || true
+  exit 1
+fi
+require_ordered_events --stop-application:cleanup --start-application:start
+
+current_edge_pid="$(docker exec "$container" systemctl show \
+  --property=MainPID --value vps-public-static-edge.service)"
+if [[ "$current_edge_pid" != "$edge_pid" ]]; then
+  echo "an application supervisor crash unexpectedly restarted the public edge" >&2
+  exit 1
+fi
+
+echo "Surplasse systemd lifecycle verified on Ubuntu 26.04"

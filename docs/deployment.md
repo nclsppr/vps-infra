@@ -818,13 +818,58 @@ and one runtime login. The runtime role cannot create schema objects. No
 service publishes port 5432. This operation does not start Surplasse, modify
 Caddy or Prometheus, consume OVH credentials, or change DNS.
 
-`make activate-surplasse` remains a fail-closed command. The current adapter
-uses the exact published Backend digest containing the reviewed migration
-command, but still lacks the complete production evidence and integration
-bundle. The controller rejects activation before it changes the application or
-shared platform. A later review must implement the persistent platform
-attachments, run the one-shot migration before the five runtime services, and
-verify strict internal and public probes with rollback.
+`make activate-surplasse` is intentionally unusable in this revision. The
+adapter and production release remain locked, the Ansible role rejects
+`state=activate` before any Surplasse host read, secret access, or mutation,
+and the runtime CLI independently rejects activation and guarded starts before
+it creates a backend, reads secrets, recovers a transaction, or mutates the
+host. Preparation is the only supported Surplasse operation.
+
+The repository includes a dormant migration-first scaffold so that its
+contracts can be reviewed and tested without presenting Atlas as activable. It
+models an immediate PostgreSQL backup followed by a restore rehearsal, a
+one-shot migrator before runtime services, persistent owner-unit attachments,
+bounded direct TLS probes, Prometheus scrape convergence, a global activation
+lock, a durable transaction journal and rollback. The Ubuntu 26.04 fixture
+proves the ordered systemd lifecycle for an explicit Docker restart and a
+supervisor crash. It does not prove the complete production crash boundary.
+
+### Blockers before any activation review
+
+- `activation-controller-implementation`: keep the Ansible and CLI hard locks
+  until every item below is closed and adversarially tested.
+- `application-release-evidence`: add the missing Surplasse
+  `.github/workflows/vps-release.yml`, define a typed application-proof schema,
+  compute the canonical proof subject, and verify artifact identity and digest.
+- `integration-artifact-materialization`: fetch the immutable integration
+  artifact declared by the release and bind every deployed file digest to it.
+  The current scaffold consumes checkout-local candidates instead.
+- `platform-runtime-provenance`: bind the active internal-platform and
+  public-edge runtime revisions, Compose inputs and images to the approved
+  platform candidate before any Surplasse mutation.
+- `runtime-crash-safety`: close the reconciliation race where a supervisor
+  authorizes against the prior `active` journal, waits for the bundle lock,
+  then continues after the controller publishes `starting`. Continuously
+  enforce the transaction lease while Compose and probes run. Prove controller
+  SIGKILL during Compose, controller SIGKILL during probes, and concurrent
+  systemd starts.
+- Docker currently uses `live-restore: true`. A dockerd crash can leave Caddy
+  and application containers alive while systemd cleanup cannot reach the
+  Docker API. A later reviewed maintenance slice must define and prove the
+  fail-closed daemon boundary. This PR does not change Atlas or that setting.
+- same-release reconciliation must avoid restarting the whole shared internal
+  platform during a Surplasse secret rotation.
+
+Preparation continues to use a temporary PostgreSQL attachment and restores
+the prior network membership after role provisioning. It never installs the
+dormant owner-unit files or integration candidates. Grafana remains an internal
+platform service on `127.0.0.1:3000`; this slice does not expose it.
+
+The future direct TLS probes use a local address override and do not cut over
+public A, AAAA, or CNAME records. Caddy DNS-01 would necessarily create and
+remove `_acme-challenge` TXT records, so zone-scoped OVH credentials and proof
+remain blockers. No OVH credential is consumed and no DNS record is changed by
+preparation or by the locked activation command.
 
 ## Modifications nécessaires par dépôt
 
@@ -861,6 +906,15 @@ verify strict internal and public probes with rollback.
 
 ### `surplasse`
 
+- ajouter `.github/workflows/vps-release.yml` et publier des preuves
+  applicatives typées, liées à un sujet canonique et vérifiées indépendamment ;
+- matérialiser le paquet `vps-integration` déclaré plutôt que déployer les
+  candidats locaux du checkout ;
+- prouver la provenance exacte des runtimes plateforme et edge actifs ;
+- fermer les courses du lease pendant Compose et les probes, puis tester les
+  SIGKILL contrôleur et Docker avec le vrai daemon ;
+- définir le contrat `live-restore` et la fenêtre de maintenance avant tout
+  changement sur Atlas ;
 - extraire `edge`, PostgreSQL, Prometheus et Grafana ;
 - rendre les réseaux et l’hôte PostgreSQL externes ;
 - désactiver Flyway au runtime et fournir un job migrateur dédié ;

@@ -1,0 +1,10 @@
+[Unit]
+Description=Simulated Docker daemon for Surplasse systemd lifecycle testing
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/vps/systemd-simulated-service docker
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
 	check-public-static-edge check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
+	check-surplasse-systemd \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	activate-public-static-edge stop-public-static-edge \
@@ -66,7 +67,7 @@ check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
 	$(MISE_EXEC) shellcheck scripts/validate-caddy-build-inputs \
 		scripts/verify-caddy-image scripts/validate-postgres-build-inputs \
-		scripts/verify-postgres-image \
+		scripts/verify-postgres-image scripts/verify-surplasse-systemd \
 		platform/caddy/entrypoint.sh platform/postgres/initdb/10-platform-exporter.sh
 
 check-public-safe: ## Reject secrets and production inventories in this public repository.
@@ -123,6 +124,9 @@ check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 		--expected-images applications/surplasse/expected-images.json \
 		surplasse "$$rendered"; \
 	./scripts/validate-surplasse-adapter "$$rendered"
+
+check-surplasse-systemd: ## Prove the Surplasse owner-unit lifecycle on Ubuntu 26.04.
+	./scripts/verify-surplasse-systemd
 
 check-prometheus: ## Validate active and inactive Prometheus rules in the pinned image.
 	@set -Eeuo pipefail; \
