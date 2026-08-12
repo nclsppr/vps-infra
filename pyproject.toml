@@ -7,7 +7,7 @@ dependencies = []
 
 [dependency-groups]
 dev = [
-  "ansible-core>=2.19,<2.21",
+  "ansible-core>=2.19,<2.22",
   "ansible-lint>=26,<27",
   "jsonschema>=4.25,<5",
   "yamllint>=1.37,<2",
