@@ -46,6 +46,22 @@ case $# in
         playbook=playbooks/internal-platform.yml
         ansible_extra_options=(--extra-vars vps_internal_platform_state=stopped)
         ;;
+      --install-postgres-backup)
+        playbook=playbooks/postgres-backup.yml
+        ansible_extra_options=(--extra-vars vps_postgres_backup_state=installed)
+        ;;
+      --stop-postgres-backup-schedule)
+        playbook=playbooks/postgres-backup.yml
+        ansible_extra_options=(--extra-vars vps_postgres_backup_state=stopped)
+        ;;
+      --backup-postgres-now)
+        playbook=playbooks/postgres-backup.yml
+        ansible_extra_options=(--extra-vars vps_postgres_backup_state=backup-now)
+        ;;
+      --rehearse-postgres-restore)
+        playbook=playbooks/postgres-backup.yml
+        ansible_extra_options=(--extra-vars vps_postgres_backup_state=rehearse-latest)
+        ;;
       *)
         fail "unsupported deployment mode" "$EX_USAGE"
         ;;

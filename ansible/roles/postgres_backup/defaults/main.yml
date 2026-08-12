@@ -1,0 +1,9 @@
+---
+vps_postgres_backup_state: installed
+vps_postgres_backup_root: /srv/vps/backups/postgresql
+vps_postgres_backup_script: /usr/local/libexec/vps/postgres-backup
+vps_postgres_backup_service: vps-postgres-backup.service
+vps_postgres_backup_timer: vps-postgres-backup.timer
+vps_postgres_restore_service: vps-postgres-restore-rehearsal.service
+vps_postgres_restore_timer: vps-postgres-restore-rehearsal.timer
+vps_postgres_backup_retention_count: 7

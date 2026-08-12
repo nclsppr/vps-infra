@@ -16,6 +16,8 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	converge converge-check prepare-public-static-edge \
 	activate-public-static-edge stop-public-static-edge \
 	start-internal-platform stop-internal-platform \
+	install-postgres-backup stop-postgres-backup-schedule \
+	backup-postgres-now rehearse-postgres-restore \
 	doctor-local
 
 help: ## Show the available commands.
@@ -52,6 +54,9 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/internal-platform.yml
+	cd ansible && ../.venv/bin/ansible-playbook \
+		--inventory inventories/production/hosts.example.yml \
+		--syntax-check playbooks/postgres-backup.yml
 
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
@@ -202,6 +207,26 @@ stop-internal-platform: ## Stop internal services and preserve their data volume
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --stop-internal-platform
+
+install-postgres-backup: ## Install and enable local backup and restore timers.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --install-postgres-backup
+
+stop-postgres-backup-schedule: ## Disable timers without deleting backup data.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --stop-postgres-backup-schedule
+
+backup-postgres-now: ## Create and verify one local PostgreSQL backup now.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --backup-postgres-now
+
+rehearse-postgres-restore: ## Restore the latest backup in a disposable container.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --rehearse-postgres-restore
 
 doctor-local: ## Audit the local checkout without contact with the VPS.
 	./scripts/doctor --local

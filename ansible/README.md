@@ -211,6 +211,33 @@ systemd unit never names Caddy. Both operations preserve named volumes and
 secrets. The start role refuses any unselected container in the shared Compose
 project before it can reconcile with `--remove-orphans`.
 
+## Local PostgreSQL backup stage
+
+Install the daily local backup and monthly isolated restore rehearsal only
+after the internal platform controller exists:
+
+```bash
+make install-postgres-backup \
+  ANSIBLE_EXTRA_VARS=/absolute/private/path/bootstrap-public.yml
+make backup-postgres-now \
+  ANSIBLE_EXTRA_VARS=/absolute/private/path/bootstrap-public.yml
+make rehearse-postgres-restore \
+  ANSIBLE_EXTRA_VARS=/absolute/private/path/bootstrap-public.yml
+```
+
+The backup playbook never starts or stops Caddy or an application. The
+immediate modes require the internal platform to be active. The stop mode
+disables only the two timers and preserves every backup and Docker volume:
+
+```bash
+make stop-postgres-backup-schedule \
+  ANSIBLE_EXTRA_VARS=/absolute/private/path/bootstrap-public.yml
+```
+
+This stage is not encrypted and is not off-site. See
+[`docs/operations/postgresql-backup.md`](../docs/operations/postgresql-backup.md)
+before accepting production data.
+
 ## Prepared Docker networks
 
 Ansible creates seven external Docker networks with fixed properties. The
