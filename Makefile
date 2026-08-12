@@ -18,6 +18,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	start-internal-platform stop-internal-platform \
 	install-postgres-backup stop-postgres-backup-schedule \
 	backup-postgres-now rehearse-postgres-restore \
+	prepare-surplasse activate-surplasse stop-surplasse \
 	doctor-local
 
 help: ## Show the available commands.
@@ -57,6 +58,9 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/postgres-backup.yml
+	cd ansible && ../.venv/bin/ansible-playbook \
+		--inventory inventories/production/hosts.example.yml \
+		--syntax-check playbooks/surplasse.yml
 
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
@@ -121,7 +125,8 @@ check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 	./scripts/validate-surplasse-adapter "$$rendered"
 
 check-prometheus: ## Validate active and inactive Prometheus rules in the pinned image.
-	@image="$$(sed -n 's/^PROMETHEUS_IMAGE=//p' "$(PLATFORM_ENV)")"; \
+	@set -Eeuo pipefail; \
+		image="$$(sed -n 's/^PROMETHEUS_IMAGE=//p' "$(PLATFORM_ENV)")"; \
 		test -n "$$image"; \
 		docker run --rm --entrypoint promtool \
 			--volume "$(CURDIR)/platform/observability/prometheus:/etc/prometheus:ro" \
@@ -131,7 +136,30 @@ check-prometheus: ## Validate active and inactive Prometheus rules in the pinned
 			docker run --rm --entrypoint promtool \
 				--volume "$$candidate:/tmp/candidate.yml:ro" \
 				"$$image" check rules /tmp/candidate.yml; \
-		done
+		done; \
+		candidate_root="$$(mktemp -d)"; \
+		trap 'rm -rf -- "$$candidate_root"' EXIT; \
+		mkdir -p "$$candidate_root/rules" "$$candidate_root/targets"; \
+		cp applications/surplasse/integration/prometheus/prometheus.yml \
+			"$$candidate_root/prometheus.yml"; \
+		cp platform/observability/prometheus/rules/platform.yml \
+			"$$candidate_root/rules/platform.yml"; \
+		cp platform/observability/prometheus/rules/surplasse.yml.disabled \
+			"$$candidate_root/rules/surplasse.yml"; \
+		cp platform/observability/prometheus/targets/node-exporter.yml \
+			"$$candidate_root/targets/node-exporter.yml"; \
+		cp platform/observability/prometheus/targets/postgres-exporter.yml \
+			"$$candidate_root/targets/postgres-exporter.yml"; \
+		cp platform/observability/prometheus/targets/surplasse.yml.disabled \
+			"$$candidate_root/targets/surplasse.yml"; \
+		chmod 0755 "$$candidate_root" "$$candidate_root/rules" \
+			"$$candidate_root/targets"; \
+		chmod 0444 "$$candidate_root/prometheus.yml" \
+			"$$candidate_root/rules/"*.yml \
+			"$$candidate_root/targets/"*.yml; \
+		docker run --rm --entrypoint promtool \
+			--volume "$$candidate_root:/etc/prometheus:ro" \
+			"$$image" check config /etc/prometheus/prometheus.yml
 
 check-caddy: ## Build Caddy and validate the inactive and candidate route sets.
 	@set -Eeuo pipefail; \
@@ -227,6 +255,21 @@ rehearse-postgres-restore: ## Restore the latest backup in a disposable containe
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --rehearse-postgres-restore
+
+prepare-surplasse: ## Stage Surplasse and provision only its private database boundary.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --prepare-surplasse
+
+activate-surplasse: ## Fail closed until every Surplasse activation gate is reviewed.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --activate-surplasse
+
+stop-surplasse: ## Stop only Surplasse application containers and preserve state.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --stop-surplasse
 
 doctor-local: ## Audit the local checkout without contact with the VPS.
 	./scripts/doctor --local

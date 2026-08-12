@@ -1,0 +1,42 @@
+---
+services:
+  postgresql:
+    networks:
+      db_monitoring:
+        aliases:
+          - postgresql
+      db_surplasse:
+        aliases:
+          - postgresql
+
+  prometheus:
+    volumes:
+      - type: bind
+        source: /srv/vps/runtime/surplasse/integration/prometheus/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/vps/runtime/surplasse/integration/prometheus/targets
+        target: /etc/prometheus/targets
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/vps/runtime/surplasse/integration/prometheus/rules
+        target: /etc/prometheus/rules
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      ops: {}
+      app_surplasse: {}
+
+networks:
+  db_surplasse:
+    external: true
+    name: db_surplasse
+  app_surplasse:
+    external: true
+    name: app_surplasse

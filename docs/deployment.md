@@ -805,6 +805,27 @@ release approuvée, utiliser le même wrapper et remplacer — jamais doubler �
 déclencheur GitHub Actions. Deux contrôleurs concurrents ne doivent pas déployer
 le même VPS.
 
+## Surplasse database preparation
+
+`make prepare-surplasse` is a bounded production operation. It validates and
+stages the exact locked adapter before it changes database state. It creates
+only the missing database passwords. It then connects the healthy shared
+PostgreSQL container to `db_surplasse` for the provisioning transaction and
+removes that temporary connection.
+
+The transaction creates one database owner with `NOLOGIN`, one migrator login,
+and one runtime login. The runtime role cannot create schema objects. No
+service publishes port 5432. This operation does not start Surplasse, modify
+Caddy or Prometheus, consume OVH credentials, or change DNS.
+
+`make activate-surplasse` remains a fail-closed command. The current adapter
+uses the exact published Backend digest containing the reviewed migration
+command, but still lacks the complete production evidence and integration
+bundle. The controller rejects activation before it changes the application or
+shared platform. A later review must implement the persistent platform
+attachments, run the one-shot migration before the five runtime services, and
+verify strict internal and public probes with rollback.
+
 ## Modifications nécessaires par dépôt
 
 ### `personal`

@@ -1,0 +1,516 @@
+---
+- name: Validate the bounded Surplasse controller contract
+  ansible.builtin.assert:
+    that:
+      - vps_surplasse_state in ['prepare', 'activate', 'stopped']
+      - vps_surplasse_project == 'surplasse'
+      - vps_surplasse_release_root == '/srv/vps/releases/surplasse'
+      - vps_surplasse_runtime_link == '/srv/vps/runtime/surplasse'
+      - >-
+        vps_surplasse_runtime_dir ==
+        '/srv/vps/runtime/surplasse/applications/surplasse'
+      - vps_surplasse_unit == 'vps-surplasse.service'
+      - >-
+        vps_surplasse_runtime_services | sort ==
+        ['backend', 'commande', 'dashboard', 'docs', 'onboarding']
+      - >-
+        vps_surplasse_database_secrets | sort ==
+        ['surplasse-postgres-migrator-password',
+         'surplasse-postgres-runtime-password']
+      - >-
+        vps_surplasse_network_contract ==
+        {'app_surplasse': {'subnet': '172.30.10.0/24', 'internal': false},
+         'db_surplasse': {'subnet': '172.30.11.0/24', 'internal': true}}
+    fail_msg: The Surplasse inputs differ from the reviewed controller contract.
+
+- name: Inspect the Surplasse unit
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ vps_surplasse_unit }}"
+    follow: false
+  register: vps_surplasse_unit_file
+
+- name: Stop only Surplasse application services and preserve all state
+  when: vps_surplasse_state == 'stopped'
+  block:
+    - name: Disable the Surplasse unit when installed
+      ansible.builtin.systemd_service:
+        name: "{{ vps_surplasse_unit }}"
+        enabled: false
+        daemon_reload: true
+      failed_when: false
+      when: vps_surplasse_unit_file.stat.exists
+
+    - name: Stop the Surplasse unit on a best-effort basis
+      ansible.builtin.systemd_service:
+        name: "{{ vps_surplasse_unit }}"
+        state: stopped
+      failed_when: false
+      when: vps_surplasse_unit_file.stat.exists
+
+    - name: List each running Surplasse project container before stop
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --quiet
+          - --filter
+          - label=com.docker.compose.project={{ vps_surplasse_project }}
+      register: vps_surplasse_running_before_stop
+      changed_when: false
+
+    - name: Read the service label of each residual Surplasse container
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - inspect
+          - --format
+          - >-
+            {{ '{{' }} index .Config.Labels
+            "com.docker.compose.service" {{ '}}' }}
+          - "{{ item }}"
+      register: vps_surplasse_residual_service_labels
+      changed_when: false
+      loop: "{{ vps_surplasse_running_before_stop.stdout_lines }}"
+
+    - name: Refuse to stop a container outside the runtime allowlist
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_surplasse_residual_service_labels.results |
+            map(attribute='stdout') | list |
+            difference(vps_surplasse_runtime_services) | length == 0
+        fail_msg: The Surplasse project contains an unexpected running service.
+
+    - name: Stop each bounded residual Surplasse runtime container
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - stop
+          - --time
+          - "120"
+          - "{{ item }}"
+      changed_when: true
+      loop: "{{ vps_surplasse_running_before_stop.stdout_lines }}"
+
+    - name: List running Surplasse project containers after stop
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --quiet
+          - --filter
+          - label=com.docker.compose.project={{ vps_surplasse_project }}
+      register: vps_surplasse_running_after_stop
+      changed_when: false
+
+    - name: Prove Surplasse stopped without deleting state
+      ansible.builtin.assert:
+        that:
+          - vps_surplasse_running_after_stop.stdout_lines | length == 0
+        fail_msg: A Surplasse application container is still running.
+
+- name: Stage a fail-closed Surplasse release
+  when: vps_surplasse_state in ['prepare', 'activate']
+  block:
+    - name: Derive the immutable Surplasse release paths
+      ansible.builtin.set_fact:
+        vps_surplasse_release_dir: >-
+          {{ vps_surplasse_release_root ~ '/' ~ vps_infra_revision }}
+        vps_surplasse_staging_dir: >-
+          {{ vps_surplasse_release_root ~ '/.' ~ vps_infra_revision ~ '.staging' }}
+        vps_surplasse_switch_link: >-
+          {{ '/srv/vps/runtime/.surplasse-' ~ vps_infra_revision }}
+
+    - name: Read converged Docker and platform unit state
+      ansible.builtin.service_facts:
+
+    - name: Require the running shared internal platform
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.services['docker.service'].state == 'running'
+          - >-
+            ansible_facts.services[vps_surplasse_internal_platform_unit].state
+            == 'running'
+          - >-
+            ansible_facts.services[vps_surplasse_internal_platform_unit].status
+            == 'enabled'
+        fail_msg: Start and verify the shared internal platform first.
+
+    - name: Inspect the exact Surplasse networks
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - network
+          - inspect
+          - "{{ item.key }}"
+      register: vps_surplasse_network_inspections
+      changed_when: false
+      failed_when: false
+      loop: "{{ vps_surplasse_network_contract | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Prove each managed Surplasse network
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - ((item.stdout | from_json) | first).Name == item.item.key
+          - ((item.stdout | from_json) | first).Driver == 'bridge'
+          - >-
+            ((item.stdout | from_json) | first).Internal | bool ==
+            item.item.value.internal | bool
+          - >-
+            ((item.stdout | from_json) | first).IPAM.Config |
+            map(attribute='Subnet') | list == [item.item.value.subnet]
+          - >-
+            ((item.stdout | from_json) |
+             first).Labels['com.nclsppr.vps-infra.managed'] | default('') ==
+            'true'
+        fail_msg: A Surplasse Docker network differs from the host contract.
+      loop: "{{ vps_surplasse_network_inspections.results }}"
+      loop_control:
+        label: "{{ item.item.key }}"
+
+    - name: Create protected Surplasse release parents
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ vps_surplasse_release_root }}"
+        - /srv/vps/runtime
+        - /usr/local/libexec/vps
+
+    - name: Inspect the immutable Surplasse release
+      ansible.builtin.stat:
+        path: "{{ vps_surplasse_release_dir }}"
+        follow: false
+      register: vps_surplasse_release
+
+    - name: Refuse a non-directory immutable release path
+      ansible.builtin.assert:
+        that:
+          - >-
+            not vps_surplasse_release.stat.exists or
+            (vps_surplasse_release.stat.isdir and
+             not vps_surplasse_release.stat.islnk)
+        fail_msg: The immutable Surplasse release path is not a directory.
+
+    - name: Create a new immutable Surplasse release tree
+      when: not vps_surplasse_release.stat.exists
+      block:
+        - name: Remove an interrupted Surplasse staging tree
+          ansible.builtin.file:
+            path: "{{ vps_surplasse_staging_dir }}"
+            state: absent
+
+        - name: Create every Surplasse staging directory
+          ansible.builtin.file:
+            path: "{{ vps_surplasse_staging_dir }}/{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+          loop:
+            - ""
+            - applications
+            - applications/surplasse
+            - integration
+            - integration/caddy
+            - integration/prometheus
+            - integration/prometheus/rules
+            - integration/prometheus/targets
+            - platform
+            - platform/caddy
+            - platform/caddy/routes
+            - platform/observability
+            - platform/observability/prometheus
+            - platform/observability/prometheus/rules
+            - platform/observability/prometheus/targets
+            - releases
+            - scripts
+
+        - name: Copy the exact Surplasse application release inputs
+          ansible.builtin.copy:
+            src: "{{ playbook_dir ~ '/../../' ~ item.src }}"
+            dest: "{{ vps_surplasse_staging_dir }}/{{ item.dest }}"
+            owner: root
+            group: root
+            mode: "0444"
+          loop: "{{ vps_surplasse_release_files }}"
+
+        - name: Copy the exact Surplasse controller validators
+          ansible.builtin.copy:
+            src: "{{ playbook_dir ~ '/../../scripts/' ~ item }}"
+            dest: "{{ vps_surplasse_staging_dir }}/scripts/{{ item }}"
+            owner: root
+            group: root
+            mode: "0555"
+          loop:
+            - validate-compose
+            - validate-surplasse-adapter
+            - validate-surplasse-controller
+
+        - name: Record the exact Surplasse controller revision
+          ansible.builtin.copy:
+            content: "{{ vps_infra_revision }}\n"
+            dest: "{{ vps_surplasse_staging_dir }}/source-revision"
+            owner: root
+            group: root
+            mode: "0444"
+
+        - name: Seal every Surplasse release directory
+          ansible.builtin.file:
+            path: "{{ vps_surplasse_staging_dir }}/{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0555"
+          loop:
+            - scripts
+            - releases
+            - platform/observability/prometheus/targets
+            - platform/observability/prometheus/rules
+            - platform/observability/prometheus
+            - platform/observability
+            - platform/caddy/routes
+            - platform/caddy
+            - platform
+            - integration/prometheus/targets
+            - integration/prometheus/rules
+            - integration/prometheus
+            - integration/caddy
+            - integration
+            - applications/surplasse
+            - applications
+            - ""
+
+        - name: Atomically install the immutable Surplasse release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/mv
+              - --no-target-directory
+              - "{{ vps_surplasse_staging_dir }}"
+              - "{{ vps_surplasse_release_dir }}"
+          changed_when: true
+
+    - name: Audit every immutable Surplasse release input
+      ansible.builtin.copy:
+        src: "{{ playbook_dir ~ '/../../' ~ item.src }}"
+        dest: "{{ vps_surplasse_release_dir }}/{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0444"
+      check_mode: true
+      register: vps_surplasse_release_file_audit
+      loop: "{{ vps_surplasse_release_files }}"
+
+    - name: Audit every immutable Surplasse validator
+      ansible.builtin.copy:
+        src: "{{ playbook_dir ~ '/../../scripts/' ~ item }}"
+        dest: "{{ vps_surplasse_release_dir }}/scripts/{{ item }}"
+        owner: root
+        group: root
+        mode: "0555"
+      check_mode: true
+      register: vps_surplasse_validator_audit
+      loop:
+        - validate-compose
+        - validate-surplasse-adapter
+        - validate-surplasse-controller
+
+    - name: Read the immutable Surplasse release revision
+      ansible.builtin.slurp:
+        src: "{{ vps_surplasse_release_dir }}/source-revision"
+      register: vps_surplasse_release_revision
+
+    - name: Prove the immutable release still matches this revision
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_surplasse_release_file_audit.results |
+            selectattr('changed', 'equalto', true) | list | length == 0
+          - >-
+            vps_surplasse_validator_audit.results |
+            selectattr('changed', 'equalto', true) | list | length == 0
+          - >-
+            (vps_surplasse_release_revision.content | b64decode | trim) ==
+            vps_infra_revision
+        fail_msg: The immutable Surplasse release differs from this checkout.
+
+    - name: Render normalized Surplasse Compose JSON before any mutation
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - compose
+          - --project-directory
+          - "{{ vps_surplasse_release_dir }}/applications/surplasse"
+          - --env-file
+          - "{{ vps_surplasse_release_dir }}/applications/surplasse/.env.example"
+          - --file
+          - "{{ vps_surplasse_release_dir }}/applications/surplasse/compose.yaml"
+          - --profile
+          - migration
+          - config
+          - --format
+          - json
+          - --output
+          - /run/vps-surplasse-compose.json
+      changed_when: false
+
+    - name: Apply the shared production Compose policy before any mutation
+      ansible.builtin.command:
+        argv:
+          - "{{ vps_surplasse_release_dir }}/scripts/validate-compose"
+          - --expected-images
+          - >-
+            {{ vps_surplasse_release_dir ~
+               '/applications/surplasse/expected-images.json' }}
+          - surplasse
+          - /run/vps-surplasse-compose.json
+      changed_when: false
+
+    - name: Prove the controller mode before any mutation
+      ansible.builtin.command:
+        argv:
+          - "{{ vps_surplasse_release_dir }}/scripts/validate-surplasse-controller"
+          - --root
+          - "{{ vps_surplasse_release_dir }}"
+          - --mode
+          - "{{ vps_surplasse_state }}"
+          - /run/vps-surplasse-compose.json
+      changed_when: false
+
+    - name: Refuse application activation while the adapter remains locked
+      ansible.builtin.assert:
+        that:
+          - vps_surplasse_state != 'activate'
+        fail_msg: >-
+          The Surplasse adapter is locked. Complete the platform integration,
+          release evidence, rollback proof, and operator secrets before
+          activation.
+
+    - name: Install the root-only Surplasse preparation helpers
+      ansible.builtin.copy:
+        src: "{{ playbook_dir ~ '/../../scripts/' ~ item }}"
+        dest: "/usr/local/libexec/vps/{{ item }}"
+        owner: root
+        group: root
+        mode: "0500"
+      loop:
+        - materialize-surplasse-secrets
+        - provision-surplasse-postgres
+
+    - name: Create only the missing database passwords
+      ansible.builtin.command:
+        argv:
+          - /usr/local/libexec/vps/materialize-surplasse-secrets
+          - --database-only
+      changed_when: false
+      no_log: true
+
+    - name: Resolve the healthy shared PostgreSQL container
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --quiet
+          - --filter
+          - label=com.docker.compose.project=vps-platform
+          - --filter
+          - label=com.docker.compose.service=postgresql
+      register: vps_surplasse_postgres_container
+      changed_when: false
+
+    - name: Require exactly one shared PostgreSQL container
+      ansible.builtin.assert:
+        that:
+          - vps_surplasse_postgres_container.stdout_lines | length == 1
+        fail_msg: The shared PostgreSQL container boundary is ambiguous.
+
+    - name: Inspect the current shared PostgreSQL networks
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - inspect
+          - "{{ vps_surplasse_postgres_container.stdout }}"
+      register: vps_surplasse_postgres_before
+      changed_when: false
+
+    - name: Remember whether PostgreSQL already joined db_surplasse
+      ansible.builtin.set_fact:
+        vps_surplasse_postgres_network_was_present: >-
+          {{ 'db_surplasse' in
+             (((vps_surplasse_postgres_before.stdout | from_json) |
+               first).NetworkSettings.Networks.keys() | list) }}
+
+    - name: Provision the database through a temporary private attachment
+      block:
+        - name: Attach PostgreSQL temporarily to the private application database network
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - network
+              - connect
+              - --alias
+              - postgresql
+              - db_surplasse
+              - "{{ vps_surplasse_postgres_container.stdout }}"
+          changed_when: true
+          when: not vps_surplasse_postgres_network_was_present
+
+        - name: Provision the isolated Surplasse roles and database
+          ansible.builtin.command:
+            argv:
+              - /usr/local/libexec/vps/provision-surplasse-postgres
+          changed_when: true
+          no_log: true
+
+      always:
+        - name: Remove the temporary PostgreSQL network attachment
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - network
+              - disconnect
+              - db_surplasse
+              - "{{ vps_surplasse_postgres_container.stdout }}"
+          changed_when: true
+          failed_when: false
+          when: not vps_surplasse_postgres_network_was_present
+
+        - name: Inspect PostgreSQL after private network cleanup
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - inspect
+              - "{{ vps_surplasse_postgres_container.stdout }}"
+          register: vps_surplasse_postgres_after
+          changed_when: false
+
+        - name: Prove preparation preserved the prior platform network state
+          ansible.builtin.assert:
+            that:
+              - >-
+                ('db_surplasse' in
+                 (((vps_surplasse_postgres_after.stdout | from_json) |
+                   first).NetworkSettings.Networks.keys() | list)) ==
+                (vps_surplasse_postgres_network_was_present | bool)
+            fail_msg: >-
+              The temporary PostgreSQL network attachment was not restored to
+              its prior state.
+
+    - name: Remove the transient rendered Compose document
+      ansible.builtin.file:
+        path: /run/vps-surplasse-compose.json
+        state: absent
+
+    - name: Report successful bounded preparation
+      ansible.builtin.debug:
+        msg: >-
+          The immutable Surplasse release and its generated database passwords
+          are prepared. The isolated database and roles match their contract.
+          No application container, lasting platform attachment, public route,
+          or DNS record changed.

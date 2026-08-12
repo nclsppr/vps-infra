@@ -28,6 +28,10 @@
 	file_server
 }
 
+(proxy_headers) {
+	header_up Host {http.request.host}
+}
+
 # This listener is available only on the external Docker network. It is not
 # published on the host.
 http://:2019 {

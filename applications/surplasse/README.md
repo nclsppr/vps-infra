@@ -18,22 +18,26 @@ service publishes a host port or mounts a volume.
 
 ## Locked state
 
-`adapter.json` has `activation_policy: locked`. No release controller consumes
-this directory. Do not copy it to Atlas and do not run `compose up` from it.
+`adapter.json` has `activation_policy: locked`. The preparation controller can
+stage this directory and provision its private database boundary, but it cannot
+activate the application. Do not copy it manually to Atlas or run `compose up`
+from it.
 
 The five candidate images in `.env.example` were published from Surplasse
-revision `fab494ad2940f9ee46bf9a186ec7fb2735185367`. The published Backend
-image does not contain `/opt/surplasse/scripts/backend-migrate.sh`. Therefore,
-the migration job cannot run from that digest. The adapter records this fact as
-`published_in_backend_image: false` and keeps the matching blocker.
+revision `d915388d11bf0dbe9111d049cf8f6c72add4d245`. All five exact digests are
+published for Linux AMD64. The Backend digest contains executable migration and
+healthcheck runners, and its V1 through V14 migration hashes match the reviewed
+source revision. The adapter records `published_in_backend_image: true`.
 
 The adapter also stays locked for these integration reasons:
 
 - the platform Caddy service does not join `app_surplasse` at the fixed trusted
   proxy address `172.30.10.254`;
 - the platform PostgreSQL service does not join `db_surplasse`;
-- no controller creates the `surplasse` database, its `NOLOGIN` owner, the
-  `surplasse_migrator` role, or the `surplasse_runtime` role;
+- the preparation controller can create the `surplasse` database, its
+  `NOLOGIN` owner, the `surplasse_migrator` role, and the
+  `surplasse_runtime` role, but the platform attachment needed at runtime is
+  still inactive;
 - the platform Prometheus service does not join `app_surplasse` and has no
   active Surplasse scrape job;
 - the Caddy route and the Prometheus target and rules still have the
@@ -120,5 +124,45 @@ must use this order:
 7. complete strict internal and public probes;
 8. change DNS only after the direct Atlas probe succeeds.
 
-Do not remove the Backend migration-entrypoint blocker until a new immutable
-Backend digest is published and verified.
+The verified Backend digest satisfies the migration-entrypoint image gate. The
+adapter remains locked by the other release, integration, secret, restore, and
+public-proof gates.
+
+## Fail-closed Atlas preparation
+
+The host controller can prepare the private database boundary while this
+adapter remains locked:
+
+```bash
+make prepare-surplasse \
+  ANSIBLE_INVENTORY=/private/path/hosts.yml \
+  ANSIBLE_EXTRA_VARS=/private/path/bootstrap-public.yml
+```
+
+Preparation validates and stages the exact adapter first. It then creates only
+the two missing random database passwords as `root:10001` with mode `0440`. It
+temporarily attaches the healthy shared PostgreSQL container to
+`db_surplasse`, provisions the `surplasse` database and these roles, and removes
+the temporary attachment:
+
+- `surplasse_owner`: `NOLOGIN` database owner;
+- `surplasse_migrator`: login role that defaults to the owner role;
+- `surplasse_runtime`: login role without schema creation rights.
+
+PostgreSQL does not publish a host port. Preparation does not start or stop an
+application container. It does not change the persistent platform network
+membership, public Caddy, Prometheus, DNS, or operator-supplied application
+secrets.
+
+`make activate-surplasse` is an intentional refusal while `adapter.json` is
+locked. The refusal occurs before a database, application, shared platform, or
+public edge mutation. The next release slice must complete image provenance,
+persistent platform attachments, operator secrets, migration-first
+orchestration, rollback, and public proof, then change the adapter through
+review before activation code can be enabled.
+
+The files under `integration/` are inactive attachment candidates. They show
+the bounded target memberships: PostgreSQL joins only `db_surplasse`,
+Prometheus joins only `ops` and `app_surplasse`, and public Caddy keeps `edge`
+plus the fixed `172.30.10.254` address on `app_surplasse`. The preparation
+controller stages these candidates but never applies them.

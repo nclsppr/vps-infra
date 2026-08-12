@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Provision the isolated Surplasse database roles in shared PostgreSQL."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+EX_CONFIG = 78
+PROJECT = "vps-platform"
+SERVICE = "postgresql"
+DATABASE = "surplasse"
+OWNER_ROLE = "surplasse_owner"
+MIGRATOR_ROLE = "surplasse_migrator"
+RUNTIME_ROLE = "surplasse_runtime"
+DATABASE_NETWORK = "db_surplasse"
+PROTECTED_ROOT = Path("/etc/vps/secrets/surplasse")
+CREDENTIAL_PATTERN = re.compile(rb"[A-Za-z0-9_-]{32,128}\n")
+
+
+class ProvisionError(RuntimeError):
+    """Raised when the PostgreSQL provisioning boundary is not exact."""
+
+
+def fail(message: str) -> int:
+    print(f"Surplasse PostgreSQL provisioning refused: {message}", file=sys.stderr)
+    return EX_CONFIG
+
+
+def command(
+    arguments: list[str], *, input_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            arguments,
+            input=input_text,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"},
+        )
+    except OSError as exc:
+        raise ProvisionError(f"cannot execute {arguments[0]}: {exc.strerror}") from exc
+
+
+def docker_json(arguments: list[str], subject: str) -> Any:
+    result = command(["/usr/bin/docker", *arguments])
+    if result.returncode != 0:
+        raise ProvisionError(f"cannot inspect {subject}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProvisionError(f"Docker returned invalid JSON for {subject}") from exc
+
+
+def resolve_postgres_container() -> str:
+    result = command(
+        [
+            "/usr/bin/docker",
+            "ps",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={PROJECT}",
+            "--filter",
+            f"label=com.docker.compose.service={SERVICE}",
+        ]
+    )
+    containers = [line for line in result.stdout.splitlines() if line]
+    if result.returncode != 0 or len(containers) != 1:
+        raise ProvisionError("expected exactly one running shared PostgreSQL container")
+    container = containers[0]
+    inspection = docker_json(["inspect", container], "the PostgreSQL container")
+    if not isinstance(inspection, list) or len(inspection) != 1:
+        raise ProvisionError("PostgreSQL container inspection is incomplete")
+    state = inspection[0]
+    labels = state.get("Config", {}).get("Labels", {})
+    networks = state.get("NetworkSettings", {}).get("Networks", {})
+    health = state.get("State", {}).get("Health", {}).get("Status")
+    if (
+        labels.get("com.docker.compose.project") != PROJECT
+        or labels.get("com.docker.compose.service") != SERVICE
+        or health != "healthy"
+        or DATABASE_NETWORK not in networks
+    ):
+        raise ProvisionError(
+            "shared PostgreSQL is not healthy on the exact Surplasse database network"
+        )
+    return container
+
+
+def read_password(name: str, root: Path) -> str:
+    path = root / name
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ProvisionError(f"cannot open protected password {name}: {exc.strerror}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 10001
+            or stat.S_IMODE(metadata.st_mode) != 0o440
+        ):
+            raise ProvisionError(f"password {name} has unsafe metadata")
+        content = os.read(descriptor, 130)
+        if CREDENTIAL_PATTERN.fullmatch(content) is None:
+            raise ProvisionError(f"password {name} has an invalid format")
+        return content[:-1].decode("ascii")
+    finally:
+        os.close(descriptor)
+
+
+def sql_literal(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", value) is None:
+        raise ProvisionError("a password left the validated character set")
+    return "'" + value.replace("'", "''") + "'"
+
+
+def psql(container: str, database: str, sql: str) -> str:
+    result = command(
+        [
+            "/usr/bin/docker",
+            "exec",
+            "--interactive",
+            container,
+            "psql",
+            "--no-password",
+            "--username",
+            "platform_admin",
+            "--dbname",
+            database,
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--no-psqlrc",
+            "--quiet",
+        ],
+        input_text=sql,
+    )
+    if result.returncode != 0:
+        raise ProvisionError("PostgreSQL rejected the bounded provisioning transaction")
+    return result.stdout
+
+
+def provision(container: str, migrator_password: str, runtime_password: str) -> None:
+    cluster_sql = f"""
+BEGIN;
+DO $provision$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{OWNER_ROLE}') THEN
+    CREATE ROLE {OWNER_ROLE} NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{MIGRATOR_ROLE}') THEN
+    CREATE ROLE {MIGRATOR_ROLE} LOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{RUNTIME_ROLE}') THEN
+    CREATE ROLE {RUNTIME_ROLE} LOGIN;
+  END IF;
+END
+$provision$;
+ALTER ROLE {OWNER_ROLE} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE {MIGRATOR_ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD {sql_literal(migrator_password)};
+ALTER ROLE {RUNTIME_ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 20 PASSWORD {sql_literal(runtime_password)};
+GRANT {OWNER_ROLE} TO {MIGRATOR_ROLE};
+COMMIT;
+SELECT 'CREATE DATABASE {DATABASE} OWNER {OWNER_ROLE} TEMPLATE template0 ENCODING ''UTF8'''
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '{DATABASE}')\\gexec
+REVOKE CONNECT ON DATABASE {DATABASE} FROM PUBLIC;
+GRANT CONNECT ON DATABASE {DATABASE} TO {MIGRATOR_ROLE}, {RUNTIME_ROLE};
+ALTER DATABASE {DATABASE} OWNER TO {OWNER_ROLE};
+ALTER ROLE {MIGRATOR_ROLE} IN DATABASE {DATABASE} SET ROLE TO {OWNER_ROLE};
+ALTER ROLE {MIGRATOR_ROLE} IN DATABASE {DATABASE} SET search_path TO public;
+ALTER ROLE {RUNTIME_ROLE} IN DATABASE {DATABASE} SET search_path TO public;
+"""
+    psql(container, "postgres", cluster_sql)
+
+    database_sql = f"""
+BEGIN;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM {RUNTIME_ROLE};
+GRANT USAGE ON SCHEMA public TO {RUNTIME_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE {OWNER_ROLE} IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {RUNTIME_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE {OWNER_ROLE} IN SCHEMA public
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO {RUNTIME_ROLE};
+ALTER DEFAULT PRIVILEGES FOR ROLE {OWNER_ROLE} IN SCHEMA public
+  GRANT EXECUTE ON FUNCTIONS TO {RUNTIME_ROLE};
+COMMIT;
+"""
+    psql(container, DATABASE, database_sql)
+
+    proof_sql = f"""
+SELECT concat_ws('|',
+  (SELECT rolcanlogin::text FROM pg_roles WHERE rolname = '{OWNER_ROLE}'),
+  (SELECT rolcanlogin::text FROM pg_roles WHERE rolname = '{MIGRATOR_ROLE}'),
+  (SELECT rolcanlogin::text FROM pg_roles WHERE rolname = '{RUNTIME_ROLE}'),
+  (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{DATABASE}'),
+  has_database_privilege('{RUNTIME_ROLE}', '{DATABASE}', 'CONNECT')::text,
+  has_schema_privilege('{RUNTIME_ROLE}', 'public', 'USAGE')::text,
+  has_schema_privilege('{RUNTIME_ROLE}', 'public', 'CREATE')::text
+);
+"""
+    result = command(
+        [
+            "/usr/bin/docker",
+            "exec",
+            container,
+            "psql",
+            "--no-password",
+            "--username",
+            "platform_admin",
+            "--dbname",
+            DATABASE,
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            proof_sql,
+        ]
+    )
+    if result.returncode != 0 or result.stdout.strip() != (
+        f"false|true|true|{OWNER_ROLE}|true|true|false"
+    ):
+        raise ProvisionError("the effective database role proof differs from the contract")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--secret-root", type=Path, default=PROTECTED_ROOT, help=argparse.SUPPRESS
+    )
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        return fail("production provisioning requires root")
+    if args.secret_root != PROTECTED_ROOT:
+        return fail("the production secret root is fixed")
+    try:
+        container = resolve_postgres_container()
+        migrator_credential = read_password(
+            "surplasse-postgres-migrator-password", args.secret_root
+        )
+        runtime_credential = read_password(
+            "surplasse-postgres-runtime-password", args.secret_root
+        )
+        provision(container, migrator_credential, runtime_credential)
+    except ProvisionError as exc:
+        return fail(str(exc))
+    print("Surplasse PostgreSQL roles and database match the isolated contract")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Validate the fail-closed Surplasse controller inputs."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+class ControllerError(ValueError):
+    """Raised when a controller input is outside the reviewed contract."""
+
+
+def fail(message: str) -> None:
+    raise ControllerError(message)
+
+
+def load_module(path: Path):
+    loader = importlib.machinery.SourceFileLoader("surplasse_adapter", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        fail("cannot load the Surplasse adapter validator")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, member in pairs:
+        if key in value:
+            fail(f"duplicate JSON key {key!r}")
+        value[key] = member
+    return value
+
+
+def load_json(path: Path, subject: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=strict_object,
+            parse_constant=lambda member: fail(f"invalid JSON constant {member!r}"),
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"{subject}: cannot read strict UTF-8 JSON: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{subject}: must be an object")
+    return value
+
+
+def validate(root: Path, mode: str, rendered: Path) -> None:
+    application = root / "applications" / "surplasse"
+    adapter_module = load_module(root / "scripts" / "validate-surplasse-adapter")
+    compose = load_json(rendered, "rendered Compose")
+    expected = load_json(application / "expected-images.json", "expected images")
+    adapter = load_json(application / "adapter.json", "adapter")
+    migrations = load_json(application / "migrations.json", "migrations")
+    try:
+        adapter_module.validate_compose(compose, expected)
+        adapter_module.validate_metadata(root, adapter, migrations, expected)
+    except adapter_module.AdapterError as exc:
+        fail(str(exc))
+
+    if mode == "prepare":
+        if adapter.get("activation_policy") != "locked":
+            fail("prepare mode requires the reviewed locked adapter")
+        return
+
+    if adapter.get("activation_policy") != "ready":
+        fail("activation requires adapter.activation_policy=ready")
+    if adapter.get("blocked_by") != []:
+        fail("activation requires an empty adapter blocker set")
+    migration = adapter.get("migration")
+    if not isinstance(migration, dict) or migration.get("published_in_backend_image") is not True:
+        fail("activation requires the verified Backend migration entrypoint")
+    source_revision = adapter.get("source_revision")
+    if not isinstance(source_revision, str) or re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
+        fail("activation requires one exact source revision")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument("--mode", choices=("prepare", "activate"), required=True)
+    parser.add_argument("rendered_compose", type=Path)
+    args = parser.parse_args()
+    try:
+        validate(args.root.resolve(), args.mode, args.rendered_compose)
+    except (ControllerError, OSError) as exc:
+        print(f"Surplasse controller validation failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Surplasse controller inputs valid: {args.mode}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

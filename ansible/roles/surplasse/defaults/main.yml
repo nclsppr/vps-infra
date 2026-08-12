@@ -1,0 +1,84 @@
+---
+vps_surplasse_state: prepare
+vps_surplasse_project: surplasse
+vps_surplasse_release_root: /srv/vps/releases/surplasse
+vps_surplasse_runtime_link: /srv/vps/runtime/surplasse
+vps_surplasse_runtime_dir: /srv/vps/runtime/surplasse/applications/surplasse
+vps_surplasse_unit: vps-surplasse.service
+vps_surplasse_internal_platform_unit: vps-internal-platform.service
+vps_surplasse_public_edge_unit: vps-public-static-edge.service
+vps_surplasse_release_files:
+  - src: applications/surplasse/adapter.json
+    dest: applications/surplasse/adapter.json
+  - src: applications/surplasse/compose.yaml
+    dest: applications/surplasse/compose.yaml
+  - src: applications/surplasse/.env.example
+    dest: applications/surplasse/.env.example
+  - src: applications/surplasse/expected-images.json
+    dest: applications/surplasse/expected-images.json
+  - src: applications/surplasse/migrations.json
+    dest: applications/surplasse/migrations.json
+  - src: applications/surplasse/integration/internal-platform.override.yaml
+    dest: integration/internal-platform.override.yaml
+  - src: applications/surplasse/integration/public-edge.override.yaml
+    dest: integration/public-edge.override.yaml
+  - src: applications/surplasse/integration/prometheus/prometheus.yml
+    dest: integration/prometheus/prometheus.yml
+  - src: platform/caddy/routes/surplasse.caddy.disabled
+    dest: integration/caddy/surplasse.caddy
+  - src: platform/observability/prometheus/rules/platform.yml
+    dest: integration/prometheus/rules/platform.yml
+  - src: platform/observability/prometheus/rules/surplasse.yml.disabled
+    dest: integration/prometheus/rules/surplasse.yml
+  - src: platform/observability/prometheus/targets/node-exporter.yml
+    dest: integration/prometheus/targets/node-exporter.yml
+  - src: platform/observability/prometheus/targets/postgres-exporter.yml
+    dest: integration/prometheus/targets/postgres-exporter.yml
+  - src: platform/observability/prometheus/targets/surplasse.yml.disabled
+    dest: integration/prometheus/targets/surplasse.yml
+  - src: platform/caddy/routes/surplasse.caddy.disabled
+    dest: platform/caddy/routes/surplasse.caddy.disabled
+  - src: platform/observability/prometheus/prometheus.yml
+    dest: platform/observability/prometheus/prometheus.yml
+  - src: platform/observability/prometheus/rules/platform.yml
+    dest: platform/observability/prometheus/rules/platform.yml
+  - src: platform/observability/prometheus/rules/surplasse.yml.disabled
+    dest: platform/observability/prometheus/rules/surplasse.yml.disabled
+  - src: platform/observability/prometheus/targets/node-exporter.yml
+    dest: platform/observability/prometheus/targets/node-exporter.yml
+  - src: platform/observability/prometheus/targets/postgres-exporter.yml
+    dest: platform/observability/prometheus/targets/postgres-exporter.yml
+  - src: platform/observability/prometheus/targets/surplasse.yml.disabled
+    dest: platform/observability/prometheus/targets/surplasse.yml.disabled
+  - src: releases/production.yaml
+    dest: releases/production.yaml
+vps_surplasse_runtime_services:
+  - backend
+  - commande
+  - dashboard
+  - docs
+  - onboarding
+vps_surplasse_network_contract:
+  app_surplasse:
+    subnet: 172.30.10.0/24
+    internal: false
+  db_surplasse:
+    subnet: 172.30.11.0/24
+    internal: true
+vps_surplasse_database_secrets:
+  - surplasse-postgres-migrator-password
+  - surplasse-postgres-runtime-password
+vps_surplasse_application_secrets:
+  - surplasse-jwt-jwks
+  - surplasse-jwt-private-key
+  - surplasse-postgres-migrator-password
+  - surplasse-postgres-runtime-password
+  - surplasse-smtp-password
+  - surplasse-smtp-username
+  - surplasse-stripe-account-webhook-secret
+  - surplasse-stripe-payment-webhook-secret
+  - surplasse-stripe-secret-key
+vps_surplasse_dns_secrets:
+  - ovh-application-key
+  - ovh-application-secret
+  - ovh-consumer-key
