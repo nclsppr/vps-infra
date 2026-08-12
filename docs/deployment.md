@@ -630,8 +630,8 @@ atomically, and starts exactly Caddy. Its preparation routes are explicitly
 HTTP-only so certificate issuance does not start while DNS still points to
 GitHub Pages.
 
-Capture the complete DNS records first. For both zones, change the apex and
-`www` A records to the single Atlas IPv4 address. Explicitly delete every old
+Capture the complete DNS records first. For all three zones, change the apex
+and `www` A records to the single Atlas IPv4 address. Explicitly delete every old
 GitHub Pages AAAA record at the apex and `www`; merely avoiding a new Atlas
 AAAA record is insufficient. Do not change MX, TXT, CAA, or mail-related
 records. Verify the answers directly against every authoritative nameserver.
@@ -645,14 +645,15 @@ make activate-public-static-edge \
 The activation refuses to start while an authoritative or recursive A answer
 differs from Atlas or while any AAAA answer remains. It atomically switches to
 the HTTPS routes, waits for certificate issuance, and requires strict HTTPS
-responses for both apexes and both `www` redirects. The bounded rollback is:
+responses for all three apexes and all three `www` redirects. The bounded
+rollback is:
 
 ```bash
 make stop-public-static-edge \
   ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
 ```
 
-Stopping the edge preserves both static release trees and the ACME volumes.
+Stopping the edge preserves all three static release trees and the ACME volumes.
 DNS rollback restores the exact records captured before the cutover.
 
 This deployment does not waive or cancel the internal platform. PostgreSQL and
