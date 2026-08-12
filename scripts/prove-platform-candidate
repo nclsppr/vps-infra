@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""Verify one exact platform candidate and write its canonical proof bundle."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from jsonschema import Draft202012Validator, FormatChecker, ValidationError
+from referencing import Registry, Resource
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPOSITORY_ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from platform_proof import (  # noqa: E402
+    PLATFORM_PROOF_BASELINE_GATES,
+    build_platform_proof,
+    platform_proof_bytes,
+)
+from release_policy import (  # noqa: E402
+    PolicyError,
+    platform_candidate_subject,
+    strict_json_loads,
+    validate_platform_candidate,
+)
+
+
+MAX_COMMAND_BYTES = 16 * 1024 * 1024
+TRIVY_SEVERITIES = "HIGH,CRITICAL"
+EXPECTED_IMAGE_SOURCES = {
+    "caddy": "https://github.com/nclsppr/vps-infra",
+    "grafana": "https://github.com/grafana/grafana",
+    "node_exporter": "https://github.com/prometheus/node_exporter",
+    "prometheus": "https://github.com/prometheus/prometheus",
+}
+IMAGE_PLATFORMS = {
+    "caddy": ("linux/amd64", "linux/arm64"),
+    "grafana": ("linux/amd64",),
+    "node_exporter": ("linux/amd64",),
+    "postgres": ("linux/amd64",),
+    "postgres_exporter": ("linux/amd64",),
+    "prometheus": ("linux/amd64",),
+}
+
+
+class ProofError(ValueError):
+    """Raised when an external platform proof control fails."""
+
+
+def _command(argv: list[str], *, accepted: tuple[int, ...] = (0,)) -> bytes:
+    try:
+        result = subprocess.run(
+            argv,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                "HOME": os.environ.get("HOME", "/nonexistent"),
+                "PATH": os.environ.get("PATH", ""),
+                "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME", ""),
+                "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME", ""),
+                "GH_TOKEN": os.environ.get("GH_TOKEN", ""),
+            },
+        )
+    except OSError as exc:
+        raise ProofError(f"cannot execute {argv[0]}: {exc}") from exc
+    if len(result.stdout) > MAX_COMMAND_BYTES or len(result.stderr) > MAX_COMMAND_BYTES:
+        raise ProofError(f"{argv[0]} output exceeds the safety limit")
+    if result.returncode not in accepted:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ProofError(f"{argv[0]} failed with code {result.returncode}: {detail}")
+    return result.stdout
+
+
+def _strict_json_bytes(value: bytes, subject: str) -> dict[str, Any]:
+    if len(value) > MAX_COMMAND_BYTES:
+        raise ProofError(f"{subject} exceeds the safety limit")
+    try:
+        payload = strict_json_loads(value.decode("utf-8"))
+    except (UnicodeDecodeError, PolicyError) as exc:
+        raise ProofError(f"{subject} is not strict JSON") from exc
+    if not isinstance(payload, dict):
+        raise ProofError(f"{subject} must be a JSON object")
+    return payload
+
+
+def _repository(reference: str) -> str:
+    tagged = reference.split("@", maxsplit=1)[0]
+    final_segment = tagged.rsplit("/", maxsplit=1)[-1]
+    if ":" in final_segment:
+        tagged = tagged.rsplit(":", maxsplit=1)[0]
+    return tagged
+
+
+def _declared_digest(reference: str) -> str:
+    return reference.rsplit("@", maxsplit=1)[1]
+
+
+def _inspect_exact_manifest(reference: str) -> dict[str, Any]:
+    descriptor = _strict_json_bytes(
+        _command(["oras", "manifest", "fetch", "--descriptor", reference]),
+        f"descriptor for {reference}",
+    )
+    digest = descriptor.get("digest")
+    expected_digest = _declared_digest(reference)
+    if digest != expected_digest:
+        raise ProofError(
+            f"registry descriptor for {reference} returned digest {digest!r}"
+        )
+    manifest = _command(["oras", "manifest", "fetch", "--output", "-", reference])
+    actual_digest = f"sha256:{hashlib.sha256(manifest).hexdigest()}"
+    if actual_digest != expected_digest:
+        raise ProofError(
+            f"registry bytes for {reference} hash to {actual_digest}, not {expected_digest}"
+        )
+    return _strict_json_bytes(manifest, f"manifest for {reference}")
+
+
+def _image_config(reference: str, platform: str) -> dict[str, Any]:
+    manifest = _strict_json_bytes(
+        _command(
+            [
+                "oras",
+                "manifest",
+                "fetch",
+                "--platform",
+                platform,
+                "--output",
+                "-",
+                reference,
+            ]
+        ),
+        f"{platform} manifest for {reference}",
+    )
+    config_descriptor = manifest.get("config")
+    if not isinstance(config_descriptor, dict):
+        raise ProofError(f"{platform} manifest for {reference} has no config descriptor")
+    config_digest = config_descriptor.get("digest")
+    if not isinstance(config_digest, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", config_digest
+    ):
+        raise ProofError(f"{platform} config digest for {reference} is invalid")
+    config = _strict_json_bytes(
+        _command(
+            [
+                "oras",
+                "blob",
+                "fetch",
+                "--output",
+                "-",
+                f"{_repository(reference)}@{config_digest}",
+            ]
+        ),
+        f"{platform} config for {reference}",
+    )
+    operating_system, architecture = platform.split("/", maxsplit=1)
+    if config.get("os") != operating_system or config.get("architecture") != architecture:
+        raise ProofError(f"config for {reference} does not match {platform}")
+    return config
+
+
+def _verify_labels(service: str, reference: str, config: dict[str, Any]) -> str | None:
+    image_config = config.get("config")
+    labels = image_config.get("Labels") if isinstance(image_config, dict) else None
+    if labels is None:
+        labels = {}
+    if not isinstance(labels, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in labels.items()
+    ):
+        raise ProofError(f"OCI labels for {reference} are invalid")
+    expected_source = EXPECTED_IMAGE_SOURCES.get(service)
+    if expected_source is not None and labels.get("org.opencontainers.image.source") != expected_source:
+        raise ProofError(
+            f"OCI source label for {reference} must be {expected_source}"
+        )
+    if service != "caddy":
+        return None
+    revision = labels.get("org.opencontainers.image.revision")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ProofError(f"OCI revision label for {reference} must be a full commit")
+    return revision
+
+
+def _scan(reference: str, platform: str, report_path: Path) -> None:
+    _command(
+        [
+            "trivy",
+            "image",
+            "--image-src",
+            "remote",
+            "--platform",
+            platform,
+            "--scanners",
+            "vuln",
+            "--severity",
+            TRIVY_SEVERITIES,
+            "--ignore-unfixed",
+            "--exit-code",
+            "1",
+            "--format",
+            "json",
+            "--output",
+            str(report_path),
+            reference,
+        ]
+    )
+    try:
+        report_bytes = report_path.read_bytes()
+    except OSError as exc:
+        raise ProofError(f"Trivy did not write {report_path}") from exc
+    report = _strict_json_bytes(report_bytes, f"Trivy report for {reference} {platform}")
+    for result in report.get("Results", []):
+        if not isinstance(result, dict):
+            raise ProofError(f"Trivy report for {reference} is invalid")
+        vulnerabilities = result.get("Vulnerabilities") or []
+        if vulnerabilities:
+            raise ProofError(
+                f"Trivy reported a fixed HIGH or CRITICAL vulnerability for {reference}"
+            )
+
+
+def _verify_attestation(
+    reference: str,
+    *,
+    source_revision: str,
+    signer_workflow: str | None,
+) -> None:
+    argv = [
+        "gh",
+        "attestation",
+        "verify",
+        f"oci://{reference}",
+        "--repo",
+        "nclsppr/vps-infra",
+        "--source-digest",
+        source_revision,
+        "--source-ref",
+        "refs/heads/main",
+        "--format",
+        "json",
+    ]
+    if signer_workflow is not None:
+        argv.extend(["--signer-workflow", signer_workflow])
+    result = _strict_json_bytes_or_array(_command(argv), f"attestation for {reference}")
+    if not result:
+        raise ProofError(f"no GitHub attestation verified for {reference}")
+
+
+def _single_caddy_revision(revisions: set[str]) -> str:
+    if len(revisions) != 1:
+        raise ProofError("Caddy image variants must use one source revision")
+    return next(iter(revisions))
+
+
+def _strict_json_bytes_or_array(value: bytes, subject: str) -> list[Any]:
+    try:
+        payload = strict_json_loads(value.decode("utf-8"))
+    except (UnicodeDecodeError, PolicyError) as exc:
+        raise ProofError(f"{subject} is not strict JSON") from exc
+    if not isinstance(payload, list):
+        raise ProofError(f"{subject} must be a JSON array")
+    return payload
+
+
+def prove(candidate: dict[str, Any], reports_directory: Path) -> None:
+    caddy_revisions: set[str] = set()
+    for service in sorted(candidate["images"]):
+        reference = candidate["images"][service]
+        _inspect_exact_manifest(reference)
+        for platform in IMAGE_PLATFORMS[service]:
+            config = _image_config(reference, platform)
+            revision = _verify_labels(service, reference, config)
+            if revision is not None:
+                caddy_revisions.add(revision)
+            report_name = f"{service}-{platform.replace('/', '-')}.json"
+            _scan(reference, platform, reports_directory / report_name)
+
+    caddy_reference = candidate["images"]["caddy"]
+    modules = _command(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            "linux/amd64",
+            caddy_reference,
+            "caddy",
+            "list-modules",
+            "--packages",
+        ]
+    ).decode("utf-8", errors="strict").splitlines()
+    if not any(line.startswith("dns.providers.ovh ") for line in modules):
+        raise ProofError("Caddy image does not contain dns.providers.ovh")
+    caddy_revision = _single_caddy_revision(caddy_revisions)
+    _verify_attestation(
+        caddy_reference,
+        source_revision=caddy_revision,
+        signer_workflow="nclsppr/vps-infra/.github/workflows/caddy-image.yml",
+    )
+
+    integration = candidate["integration"]
+    integration_manifest = _inspect_exact_manifest(integration["artifact"])
+    annotations = integration_manifest.get("annotations")
+    if not isinstance(annotations, dict):
+        raise ProofError("platform integration manifest must contain OCI annotations")
+    if annotations.get("org.opencontainers.image.source") != (
+        "https://github.com/nclsppr/vps-infra"
+    ):
+        raise ProofError("platform integration source annotation is invalid")
+    if annotations.get("org.opencontainers.image.revision") != integration["source_revision"]:
+        raise ProofError("platform integration revision annotation is invalid")
+    _verify_attestation(
+        integration["artifact"],
+        source_revision=integration["source_revision"],
+        signer_workflow=None,
+    )
+
+
+def _positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("positive integer required") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("positive integer required")
+    return parsed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("candidate", help="platform candidate JSON file")
+    parser.add_argument(
+        "--print-subject",
+        action="store_true",
+        help="validate the candidate and print its canonical subject without network access",
+    )
+    parser.add_argument("--expected-subject")
+    parser.add_argument("--source-revision")
+    parser.add_argument("--run-id")
+    parser.add_argument("--run-attempt", type=_positive_integer)
+    parser.add_argument("--output")
+    args = parser.parse_args()
+
+    try:
+        raw_candidate = strict_json_loads(Path(args.candidate).read_text(encoding="utf-8"))
+        candidate = validate_platform_candidate(raw_candidate)
+        candidate_schema = strict_json_loads(
+            (REPOSITORY_ROOT / "schemas/platform-candidate.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        Draft202012Validator(
+            candidate_schema,
+            format_checker=FormatChecker(),
+        ).validate(candidate)
+        subject = platform_candidate_subject(candidate)
+        if args.print_subject:
+            if any(
+                value is not None
+                for value in (
+                    args.expected_subject,
+                    args.source_revision,
+                    args.run_id,
+                    args.run_attempt,
+                    args.output,
+                )
+            ):
+                raise ProofError("--print-subject cannot be combined with proof-run options")
+            print(subject)
+            return 0
+        missing_options = [
+            name
+            for name, value in (
+                ("--expected-subject", args.expected_subject),
+                ("--source-revision", args.source_revision),
+                ("--run-id", args.run_id),
+                ("--run-attempt", args.run_attempt),
+                ("--output", args.output),
+            )
+            if value is None
+        ]
+        if missing_options:
+            raise ProofError(f"proof run requires {', '.join(missing_options)}")
+        assert args.expected_subject is not None
+        assert args.source_revision is not None
+        assert args.run_id is not None
+        assert args.run_attempt is not None
+        assert args.output is not None
+        output_path = Path(args.output)
+        if subject != args.expected_subject:
+            raise ProofError(
+                f"candidate subject is {subject}, not {args.expected_subject}"
+            )
+        if candidate["integration"]["source_revision"] != args.source_revision:
+            raise ProofError("candidate source revision does not match the workflow commit")
+        expected_name = (
+            f"platform-candidate-proof-{subject.removeprefix('sha256:')}"
+            f"-{args.run_id}-{args.run_attempt}.json"
+        )
+        if output_path.name != expected_name:
+            raise ProofError(f"output filename must be {expected_name}")
+        with tempfile.TemporaryDirectory(prefix="vps-platform-proof-") as temporary:
+            reports_directory = Path(temporary)
+            prove(candidate, reports_directory)
+        proof = build_platform_proof(
+            candidate,
+            source_revision=args.source_revision,
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+            verified_gates=sorted(PLATFORM_PROOF_BASELINE_GATES),
+        )
+        proof_schema = strict_json_loads(
+            (REPOSITORY_ROOT / "schemas/platform-proof.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        registry = Registry().with_resource(
+            candidate_schema["$id"],
+            Resource.from_contents(candidate_schema),
+        )
+        Draft202012Validator(
+            proof_schema,
+            format_checker=FormatChecker(),
+            registry=registry,
+        ).validate(proof)
+        output_path.write_bytes(platform_proof_bytes(proof))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        PolicyError,
+        ProofError,
+        ValidationError,
+        json.JSONDecodeError,
+    ) as exc:
+        print(f"platform proof failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"platform proof written: {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

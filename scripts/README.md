@@ -18,6 +18,7 @@ Ansible installe, root-owned et non modifiables par le groupe ou les autres :
 - `/usr/local/libexec/vps/verify-github-evidence`
 - `/usr/local/libexec/vps/verify-state`
 - `/usr/local/libexec/vps/lib/release_policy.py`
+- `/usr/local/libexec/vps/lib/platform_proof.py`
 - `/usr/local/share/vps-infra/schemas/production-release.schema.json`
 
 `check`, `check-public-safe` et `doctor` sont des outils d'audit à installer si
@@ -69,9 +70,28 @@ d'environnement et lier les secrets `_FILE` aux secrets déclarés.
 
 `verify-github-evidence` confirms the repository, branch, commit, run attempt,
 and exact `.github/workflows/vps-release.yml` workflow through the public GitHub
-API. This check does not yet provide a cryptographic link from the workflow run
-to each OCI digest. A complete candidate declaration is therefore not
-provenance-complete. The provenance link stays an explicit blocker.
+API. The `caddy-ovh-image` and `immutable-image-digests` gates must also name a
+raw Actions artifact. The verifier reconstructs the canonical proof bytes from
+the candidate and run metadata. It compares the expected digest, size, name,
+run, branch, and commit with the public artifact metadata. An older run or
+artifact cannot prove a changed candidate or a repeated run attempt.
+
+`prove-platform-candidate` validates the secret-free candidate with both the
+JSON Schema and Python policy. It resolves each exact OCI manifest, hashes the
+registry bytes, verifies the supported OCI labels, scans each image for fixed
+HIGH and CRITICAL vulnerabilities, checks the Caddy OVH module, and verifies
+first-party GitHub attestations. It writes one canonical JSON proof file. The
+workflow uploads that file as a raw Actions artifact. Use this local command to
+calculate the workflow input without registry access:
+
+```bash
+./scripts/prove-platform-candidate --print-subject candidate.json
+```
+
+The workflow requests 90-day proof retention, subject to the repository
+retention policy. The proof is valid for locked candidate review, not for
+long-term active-state provenance. The other platform gates still require
+separate evidence. The activation policy stays locked.
 
 Without `/etc/vps/production-enabled`, `deploy` stays in dry-run mode. It exits
 with code 78 after evidence verification, reconciliation, and desired-state

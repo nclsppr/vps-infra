@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nclsppr/vps-infra/schemas/platform-proof.schema.json",
+  "title": "Digest-bound VPS platform proof",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "candidate", "candidate_subject", "source_revision", "run", "artifact_name", "verified_gates", "controls"],
+  "$defs": {
+    "sha40": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "gate": {
+      "enum": [
+        "alert-routing-and-delivery",
+        "caddy-ovh-image",
+        "external-networks-and-cidrs",
+        "immutable-image-digests",
+        "ovh-dns-credentials",
+        "platform-config-and-probes",
+        "platform-secrets-and-permissions",
+        "postgres-pgdata-and-compatibility"
+      ]
+    }
+  },
+  "properties": {
+    "contract": { "const": "vps-infra.platform-proof.v1" },
+    "candidate": { "$ref": "platform-candidate.schema.json" },
+    "candidate_subject": { "$ref": "#/$defs/sha256" },
+    "source_revision": { "$ref": "#/$defs/sha40" },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "workflow_path", "id", "attempt"],
+      "properties": {
+        "repository": { "const": "nclsppr/vps-infra" },
+        "workflow_path": { "const": ".github/workflows/vps-release.yml" },
+        "id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "attempt": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "artifact_name": {
+      "type": "string",
+      "pattern": "^platform-candidate-proof-[0-9a-f]{64}-[1-9][0-9]*-[1-9][0-9]*\\.json$"
+    },
+    "verified_gates": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "contains": { "const": "caddy-ovh-image" },
+      "items": {
+        "enum": ["caddy-ovh-image", "immutable-image-digests"]
+      },
+      "allOf": [
+        { "contains": { "const": "immutable-image-digests" } }
+      ]
+    },
+    "controls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caddy-ovh-module", "exact-oci-references", "first-party-github-attestations", "fixed-high-critical-scans", "oci-labels"],
+      "properties": {
+        "caddy-ovh-module": { "const": "passed" },
+        "exact-oci-references": { "const": "passed" },
+        "fixed-high-critical-scans": { "const": "passed" },
+        "first-party-github-attestations": { "const": "passed" },
+        "oci-labels": { "const": "passed" }
+      }
+    }
+  }
+}

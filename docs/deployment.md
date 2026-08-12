@@ -171,10 +171,20 @@ Candidate metadata is not an activation request. While
 the production marker even if an applicator exists. It cannot create active
 state.
 
-The evidence run does not yet certify each declared OCI digest. The manifest
-therefore retains the provenance blockers. A later workflow must verify the
-digest, OCI labels, and attestation explicitly before those blockers can be
-removed.
+The manual `.github/workflows/vps-release.yml` workflow certifies the exact
+platform candidate subject for two gates: `caddy-ovh-image` and
+`immutable-image-digests`. It resolves and hashes all seven OCI references,
+verifies supported labels, scans the image variants, checks the Caddy OVH
+module, and verifies first-party GitHub attestations. It writes a canonical raw
+proof artifact. `scripts/verify-github-evidence` reconstructs the same bytes
+and compares their digest and run identity with public GitHub artifact
+metadata. This prevents the reuse of a successful run after any candidate
+digest or run-attempt change.
+
+This proof does not remove the other platform blockers. The workflow requests
+90-day artifact retention, subject to the repository retention policy. Keep
+`activation_policy: locked` until durable provenance and the remaining
+semantic gates have separate evidence.
 
 The schema stays at version 1 and still accepts the legacy manifest. An older
 controller does not understand the candidate fields. Before a controller

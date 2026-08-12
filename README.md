@@ -52,8 +52,11 @@ rejects activation, and the controller still has no live applicator.
 
 The release contract can validate a complete immutable candidate declaration
 while the platform stays disabled. Candidate evidence is checked before the
-controller records desired state. The evidence does not yet prove each digest.
-A candidate does not publish a port, start a container, or create active state.
+controller records desired state. The manual `vps-release.yml` workflow now
+proves the exact platform candidate subject. It verifies the seven OCI
+references, image labels, fixed HIGH and CRITICAL vulnerability scans, the OVH
+DNS module, and first-party GitHub attestations. A candidate does not publish a
+port, start a container, or create active state.
 
 ## Démarrage local
 

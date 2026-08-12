@@ -228,6 +228,7 @@
   register: vps_deploy_source_support_files
   loop:
     - "{{ vps_deploy_repository_dir }}/scripts/lib/release_policy.py"
+    - "{{ vps_deploy_repository_dir }}/scripts/lib/platform_proof.py"
     - "{{ vps_deploy_repository_dir }}/schemas/production-release.schema.json"
   when: not ansible_check_mode
 
@@ -260,6 +261,16 @@
   ansible.builtin.copy:
     src: "{{ vps_deploy_repository_dir }}/scripts/lib/release_policy.py"
     dest: "{{ vps_deploy_install_root }}/lib/release_policy.py"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Install the canonical platform proof module from the proven mirror
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/lib/platform_proof.py"
+    dest: "{{ vps_deploy_install_root }}/lib/platform_proof.py"
     remote_src: true
     owner: root
     group: root
@@ -332,6 +343,7 @@
     - "{{ vps_deploy_gate_path }}"
     - "{{ vps_deploy_controller_path }}"
     - "{{ vps_deploy_install_root }}/lib/release_policy.py"
+    - "{{ vps_deploy_install_root }}/lib/platform_proof.py"
     - "{{ vps_deploy_schema_root }}/production-release.schema.json"
     - "{{ vps_deploy_revision_path }}"
   when: not ansible_check_mode

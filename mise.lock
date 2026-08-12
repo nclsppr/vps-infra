@@ -149,43 +149,128 @@ url_api = "https://api.github.com/repos/docker/compose/releases/assets/469146923
 [tools.docker-compose."platforms.windows-x64".provenance.slsa]
 url = "https://github.com/docker/compose/releases/download/v5.3.1/docker-compose-windows-x86_64.provenance.json"
 
+[[tools.gh]]
+version = "2.97.0"
+backend = "aqua:cli/cli"
+
+[tools.gh."platforms.linux-arm64"]
+checksum = "sha256:73ea440ecad9c9e284429997ee6f93577bc6f7bc6fba357ef62c53ad8fb641a5"
+url = "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/cli/cli/releases/assets/496108278"
+provenance = "github-attestations"
+
+[tools.gh."platforms.linux-arm64-musl"]
+checksum = "sha256:73ea440ecad9c9e284429997ee6f93577bc6f7bc6fba357ef62c53ad8fb641a5"
+url = "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/cli/cli/releases/assets/496108278"
+provenance = "github-attestations"
+
+[tools.gh."platforms.linux-x64"]
+checksum = "sha256:a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"
+url = "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/cli/cli/releases/assets/496108269"
+provenance = "github-attestations"
+
+[tools.gh."platforms.linux-x64-musl"]
+checksum = "sha256:a2c9b8497e1f85b1ad0dfcb78b5a622e098801b8e461e459e88e1ee12f018112"
+url = "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/cli/cli/releases/assets/496108269"
+provenance = "github-attestations"
+
+[tools.gh."platforms.macos-arm64"]
+checksum = "sha256:a58b8fd77b417a38f47a0b54d1370c59b0fcdb324ccc9ca002b0998f7c4c999e"
+url = "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_macOS_arm64.zip"
+url_api = "https://api.github.com/repos/cli/cli/releases/assets/496108298"
+provenance = "github-attestations"
+
+[tools.gh."platforms.macos-x64"]
+checksum = "sha256:63298c998cc2a924c9e254c6af6a1caad6ece281122687a91f079bc0a462700e"
+url = "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_macOS_amd64.zip"
+url_api = "https://api.github.com/repos/cli/cli/releases/assets/496108300"
+provenance = "github-attestations"
+
+[tools.gh."platforms.windows-x64"]
+checksum = "sha256:35d7fe05c4dd1411ffda1e73dfc7c6f44b75c936ca51fa6595c657fdc0350cec"
+url = "https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_windows_amd64.zip"
+url_api = "https://api.github.com/repos/cli/cli/releases/assets/496108319"
+provenance = "github-attestations"
+
+[[tools.oras]]
+version = "1.3.3"
+backend = "aqua:oras-project/oras"
+
+[tools.oras."platforms.linux-arm64"]
+checksum = "sha256:ac7156f93a21e903f7ad606c792f3560f17e0cd0e36365634701b1e7cc4e4eca"
+url = "https://github.com/oras-project/oras/releases/download/v1.3.3/oras_1.3.3_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/oras-project/oras/releases/assets/472780865"
+
+[tools.oras."platforms.linux-arm64-musl"]
+checksum = "sha256:ac7156f93a21e903f7ad606c792f3560f17e0cd0e36365634701b1e7cc4e4eca"
+url = "https://github.com/oras-project/oras/releases/download/v1.3.3/oras_1.3.3_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/oras-project/oras/releases/assets/472780865"
+
+[tools.oras."platforms.linux-x64"]
+checksum = "sha256:9ce999f8d2de03fc03968b29d743077a58783e545e5eaa53917ca177352d0e59"
+url = "https://github.com/oras-project/oras/releases/download/v1.3.3/oras_1.3.3_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/oras-project/oras/releases/assets/472780866"
+
+[tools.oras."platforms.linux-x64-musl"]
+checksum = "sha256:9ce999f8d2de03fc03968b29d743077a58783e545e5eaa53917ca177352d0e59"
+url = "https://github.com/oras-project/oras/releases/download/v1.3.3/oras_1.3.3_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/oras-project/oras/releases/assets/472780866"
+
+[tools.oras."platforms.macos-arm64"]
+checksum = "sha256:f33fc12753c54172b0d0d19eaa0318d3f90fe9b094d96e8b259c881713c92e1c"
+url = "https://github.com/oras-project/oras/releases/download/v1.3.3/oras_1.3.3_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/oras-project/oras/releases/assets/472780873"
+
+[tools.oras."platforms.macos-x64"]
+checksum = "sha256:aeb684d8c24c18dce28fd1f7326636e4782b573108e244a93d4b1c4a5ec50f48"
+url = "https://github.com/oras-project/oras/releases/download/v1.3.3/oras_1.3.3_darwin_amd64.tar.gz"
+url_api = "https://api.github.com/repos/oras-project/oras/releases/assets/472780864"
+
+[tools.oras."platforms.windows-x64"]
+checksum = "sha256:30ca213a565a450de33001dae83053db53c221e6674c5233dc3406b686657969"
+url = "https://github.com/oras-project/oras/releases/download/v1.3.3/oras_1.3.3_windows_amd64.zip"
+url_api = "https://api.github.com/repos/oras-project/oras/releases/assets/472780852"
+
 [[tools.python]]
 version = "3.13.14"
 backend = "core:python"
 
 [tools.python."platforms.linux-arm64"]
-checksum = "sha256:1eaf979af6c6986553b91a9e3b03647f63ce52a888e00892d3bddc96f43748e9"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14+20260728-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:f1cda716f5595a97e79f760f81da7150e4f6b4ae9dc49968b4ce5d6d64bba058"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260805/cpython-3.13.14+20260805-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-arm64-musl"]
-checksum = "sha256:2a3fcda74f7affca70055a0161aeb5f1f7a0d7ebe200bb031c2185ce49da8710"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14+20260728-aarch64-unknown-linux-musl-install_only_stripped.tar.gz"
+checksum = "sha256:960738ebde53abeceb5452b71c2217d50452023e3baf2439dc57290d07930637"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260805/cpython-3.13.14+20260805-aarch64-unknown-linux-musl-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64"]
-checksum = "sha256:6734c3e643c75e860c36ee3a7904e8e6bafbf3232d89b17ffd5fbfa72ab2816c"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14+20260728-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:39e82d05926bdcd206732026bcd878d9f00e288cd227d91c1fabf379b6ea4fa5"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260805/cpython-3.13.14+20260805-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64-musl"]
-checksum = "sha256:99655ffe8329e3cb9c4351acfa08db091e1bd72df3a3461fce37bb0ced376891"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14+20260728-x86_64-unknown-linux-musl-install_only_stripped.tar.gz"
+checksum = "sha256:c6b77767b2c97ce77c21496909396b6e056b96220b2cda45f2c93b654376dd93"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260805/cpython-3.13.14+20260805-x86_64-unknown-linux-musl-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-arm64"]
-checksum = "sha256:aa2a054f5e04bde63ae199e3bb6bbb634e457423efd294842deeb1299e7e5932"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14+20260728-aarch64-apple-darwin-install_only_stripped.tar.gz"
+checksum = "sha256:f0e634654e1d6b55cf81419eb629caf78f50234d01ede318f78e5091bada6085"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260805/cpython-3.13.14+20260805-aarch64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-x64"]
-checksum = "sha256:aa73c37aebebe3b7264dce1e49923719ab0ac0fc590353adf393eee3e2041c18"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14+20260728-x86_64-apple-darwin-install_only_stripped.tar.gz"
+checksum = "sha256:ffcd382b54efff287c0b9ae34b3bb6e956b3cb05899f89caa36d83ca11c02f5f"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260805/cpython-3.13.14+20260805-x86_64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.windows-x64"]
-checksum = "sha256:a091ab914f2b7d2dbc52e9cf4a225190f72709fc79a64ec44bc61ca4d2908a64"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14+20260728-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+checksum = "sha256:e0df6dea5aa2a7f6fab10ee187abcf1da554e1ebd0aafe4e404ff4a647f92081"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260805/cpython-3.13.14+20260805-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [[tools.shellcheck]]
@@ -286,6 +371,52 @@ url_api = "https://api.github.com/repos/getsops/sops/releases/assets/486808200"
 
 [tools.sops."platforms.windows-x64".provenance.slsa]
 url = "https://github.com/getsops/sops/releases/download/v3.13.3/sops-v3.13.3.intoto.jsonl"
+
+[[tools.trivy]]
+version = "0.73.0"
+backend = "aqua:aquasecurity/trivy"
+
+[tools.trivy."platforms.linux-arm64"]
+checksum = "sha256:13833d97e8a1a5367471c372a173180157f593bece570e20d5d925fef552f5dd"
+url = "https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-ARM64.tar.gz"
+url_api = "https://api.github.com/repos/aquasecurity/trivy/releases/assets/499939954"
+provenance = "cosign"
+
+[tools.trivy."platforms.linux-arm64-musl"]
+checksum = "sha256:13833d97e8a1a5367471c372a173180157f593bece570e20d5d925fef552f5dd"
+url = "https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-ARM64.tar.gz"
+url_api = "https://api.github.com/repos/aquasecurity/trivy/releases/assets/499939954"
+provenance = "cosign"
+
+[tools.trivy."platforms.linux-x64"]
+checksum = "sha256:2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b"
+url = "https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-64bit.tar.gz"
+url_api = "https://api.github.com/repos/aquasecurity/trivy/releases/assets/499939909"
+provenance = "cosign"
+
+[tools.trivy."platforms.linux-x64-musl"]
+checksum = "sha256:2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b"
+url = "https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-64bit.tar.gz"
+url_api = "https://api.github.com/repos/aquasecurity/trivy/releases/assets/499939909"
+provenance = "cosign"
+
+[tools.trivy."platforms.macos-arm64"]
+checksum = "sha256:80cc25faaf6378e37701202d0b4f9f43d9e413d198d594ba60fdf559fe44a683"
+url = "https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_macOS-ARM64.tar.gz"
+url_api = "https://api.github.com/repos/aquasecurity/trivy/releases/assets/499939985"
+provenance = "cosign"
+
+[tools.trivy."platforms.macos-x64"]
+checksum = "sha256:d39d1374dd3e35d48621b82df9b6625fe69f9920cc67d2739ed81bb679f16f51"
+url = "https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_macOS-64bit.tar.gz"
+url_api = "https://api.github.com/repos/aquasecurity/trivy/releases/assets/499939988"
+provenance = "cosign"
+
+[tools.trivy."platforms.windows-x64"]
+checksum = "sha256:d2d3ad5292aae470a03eb6506db86fce81b1894592b8451cadaf60eaa22f2025"
+url = "https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_windows-64bit.zip"
+url_api = "https://api.github.com/repos/aquasecurity/trivy/releases/assets/499939953"
+provenance = "cosign"
 
 [[tools.uv]]
 version = "0.12.0"
