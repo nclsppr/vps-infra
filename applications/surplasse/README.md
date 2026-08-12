@@ -67,7 +67,9 @@ development seed.
 ## Secret file contract
 
 The future applicator must create these files under
-`/etc/vps/secrets/surplasse` with one reader and no group or other access:
+`/etc/vps/secrets/surplasse` as `root:10001` with mode `0440`. GID `10001` is
+the dedicated group of the Backend and migrator containers. Docker Compose
+file secrets preserve the host file ownership; they do not remap it:
 
 ```text
 surplasse-jwt-jwks

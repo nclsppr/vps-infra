@@ -104,7 +104,8 @@ check-public-static-edge: ## Validate the isolated Caddy-only public edge.
 		vps-public-static-edge "$$rendered"
 
 check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
-	@rendered="$$(mktemp)"; \
+	@set -Eeuo pipefail; \
+	rendered="$$(mktemp)"; \
 	trap 'rm -f -- "$$rendered"' EXIT; \
 	$(COMPOSE) --env-file applications/surplasse/.env.example \
 		--file applications/surplasse/compose.yaml --profile migration \

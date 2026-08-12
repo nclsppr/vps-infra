@@ -1033,7 +1033,114 @@ class ComposePolicyTests(unittest.TestCase):
         migrations = json.loads(
             (application / "migrations.json").read_text(encoding="utf-8")
         )
-        SURPLASSE_ADAPTER.validate_metadata(ROOT, adapter, migrations)
+        expected_images = json.loads(
+            (application / "expected-images.json").read_text(encoding="utf-8")
+        )
+        SURPLASSE_ADAPTER.validate_metadata(
+            ROOT, adapter, migrations, expected_images
+        )
+
+    def test_surplasse_adapter_revision_is_bound_to_every_image_tag(self) -> None:
+        application = ROOT / "applications/surplasse"
+        adapter = json.loads((application / "adapter.json").read_text(encoding="utf-8"))
+        migrations = json.loads(
+            (application / "migrations.json").read_text(encoding="utf-8")
+        )
+        expected_images = json.loads(
+            (application / "expected-images.json").read_text(encoding="utf-8")
+        )
+
+        changed_adapter = copy.deepcopy(adapter)
+        changed_migrations = copy.deepcopy(migrations)
+        changed_adapter["source_revision"] = SHA_B
+        changed_migrations["source_revision"] = SHA_B
+        with self.assertRaisesRegex(
+            SURPLASSE_ADAPTER.AdapterError,
+            "image tag must equal the adapter source revision",
+        ):
+            SURPLASSE_ADAPTER.validate_metadata(
+                ROOT, changed_adapter, changed_migrations, expected_images
+            )
+
+        original_revision = adapter["source_revision"]
+        for name in expected_images:
+            with self.subTest(name=name):
+                changed_images = copy.deepcopy(expected_images)
+                changed_images[name] = changed_images[name].replace(
+                    f":{original_revision}@sha256:", f":{SHA_B}@sha256:"
+                )
+                with self.assertRaisesRegex(
+                    SURPLASSE_ADAPTER.AdapterError,
+                    f"expected-images.{name}: image tag must equal",
+                ):
+                    SURPLASSE_ADAPTER.validate_metadata(
+                        ROOT, adapter, migrations, changed_images
+                    )
+
+    def test_surplasse_adapter_requires_exact_component_repositories(self) -> None:
+        application = ROOT / "applications/surplasse"
+        adapter = json.loads((application / "adapter.json").read_text(encoding="utf-8"))
+        migrations = json.loads(
+            (application / "migrations.json").read_text(encoding="utf-8")
+        )
+        expected_images = json.loads(
+            (application / "expected-images.json").read_text(encoding="utf-8")
+        )
+        expected_images["backend"] = expected_images["backend"].replace(
+            "ghcr.io/nclsppr/surplasse/backend",
+            "ghcr.io/nclsppr/surplasse/backend-copy",
+        )
+        with self.assertRaisesRegex(
+            SURPLASSE_ADAPTER.AdapterError,
+            "expected-images.backend: must be the exact immutable",
+        ):
+            SURPLASSE_ADAPTER.validate_metadata(
+                ROOT, adapter, migrations, expected_images
+            )
+
+    def test_surplasse_make_target_stops_after_shared_policy_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            fake_compose = root / "fake-compose"
+            shared_validator = scripts / "validate-compose"
+            adapter_validator = scripts / "validate-surplasse-adapter"
+            adapter_marker = root / "adapter-validator-ran"
+            fake_compose.write_text(
+                "#!/usr/bin/env bash\nprintf '{}\\n'\n",
+                encoding="utf-8",
+            )
+            shared_validator.write_text(
+                "#!/usr/bin/env bash\nexit 73\n",
+                encoding="utf-8",
+            )
+            adapter_validator.write_text(
+                f"#!/usr/bin/env bash\ntouch -- {adapter_marker}\n",
+                encoding="utf-8",
+            )
+            for executable in (fake_compose, shared_validator, adapter_validator):
+                executable.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    "make",
+                    "--no-print-directory",
+                    "--file",
+                    str(ROOT / "Makefile"),
+                    "check-surplasse-adapter",
+                    f"COMPOSE={fake_compose}",
+                ],
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(
+                adapter_marker.exists(),
+                "the specialized validator ran after the shared policy failed",
+            )
 
     def test_public_static_edge_is_a_caddy_only_verified_unit(self) -> None:
         document = public_static_edge_document()

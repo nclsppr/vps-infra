@@ -11,6 +11,16 @@ from pathlib import Path
 from typing import Any
 
 
+IMAGE_REPOSITORIES = {
+    "backend": "ghcr.io/nclsppr/surplasse/backend",
+    "commande": "ghcr.io/nclsppr/surplasse/commande",
+    "dashboard": "ghcr.io/nclsppr/surplasse/dashboard",
+    "docs": "ghcr.io/nclsppr/surplasse/docs",
+    "migrator": "ghcr.io/nclsppr/surplasse/backend",
+    "onboarding": "ghcr.io/nclsppr/surplasse/onboarding",
+}
+
+
 class AdapterError(ValueError):
     """Raised when the adapter is not the exact reviewed locked candidate."""
 
@@ -77,6 +87,33 @@ def secret_sources(service: dict[str, Any], name: str) -> set[str]:
     if len(result) != len(secrets):
         fail(f"services.{name}.secrets: contains a duplicate source")
     return result
+
+
+def validate_image_contract(
+    expected_images: dict[str, Any], source_revision: str
+) -> None:
+    require_keys(expected_images, set(IMAGE_REPOSITORIES), "expected-images")
+    for name, repository in IMAGE_REPOSITORIES.items():
+        reference = expected_images[name]
+        if not isinstance(reference, str):
+            fail(f"expected-images.{name}: must be a string")
+        match = re.fullmatch(
+            rf"{re.escape(repository)}:"
+            r"(?P<revision>[0-9a-f]{40})@sha256:(?P<digest>[0-9a-f]{64})",
+            reference,
+        )
+        if match is None:
+            fail(
+                f"expected-images.{name}: must be the exact immutable "
+                f"{repository} image contract"
+            )
+        if match.group("revision") != source_revision:
+            fail(
+                f"expected-images.{name}: image tag must equal the adapter "
+                "source revision"
+            )
+    if expected_images["migrator"] != expected_images["backend"]:
+        fail("expected-images.migrator: must equal the exact Backend reference")
 
 
 def validate_compose(document: dict[str, Any], expected_images: dict[str, Any]) -> None:
@@ -208,6 +245,7 @@ def validate_metadata(
     root: Path,
     adapter: dict[str, Any],
     migrations: dict[str, Any],
+    expected_images: dict[str, Any],
 ) -> None:
     release = load_json(root / "releases/production.yaml", "production release")
     applications = release.get("applications")
@@ -240,6 +278,7 @@ def validate_metadata(
         r"[0-9a-f]{40}", adapter["source_revision"]
     ) is None:
         fail("adapter: source identity is invalid")
+    validate_image_contract(expected_images, adapter["source_revision"])
 
     migration = adapter.get("migration")
     if migration != {
@@ -333,7 +372,7 @@ def main() -> int:
         adapter = load_json(application / "adapter.json", "adapter")
         migrations = load_json(application / "migrations.json", "migrations")
         validate_compose(compose, expected_images)
-        validate_metadata(root, adapter, migrations)
+        validate_metadata(root, adapter, migrations, expected_images)
     except (AdapterError, OSError, UnicodeDecodeError) as exc:
         print(f"Surplasse adapter validation failed: {exc}", file=sys.stderr)
         return 1
