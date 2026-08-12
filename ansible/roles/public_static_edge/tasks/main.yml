@@ -222,7 +222,7 @@
           - item.stat.islnk
           - item.stat.uid == 0
           - item.stat.gid == 0
-          - item.stat.lnk_source is match('^releases/sha256-[0-9a-f]{64}$')
+          - item.stat.lnk_target is match('^releases/sha256-[0-9a-f]{64}$')
         fail_msg: >-
           Each static site must have a root-owned digest release link before
           the public edge can start.
