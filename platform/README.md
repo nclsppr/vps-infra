@@ -25,9 +25,15 @@ Caddy image with `caddy-dns/ovh` v1.1.0 at commit
 `platform/caddy/build.env` defines the immutable upstream images. The generated
 entry point and complete Go graph are in `platform/caddy/build/`. The graph
 locks Caddy v2.11.4, the OVH module v1.1.0, `golang.org/x/text` v0.39.0, and
-`google.golang.org/grpc` v1.82.1. The build uses `go build -mod=readonly` and
-the committed `go.sum`. It does not let `xcaddy` resolve a new graph during a
-production build.
+`google.golang.org/grpc` v1.82.1. It also locks `github.com/google/cel-go`
+v0.29.2. Caddy v2.11.4 needs the two-line compatibility change from upstream
+commit `b2693fb63a30e6d7be0972c3645e9a2c0a500e93` to compile with that version.
+The build applies only that committed patch after `go mod verify`. It then
+checks the patched source file checksum before compilation. This avoids the 32
+unrelated Caddy changes between v2.11.4 and the upstream compatibility commit.
+
+The build uses `go build -mod=readonly` and the committed `go.sum`. It does not
+let `xcaddy` resolve a new graph during a production build.
 
 The runtime layer installs the reviewed Alpine 3.23 fixes for `c-ares`, `curl`,
 and `libcurl`. The Dockerfile downloads each architecture-specific APK from an

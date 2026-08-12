@@ -21,6 +21,7 @@ go_mod=$repository_root/platform/caddy/build/go.mod
 
 caddy_version=$(awk '$1 == "github.com/caddyserver/caddy/v2" { print $2 }' "$go_mod")
 ovh_version=$(awk '$1 == "github.com/caddy-dns/ovh" { print $2 }' "$go_mod")
+cel_version=$(awk '$1 == "github.com/google/cel-go" { print $2 }' "$go_mod")
 text_version=$(awk '$1 == "replace" && $2 == "golang.org/x/text" { print $5 }' "$go_mod")
 grpc_version=$(awk '$1 == "replace" && $2 == "google.golang.org/grpc" { print $5 }' "$go_mod")
 
@@ -38,6 +39,7 @@ fi
   --entrypoint /bin/sh \
   --env "EXPECTED_CADDY_VERSION=$caddy_version" \
   --env "EXPECTED_OVH_VERSION=$ovh_version" \
+  --env "EXPECTED_CEL_VERSION=$cel_version" \
   --env "EXPECTED_TEXT_VERSION=$text_version" \
   --env "EXPECTED_GRPC_VERSION=$grpc_version" \
   "$image" -eu -c '
@@ -54,6 +56,8 @@ fi
       | grep -Fq "github.com/caddyserver/caddy/v2${tab}${EXPECTED_CADDY_VERSION}"
     printf "%s\n" "$build_info" \
       | grep -Fq "github.com/caddy-dns/ovh${tab}${EXPECTED_OVH_VERSION}"
+    printf "%s\n" "$build_info" \
+      | grep -Fq "github.com/google/cel-go${tab}${EXPECTED_CEL_VERSION}"
     printf "%s\n" "$build_info" \
       | grep -Fq "golang.org/x/text${tab}${EXPECTED_TEXT_VERSION}"
     printf "%s\n" "$build_info" \
