@@ -795,9 +795,105 @@ def platform_document(*, include_grafana: bool = True) -> dict:
 
 
 class ComposePolicyTests(unittest.TestCase):
+    def run_cli(
+        self,
+        document: dict,
+        expected_images: dict | str | None,
+        *options: str,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            compose_path = root / "compose.json"
+            compose_path.write_text(json.dumps(document), encoding="utf-8")
+            command = [sys.executable, str(SCRIPTS / "validate-compose")]
+            if expected_images is not None:
+                expected_path = root / "expected-images.json"
+                expected_payload = (
+                    expected_images
+                    if isinstance(expected_images, str)
+                    else json.dumps(expected_images)
+                )
+                expected_path.write_text(expected_payload, encoding="utf-8")
+                command.extend(["--expected-images", str(expected_path)])
+            command.extend(options)
+            command.extend([document["name"], str(compose_path)])
+            return subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
     def test_application_without_host_ports_is_valid(self) -> None:
         document = app_document()
         validate_app_document(document)
+
+    def test_cli_accepts_verified_application_images(self) -> None:
+        document = app_document()
+        expected = {
+            name: service["image"] for name, service in document["services"].items()
+        }
+        result = self.run_cli(document, expected)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("compose policy valid: surplasse", result.stdout)
+
+    def test_cli_rejects_incomplete_or_changed_expected_images(self) -> None:
+        document = app_document()
+        expected = {
+            name: service["image"] for name, service in document["services"].items()
+        }
+        missing = dict(expected)
+        missing.pop("backend")
+        changed = dict(expected)
+        changed["backend"] = image(
+            "ghcr.io/nclsppr/surplasse/backend", DIGEST_D
+        )
+        cases = (
+            (missing, "expected-image contract is incomplete"),
+            (changed, "differs from the verified release-manifest reference"),
+        )
+        for payload, message in cases:
+            with self.subTest(message=message):
+                result = self.run_cli(document, payload)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+
+    def test_cli_strictly_validates_expected_images_json(self) -> None:
+        document = app_document()
+        backend_image = document["services"]["backend"]["image"]
+        cases = (
+            (
+                '{"backend":'
+                + json.dumps(backend_image)
+                + ',"backend":'
+                + json.dumps(backend_image)
+                + "}",
+                "duplicate JSON object key",
+            ),
+            ("[]", "must be a JSON object"),
+            (
+                json.dumps({"backend": "ghcr.io/nclsppr/surplasse/backend:latest"}),
+                "must be an immutable sha256 image reference",
+            ),
+            (
+                " " * (COMPOSE_POLICY.MAX_EXPECTED_IMAGES_BYTES + 1),
+                "file exceeds the",
+            ),
+        )
+        for payload, message in cases:
+            with self.subTest(message=message):
+                result = self.run_cli(document, payload)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+
+    def test_cli_expected_images_and_structural_lint_are_mutually_exclusive(self) -> None:
+        document = app_document()
+        expected = {
+            name: service["image"] for name, service in document["services"].items()
+        }
+        result = self.run_cli(document, expected, "--structural-only")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not allowed with argument", result.stderr)
 
     def test_application_compose_is_locked_without_verified_release_binding(self) -> None:
         document = app_document()

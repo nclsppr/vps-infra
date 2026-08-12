@@ -17,6 +17,7 @@ IMAGE_REF_RE = re.compile(
     r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
     r"@sha256:[0-9a-f]{64}$"
 )
+MAX_EXPECTED_IMAGES_BYTES = 64 * 1024
 PROJECTS = frozenset({"vps-platform", "surplasse", "parkventory"})
 APPLICATION_COMPONENTS = {
     "surplasse": frozenset({"backend", "onboarding", "commande", "dashboard", "docs"}),
@@ -227,6 +228,52 @@ class ComposePolicyError(ValueError):
 
 def fail(message: str) -> None:
     raise ComposePolicyError(message)
+
+
+def strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"expected-images: duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
+def reject_json_constant(value: str) -> None:
+    fail(f"expected-images: invalid JSON constant {value!r}")
+
+
+def load_expected_images(path: Path) -> dict[str, str]:
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_EXPECTED_IMAGES_BYTES + 1)
+    if len(raw) > MAX_EXPECTED_IMAGES_BYTES:
+        fail(
+            f"expected-images: file exceeds the {MAX_EXPECTED_IMAGES_BYTES}-byte limit"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"expected-images: file must be UTF-8 JSON: {exc}")
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=strict_json_object,
+            parse_constant=reject_json_constant,
+        )
+    except json.JSONDecodeError as exc:
+        fail(f"expected-images: JSON:{exc.lineno}:{exc.colno}: {exc.msg}")
+    if not isinstance(value, dict):
+        fail("expected-images: must be a JSON object")
+    for service_name, image_reference in value.items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", service_name):
+            fail(f"expected-images: invalid service name {service_name!r}")
+        if not isinstance(image_reference, str) or not IMAGE_REF_RE.fullmatch(
+            image_reference
+        ):
+            fail(
+                f"expected-images.{service_name}: must be an immutable sha256 image reference"
+            )
+    return value
 
 
 def as_port(value: Any, path: str) -> int:
@@ -819,6 +866,8 @@ def validate_compose(
 ) -> None:
     if project not in PROJECTS:
         fail(f"project must be one of: {', '.join(sorted(PROJECTS))}")
+    if structural_only and expected_images is not None:
+        fail("expected-images and structural-only validation are mutually exclusive")
     if not isinstance(document, dict):
         fail("Compose document must be an object")
     services = document.get("services")
@@ -890,15 +939,25 @@ def main() -> int:
         "--repository-root",
         help="exact repository root used to normalize reviewed platform bind sources",
     )
-    parser.add_argument(
+    validation_mode = parser.add_mutually_exclusive_group()
+    validation_mode.add_argument(
         "--structural-only",
         action="store_true",
         help="local lint only; never authorizes deployment or image provenance",
+    )
+    validation_mode.add_argument(
+        "--expected-images",
+        help="JSON object that binds each service to its verified immutable image",
     )
     args = parser.parse_args()
     try:
         with Path(args.compose_json).open("r", encoding="utf-8") as handle:
             document = json.load(handle)
+        expected_images = (
+            load_expected_images(Path(args.expected_images))
+            if args.expected_images
+            else None
+        )
         if args.repository_root:
             repository_root = Path(args.repository_root).resolve()
         elif (SCRIPT_DIR.parent / "platform").is_dir():
@@ -908,6 +967,7 @@ def main() -> int:
         validate_compose(
             args.project,
             document,
+            expected_images=expected_images,
             repository_root=repository_root,
             structural_only=args.structural_only,
         )
