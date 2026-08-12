@@ -47,7 +47,8 @@ valide et ne l'écrit pas dans les sorties Ansible.
 The Surplasse preparation controller now creates separate migrator and runtime
 database passwords. It also installs a helper that validates and materializes
 the complete operator bundle under `/etc/vps/secrets/surplasse`. The exact file
-list, metadata, offline format checks, and JWT key-pair proof are in
+list, metadata, offline format checks, JWT key-pair proof, serialized install,
+and generation-manifest rules are in
 [`applications/surplasse/README.md`](../applications/surplasse/README.md).
 
 The adapter remains locked. A locally valid OVH token shape does not prove its

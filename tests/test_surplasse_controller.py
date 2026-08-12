@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -19,6 +20,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
+OPERATOR_MANIFEST = "surplasse-operator-bundle-manifest.json"
+OPERATOR_LOCK = ".surplasse-operator-bundle.lock"
 
 
 def load_script(name: str, path: Path):
@@ -113,6 +116,24 @@ class SurplasseControllerTests(unittest.TestCase):
             path.write_bytes(value)
             path.chmod(0o600)
         return values
+
+    def run_secret_helper(
+        self, protected_root: Path, *arguments: str
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
+        return subprocess.run(
+            [
+                str(SCRIPTS / "materialize-surplasse-secrets"),
+                *arguments,
+                "--test-root",
+                str(protected_root),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
 
     def rendered_compose(self, root: Path) -> Path:
         output = root / "compose.json"
@@ -247,9 +268,22 @@ class SurplasseControllerTests(unittest.TestCase):
                     else 0o440
                 )
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
+            manifest_path = protected_root / OPERATOR_MANIFEST
+            manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+            self.assertEqual(manifest["contract"], "surplasse-operator-bundle")
+            self.assertEqual(manifest["version"], 1)
+            self.assertEqual(
+                manifest["sha256"],
+                {
+                    name: hashlib.sha256(value).hexdigest()
+                    for name, value in values.items()
+                },
+            )
+            self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o400)
             inode_contract = {
                 name: (protected_root / name).stat().st_ino for name in values
             }
+            manifest_inode = manifest_path.stat().st_ino
 
             second = subprocess.run(
                 command, check=False, capture_output=True, text=True, env=environment
@@ -263,6 +297,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 inode_contract,
                 {name: (protected_root / name).stat().st_ino for name in values},
             )
+            self.assertEqual(manifest_inode, manifest_path.stat().st_ino)
             validation = subprocess.run(
                 [
                     str(SCRIPTS / "materialize-surplasse-secrets"),
@@ -318,6 +353,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 {
                     path.name: (path.read_bytes(), path.stat().st_ino)
                     for path in protected_root.iterdir()
+                    if path.name != OPERATOR_LOCK
                 },
             )
 
@@ -350,7 +386,206 @@ class SurplasseControllerTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 78)
             self.assertIn("active kid exactly once", result.stderr)
-            self.assertEqual(list(protected_root.iterdir()), [])
+            self.assertEqual(
+                {path.name for path in protected_root.iterdir()}, {OPERATOR_LOCK}
+            )
+
+    def test_operator_bundle_rejects_concatenated_private_keys(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source = root / "source"
+            values = self.write_operator_bundle(source)
+            pem_path = source / "surplasse-jwt-private-key"
+            pem_path.write_bytes(
+                values["surplasse-jwt-private-key"]
+                + values["surplasse-jwt-private-key"]
+            )
+            pem_path.chmod(0o600)
+
+            result = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source)
+            )
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("not a bounded PEM private key", result.stderr)
+            self.assertEqual(
+                {path.name for path in protected_root.iterdir()}, {OPERATOR_LOCK}
+            )
+
+    def test_interrupted_rotation_fails_closed_and_recovers(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source_a = root / "source-a"
+            source_b = root / "source-b"
+            self.write_operator_bundle(source_a)
+            values_b = self.write_operator_bundle(source_b)
+            changes = {
+                "surplasse-smtp-password": b"rotated-smtp-password\n",
+                "surplasse-stripe-secret-key": b"sk_live_" + b"G" * 32 + b"\n",
+                "ovh-consumer-key": b"H" * 32 + b"\n",
+            }
+            values_b.update(changes)
+            for name, value in changes.items():
+                path = source_b / name
+                path.write_bytes(value)
+                path.chmod(0o600)
+
+            first = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source_a)
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            for index, (name, value) in enumerate(changes.items()):
+                destination = protected_root / name
+                pending = protected_root / f".{name}.{index:024x}.pending"
+                pending.write_bytes(value)
+                pending.chmod(stat.S_IMODE(destination.stat().st_mode))
+                os.replace(pending, destination)
+            orphan = (
+                protected_root
+                / ".surplasse-stripe-secret-key.ffffffffffffffffffffffff.pending"
+            )
+            orphan.write_bytes(b"sk_live_" + b"Z" * 32 + b"\n")
+            orphan.chmod(0o440)
+
+            interrupted = self.run_secret_helper(protected_root, "--operator-only")
+            self.assertEqual(interrupted.returncode, 78)
+            self.assertIn("manifest does not match", interrupted.stderr)
+            self.assertFalse(orphan.exists())
+
+            recovery = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source_b)
+            )
+            self.assertEqual(recovery.returncode, 0, recovery.stderr)
+            validation = self.run_secret_helper(protected_root, "--operator-only")
+            self.assertEqual(validation.returncode, 0, validation.stderr)
+            self.assertEqual(
+                values_b,
+                {name: (protected_root / name).read_bytes() for name in values_b},
+            )
+
+    def test_missing_and_malformed_operator_manifest_are_rejected(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source = root / "source"
+            self.write_operator_bundle(source)
+            install = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source)
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+
+            manifest = protected_root / OPERATOR_MANIFEST
+            manifest.unlink()
+            missing = self.run_secret_helper(protected_root, "--operator-only")
+            self.assertEqual(missing.returncode, 78)
+            self.assertIn("manifest is missing", missing.stderr)
+
+            reinstall = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source)
+            )
+            self.assertEqual(reinstall.returncode, 0, reinstall.stderr)
+            manifest.chmod(0o600)
+            manifest.write_bytes(b"{}\n")
+            manifest.chmod(0o400)
+            malformed = self.run_secret_helper(protected_root, "--operator-only")
+            self.assertEqual(malformed.returncode, 78)
+            self.assertIn("manifest does not match", malformed.stderr)
+
+    def test_unrecognized_pending_secret_copy_is_rejected(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source = root / "source"
+            values = self.write_operator_bundle(source)
+            install = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source)
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            pending = (
+                protected_root
+                / ".surplasse-stripe-secret-key.deadbeef.pending"
+            )
+            pending.write_bytes(values["surplasse-stripe-secret-key"])
+            pending.chmod(0o440)
+
+            validation = self.run_secret_helper(protected_root, "--operator-only")
+
+            self.assertEqual(validation.returncode, 78)
+            self.assertIn("unexpected entry", validation.stderr)
+
+    def test_concurrent_operator_installers_publish_one_complete_bundle(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source_a = root / "source-a"
+            source_b = root / "source-b"
+            values_a = self.write_operator_bundle(source_a)
+            values_b = self.write_operator_bundle(source_b)
+            changes = {
+                "surplasse-smtp-password": b"concurrent-smtp-password\n",
+                "surplasse-stripe-account-webhook-secret": b"whsec_"
+                + b"J" * 32
+                + b"\n",
+                "surplasse-stripe-secret-key": b"sk_live_" + b"K" * 32 + b"\n",
+                "ovh-application-key": b"L" * 16 + b"\n",
+                "ovh-application-secret": b"M" * 32 + b"\n",
+                "ovh-consumer-key": b"N" * 32 + b"\n",
+            }
+            values_b.update(changes)
+            for name, value in changes.items():
+                path = source_b / name
+                path.write_bytes(value)
+                path.chmod(0o600)
+            environment = os.environ.copy()
+            environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
+
+            def command(source: Path) -> list[str]:
+                return [
+                    str(SCRIPTS / "materialize-surplasse-secrets"),
+                    "--install-operator-from",
+                    str(source),
+                    "--test-root",
+                    str(protected_root),
+                ]
+
+            processes = [
+                subprocess.Popen(
+                    command(source),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=environment,
+                )
+                for source in (source_a, source_b)
+            ]
+            outputs = [process.communicate(timeout=20) for process in processes]
+            for process, (_, stderr) in zip(processes, outputs, strict=True):
+                self.assertEqual(process.returncode, 0, stderr)
+
+            installed = {
+                name: (protected_root / name).read_bytes() for name in values_a
+            }
+            self.assertIn(installed, (values_a, values_b))
+            validation = self.run_secret_helper(protected_root, "--operator-only")
+            self.assertEqual(validation.returncode, 0, validation.stderr)
 
     def test_postgres_provisioning_sql_separates_roles(self) -> None:
         statements: list[tuple[str, str]] = []
