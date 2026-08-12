@@ -420,7 +420,7 @@ class PlatformIntegrationWorkflowTests(unittest.TestCase):
 
     def test_every_action_is_pinned_to_a_full_commit(self) -> None:
         actions = [step["uses"] for step in self.steps if "uses" in step]
-        self.assertEqual(len(actions), 4)
+        self.assertEqual(len(actions), 5)
         for action in actions:
             self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
         self.assertIn(
@@ -431,6 +431,24 @@ class PlatformIntegrationWorkflowTests(unittest.TestCase):
             "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
             actions,
         )
+        self.assertIn(
+            "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
+            actions,
+        )
+
+    def test_oras_and_attestation_share_standard_registry_credentials(self) -> None:
+        login = next(step for step in self.steps if step["name"] == "Authenticate to GHCR")
+        self.assertEqual(login["with"]["registry"], "ghcr.io")
+        self.assertEqual(login["with"]["username"], "${{ github.actor }}")
+        self.assertEqual(login["with"]["password"], "${{ secrets.GITHUB_TOKEN }}")
+
+        oras_commands = "\n".join(
+            step["run"]
+            for step in self.steps
+            if "run" in step and "oras " in step["run"]
+        )
+        self.assertNotIn("--registry-config", oras_commands)
+        self.assertNotIn("DOCKER_CONFIG", self.text)
 
     def test_attestation_follows_registry_content_validation(self) -> None:
         names = [step["name"] for step in self.steps]

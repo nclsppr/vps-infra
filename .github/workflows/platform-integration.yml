@@ -95,20 +95,15 @@ jobs:
             --expected-revision "${GITHUB_SHA}" \
             --expected-created "${CREATED}"
 
-      - name: Authenticate ORAS to GHCR
-        shell: bash
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          docker_config="${RUNNER_TEMP}/platform-integration-registry-auth"
-          install -d -m 0700 "${docker_config}"
-          printf '%s' "${GHCR_TOKEN}" | oras login \
-            --registry-config "${docker_config}/config.json" \
-            --username "${GITHUB_ACTOR}" \
-            --password-stdin \
-            ghcr.io
-          printf 'DOCKER_CONFIG=%s\n' "${docker_config}" >>"${GITHUB_ENV}"
+      # ORAS and the provenance action must share Docker's standard credential
+      # store. A private ORAS-only registry config cannot authenticate the
+      # attestation push.
+      - name: Authenticate to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push the source revision tag
         id: published
@@ -124,7 +119,6 @@ jobs:
           push_result=$(
             cd -- "${package_directory}"
             oras push \
-              --registry-config "${DOCKER_CONFIG}/config.json" \
               --no-tty \
               --format json \
               --artifact-type "${ARTIFACT_TYPE}" \
@@ -166,7 +160,6 @@ jobs:
           remote_inventory="${remote_directory}/platform-integration.inventory.json"
 
           oras manifest fetch \
-            --registry-config "${DOCKER_CONFIG}/config.json" \
             --output "${remote_manifest}" \
             "${TAG}"
           ./scripts/verify-platform-integration-manifest \
@@ -178,11 +171,9 @@ jobs:
             --expected-created "${CREATED}"
 
           oras blob fetch \
-            --registry-config "${DOCKER_CONFIG}/config.json" \
             --output "${remote_archive}" \
             "${PACKAGE_REPOSITORY}@${ARCHIVE_DIGEST}"
           oras blob fetch \
-            --registry-config "${DOCKER_CONFIG}/config.json" \
             --output "${remote_inventory}" \
             "${PACKAGE_REPOSITORY}@${INVENTORY_DIGEST}"
           cmp -- "${ARCHIVE}" "${remote_archive}"
