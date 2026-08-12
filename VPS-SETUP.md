@@ -201,9 +201,9 @@ platform/
 - [ ] assembler `site/` par allowlist ;
 - [ ] prouver qu’aucun fichier interne ou d’outillage n’est publié ;
 - [ ] publier l’archive comme artefact OCI GHCR ;
-- [ ] générer et sonder l’inventaire complet EN/FR, Work, CV, Blog et articles,
-      Dashboard, Claude, archive, erreurs et assets ;
-- [ ] sonder séparément les redirections de domaines ;
+- [ ] generate and probe the complete EN/FR, Work, CV, Blog, article,
+      Dashboard, Claude, archive, error-page, and asset inventory;
+- [ ] probe domain redirects separately;
 - [ ] conserver Pages jusqu’à la bascule DNS validée.
 
 ### Papers Empire
@@ -283,14 +283,29 @@ Critères :
 - [ ] empreinte d’hôte préenregistrée ;
 - [ ] commit d’infrastructure complet et présent sur `main` ;
 - [ ] pull avant activation ;
-- [x] install ORAS 1.3.0 from checksum-locked `amd64` and `arm64` archives;
+- [x] install GitHub CLI 2.97.0 from checksum-locked `amd64` and `arm64`
+      archives;
 - [x] validate the Personal and Papers Empire OCI envelopes, profile limits,
       unsafe tar cases, and the full archive-to-route-inventory bijection;
-- [x] extract each static release without privilege, make it root-owned, and
-      probe every route through the exact Caddy image before activation;
+- [x] verify exact GitHub attestations for site, route, and platform integration
+      manifests with separate sequential systemd `DynamicUser` fetch and
+      offline-verifier executions, bounded root-owned local bundles, and no
+      operator token;
+- [x] keep branch protection as a separate external production gate;
+- [x] verify the exact platform integration package and activate its
+      application `.caddy.disabled` route only inside the temporary probe;
+- [x] fetch, validate, and extract each static release in bounded systemd
+      `DynamicUser` units backed by a dedicated tmpfs, copy the exact verified
+      files into root-owned trees, and validate the exact Caddy configuration
+      before an HTTPS `local_certs` probe of every route through the exact Caddy
+      image;
 - [ ] `compose up --wait` ciblé ;
-- [x] bascule statique atomique dans le matérialiseur autonome ;
-- [ ] état précédent conservé ;
+- [x] fsync static release files and directories bottom-up before the durable
+      digest-named rename;
+- [x] replace the static `current` symlink atomically and restore the previous
+      target if the post-replacement fsync fails;
+- [ ] retain a bounded set of previous static and application states for
+      operator rollback;
 - [ ] rollback automatique des statiques et des échecs applicatifs
       pré-migration ; arrêt explicite après migration sans compatibilité prouvée ;
 - [ ] digests en échec placés en quarantaine jusqu’au revert ou à une action

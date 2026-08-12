@@ -2,7 +2,6 @@
 - name: Validate managed directory and network names
   ansible.builtin.assert:
     that:
-      - vps_static_user is match('^[a-z_][a-z0-9_-]{0,30}$')
       - vps_static_sites | list | sort == ['papersempire', 'personal']
       - >-
         vps_docker_networks | map(attribute='name') | list | sort ==
@@ -38,21 +37,15 @@
         vps_docker_networks | selectattr('internal', 'equalto', false) |
         map(attribute='name') | list | sort ==
         ['app_parkventory', 'app_surplasse', 'ops']
+      - vps_static_jobs_backing_path == '/run/private/vps-static-jobs'
+      - >-
+        vps_static_jobs_mount_unit ==
+        'run-private-vps\x2dstatic\x2djobs.mount'
+      - vps_static_jobs_tmpfs_size_mib | int == 384
+      - vps_static_jobs_tmpfs_inodes | int == 16384
     fail_msg: >-
-      Les identités statiques et les six réseaux externes sont un contrat de
-      plateforme ; toute modification requiert une décision explicite.
-
-- name: Create the non-login static release account
-  ansible.builtin.user:
-    name: "{{ vps_static_user }}"
-    comment: Unprivileged static release extractor
-    shell: /usr/sbin/nologin
-    create_home: false
-    home: /nonexistent
-    groups: ""
-    append: false
-    password_lock: true
-    state: present
+      The static roots and six external networks are a platform contract. A
+      change requires an explicit decision.
 
 - name: Create stable platform directories
   ansible.builtin.file:
@@ -98,6 +91,197 @@
     group: root
     mode: "0755"
   loop: "{{ vps_static_sites }}"
+
+- name: Migrate existing static content to the root trust boundary
+  ansible.builtin.file:
+    path: "/srv/www/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    recurse: true
+  loop: "{{ vps_static_sites }}"
+
+- name: Inspect the private runtime parent for static jobs
+  ansible.builtin.stat:
+    path: /run/private
+    follow: false
+  register: vps_static_jobs_private_parent
+
+- name: Refuse an unsafe private runtime parent for static jobs
+  ansible.builtin.assert:
+    that:
+      - vps_static_jobs_private_parent.stat.exists
+      - vps_static_jobs_private_parent.stat.isdir
+      - not vps_static_jobs_private_parent.stat.islnk
+      - vps_static_jobs_private_parent.stat.uid == 0
+      - vps_static_jobs_private_parent.stat.gid == 0
+      - vps_static_jobs_private_parent.stat.mode == '0700'
+    fail_msg: >-
+      /run/private must be a real root:root 0700 directory before the role
+      creates the DynamicUser job backing store.
+
+- name: Inspect the static job backing path
+  ansible.builtin.stat:
+    path: "{{ vps_static_jobs_backing_path }}"
+    follow: false
+  register: vps_static_jobs_backing
+
+- name: Inspect an active static job backing mount
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --json
+      - --mountpoint
+      - "{{ vps_static_jobs_backing_path }}"
+      - --output
+      - TARGET,SOURCE,FSTYPE,OPTIONS
+  register: vps_static_jobs_findmnt
+  changed_when: false
+  failed_when: vps_static_jobs_findmnt.rc not in [0, 1]
+  check_mode: false
+
+- name: Inspect content that would be shadowed by the static job mount
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/find
+      - "{{ vps_static_jobs_backing_path }}"
+      - -mindepth
+      - "1"
+      - -maxdepth
+      - "1"
+      - -print
+      - -quit
+  register: vps_static_jobs_backing_content
+  changed_when: false
+  check_mode: false
+  when:
+    - vps_static_jobs_findmnt.rc == 1
+    - vps_static_jobs_backing.stat.exists
+    - vps_static_jobs_backing.stat.isdir
+    - not vps_static_jobs_backing.stat.islnk
+
+- name: Refuse unsafe or shadowed static job backing content
+  ansible.builtin.assert:
+    that:
+      - >-
+        not vps_static_jobs_backing.stat.exists or
+        (vps_static_jobs_backing.stat.isdir and
+         not vps_static_jobs_backing.stat.islnk)
+      - >-
+        not vps_static_jobs_backing.stat.exists or
+        (vps_static_jobs_backing_content.stdout | default('')) == ''
+    fail_msg: >-
+      The static job backing store has a type or content that the tmpfs would
+      hide. An explicit migration is required.
+  when: vps_static_jobs_findmnt.rc == 1
+
+- name: Parse the active static job backing mount
+  ansible.builtin.set_fact:
+    vps_static_jobs_active_mount: >-
+      {{ (vps_static_jobs_findmnt.stdout | from_json).filesystems | first }}
+    vps_static_jobs_active_options: >-
+      {{ ((vps_static_jobs_findmnt.stdout | from_json).filesystems |
+          first).options.split(',') }}
+  when: vps_static_jobs_findmnt.rc == 0
+
+- name: Define the required static job backing mount options
+  ansible.builtin.set_fact:
+    vps_static_jobs_required_options:
+      - rw
+      - nosuid
+      - nodev
+      - noexec
+      - relatime
+      - >-
+        size={{ (vps_static_jobs_tmpfs_size_mib | int) * 1024 }}k
+      - "nr_inodes={{ vps_static_jobs_tmpfs_inodes }}"
+      - mode=700
+
+- name: Refuse a divergent active static job backing mount
+  ansible.builtin.assert:
+    that:
+      - vps_static_jobs_active_mount.target == vps_static_jobs_backing_path
+      - vps_static_jobs_active_mount.source == 'tmpfs'
+      - vps_static_jobs_active_mount.fstype == 'tmpfs'
+      - >-
+        (vps_static_jobs_required_options |
+         difference(vps_static_jobs_active_options) | length) == 0
+      - vps_static_jobs_backing.stat.exists
+      - vps_static_jobs_backing.stat.isdir
+      - not vps_static_jobs_backing.stat.islnk
+      - vps_static_jobs_backing.stat.uid == 0
+      - vps_static_jobs_backing.stat.gid == 0
+      - vps_static_jobs_backing.stat.mode == '0700'
+    fail_msg: >-
+      A divergent active mount occupies the static job backing store. The role
+      will not unmount or replace it implicitly.
+  when: vps_static_jobs_findmnt.rc == 0
+
+- name: Create the empty static job backing mountpoint
+  ansible.builtin.file:
+    path: "{{ vps_static_jobs_backing_path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: vps_static_jobs_findmnt.rc == 1
+
+- name: Install the persistent static job tmpfs mount unit
+  ansible.builtin.template:
+    src: run-private-vps-static-jobs.mount.j2
+    dest: "/etc/systemd/system/{{ vps_static_jobs_mount_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable and start the static job tmpfs before installing the deploy controller
+  ansible.builtin.systemd_service:
+    name: "{{ vps_static_jobs_mount_unit }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Reinspect the activated static job backing mount
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --json
+      - --mountpoint
+      - "{{ vps_static_jobs_backing_path }}"
+      - --output
+      - TARGET,SOURCE,FSTYPE,OPTIONS
+  register: vps_static_jobs_activated_findmnt
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Prove the activated static job backing mount contract
+  ansible.builtin.assert:
+    that:
+      - vps_static_jobs_activated_findmnt.rc == 0
+      - >-
+        ((vps_static_jobs_activated_findmnt.stdout | from_json).filesystems |
+         first).target == vps_static_jobs_backing_path
+      - >-
+        ((vps_static_jobs_activated_findmnt.stdout | from_json).filesystems |
+         first).source == 'tmpfs'
+      - >-
+        ((vps_static_jobs_activated_findmnt.stdout | from_json).filesystems |
+         first).fstype == 'tmpfs'
+      - >-
+        (vps_static_jobs_required_options | difference(
+          ((vps_static_jobs_activated_findmnt.stdout |
+            from_json).filesystems | first).options.split(',')) | length) == 0
+    fail_msg: >-
+      The static job tmpfs does not satisfy the bounded contract after
+      activation.
+  when: not ansible_check_mode
+
+- name: Remove the obsolete fixed static worker account
+  ansible.builtin.user:
+    name: vps-static
+    state: absent
+    remove: false
 
 - name: Inspect managed external Docker networks
   ansible.builtin.command:

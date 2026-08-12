@@ -35,8 +35,8 @@ Le premier socle exécutable est livré :
 - Docker et Compose épinglés, pare-feu, SSH, comptes et répertoires ;
 - Compose plateforme durci et images amont épinglées par digest ;
 - Caddy with a generated, checksum-locked Go graph and the OVH DNS provider;
-- ORAS 1.3.0 with archive and executable checksums, plus a fail-closed static
-  OCI materializer for Personal and Papers Empire;
+- GitHub CLI 2.97.0 with archive and executable checksums, plus a fail-closed
+  static OCI materializer for Personal and Papers Empire;
 - PostgreSQL 17, observabilité commune et provisioning Grafana ;
 - manifeste de production, schéma, vérificateur de preuves GitHub et contrôleur
   de déploiement borné ;
@@ -66,9 +66,13 @@ attestations. All eight production blockers remain. A candidate does not
 publish a port, start a container, or create active state.
 
 The deploy role installs the static materializer as a root-owned primitive. It
-validates and probes a candidate release before it changes the `current`
-symlink. The locked controller cannot call it because `apply-release` is still
-absent.
+binds each site, route inventory, and platform integration artifact to an exact
+GitHub attestation. It performs bounded unprivileged parsing and verifies the
+exact integration route through temporary HTTPS Caddy before it changes the
+`current` symlink. It makes release and symlink changes durable with ordered
+fsync operations and restores the previous symlink after an activation fsync
+failure. Branch protection remains a separate external gate. The locked
+controller cannot call the primitive because `apply-release` is still absent.
 
 ## Démarrage local
 

@@ -10,10 +10,12 @@ import datetime
 import fcntl
 import gzip
 import hashlib
+import ipaddress
+import io
 import json
 import os
-import pwd
 import re
+import resource
 import secrets
 import shutil
 import stat
@@ -28,9 +30,31 @@ import zlib
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIRECTORY / "lib"))
+
+from platform_integration import (  # noqa: E402
+    ARCHIVE_MEDIA_TYPE as INTEGRATION_ARCHIVE_MEDIA_TYPE,
+    ARCHIVE_NAME as INTEGRATION_ARCHIVE_NAME,
+    ARTIFACT_TYPE as INTEGRATION_ARTIFACT_TYPE,
+    INVENTORY_MEDIA_TYPE as INTEGRATION_INVENTORY_MEDIA_TYPE,
+    INVENTORY_NAME as INTEGRATION_INVENTORY_NAME,
+    IntegrationError,
+    MAX_ARCHIVE_SIZE as MAX_INTEGRATION_ARCHIVE_SIZE,
+    MAX_FILE_SIZE as MAX_INTEGRATION_FILE_SIZE,
+    MAX_TOTAL_SIZE as MAX_INTEGRATION_INVENTORY_SIZE,
+    RUNTIME_PATHS as INTEGRATION_RUNTIME_PATHS,
+    RuntimeFile as IntegrationRuntimeFile,
+    archive_for as build_integration_archive,
+    epoch_from_created as integration_epoch_from_created,
+    validate_inventory as validate_integration_inventory,
+    verify_package as verify_integration_package,
+)
+
 
 MIB = 1024 * 1024
 OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+OCI_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
 OCI_EMPTY_CONFIG = {
     "mediaType": "application/vnd.oci.empty.v1+json",
     "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
@@ -41,6 +65,12 @@ SITE_ARTIFACT_TYPE = "application/vnd.vps-infra.static-site.v1"
 SITE_LAYER_MEDIA_TYPE = "application/vnd.vps-infra.static-site.v1+tar+gzip"
 ROUTES_ARTIFACT_TYPE = "application/vnd.vps-infra.route-inventory.v1"
 ROUTES_LAYER_MEDIA_TYPE = "application/vnd.vps-infra.route-inventory.v1+json"
+INTEGRATION_REPOSITORY = "ghcr.io/nclsppr/vps-infra/platform-integration"
+INTEGRATION_SOURCE_URL = "https://github.com/nclsppr/vps-infra"
+INTEGRATION_SIGNER_WORKFLOW = (
+    "nclsppr/vps-infra/.github/workflows/platform-integration.yml"
+)
+INTEGRATION_SOURCE_REF = "refs/heads/main"
 SOURCE_ANNOTATION = "org.opencontainers.image.source"
 REVISION_ANNOTATION = "org.opencontainers.image.revision"
 CREATED_ANNOTATION = "org.opencontainers.image.created"
@@ -57,20 +87,38 @@ CADDY_IMAGE_RE = re.compile(
     r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"
 )
 GZIP_HEADER = bytes.fromhex("1f8b08000000000002ff")
-ORAS_VERSION = "1.3.0"
-ORAS_BINARY_SHA256 = {
-    "x86_64": "040e140304b7dbdd9b40dacd798e2303cea44ad84eeb210750afdf15f1dcf8b4",
-    "aarch64": "e2b67c4efb35f20a546aacc680e0f81f907d3cf4cf9f1b2040c34bb471c428f1",
-}
 PRODUCTION_ROOT = Path("/srv/www")
-ORAS_PATH = Path("/usr/local/bin/oras")
+GH_PATH = Path("/usr/local/bin/gh")
 DOCKER_PATH = Path("/usr/bin/docker")
 CURL_PATH = Path("/usr/bin/curl")
-SETPRIV_PATH = Path("/usr/bin/setpriv")
 PYTHON_PATH = Path("/usr/bin/python3")
+SYSTEMD_RUN_PATH = Path("/usr/bin/systemd-run")
+SYSTEMCTL_PATH = Path("/usr/bin/systemctl")
+IP_PATH = Path("/usr/sbin/ip")
+SYSTEMD_WORKER_LOGICAL_ROOT = Path("/run/vps-static-jobs")
+SYSTEMD_WORKER_PRIVATE_ROOT = Path("/run/private/vps-static-jobs")
+SYSTEMD_CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
+SYSTEMD_WORKER_UNIT = "vpsw-static.service"
 PLATFORM_ENV_PATH = Path("/srv/vps/repository/platform/.env.example")
-STATIC_USER = "vps-static"
 READ_CHUNK = 1024 * 1024
+GH_VERSION = "2.97.0"
+GH_BINARY_SHA256 = {
+    "x86_64": "141507c337e8b202ad398550c3b73d72f5af92e86f71665214538a81efd4c409",
+    "aarch64": "ccbb0f14178faefac1cb0f336a853071fa63a1d0df23ef5ab7a304fe3859e082",
+}
+MAX_MANIFEST_BYTES = 64 * 1024
+MAX_REGISTRY_AUTH_RESPONSE_BYTES = 64 * 1024
+MAX_ROUTES_BYTES = 2 * MIB
+SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
+SLSA_PROVENANCE_TYPE = "https://slsa.dev/provenance/v1"
+MAX_ATTESTATION_INDEX_BYTES = 1 * MIB
+MAX_ATTESTATION_MANIFEST_BYTES = 64 * 1024
+MAX_ATTESTATION_BUNDLE_BYTES = 1 * MIB
+MAX_ATTESTATIONS = 8
+MAX_ATTESTATION_BUNDLE_SET_BYTES = MAX_ATTESTATIONS * (
+    MAX_ATTESTATION_BUNDLE_BYTES + 1
+)
+MAX_ISOLATED_WORKER_INODES = 16_384
 
 
 class StaticDeploymentError(ValueError):
@@ -82,6 +130,10 @@ class StaticProfile:
     application: str
     source_repository: str
     source_url: str
+    source_ref: str
+    signer_workflow: str
+    canonical_domain: str
+    redirect_domains: tuple[str, ...]
     site_repository: str
     routes_repository: str
     max_archive_bytes: int
@@ -104,6 +156,32 @@ class LayerContract:
 
 
 @dataclasses.dataclass(frozen=True)
+class IntegrationContract:
+    manifest_digest: str
+    archive_digest: str
+    archive_size: int
+    inventory_digest: str
+    inventory_size: int
+    created: str
+
+
+@dataclasses.dataclass(frozen=True)
+class IntegrationFileContract:
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RegistryFetchContract:
+    repository: str
+    kind: str
+    digest: str
+    maximum_size: int
+    expected_size: int | None
+
+
+@dataclasses.dataclass(frozen=True)
 class RouteFile:
     file: str
     route: str
@@ -120,11 +198,25 @@ class InventoryContract:
     files: tuple[RouteFile, ...]
 
 
+@dataclasses.dataclass(frozen=True)
+class IsolatedWorkerState:
+    unit: str
+    state_name: str
+    logical_root: Path
+    physical_root: Path
+    uid: int
+    gid: int
+
+
 PROFILES = {
     "personal": StaticProfile(
         application="personal",
         source_repository="nclsppr/personal",
         source_url="https://github.com/nclsppr/personal",
+        source_ref="refs/heads/main",
+        signer_workflow="nclsppr/personal/.github/workflows/vps-release.yml",
+        canonical_domain="nicolaspieper.com",
+        redirect_domains=("www.nicolaspieper.com", "nicolas.pieper.fr"),
         site_repository="ghcr.io/nclsppr/personal/site",
         routes_repository="ghcr.io/nclsppr/personal/routes",
         max_archive_bytes=50 * MIB,
@@ -141,6 +233,10 @@ PROFILES = {
         application="papersempire",
         source_repository="nclsppr/papersempire",
         source_url="https://github.com/nclsppr/papersempire",
+        source_ref="refs/heads/master",
+        signer_workflow="nclsppr/papersempire/.github/workflows/vps-release.yml",
+        canonical_domain="papersempire.com",
+        redirect_domains=(),
         site_repository="ghcr.io/nclsppr/papersempire/site",
         routes_repository="ghcr.io/nclsppr/papersempire/routes",
         max_archive_bytes=75 * MIB,
@@ -233,6 +329,118 @@ def sha256_file(path: Path, *, max_bytes: int | None = None) -> tuple[str, int]:
     return digest.hexdigest(), total
 
 
+def read_bounded_file(path: Path, max_bytes: int, label: str) -> bytes:
+    try:
+        with path.open("rb") as stream:
+            value = stream.read(max_bytes + 1)
+    except OSError as exc:
+        fail(f"cannot read {label}: {exc}")
+    if len(value) > max_bytes:
+        fail(f"{label} exceeds the {max_bytes}-byte limit")
+    return value
+
+
+def read_worker_result(
+    path: Path,
+    max_bytes: int,
+    label: str,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> bytes:
+    """Read one completed worker result without following mutable path components."""
+
+    if path.name in {"", ".", ".."} or path.parent == path:
+        fail(f"{label} path is invalid")
+    try:
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        fail(f"cannot open {label} directory: {exc}")
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or stat.S_IMODE(parent.st_mode) != 0o700
+        ):
+            fail(f"{label} directory is not the protected worker directory")
+        try:
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        except OSError as exc:
+            fail(f"cannot open {label}: {exc}")
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o444
+            ):
+                fail(f"{label} is not one protected worker result")
+            if metadata.st_size > max_bytes:
+                fail(f"{label} exceeds the {max_bytes}-byte limit")
+            chunks: list[bytes] = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(READ_CHUNK, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            value = b"".join(chunks)
+            if len(value) > max_bytes:
+                fail(f"{label} exceeds the {max_bytes}-byte limit")
+            final = os.fstat(descriptor)
+            if (
+                final.st_dev != metadata.st_dev
+                or final.st_ino != metadata.st_ino
+                or final.st_size != metadata.st_size
+                or len(value) != metadata.st_size
+            ):
+                fail(f"{label} changed while it was consumed")
+            return value
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+
+
+def require_unprivileged_worker(label: str) -> None:
+    if os.geteuid() == 0 or os.getegid() == 0:
+        fail(f"{label} must be unprivileged")
+
+
+def write_worker_result(path: Path, value: object, label: str) -> None:
+    encoded = (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o444,
+        )
+    except OSError as exc:
+        fail(f"cannot create {label}: {exc}")
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+    except OSError as exc:
+        fail(f"cannot write {label}: {exc}")
+    finally:
+        os.close(descriptor)
+
+
 def parse_digest_reference(reference: str, repository: str, label: str) -> str:
     prefix = f"{repository}@sha256:"
     if not reference.startswith(prefix):
@@ -280,9 +488,7 @@ def validate_manifest(
         fail(f"unsupported manifest kind {kind!r}")
 
     expected_digest = parse_digest_reference(reference, repository, f"{kind} reference")
-    raw = path.read_bytes()
-    if len(raw) > 64 * 1024:
-        fail(f"{kind} manifest exceeds 65536 bytes")
+    raw = read_bounded_file(path, MAX_MANIFEST_BYTES, f"{kind} manifest")
     actual_digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
     if actual_digest != expected_digest:
         fail(f"{kind} manifest digest does not match its immutable reference")
@@ -345,6 +551,250 @@ def validate_manifest(
     )
 
 
+def validate_integration_manifest(
+    path: Path,
+    reference: str,
+    source_revision: str,
+) -> IntegrationContract:
+    expected_digest = parse_digest_reference(
+        reference,
+        INTEGRATION_REPOSITORY,
+        "platform integration reference",
+    )
+    raw = read_bounded_file(
+        path,
+        MAX_MANIFEST_BYTES,
+        "platform integration manifest",
+    )
+    actual_digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    if actual_digest != expected_digest:
+        fail("platform integration manifest digest does not match its reference")
+    value = strict_json_bytes(raw, "platform integration manifest", canonical=False)
+    if not isinstance(value, dict):
+        fail("platform integration manifest must be a JSON object")
+    require_exact_keys(
+        value,
+        {"schemaVersion", "mediaType", "artifactType", "config", "layers", "annotations"},
+        "platform integration manifest",
+    )
+    if value["schemaVersion"] != 2 or isinstance(value["schemaVersion"], bool):
+        fail("platform integration manifest schemaVersion must be 2")
+    if value["mediaType"] != OCI_MANIFEST_MEDIA_TYPE:
+        fail("platform integration manifest mediaType is invalid")
+    if value["artifactType"] != INTEGRATION_ARTIFACT_TYPE:
+        fail("platform integration artifactType is invalid")
+    if value["config"] != OCI_EMPTY_CONFIG:
+        fail("platform integration manifest must use the embedded empty OCI config")
+    annotations = value["annotations"]
+    if not isinstance(annotations, dict):
+        fail("platform integration annotations must be an object")
+    require_exact_keys(
+        annotations,
+        {CREATED_ANNOTATION, SOURCE_ANNOTATION, REVISION_ANNOTATION},
+        "platform integration annotations",
+    )
+    if annotations[SOURCE_ANNOTATION] != INTEGRATION_SOURCE_URL:
+        fail("platform integration source annotation is invalid")
+    if annotations[REVISION_ANNOTATION] != source_revision:
+        fail("platform integration revision annotation is invalid")
+    created = parse_created(
+        annotations[CREATED_ANNOTATION],
+        "platform integration created annotation",
+    )
+    layers = value["layers"]
+    if not isinstance(layers, list) or len(layers) != 2:
+        fail("platform integration manifest must contain exactly two layers")
+    expected_layers = (
+        (
+            INTEGRATION_ARCHIVE_NAME,
+            INTEGRATION_ARCHIVE_MEDIA_TYPE,
+            MAX_INTEGRATION_ARCHIVE_SIZE,
+        ),
+        (
+            INTEGRATION_INVENTORY_NAME,
+            INTEGRATION_INVENTORY_MEDIA_TYPE,
+            MAX_INTEGRATION_INVENTORY_SIZE,
+        ),
+    )
+    descriptors: list[tuple[str, int]] = []
+    for index, (title, media_type, maximum_size) in enumerate(expected_layers):
+        layer = layers[index]
+        if not isinstance(layer, dict):
+            fail(f"platform integration layer {index} must be an object")
+        require_exact_keys(
+            layer,
+            {"mediaType", "digest", "size", "annotations"},
+            f"platform integration layer {index}",
+        )
+        if layer["mediaType"] != media_type:
+            fail(f"platform integration layer {index} mediaType is invalid")
+        if not isinstance(layer["digest"], str) or not SHA256_RE.fullmatch(layer["digest"]):
+            fail(f"platform integration layer {index} digest is invalid")
+        if (
+            not is_int(layer["size"])
+            or layer["size"] < 1
+            or layer["size"] > maximum_size
+        ):
+            fail(f"platform integration layer {index} size is outside the limit")
+        if layer["annotations"] != {TITLE_ANNOTATION: title}:
+            fail(f"platform integration layer {index} title is invalid")
+        descriptors.append((layer["digest"], layer["size"]))
+    return IntegrationContract(
+        manifest_digest=expected_digest,
+        archive_digest=descriptors[0][0],
+        archive_size=descriptors[0][1],
+        inventory_digest=descriptors[1][0],
+        inventory_size=descriptors[1][1],
+        created=created,
+    )
+
+
+def producer_oci_manifest_bytes(
+    *,
+    artifact_type: str,
+    layers: tuple[tuple[str, str, int, str], ...],
+    created: str,
+    source_revision: str,
+    source_url: str,
+) -> bytes:
+    """Reproduce the compact OCI manifest emitted by the pinned ORAS producer."""
+
+    value = {
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+        "artifactType": artifact_type,
+        "config": dict(OCI_EMPTY_CONFIG),
+        "layers": [
+            {
+                "mediaType": media_type,
+                "digest": digest,
+                "size": size,
+                "annotations": {TITLE_ANNOTATION: title},
+            }
+            for media_type, digest, size, title in layers
+        ],
+        "annotations": {
+            CREATED_ANNOTATION: created,
+            REVISION_ANNOTATION: source_revision,
+            SOURCE_ANNOTATION: source_url,
+        },
+    }
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
+def bind_exact_signed_bytes(
+    path: Path,
+    *,
+    maximum_size: int,
+    expected_size: int,
+    expected_digest: str,
+    expected_bytes: bytes,
+    label: str,
+) -> None:
+    if expected_size != len(expected_bytes):
+        fail(f"{label} reconstructed size is inconsistent")
+    raw = read_bounded_file(path, maximum_size, label)
+    if len(raw) != expected_size:
+        fail(f"{label} size is not bound to the root reconstruction")
+    actual_digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    if actual_digest != expected_digest:
+        fail(f"{label} digest is not bound to the signed descriptor")
+    if raw != expected_bytes:
+        fail(f"{label} bytes do not match the root reconstruction")
+
+
+def bind_static_manifest_contract(
+    path: Path,
+    reference: str,
+    profile: StaticProfile,
+    source_revision: str,
+    contract: LayerContract,
+    *,
+    kind: str,
+) -> None:
+    if kind == "site":
+        repository = profile.site_repository
+        artifact_type = SITE_ARTIFACT_TYPE
+        media_type = SITE_LAYER_MEDIA_TYPE
+        title = "site.tar.gz"
+    elif kind == "routes":
+        repository = profile.routes_repository
+        artifact_type = ROUTES_ARTIFACT_TYPE
+        media_type = ROUTES_LAYER_MEDIA_TYPE
+        title = "routes.json"
+    else:
+        fail(f"unsupported manifest binding kind {kind!r}")
+    expected_manifest_digest = parse_digest_reference(
+        reference,
+        repository,
+        f"{kind} reference",
+    )
+    if contract.manifest_digest != expected_manifest_digest:
+        fail(f"{kind} worker contract changed the immutable manifest digest")
+    expected = producer_oci_manifest_bytes(
+        artifact_type=artifact_type,
+        layers=((media_type, contract.layer_digest, contract.layer_size, title),),
+        created=contract.created,
+        source_revision=source_revision,
+        source_url=profile.source_url,
+    )
+    bind_exact_signed_bytes(
+        path,
+        maximum_size=MAX_MANIFEST_BYTES,
+        expected_size=len(expected),
+        expected_digest=expected_manifest_digest,
+        expected_bytes=expected,
+        label=f"{kind} manifest",
+    )
+
+
+def bind_integration_manifest_contract(
+    path: Path,
+    reference: str,
+    source_revision: str,
+    contract: IntegrationContract,
+) -> None:
+    expected_manifest_digest = parse_digest_reference(
+        reference,
+        INTEGRATION_REPOSITORY,
+        "platform integration reference",
+    )
+    if contract.manifest_digest != expected_manifest_digest:
+        fail("platform integration worker contract changed the immutable manifest digest")
+    expected = producer_oci_manifest_bytes(
+        artifact_type=INTEGRATION_ARTIFACT_TYPE,
+        layers=(
+            (
+                INTEGRATION_ARCHIVE_MEDIA_TYPE,
+                contract.archive_digest,
+                contract.archive_size,
+                INTEGRATION_ARCHIVE_NAME,
+            ),
+            (
+                INTEGRATION_INVENTORY_MEDIA_TYPE,
+                contract.inventory_digest,
+                contract.inventory_size,
+                INTEGRATION_INVENTORY_NAME,
+            ),
+        ),
+        created=contract.created,
+        source_revision=source_revision,
+        source_url=INTEGRATION_SOURCE_URL,
+    )
+    bind_exact_signed_bytes(
+        path,
+        maximum_size=MAX_MANIFEST_BYTES,
+        expected_size=len(expected),
+        expected_digest=expected_manifest_digest,
+        expected_bytes=expected,
+        label="platform integration manifest",
+    )
+
+
 def validate_relative_path(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value:
         fail(f"{label} must be a non-empty string")
@@ -381,9 +831,7 @@ def validate_inventory(
     source_revision: str,
     site_layer: LayerContract,
 ) -> InventoryContract:
-    raw = path.read_bytes()
-    if len(raw) > 2 * MIB:
-        fail("route inventory exceeds the 2 MiB consumer limit")
+    raw = read_bounded_file(path, MAX_ROUTES_BYTES, "route inventory")
     value = strict_json_bytes(raw, "route inventory", canonical=True)
     if not isinstance(value, dict):
         fail("route inventory must be a JSON object")
@@ -479,6 +927,63 @@ def validate_inventory(
         file_count=site["file_count"],
         uncompressed_bytes=site["uncompressed_bytes"],
         files=tuple(files),
+    )
+
+
+def canonical_route_inventory_bytes(
+    inventory: InventoryContract,
+    profile: StaticProfile,
+    source_revision: str,
+) -> bytes:
+    value = {
+        "contract": "vps-infra.route-inventory.v1",
+        "schema": 1,
+        "site": {
+            "archive_bytes": inventory.archive_bytes,
+            "archive_sha256": inventory.archive_sha256,
+            "file_count": inventory.file_count,
+            "uncompressed_bytes": inventory.uncompressed_bytes,
+        },
+        "source": {
+            "repository": profile.source_repository,
+            "revision": source_revision,
+        },
+        "routes": [
+            {
+                "bytes": item.size,
+                "file": item.file,
+                "path": item.route,
+                "sha256": item.sha256,
+                "status": 200,
+            }
+            for item in inventory.files
+        ],
+    }
+    return (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+
+
+def bind_route_inventory_contract(
+    path: Path,
+    inventory: InventoryContract,
+    profile: StaticProfile,
+    source_revision: str,
+    routes_layer: LayerContract,
+) -> None:
+    expected = canonical_route_inventory_bytes(
+        inventory,
+        profile,
+        source_revision,
+    )
+    bind_exact_signed_bytes(
+        path,
+        maximum_size=MAX_ROUTES_BYTES,
+        expected_size=routes_layer.layer_size,
+        expected_digest=routes_layer.layer_digest,
+        expected_bytes=expected,
+        label="route inventory",
     )
 
 
@@ -858,6 +1363,82 @@ def lock_down_release(path: Path) -> None:
     os.chmod(path, 0o755, follow_symlinks=False)
 
 
+def lock_down_integration(path: Path) -> None:
+    for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for name in files:
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                fail(f"platform integration contains an unsafe file at {candidate}")
+            os.chown(candidate, 0, 0, follow_symlinks=False)
+            os.chmod(candidate, 0o444, follow_symlinks=False)
+        for name in directories:
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                fail(f"platform integration contains an unsafe directory at {candidate}")
+            os.chown(candidate, 0, 0, follow_symlinks=False)
+            os.chmod(candidate, 0o555, follow_symlinks=False)
+    os.chown(path, 0, 0, follow_symlinks=False)
+    os.chmod(path, 0o555, follow_symlinks=False)
+
+
+def fsync_release_tree(path: Path) -> None:
+    """Persist file content, ownership, modes, entries, and directory metadata."""
+
+    directories: list[Path] = []
+    for current, child_directories, files in os.walk(
+        path,
+        topdown=True,
+        followlinks=False,
+    ):
+        current_path = Path(current)
+        directories.append(current_path)
+        for name in child_directories:
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                fail(f"release contains an unsafe directory before fsync: {candidate}")
+        for name in files:
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o644
+            ):
+                fail(f"release contains an unsafe file before fsync: {candidate}")
+            descriptor = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                opened = os.fstat(descriptor)
+                if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+                    fail(f"release file changed before fsync: {candidate}")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    for directory in reversed(directories):
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o755
+        ):
+            fail(f"release contains an unsafe directory before fsync: {directory}")
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            opened = os.fstat(descriptor)
+            if opened.st_dev != metadata.st_dev or opened.st_ino != metadata.st_ino:
+                fail(f"release directory changed before fsync: {directory}")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def safe_environment(home: Path) -> dict[str, str]:
     return {
         "HOME": str(home),
@@ -866,6 +1447,271 @@ def safe_environment(home: Path) -> dict[str, str]:
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "XDG_CONFIG_HOME": str(home / ".config"),
     }
+
+
+def run_attestation_fetch_worker(reference: str, output_path: Path) -> None:
+    require_unprivileged_worker("attestation fetch worker")
+    worker_home = Path(os.environ.get("HOME", ""))
+    if output_path.name != "attestation-bundles.jsonl" or output_path.parent != worker_home:
+        fail("attestation fetch worker output must stay inside its protected worker home")
+    scratch = worker_home / "scratch"
+    try:
+        scratch.mkdir(mode=0o700)
+        bundle_path = fetch_attestation_bundles_bounded(
+            reference,
+            scratch,
+            safe_environment(worker_home),
+        )
+        source_fd = os.open(bundle_path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            source = os.fstat(source_fd)
+            if (
+                not stat.S_ISREG(source.st_mode)
+                or source.st_uid != os.geteuid()
+                or source.st_gid != os.getegid()
+                or source.st_nlink != 1
+                or stat.S_IMODE(source.st_mode) != 0o444
+                or not 1 <= source.st_size <= MAX_ATTESTATION_BUNDLE_SET_BYTES
+            ):
+                fail("attestation fetch worker produced an unsafe bundle set")
+            output_fd = os.open(
+                output_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o400,
+            )
+            try:
+                copied = 0
+                while chunk := os.read(source_fd, READ_CHUNK):
+                    copied += len(chunk)
+                    if copied > MAX_ATTESTATION_BUNDLE_SET_BYTES:
+                        fail("attestation bundle set exceeds its total size limit")
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(output_fd, view)
+                        view = view[written:]
+                after = os.fstat(source_fd)
+                if stable_file_identity(after) != stable_file_identity(source):
+                    fail("attestation bundle set changed while it was finalized")
+                if copied != source.st_size:
+                    fail("attestation bundle set size changed while it was finalized")
+                os.fchmod(output_fd, 0o444)
+                os.fsync(output_fd)
+            finally:
+                os.close(output_fd)
+        finally:
+            os.close(source_fd)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def copy_trusted_worker_file(
+    source: Path,
+    destination: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    maximum_size: int,
+    label: str,
+    expected_digest: str | None = None,
+    expected_size: int | None = None,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> tuple[str, int]:
+    """Copy one exact bounded worker output into a protected root file."""
+
+    if source.name in {"", ".", ".."} or destination.name in {"", ".", ".."}:
+        fail(f"{label} path is invalid")
+    try:
+        source_parent_fd = os.open(
+            source.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        fail(f"cannot open {label} worker parent: {exc}")
+    try:
+        destination_parent_fd = os.open(
+            destination.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        os.close(source_parent_fd)
+        fail(f"cannot open {label} trusted parent: {exc}")
+    try:
+        source_parent = os.fstat(source_parent_fd)
+        destination_parent = os.fstat(destination_parent_fd)
+        if (
+            source_parent.st_uid != expected_uid
+            or source_parent.st_gid != expected_gid
+            or stat.S_IMODE(source_parent.st_mode) != 0o700
+        ):
+            fail(f"{label} worker parent is not protected")
+        if (
+            destination_parent.st_uid != trusted_uid
+            or destination_parent.st_gid != trusted_gid
+            or destination_parent.st_mode & 0o022
+        ):
+            fail(f"{label} trusted parent is not protected")
+        if set(os.listdir(source_parent_fd)) != {source.name}:
+            fail(f"{label} worker directory does not contain exactly one output")
+        try:
+            source_fd = os.open(
+                source.name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=source_parent_fd,
+            )
+        except OSError as exc:
+            fail(f"cannot open {label} worker output: {exc}")
+        try:
+            destination_fd = os.open(
+                destination.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o400,
+                dir_fd=destination_parent_fd,
+            )
+        except OSError as exc:
+            os.close(source_fd)
+            fail(f"cannot open {label} trusted output: {exc}")
+        try:
+            before = os.fstat(source_fd)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != expected_uid
+                or before.st_gid != expected_gid
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o444
+                or not 1 <= before.st_size <= maximum_size
+            ):
+                fail(f"{label} worker output is unsafe")
+            if expected_size is not None and before.st_size != expected_size:
+                fail(f"{label} worker output size does not match its contract")
+            digest = hashlib.sha256()
+            copied = 0
+            while chunk := os.read(source_fd, READ_CHUNK):
+                copied += len(chunk)
+                if copied > maximum_size:
+                    fail(f"{label} exceeds its total size limit")
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    view = view[written:]
+            after = os.fstat(source_fd)
+            if stable_file_identity(after) != stable_file_identity(before):
+                fail(f"{label} changed while it was copied")
+            actual_digest = f"sha256:{digest.hexdigest()}"
+            if copied != before.st_size:
+                fail(f"{label} size changed while it was copied")
+            if expected_digest is not None and actual_digest != expected_digest:
+                fail(f"{label} digest does not match its contract")
+            os.fchmod(destination_fd, 0o444)
+            os.fsync(destination_fd)
+            trusted = os.fstat(destination_fd)
+            if (
+                trusted.st_uid != trusted_uid
+                or trusted.st_gid != trusted_gid
+                or trusted.st_nlink != 1
+                or stat.S_IMODE(trusted.st_mode) != 0o444
+                or trusted.st_size != copied
+            ):
+                fail(f"{label} trusted copy was not normalized")
+            os.fsync(destination_parent_fd)
+            return actual_digest, copied
+        finally:
+            os.close(source_fd)
+            os.close(destination_fd)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            destination.unlink()
+        raise
+    finally:
+        os.close(source_parent_fd)
+        os.close(destination_parent_fd)
+
+
+def verify_github_provenance_isolated(
+    reference: str,
+    *,
+    subject_path: Path,
+    repository: str,
+    source_revision: str,
+    source_ref: str,
+    signer_workflow: str,
+    trusted_directory: Path,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> None:
+    subject_digest = parse_digest_reference(reference, reference.rpartition("@")[0], "attestation reference")
+    actual_subject_digest, _ = sha256_file(subject_path, max_bytes=MAX_MANIFEST_BYTES)
+    if f"sha256:{actual_subject_digest}" != subject_digest:
+        fail("local provenance subject does not match its immutable reference")
+    trusted_bundle = trusted_directory / f"attestation-{secrets.token_hex(8)}.jsonl"
+    try:
+        fetch_state = run_isolated_worker(
+            "attestfetch",
+            [
+                str(PYTHON_PATH),
+                str(Path(__file__)),
+                "--attestation-fetch-worker",
+                reference,
+                "{STATE_DIRECTORY}/attestation-bundles.jsonl",
+            ],
+            inputs=(Path(__file__), SCRIPT_DIRECTORY / "lib/platform_integration.py"),
+            runtime_seconds=300,
+            memory_max="256M",
+            memory_swap_max="64M",
+            file_size_max=f"{MAX_ATTESTATION_BUNDLE_SET_BYTES}",
+            network=True,
+        )
+        try:
+            copy_trusted_worker_file(
+                fetch_state.physical_root / "attestation-bundles.jsonl",
+                trusted_bundle,
+                expected_uid=fetch_state.uid,
+                expected_gid=fetch_state.gid,
+                maximum_size=MAX_ATTESTATION_BUNDLE_SET_BYTES,
+                label="attestation bundle set",
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+        finally:
+            cleanup_isolated_worker_state(fetch_state)
+        verifier_command = [
+            str(GH_PATH),
+            "attestation",
+            "verify",
+            str(subject_path),
+            "--bundle",
+            str(trusted_bundle),
+            "--digest-alg",
+            "sha256",
+            "--repo",
+            repository,
+            "--source-digest",
+            source_revision,
+            "--source-ref",
+            source_ref,
+            "--signer-workflow",
+            signer_workflow,
+            "--deny-self-hosted-runners",
+        ]
+        verifier_state = run_isolated_worker(
+            "attestverify",
+            verifier_command,
+            inputs=(GH_PATH, subject_path, trusted_bundle),
+            runtime_seconds=120,
+            memory_max="256M",
+            memory_swap_max="64M",
+            file_size_max="1M",
+            network=False,
+        )
+        cleanup_isolated_worker_state(verifier_state)
+    finally:
+        if trusted_bundle.exists() or trusted_bundle.is_symlink():
+            unlink_trusted_file(
+                trusted_bundle,
+                expected_uid=trusted_uid,
+                expected_gid=trusted_gid,
+            )
 
 
 def run_checked(
@@ -891,49 +1737,1240 @@ def run_checked(
     return result
 
 
-def fetch_manifest(reference: str, destination: Path, registry_config: Path, environment: dict[str, str]) -> None:
-    run_checked(
-        [
-            str(ORAS_PATH),
-            "manifest",
-            "fetch",
-            "--media-type",
-            OCI_MANIFEST_MEDIA_TYPE,
-            "--registry-config",
-            str(registry_config),
-            "--output",
-            str(destination),
-            reference,
-        ],
-        environment=environment,
+def isolated_worker_properties(
+    state_name: str,
+    *,
+    runtime_seconds: int,
+    memory_max: str,
+    memory_swap_max: str,
+    file_size_max: str,
+    network: bool,
+    inputs: tuple[Path, ...],
+    denied_host_addresses: tuple[str, ...] = (),
+) -> list[str]:
+    if re.fullmatch(r"[0-9a-f]{32}", state_name) is None:
+        fail("isolated worker runtime name is invalid")
+    if not 1 <= runtime_seconds <= 600:
+        fail("isolated worker runtime limit is invalid")
+    properties = [
+        "Type=exec",
+        "DynamicUser=yes",
+        f"RuntimeDirectory=vps-static-jobs/{state_name}",
+        "RuntimeDirectoryMode=0700",
+        "RuntimeDirectoryPreserve=yes",
+        "ExitType=cgroup",
+        "KillMode=control-group",
+        "SendSIGKILL=yes",
+        "FinalKillSignal=SIGKILL",
+        "TimeoutStopSec=5s",
+        f"RuntimeMaxSec={runtime_seconds}s",
+        "RuntimeRandomizedExtraSec=0",
+        "Restart=no",
+        "NotifyAccess=none",
+        "ProtectControlGroups=strict",
+        "Delegate=no",
+        "RestrictNamespaces=yes",
+        "NoNewPrivileges=yes",
+        "CapabilityBoundingSet=",
+        "AmbientCapabilities=",
+        "SupplementaryGroups=",
+        "ProtectSystem=strict",
+        "ProtectHome=yes",
+        "PrivateTmp=disconnected",
+        "PrivateDevices=yes",
+        "DevicePolicy=closed",
+        "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes",
+        "ProtectKernelLogs=yes",
+        "ProtectClock=yes",
+        "ProtectHostname=yes",
+        "ProtectProc=invisible",
+        "LockPersonality=yes",
+        "RestrictRealtime=yes",
+        "RemoveIPC=yes",
+        "PrivateIPC=yes",
+        "KeyringMode=private",
+        "UMask=0077",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=@system-service",
+        "SystemCallFilter=~@mount",
+        "TasksMax=64",
+        f"MemoryMax={memory_max}",
+        f"MemorySwapMax={memory_swap_max}",
+        "CPUQuota=100%",
+        "LimitNOFILE=256",
+        f"LimitFSIZE={file_size_max}",
+        "LimitCORE=0",
+        "OOMPolicy=kill",
+        "StandardInput=null",
+        "StandardOutput=null",
+        "StandardError=null",
+        (
+            "InaccessiblePaths=/run/dbus /run/systemd/private /run/systemd/notify "
+            "/run/systemd/journal /dev/log -/run/docker.sock -/run/containerd "
+            "-/run/podman -/var/run/docker.sock"
+        ),
+        f"WorkingDirectory=/run/vps-static-jobs/{state_name}",
+        f"Environment=HOME=/run/vps-static-jobs/{state_name}",
+        f"Environment=XDG_CONFIG_HOME=/run/vps-static-jobs/{state_name}/.config",
+        "Environment=LANG=C.UTF-8",
+        "Environment=LC_ALL=C.UTF-8",
+        "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ]
+    if network:
+        if not denied_host_addresses:
+            fail("network worker requires exact global host address denials")
+        normalized_denials: list[str] = []
+        for value in denied_host_addresses:
+            try:
+                network_value = ipaddress.ip_network(value, strict=True)
+            except ValueError as exc:
+                fail(f"network worker host address denial is invalid: {exc}")
+            if (
+                network_value.prefixlen != network_value.max_prefixlen
+                or network_value.network_address.is_unspecified
+                or network_value.network_address.is_loopback
+                or network_value.network_address.is_link_local
+                or network_value.network_address.is_multicast
+            ):
+                fail("network worker host address denial is not one usable host address")
+            normalized_denials.append(str(network_value))
+        properties.extend(
+            (
+                "RestrictAddressFamilies=AF_INET AF_INET6",
+                (
+                    "IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 "
+                    "224.0.0.0/4 ff00::/8 10.0.0.0/8 100.64.0.0/10 "
+                    "172.16.0.0/12 192.168.0.0/16 fc00::/7"
+                ),
+                "IPAddressAllow=127.0.0.53/32",
+                "SocketBindDeny=any",
+                *(f"IPAddressDeny={value}" for value in sorted(normalized_denials)),
+            )
+        )
+    else:
+        properties.extend(
+            (
+                "PrivateNetwork=yes",
+                "RestrictAddressFamilies=",
+            )
+        )
+    for path in inputs:
+        if not path.is_absolute() or ":" in str(path) or "\x00" in str(path):
+            fail("isolated worker bind input path is invalid")
+        properties.append(f"BindReadOnlyPaths={path}:{path}:norbind")
+    return properties
+
+
+def isolated_worker_command(
+    unit: str,
+    properties: list[str],
+    worker_command: list[str],
+) -> list[str]:
+    if unit != SYSTEMD_WORKER_UNIT:
+        fail("isolated worker unit name is invalid")
+    command = [
+        str(SYSTEMD_RUN_PATH),
+        "--system",
+        f"--unit={unit}",
+        "--service-type=exec",
+        "--wait",
+        "--collect",
+        "--quiet",
+        "--expand-environment=no",
+    ]
+    for property_value in properties:
+        command.extend(("--property", property_value))
+    command.extend(("--", *worker_command))
+    return command
+
+
+def verify_isolated_worker_quiescent(
+    unit: str,
+    environment: dict[str, str],
+) -> None:
+    cgroup = SYSTEMD_CGROUP_ROOT / unit
+    if cgroup.exists() or cgroup.is_symlink():
+        fail("isolated worker returned while its cgroup still exists")
+
+    def unit_property(name: str) -> str | None:
+        try:
+            result = subprocess.run(
+                [str(SYSTEMCTL_PATH), "show", f"--property={name}", "--value", unit],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            fail(f"isolated worker unit state cannot be verified: {exc}")
+        if result.returncode == 0:
+            value = result.stdout.strip()
+            if "\n" in value:
+                fail("isolated worker unit state returned multiple values")
+            return value
+        expected_missing = f"Unit {unit} could not be found."
+        if (
+            result.returncode == 1
+            and not result.stdout.strip()
+            and result.stderr.strip() == expected_missing
+        ):
+            return None
+        fail("isolated worker unit state query failed unexpectedly")
+
+    load_state = unit_property("LoadState")
+    active_state = unit_property("ActiveState")
+    if (load_state is None) != (active_state is None):
+        fail("isolated worker unit disappeared inconsistently")
+    if active_state == "failed":
+        try:
+            reset = subprocess.run(
+                [str(SYSTEMCTL_PATH), "reset-failed", unit],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            fail(f"isolated worker failed-unit state cannot be reset: {exc}")
+        if reset.returncode != 0:
+            fail("isolated worker failed-unit state cannot be reset")
+        load_state = unit_property("LoadState")
+        active_state = unit_property("ActiveState")
+        if (load_state is None) != (active_state is None):
+            fail("isolated worker failed unit disappeared inconsistently")
+    if load_state is None:
+        pass
+    elif load_state == "not-found" and active_state in {"", "inactive"}:
+        pass
+    elif active_state != "inactive":
+        fail("isolated worker unit is not absent or inactive after systemd-run returned")
+    try:
+        cgroup_exists = cgroup.exists() or cgroup.is_symlink()
+    except OSError as exc:
+        fail(f"isolated worker cgroup cannot be rechecked: {exc}")
+    if cgroup_exists:
+        fail("isolated worker cgroup reappeared after unit collection")
+
+
+def decode_mountinfo_path(value: str) -> str:
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+def require_isolated_worker_tmpfs() -> None:
+    root = SYSTEMD_WORKER_PRIVATE_ROOT
+    try:
+        metadata = root.lstat()
+        run_metadata = Path("/run").stat()
+        filesystem = os.statvfs(root)
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="ascii")
+    except OSError as exc:
+        fail(f"isolated worker tmpfs cannot be inspected: {exc}")
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail("isolated worker tmpfs root must be a root-owned 0700 directory")
+    if metadata.st_dev == run_metadata.st_dev:
+        fail("isolated worker storage is not a distinct bounded filesystem")
+    matching: list[tuple[set[str], set[str], str]] = []
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError:
+            fail("kernel mountinfo contains a malformed record")
+        if len(fields) < 6 or separator + 3 >= len(fields):
+            fail("kernel mountinfo contains a truncated record")
+        if decode_mountinfo_path(fields[4]) != str(root):
+            continue
+        matching.append(
+            (
+                set(fields[5].split(",")),
+                set(fields[separator + 3].split(",")),
+                fields[separator + 1],
+            )
+        )
+    if len(matching) != 1:
+        fail("isolated worker storage is not one exact mount point")
+    mount_options, super_options, filesystem_type = matching[0]
+    combined_options = mount_options | super_options
+    if filesystem_type != "tmpfs" or not {"rw", "nodev", "nosuid", "noexec"}.issubset(
+        combined_options
+    ):
+        fail("isolated worker storage lacks the required tmpfs mount protections")
+    capacity = filesystem.f_blocks * filesystem.f_frsize
+    if capacity <= 0 or capacity > 384 * MIB:
+        fail("isolated worker tmpfs byte capacity is outside the approved bound")
+    if filesystem.f_files <= 0 or filesystem.f_files > 16_384:
+        fail("isolated worker tmpfs inode capacity is outside the approved bound")
+
+
+def global_host_address_prefixes() -> tuple[str, ...]:
+    try:
+        result = subprocess.run(
+            [str(IP_PATH), "-json", "address", "show", "scope", "global"],
+            check=False,
+            capture_output=True,
+            env=safe_environment(Path("/nonexistent")),
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"cannot enumerate global host addresses: {exc}")
+    if result.returncode != 0 or result.stderr or len(result.stdout) > 64 * 1024:
+        fail("cannot enumerate global host addresses exactly")
+    try:
+        value = json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"global host address inventory is invalid: {exc}")
+    if not isinstance(value, list) or not value:
+        fail("global host address inventory is empty")
+    addresses: set[str] = set()
+    has_public_address = False
+    for interface in value:
+        if not isinstance(interface, dict) or not isinstance(interface.get("addr_info"), list):
+            fail("global host address inventory contains an invalid interface")
+        for address in interface["addr_info"]:
+            if address == {}:
+                continue
+            if not isinstance(address, dict):
+                fail("global host address inventory contains an invalid address")
+            family = address.get("family")
+            local = address.get("local")
+            scope = address.get("scope")
+            if family not in {"inet", "inet6"} or not isinstance(local, str) or scope != "global":
+                fail("global host address inventory contains an unexpected address")
+            try:
+                parsed = ipaddress.ip_address(local)
+            except ValueError as exc:
+                fail(f"global host address inventory contains an invalid IP: {exc}")
+            if parsed.is_unspecified or parsed.is_loopback or parsed.is_link_local or parsed.is_multicast:
+                fail("global host address inventory contains an unusable IP")
+            addresses.add(f"{parsed}/{parsed.max_prefixlen}")
+            has_public_address = has_public_address or parsed.is_global
+    if not addresses or not has_public_address:
+        fail("global host address inventory has no publicly routable address")
+    return tuple(sorted(addresses))
+
+
+def open_isolated_worker_state(unit: str, token: str) -> IsolatedWorkerState:
+    try:
+        parent_fd = os.open(
+            SYSTEMD_WORKER_PRIVATE_ROOT,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        fail(f"cannot open protected systemd state root: {exc}")
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != 0
+            or parent.st_gid != 0
+            or parent.st_mode & 0o077
+        ):
+            fail("systemd private state root is not protected")
+        try:
+            state_fd = os.open(
+                token,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            fail(f"cannot open isolated worker state: {exc}")
+        try:
+            state = os.fstat(state_fd)
+            if (
+                not stat.S_ISDIR(state.st_mode)
+                or stat.S_IMODE(state.st_mode) != 0o700
+                or state.st_uid == 0
+                or state.st_gid == 0
+            ):
+                fail("isolated worker state directory is unsafe")
+            return IsolatedWorkerState(
+                unit=unit,
+                state_name=token,
+                logical_root=SYSTEMD_WORKER_LOGICAL_ROOT / token,
+                physical_root=SYSTEMD_WORKER_PRIVATE_ROOT / token,
+                uid=state.st_uid,
+                gid=state.st_gid,
+            )
+        finally:
+            os.close(state_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def remove_isolated_tree(parent_fd: int, name: str, *, expected_device: int) -> None:
+    root_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    original_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    desired_soft_limit = max(original_limit[0], MAX_ISOLATED_WORKER_INODES + 64)
+    if original_limit[1] == resource.RLIM_INFINITY:
+        required_soft_limit = desired_soft_limit
+    else:
+        required_soft_limit = min(desired_soft_limit, original_limit[1])
+    if required_soft_limit < MAX_ISOLATED_WORKER_INODES + 64:
+        os.close(root_fd)
+        fail("isolated worker cleanup file descriptor hard limit is too low")
+    descriptors: set[int] = {root_fd}
+    try:
+        if original_limit[0] != required_soft_limit:
+            resource.setrlimit(
+                resource.RLIMIT_NOFILE,
+                (required_soft_limit, original_limit[1]),
+            )
+        root = os.fstat(root_fd)
+        if not stat.S_ISDIR(root.st_mode) or root.st_dev != expected_device:
+            fail("isolated worker cleanup encountered a mount boundary")
+        stack: list[tuple[int, int | None, str | None, bool]] = [
+            (root_fd, None, None, False)
+        ]
+        seen = 1
+        while stack:
+            descriptor, parent_descriptor, directory_name, visited = stack.pop()
+            if visited:
+                os.fsync(descriptor)
+                if parent_descriptor is not None and directory_name is not None:
+                    os.close(descriptor)
+                    descriptors.discard(descriptor)
+                    os.rmdir(directory_name, dir_fd=parent_descriptor)
+                continue
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_dev != expected_device:
+                fail("isolated worker cleanup encountered a mount boundary")
+            stack.append((descriptor, parent_descriptor, directory_name, True))
+            for child in os.listdir(descriptor):
+                seen += 1
+                if seen > MAX_ISOLATED_WORKER_INODES:
+                    fail("isolated worker cleanup exceeded its inode bound")
+                child_metadata = os.stat(
+                    child,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if child_metadata.st_dev != expected_device:
+                    fail("isolated worker cleanup encountered a foreign filesystem")
+                if stat.S_ISDIR(child_metadata.st_mode):
+                    child_fd = os.open(
+                        child,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                    descriptors.add(child_fd)
+                    stack.append((child_fd, descriptor, child, False))
+                else:
+                    os.unlink(child, dir_fd=descriptor)
+        os.fsync(root_fd)
+    finally:
+        for descriptor in descriptors:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        with contextlib.suppress(OSError, ValueError):
+            if resource.getrlimit(resource.RLIMIT_NOFILE) != original_limit:
+                resource.setrlimit(resource.RLIMIT_NOFILE, original_limit)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def cleanup_isolated_worker_token(unit: str, state_name: str) -> None:
+    if re.fullmatch(r"[0-9a-f]{32}", state_name) is None:
+        fail("refusing to clean an invalid isolated worker runtime name")
+    if unit != SYSTEMD_WORKER_UNIT:
+        fail("refusing to clean an invalid isolated worker unit")
+    cgroup = SYSTEMD_CGROUP_ROOT / unit
+    if cgroup.exists() or cgroup.is_symlink():
+        fail("refusing to clean an isolated worker with a live cgroup")
+    expected = SYSTEMD_WORKER_PRIVATE_ROOT / state_name
+    logical_parent_fd = os.open(
+        SYSTEMD_WORKER_LOGICAL_ROOT,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        try:
+            logical_parent = os.fstat(logical_parent_fd)
+            if (
+                not stat.S_ISDIR(logical_parent.st_mode)
+                or logical_parent.st_uid != 0
+                or logical_parent.st_gid != 0
+                or logical_parent.st_mode & 0o022
+            ):
+                fail("isolated worker logical runtime parent is not protected")
+            logical_metadata = os.stat(
+                state_name,
+                dir_fd=logical_parent_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISLNK(logical_metadata.st_mode):
+                fail("isolated worker logical runtime path is not the expected symlink")
+            target = os.readlink(state_name, dir_fd=logical_parent_fd)
+            resolved_target = Path(
+                os.path.normpath(str(SYSTEMD_WORKER_LOGICAL_ROOT / target))
+            )
+            if resolved_target != expected:
+                fail("isolated worker logical runtime symlink has an unexpected target")
+        except FileNotFoundError:
+            fail("isolated worker logical runtime symlink disappeared before cleanup")
+        parent_fd = os.open(
+            SYSTEMD_WORKER_PRIVATE_ROOT,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            parent = os.fstat(parent_fd)
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid != 0
+                or parent.st_gid != 0
+                or parent.st_mode & 0o077
+            ):
+                fail("isolated worker cleanup parent is not protected")
+            physical = os.stat(state_name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(physical.st_mode) or physical.st_dev != parent.st_dev:
+                fail("isolated worker cleanup root is not a directory on the worker tmpfs")
+            remove_isolated_tree(
+                parent_fd,
+                state_name,
+                expected_device=parent.st_dev,
+            )
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        if expected.exists() or expected.is_symlink():
+            fail("isolated worker state cleanup left files behind")
+        os.unlink(state_name, dir_fd=logical_parent_fd)
+        os.fsync(logical_parent_fd)
+    finally:
+        os.close(logical_parent_fd)
+    logical = SYSTEMD_WORKER_LOGICAL_ROOT / state_name
+    if logical.exists() or logical.is_symlink():
+        fail("isolated worker logical runtime cleanup left a symlink behind")
+
+
+def cleanup_isolated_worker_state(state: IsolatedWorkerState) -> None:
+    expected = SYSTEMD_WORKER_PRIVATE_ROOT / state.state_name
+    if state.physical_root != expected:
+        fail("refusing to clean an unexpected isolated worker runtime path")
+    cleanup_isolated_worker_token(state.unit, state.state_name)
+
+
+def run_isolated_worker(
+    phase: str,
+    worker_command: list[str],
+    *,
+    inputs: tuple[Path, ...],
+    runtime_seconds: int,
+    memory_max: str,
+    memory_swap_max: str,
+    file_size_max: str,
+    network: bool = False,
+) -> IsolatedWorkerState:
+    state_name = secrets.token_hex(16)
+    if re.fullmatch(r"[a-z]{1,24}", phase) is None:
+        fail("isolated worker phase is invalid")
+    unit = SYSTEMD_WORKER_UNIT
+    state_path = SYSTEMD_WORKER_PRIVATE_ROOT / state_name
+    cgroup_path = SYSTEMD_CGROUP_ROOT / unit
+    logical_path = SYSTEMD_WORKER_LOGICAL_ROOT / state_name
+    if (
+        state_path.exists()
+        or state_path.is_symlink()
+        or logical_path.exists()
+        or logical_path.is_symlink()
+        or cgroup_path.exists()
+    ):
+        fail("isolated worker random name collided with existing state")
+    properties = isolated_worker_properties(
+        state_name,
+        runtime_seconds=runtime_seconds,
+        memory_max=memory_max,
+        memory_swap_max=memory_swap_max,
+        file_size_max=file_size_max,
+        network=network,
+        inputs=inputs,
+        denied_host_addresses=(global_host_address_prefixes() if network else ()),
+    )
+    logical_root = str(SYSTEMD_WORKER_LOGICAL_ROOT / state_name)
+    resolved_worker_command = [
+        argument.replace("{STATE_DIRECTORY}", logical_root)
+        for argument in worker_command
+    ]
+    command = isolated_worker_command(unit, properties, resolved_worker_command)
+    environment = safe_environment(Path("/nonexistent"))
+    failure: BaseException | None = None
+    try:
+        run_checked(command, environment=environment, timeout=runtime_seconds + 30)
+    except BaseException as exc:
+        failure = exc
+    verify_isolated_worker_quiescent(unit, environment)
+    if failure is not None:
+        if (
+            state_path.exists()
+            or state_path.is_symlink()
+            or logical_path.exists()
+            or logical_path.is_symlink()
+        ):
+            cleanup_isolated_worker_token(unit, state_name)
+        raise failure
+    try:
+        return open_isolated_worker_state(unit, state_name)
+    except BaseException:
+        cleanup_isolated_worker_token(unit, state_name)
+        raise
+
+
+def download_https_bounded(
+    url: str,
+    destination: Path,
+    max_bytes: int,
+    environment: dict[str, str],
+    *,
+    headers: tuple[str, ...] = (),
+    header_files: tuple[Path, ...] = (),
+) -> None:
+    require_unprivileged_worker("network download")
+    if not url.startswith("https://"):
+        fail("bounded download URL must use HTTPS")
+    if destination.exists() or destination.is_symlink():
+        fail(f"bounded download destination already exists: {destination}")
+    temporary = destination.parent / f".{destination.name}-{secrets.token_hex(8)}"
+    command = [
+        str(CURL_PATH),
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--noproxy",
+        "*",
+        "--max-redirs",
+        "3",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "300",
+        "--max-filesize",
+        str(max_bytes),
+        "--remove-on-error",
+        "--output",
+        str(temporary),
+    ]
+    for header in headers:
+        if "\n" in header or "\r" in header:
+            fail("bounded download header is invalid")
+        command.extend(["--header", header])
+    for header_file in header_files:
+        if not header_file.is_absolute() or "\x00" in str(header_file):
+            fail("bounded download header file path is invalid")
+        command.extend(["--header", f"@{header_file}"])
+    command.append(url)
+    try:
+        run_checked(command, environment=environment, timeout=330)
+        _, size = sha256_file(temporary, max_bytes=max_bytes)
+        if size < 1:
+            fail("bounded download returned an empty response")
+        temporary.chmod(0o444)
+        os.replace(temporary, destination)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def registry_repository_path(repository: str) -> str:
+    prefix = "ghcr.io/"
+    if not repository.startswith(prefix):
+        fail("static OCI repository must use ghcr.io")
+    path = repository.removeprefix(prefix)
+    if not re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+", path):
+        fail("static OCI repository path is invalid")
+    return path
+
+
+def registry_pull_bearer(
+    repository: str,
+    work_directory: Path,
+    environment: dict[str, str],
+) -> str:
+    repository_path = registry_repository_path(repository)
+    query = urllib.parse.urlencode(
+        {
+            "service": "ghcr.io",
+            "scope": f"repository:{repository_path}:pull",
+        }
+    )
+    auth_path = work_directory / f"registry-auth-{secrets.token_hex(8)}.json"
+    try:
+        download_https_bounded(
+            f"https://ghcr.io/token?{query}",
+            auth_path,
+            MAX_REGISTRY_AUTH_RESPONSE_BYTES,
+            environment,
+            headers=("Accept: application/json", "Accept-Encoding: identity"),
+        )
+        value = strict_json_bytes(
+            read_bounded_file(
+                auth_path,
+                MAX_REGISTRY_AUTH_RESPONSE_BYTES,
+                "registry authorization response",
+            ),
+            "registry authorization response",
+            canonical=False,
+        )
+        if not isinstance(value, dict) or set(value) not in ({"token"}, {"token", "expires_in"}):
+            fail("registry authorization response has invalid fields")
+        bearer = value.get("token")
+        if (
+            not isinstance(bearer, str)
+            or not bearer
+            or len(bearer) > 32 * 1024
+            or not bearer.isascii()
+            or any(character.isspace() or ord(character) < 0x21 for character in bearer)
+        ):
+            fail("registry authorization response contains an invalid bearer")
+        return bearer
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            auth_path.unlink()
+
+
+@contextlib.contextmanager
+def private_registry_headers(
+    repository: str,
+    work_directory: Path,
+    environment: dict[str, str],
+    *,
+    accept: str | None = None,
+) -> Iterator[Path]:
+    bearer = registry_pull_bearer(repository, work_directory, environment)
+    lines = [
+        f"Authorization: Bearer {bearer}",
+        "Accept-Encoding: identity",
+    ]
+    if accept is not None:
+        if not accept.isascii() or "\r" in accept or "\n" in accept:
+            fail("registry Accept header is invalid")
+        lines.append(f"Accept: {accept}")
+    encoded = ("\n".join(lines) + "\n").encode("ascii")
+    if len(encoded) > 40 * 1024:
+        fail("registry authorization headers exceed their size limit")
+    path = work_directory / f"registry-headers-{secrets.token_hex(8)}"
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        yield path
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+
+
+def fetch_registry_object(
+    repository: str,
+    digest: str,
+    destination: Path,
+    max_bytes: int,
+    environment: dict[str, str],
+    *,
+    kind: str,
+    expected_size: int | None = None,
+) -> None:
+    if not SHA256_RE.fullmatch(digest):
+        fail(f"{kind} digest is invalid")
+    repository_path = registry_repository_path(repository)
+    endpoint = "manifests" if kind == "manifest" else "blobs"
+    accept: str | None = None
+    if kind == "manifest":
+        accept = OCI_MANIFEST_MEDIA_TYPE
+    elif kind != "blob":
+        fail(f"unsupported registry object kind {kind!r}")
+    with private_registry_headers(
+        repository,
+        destination.parent,
+        environment,
+        accept=accept,
+    ) as header_file:
+        download_https_bounded(
+            f"https://ghcr.io/v2/{repository_path}/{endpoint}/{digest}",
+            destination,
+            max_bytes,
+            environment,
+            header_files=(header_file,),
+        )
+    actual_digest, actual_size = sha256_file(destination, max_bytes=max_bytes)
+    if f"sha256:{actual_digest}" != digest:
+        fail(f"downloaded {kind} from {repository} does not match its digest")
+    if expected_size is not None and actual_size != expected_size:
+        fail(f"downloaded {kind} from {repository} does not match its size")
+
+
+def fetch_registry_named_manifest(
+    repository: str,
+    name: str,
+    destination: Path,
+    max_bytes: int,
+    environment: dict[str, str],
+    *,
+    accept: str,
+) -> None:
+    if re.fullmatch(r"sha256-[0-9a-f]{64}", name) is None:
+        fail("registry manifest name is outside the digest-tag allowlist")
+    repository_path = registry_repository_path(repository)
+    with private_registry_headers(
+        repository,
+        destination.parent,
+        environment,
+        accept=accept,
+    ) as header_file:
+        download_https_bounded(
+            f"https://ghcr.io/v2/{repository_path}/manifests/{name}",
+            destination,
+            max_bytes,
+            environment,
+            header_files=(header_file,),
+        )
+
+
+def fetch_attestation_bundles_bounded(
+    reference: str,
+    work_directory: Path,
+    environment: dict[str, str],
+) -> Path:
+    repository, separator, subject_digest = reference.rpartition("@")
+    if not separator:
+        fail("attestation reference must contain an immutable digest")
+    parse_digest_reference(reference, repository, "attestation reference")
+    subject_hex = subject_digest.removeprefix("sha256:")
+    index_path = work_directory / f"attestation-index-{secrets.token_hex(8)}.json"
+    fetch_registry_named_manifest(
+        repository,
+        f"sha256-{subject_hex}",
+        index_path,
+        MAX_ATTESTATION_INDEX_BYTES,
+        environment,
+        accept=OCI_INDEX_MEDIA_TYPE,
+    )
+    index_raw = read_bounded_file(
+        index_path,
+        MAX_ATTESTATION_INDEX_BYTES,
+        "attestation index",
+    )
+    index = strict_json_bytes(index_raw, "attestation index", canonical=False)
+    if not isinstance(index, dict):
+        fail("attestation index must be a JSON object")
+    require_exact_keys(index, {"mediaType", "schemaVersion", "manifests"}, "attestation index")
+    if index["mediaType"] != OCI_INDEX_MEDIA_TYPE:
+        fail("attestation index mediaType is invalid")
+    if index["schemaVersion"] != 2 or isinstance(index["schemaVersion"], bool):
+        fail("attestation index schemaVersion must be 2")
+    manifests = index["manifests"]
+    if not isinstance(manifests, list) or not 1 <= len(manifests) <= MAX_ATTESTATIONS:
+        fail("attestation index has an invalid manifest count")
+
+    bundle_paths: list[Path] = []
+    seen_manifests: set[str] = set()
+    for index_number, descriptor in enumerate(manifests):
+        if not isinstance(descriptor, dict):
+            fail(f"attestation descriptor {index_number} must be an object")
+        require_exact_keys(
+            descriptor,
+            {"annotations", "artifactType", "digest", "mediaType", "size"},
+            f"attestation descriptor {index_number}",
+        )
+        if descriptor["mediaType"] != OCI_MANIFEST_MEDIA_TYPE:
+            fail(f"attestation descriptor {index_number} mediaType is invalid")
+        if descriptor["artifactType"] != SIGSTORE_BUNDLE_MEDIA_TYPE:
+            fail(f"attestation descriptor {index_number} artifactType is invalid")
+        digest = descriptor["digest"]
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            fail(f"attestation descriptor {index_number} digest is invalid")
+        if digest in seen_manifests:
+            fail("attestation index contains a duplicate manifest")
+        seen_manifests.add(digest)
+        if (
+            not is_int(descriptor["size"])
+            or descriptor["size"] < 1
+            or descriptor["size"] > MAX_ATTESTATION_MANIFEST_BYTES
+        ):
+            fail(f"attestation descriptor {index_number} size is outside the limit")
+        annotations = descriptor["annotations"]
+        if not isinstance(annotations, dict):
+            fail(f"attestation descriptor {index_number} annotations must be an object")
+        if annotations.get("dev.sigstore.bundle.predicateType") != SLSA_PROVENANCE_TYPE:
+            fail(f"attestation descriptor {index_number} predicate type is invalid")
+
+        manifest_path = work_directory / f"attestation-manifest-{index_number}.json"
+        fetch_registry_object(
+            repository,
+            digest,
+            manifest_path,
+            descriptor["size"],
+            environment,
+            kind="manifest",
+            expected_size=descriptor["size"],
+        )
+        manifest_raw = read_bounded_file(
+            manifest_path,
+            descriptor["size"],
+            f"attestation manifest {index_number}",
+        )
+        manifest = strict_json_bytes(
+            manifest_raw,
+            f"attestation manifest {index_number}",
+            canonical=False,
+        )
+        if not isinstance(manifest, dict):
+            fail(f"attestation manifest {index_number} must be an object")
+        require_exact_keys(
+            manifest,
+            {
+                "annotations",
+                "artifactType",
+                "config",
+                "layers",
+                "mediaType",
+                "schemaVersion",
+                "subject",
+            },
+            f"attestation manifest {index_number}",
+        )
+        if (
+            manifest["schemaVersion"] != 2
+            or isinstance(manifest["schemaVersion"], bool)
+            or manifest["mediaType"] != OCI_MANIFEST_MEDIA_TYPE
+            or manifest["artifactType"] != SIGSTORE_BUNDLE_MEDIA_TYPE
+        ):
+            fail(f"attestation manifest {index_number} envelope is invalid")
+        if manifest["config"] != {
+            "digest": OCI_EMPTY_CONFIG["digest"],
+            "mediaType": OCI_EMPTY_CONFIG["mediaType"],
+            "size": OCI_EMPTY_CONFIG["size"],
+        }:
+            fail(f"attestation manifest {index_number} config is invalid")
+        subject = manifest["subject"]
+        if (
+            not isinstance(subject, dict)
+            or set(subject) != {"digest", "mediaType", "size"}
+            or subject.get("digest") != subject_digest
+            or subject.get("mediaType") != OCI_MANIFEST_MEDIA_TYPE
+            or not is_int(subject.get("size"))
+            or subject.get("size") < 1
+            or subject.get("size") > MAX_MANIFEST_BYTES
+        ):
+            fail(f"attestation manifest {index_number} subject is invalid")
+        layers = manifest["layers"]
+        if not isinstance(layers, list) or len(layers) != 1 or not isinstance(layers[0], dict):
+            fail(f"attestation manifest {index_number} must contain one bundle")
+        layer = layers[0]
+        require_exact_keys(
+            layer,
+            {"digest", "mediaType", "size"},
+            f"attestation manifest {index_number} bundle",
+        )
+        if layer["mediaType"] != SIGSTORE_BUNDLE_MEDIA_TYPE:
+            fail(f"attestation manifest {index_number} bundle mediaType is invalid")
+        if not isinstance(layer["digest"], str) or not SHA256_RE.fullmatch(layer["digest"]):
+            fail(f"attestation manifest {index_number} bundle digest is invalid")
+        if (
+            not is_int(layer["size"])
+            or layer["size"] < 1
+            or layer["size"] > MAX_ATTESTATION_BUNDLE_BYTES
+        ):
+            fail(f"attestation manifest {index_number} bundle size is outside the limit")
+        bundle_path = work_directory / f"attestation-bundle-{index_number}.json"
+        fetch_registry_object(
+            repository,
+            layer["digest"],
+            bundle_path,
+            layer["size"],
+            environment,
+            kind="blob",
+            expected_size=layer["size"],
+        )
+        bundle_raw = read_bounded_file(
+            bundle_path,
+            layer["size"],
+            f"attestation bundle {index_number}",
+        )
+        bundle = strict_json_bytes(
+            bundle_raw,
+            f"attestation bundle {index_number}",
+            canonical=False,
+        )
+        if not isinstance(bundle, dict):
+            fail(f"attestation bundle {index_number} must be a JSON object")
+        bundle_paths.append(bundle_path)
+
+    combined = work_directory / "attestation-bundles.jsonl"
+    with combined.open("xb") as output:
+        for path in bundle_paths:
+            raw = read_bounded_file(
+                path,
+                MAX_ATTESTATION_BUNDLE_BYTES,
+                "attestation bundle",
+            )
+            output.write(raw.rstrip(b"\n") + b"\n")
+    combined.chmod(0o444)
+    return combined
+
+
+def registry_repository_blob_limit(repository: str) -> int:
+    limits: dict[str, int] = {INTEGRATION_REPOSITORY: MAX_INTEGRATION_INVENTORY_SIZE}
+    for profile in PROFILES.values():
+        limits[profile.site_repository] = profile.max_archive_bytes
+        limits[profile.routes_repository] = MAX_ROUTES_BYTES
+    maximum = limits.get(repository)
+    if maximum is None:
+        fail("registry fetch repository is outside the production allowlist")
+    return maximum
+
+
+def validate_registry_fetch_contract(contract: RegistryFetchContract) -> None:
+    registry_repository_path(contract.repository)
+    repository_limit = registry_repository_blob_limit(contract.repository)
+    if not SHA256_RE.fullmatch(contract.digest):
+        fail("registry fetch contract digest is invalid")
+    if contract.kind == "manifest":
+        if contract.maximum_size != MAX_MANIFEST_BYTES or contract.expected_size is not None:
+            fail("registry manifest fetch contract has invalid size bounds")
+    elif contract.kind == "blob":
+        if (
+            not is_int(contract.maximum_size)
+            or not is_int(contract.expected_size)
+            or contract.maximum_size != contract.expected_size
+            or not 1 <= contract.maximum_size <= repository_limit
+        ):
+            fail("registry blob fetch contract has invalid size bounds")
+    else:
+        fail("registry fetch contract kind is invalid")
+
+
+def read_registry_fetch_contract(path: Path) -> RegistryFetchContract:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect registry fetch contract: {exc}")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o444
+    ):
+        fail("registry fetch contract is not one protected root file")
+    value = strict_json_bytes(
+        read_bounded_file(path, 2048, "registry fetch contract"),
+        "registry fetch contract",
+        canonical=True,
+    )
+    if not isinstance(value, dict):
+        fail("registry fetch contract must be an object")
+    require_exact_keys(
+        value,
+        {"digest", "expected_size", "kind", "maximum_size", "repository"},
+        "registry fetch contract",
+    )
+    if (
+        not isinstance(value["repository"], str)
+        or not isinstance(value["kind"], str)
+        or not isinstance(value["digest"], str)
+        or not is_int(value["maximum_size"])
+        or (value["expected_size"] is not None and not is_int(value["expected_size"]))
+    ):
+        fail("registry fetch contract contains invalid value types")
+    contract = RegistryFetchContract(**value)
+    validate_registry_fetch_contract(contract)
+    return contract
+
+
+def run_registry_fetch_worker(request_path: Path, output_path: Path) -> None:
+    require_unprivileged_worker("registry fetch worker")
+    worker_home = Path(os.environ.get("HOME", ""))
+    if output_path.name != "registry-object" or output_path.parent != worker_home:
+        fail("registry fetch worker output must stay inside its protected worker home")
+    contract = read_registry_fetch_contract(request_path)
+    fetch_registry_object(
+        contract.repository,
+        contract.digest,
+        output_path,
+        contract.maximum_size,
+        safe_environment(worker_home),
+        kind=contract.kind,
+        expected_size=contract.expected_size,
+    )
+    if set(worker_home.iterdir()) != {output_path}:
+        fail("registry fetch worker left unexpected runtime files")
+
+
+def unlink_trusted_file(
+    path: Path,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or parent.st_mode & 0o022
+        ):
+            fail("trusted file cleanup parent is unsafe")
+        metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or metadata.st_nlink != 1
+        ):
+            fail("trusted file cleanup target is unsafe")
+        os.unlink(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def fetch_registry_object_isolated(
+    contract: RegistryFetchContract,
+    destination: Path,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> None:
+    validate_registry_fetch_contract(contract)
+    request_path = destination.parent / f".registry-request-{secrets.token_hex(8)}.json"
+    write_worker_result(
+        request_path,
+        dataclasses.asdict(contract),
+        "root registry fetch contract",
+    )
+    state: IsolatedWorkerState | None = None
+    failure: BaseException | None = None
+    try:
+        try:
+            state = run_isolated_worker(
+                "registry",
+                [
+                    str(PYTHON_PATH),
+                    str(Path(__file__)),
+                    "--registry-fetch-worker",
+                    str(request_path),
+                    "{STATE_DIRECTORY}/registry-object",
+                ],
+                inputs=(
+                    Path(__file__),
+                    SCRIPT_DIRECTORY / "lib/platform_integration.py",
+                    request_path,
+                ),
+                runtime_seconds=390,
+                memory_max="128M",
+                memory_swap_max="64M",
+                file_size_max=str(
+                    max(MAX_REGISTRY_AUTH_RESPONSE_BYTES, contract.maximum_size)
+                ),
+                network=True,
+            )
+            copy_trusted_worker_file(
+                state.physical_root / "registry-object",
+                destination,
+                expected_uid=state.uid,
+                expected_gid=state.gid,
+                maximum_size=contract.maximum_size,
+                expected_digest=contract.digest,
+                expected_size=contract.expected_size,
+                label=f"registry {contract.kind}",
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+        except BaseException as exc:
+            failure = exc
+        if state is not None:
+            try:
+                cleanup_isolated_worker_state(state)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            if destination.exists() or destination.is_symlink():
+                unlink_trusted_file(
+                    destination,
+                    expected_uid=trusted_uid,
+                    expected_gid=trusted_gid,
+                )
+            raise failure
+    finally:
+        if request_path.exists() or request_path.is_symlink():
+            unlink_trusted_file(
+                request_path,
+                expected_uid=trusted_uid,
+                expected_gid=trusted_gid,
+            )
+
+
+def fetch_manifest(
+    reference: str,
+    repository: str,
+    destination: Path,
+    environment: dict[str, str],
+) -> None:
+    del environment
+    digest = parse_digest_reference(reference, repository, "manifest reference")
+    fetch_registry_object_isolated(
+        RegistryFetchContract(
+            repository=repository,
+            kind="manifest",
+            digest=digest,
+            maximum_size=MAX_MANIFEST_BYTES,
+            expected_size=None,
+        ),
+        destination,
     )
 
 
 def fetch_blob(
     repository: str,
-    descriptor: LayerContract,
+    digest: str,
+    size: int,
     destination: Path,
-    registry_config: Path,
     environment: dict[str, str],
 ) -> None:
-    run_checked(
-        [
-            str(ORAS_PATH),
-            "blob",
-            "fetch",
-            "--no-tty",
-            "--registry-config",
-            str(registry_config),
-            "--output",
-            str(destination),
-            f"{repository}@{descriptor.layer_digest}",
-        ],
-        environment=environment,
+    del environment
+    fetch_registry_object_isolated(
+        RegistryFetchContract(
+            repository=repository,
+            kind="blob",
+            digest=digest,
+            maximum_size=size,
+            expected_size=size,
+        ),
+        destination,
     )
-    digest, size = sha256_file(destination, max_bytes=descriptor.layer_size)
-    if f"sha256:{digest}" != descriptor.layer_digest or size != descriptor.layer_size:
-        fail(f"downloaded layer from {repository} does not match its descriptor")
-    destination.chmod(0o444)
 
 
 def assert_protected_executable(path: Path) -> None:
@@ -994,22 +3031,61 @@ def validate_runtime() -> None:
     if script_path.is_symlink():
         fail("deploy-static trust root must not be a symlink")
     assert_protected_executable(script_path)
-    for executable in (ORAS_PATH, DOCKER_PATH, CURL_PATH, SETPRIV_PATH, PYTHON_PATH):
+    for executable in (
+        GH_PATH,
+        DOCKER_PATH,
+        CURL_PATH,
+        PYTHON_PATH,
+        SYSTEMD_RUN_PATH,
+        SYSTEMCTL_PATH,
+        IP_PATH,
+    ):
         assert_protected_executable(executable)
+    require_isolated_worker_tmpfs()
     architecture = os.uname().machine
-    expected_oras_digest = ORAS_BINARY_SHA256.get(architecture)
-    if expected_oras_digest is None:
-        fail(f"ORAS is not approved for architecture {architecture!r}")
-    actual_oras_digest, _ = sha256_file(ORAS_PATH)
-    if actual_oras_digest != expected_oras_digest:
-        fail("installed ORAS binary checksum is not approved")
+    expected_gh_digest = GH_BINARY_SHA256.get(architecture)
+    if expected_gh_digest is None:
+        fail(f"GitHub CLI is not approved for architecture {architecture!r}")
+    actual_gh_digest, _ = sha256_file(GH_PATH)
+    if actual_gh_digest != expected_gh_digest:
+        fail("installed GitHub CLI binary checksum is not approved")
     result = run_checked(
-        [str(ORAS_PATH), "version"],
+        [str(GH_PATH), "version"],
         environment=safe_environment(Path("/nonexistent")),
         timeout=10,
     )
-    if not re.search(rf"(?m)^Version:\s+{re.escape(ORAS_VERSION)}$", result.stdout):
-        fail(f"installed ORAS version is not {ORAS_VERSION}")
+    if not re.search(rf"(?m)^gh version\s+{re.escape(GH_VERSION)}(?:\s|$)", result.stdout):
+        fail(f"installed GitHub CLI version is not {GH_VERSION}")
+
+
+def parse_layer_contract(path: Path) -> LayerContract:
+    layer_value = strict_json_bytes(
+        read_bounded_file(path, 4096, "worker layer contract"),
+        "worker layer contract",
+        canonical=True,
+    )
+    if not isinstance(layer_value, dict):
+        fail("worker layer contract must be an object")
+    require_exact_keys(
+        layer_value,
+        {"created", "layer_digest", "layer_size", "manifest_digest"},
+        "worker layer contract",
+    )
+    if (
+        not isinstance(layer_value["manifest_digest"], str)
+        or not SHA256_RE.fullmatch(layer_value["manifest_digest"])
+        or not isinstance(layer_value["layer_digest"], str)
+        or not SHA256_RE.fullmatch(layer_value["layer_digest"])
+        or not is_int(layer_value["layer_size"])
+        or layer_value["layer_size"] < 1
+    ):
+        fail("worker layer contract contains invalid values")
+    return LayerContract(
+        manifest_digest=layer_value["manifest_digest"],
+        layer_digest=layer_value["layer_digest"],
+        layer_size=layer_value["layer_size"],
+        created=parse_created(layer_value["created"], "worker layer created"),
+    )
 
 
 def run_extract_worker(
@@ -1019,61 +3095,1356 @@ def run_extract_worker(
     inventory_path: Path,
     site_layer_path: Path,
     destination: Path,
+    output_path: Path,
 ) -> None:
-    expected_parent = PRODUCTION_ROOT / profile.application / "releases"
-    if destination.parent.resolve(strict=True) != expected_parent.resolve(strict=True):
-        fail("extract worker destination is outside the application release root")
-    layer_value = strict_json_bytes(site_layer_path.read_bytes(), "worker layer contract", canonical=True)
-    if not isinstance(layer_value, dict):
-        fail("worker layer contract must be an object")
-    require_exact_keys(
-        layer_value,
-        {"created", "layer_digest", "layer_size", "manifest_digest"},
-        "worker layer contract",
-    )
-    site_layer = LayerContract(
-        manifest_digest=layer_value["manifest_digest"],
-        layer_digest=layer_value["layer_digest"],
-        layer_size=layer_value["layer_size"],
-        created=layer_value["created"],
-    )
+    require_unprivileged_worker("extract worker")
+    worker_home = Path(os.environ.get("HOME", ""))
+    if (
+        destination.name != "untrusted-site"
+        or destination.parent.resolve(strict=True) != worker_home.resolve(strict=True)
+        or output_path.parent.resolve(strict=True) != worker_home.resolve(strict=True)
+    ):
+        fail("extract worker outputs must stay inside its protected worker home")
+    try:
+        destination.mkdir(mode=0o700)
+    except OSError as exc:
+        fail(f"cannot create extract worker destination exclusively: {exc}")
+    site_layer = parse_layer_contract(site_layer_path)
     inventory = validate_bundle(archive, inventory_path, profile, source_revision, site_layer)
     extract_archive(archive, destination, inventory)
+    write_worker_result(
+        output_path,
+        {
+            "archive_bytes": inventory.archive_bytes,
+            "archive_sha256": inventory.archive_sha256,
+            "file_count": inventory.file_count,
+            "files": [dataclasses.asdict(item) for item in inventory.files],
+            "uncompressed_bytes": inventory.uncompressed_bytes,
+        },
+        "validated inventory",
+    )
+
+
+def read_validated_inventory(
+    path: Path,
+    profile: StaticProfile,
+    site_layer: LayerContract,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> InventoryContract:
+    value = strict_json_bytes(
+        read_worker_result(
+            path,
+            MAX_ROUTES_BYTES,
+            "validated inventory",
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        ),
+        "validated inventory",
+        canonical=True,
+    )
+    if not isinstance(value, dict):
+        fail("validated inventory must be an object")
+    require_exact_keys(
+        value,
+        {"archive_bytes", "archive_sha256", "file_count", "files", "uncompressed_bytes"},
+        "validated inventory",
+    )
+    if (
+        not is_int(value["archive_bytes"])
+        or value["archive_bytes"] < 1
+        or not isinstance(value["archive_sha256"], str)
+        or not HEX_SHA256_RE.fullmatch(value["archive_sha256"])
+        or not is_int(value["file_count"])
+        or value["file_count"] < 1
+        or not is_int(value["uncompressed_bytes"])
+        or value["uncompressed_bytes"] < 1
+        or not isinstance(value["files"], list)
+        or len(value["files"]) != value["file_count"]
+    ):
+        fail("validated inventory contains invalid totals")
+    if (
+        value["archive_bytes"] != site_layer.layer_size
+        or value["archive_bytes"] > profile.max_archive_bytes
+        or f"sha256:{value['archive_sha256']}" != site_layer.layer_digest
+    ):
+        fail("validated inventory does not match the bounded site layer")
+    if value["file_count"] > profile.max_files:
+        fail("validated inventory file count exceeds the application profile")
+    if value["uncompressed_bytes"] > profile.max_uncompressed_bytes:
+        fail("validated inventory size exceeds the application profile")
+    files: list[RouteFile] = []
+    file_names: set[str] = set()
+    route_names: set[str] = set()
+    total_size = 0
+    for index, item in enumerate(value["files"]):
+        if not isinstance(item, dict):
+            fail(f"validated inventory file {index} must be an object")
+        require_exact_keys(item, {"file", "route", "sha256", "size"}, f"validated inventory file {index}")
+        file_name = validate_relative_path(item["file"], f"validated inventory file {index}.file")
+        route = route_for_file(file_name)
+        if file_name in file_names or route in route_names:
+            fail(f"validated inventory file {index} is duplicated")
+        file_names.add(file_name)
+        route_names.add(route)
+        if item["route"] != route:
+            fail(f"validated inventory file {index} route is invalid")
+        if len(route.encode("ascii")) > 4096:
+            fail(f"validated inventory file {index} route is too long")
+        if not is_int(item["size"]) or item["size"] < 0:
+            fail(f"validated inventory file {index} size is invalid")
+        if not isinstance(item["sha256"], str) or not HEX_SHA256_RE.fullmatch(item["sha256"]):
+            fail(f"validated inventory file {index} digest is invalid")
+        total_size += item["size"]
+        if total_size > profile.max_uncompressed_bytes:
+            fail("validated inventory byte sum exceeds the application profile")
+        files.append(RouteFile(file=file_name, route=route, size=item["size"], sha256=item["sha256"]))
+    if total_size != value["uncompressed_bytes"]:
+        fail("validated inventory byte sum does not match its total")
+    if "index.html" not in file_names:
+        fail("validated inventory must contain index.html")
+    return InventoryContract(
+        archive_bytes=value["archive_bytes"],
+        archive_sha256=value["archive_sha256"],
+        file_count=value["file_count"],
+        uncompressed_bytes=value["uncompressed_bytes"],
+        files=tuple(files),
+    )
+
+
+def run_validation_worker(
+    profile: StaticProfile,
+    source_revision: str,
+    site_manifest_path: Path,
+    site_reference: str,
+    routes_manifest_path: Path,
+    routes_reference: str,
+    integration_manifest_path: Path,
+    integration_reference: str,
+    integration_revision: str,
+    output_path: Path,
+) -> None:
+    require_unprivileged_worker("manifest validation worker")
+    site_layer = validate_manifest(
+        site_manifest_path,
+        site_reference,
+        profile,
+        source_revision,
+        kind="site",
+    )
+    routes_layer = validate_manifest(
+        routes_manifest_path,
+        routes_reference,
+        profile,
+        source_revision,
+        kind="routes",
+    )
+    if routes_layer.created != site_layer.created:
+        fail("site and route manifests must use the same creation timestamp")
+    integration = validate_integration_manifest(
+        integration_manifest_path,
+        integration_reference,
+        integration_revision,
+    )
+    value = {
+        "integration": dataclasses.asdict(integration),
+        "routes_layer": dataclasses.asdict(routes_layer),
+        "site_layer": dataclasses.asdict(site_layer),
+    }
+    write_worker_result(output_path, value, "manifest validation worker result")
+
+
+def read_validation_contract(
+    path: Path,
+    profile: StaticProfile,
+    site_reference: str,
+    routes_reference: str,
+    integration_reference: str,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> tuple[LayerContract, LayerContract, IntegrationContract]:
+    value = strict_json_bytes(
+        read_worker_result(
+            path,
+            8192,
+            "validation worker output",
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        ),
+        "validation worker output",
+        canonical=True,
+    )
+    if not isinstance(value, dict):
+        fail("validation worker output must be an object")
+    require_exact_keys(
+        value,
+        {"integration", "routes_layer", "site_layer"},
+        "validation worker output",
+    )
+    contracts: list[LayerContract] = []
+    expected_layers = (
+        (
+            "site_layer",
+            parse_digest_reference(site_reference, profile.site_repository, "site reference"),
+            profile.max_archive_bytes,
+        ),
+        (
+            "routes_layer",
+            parse_digest_reference(routes_reference, profile.routes_repository, "routes reference"),
+            MAX_ROUTES_BYTES,
+        ),
+    )
+    for label, expected_manifest_digest, maximum_size in expected_layers:
+        item = value[label]
+        if not isinstance(item, dict):
+            fail(f"validation worker output {label} must be an object")
+        require_exact_keys(
+            item,
+            {"created", "layer_digest", "layer_size", "manifest_digest"},
+            f"validation worker output {label}",
+        )
+        if (
+            not isinstance(item["manifest_digest"], str)
+            or not SHA256_RE.fullmatch(item["manifest_digest"])
+            or not isinstance(item["layer_digest"], str)
+            or not SHA256_RE.fullmatch(item["layer_digest"])
+            or not is_int(item["layer_size"])
+            or item["layer_size"] < 1
+            or item["layer_size"] > maximum_size
+            or item["manifest_digest"] != expected_manifest_digest
+        ):
+            fail(f"validation worker output {label} contains invalid values")
+        contracts.append(
+            LayerContract(
+                manifest_digest=item["manifest_digest"],
+                layer_digest=item["layer_digest"],
+                layer_size=item["layer_size"],
+                created=parse_created(item["created"], f"validation worker output {label}.created"),
+            )
+        )
+    if contracts[0].created != contracts[1].created:
+        fail("validation worker output site and route timestamps differ")
+    integration = value["integration"]
+    if not isinstance(integration, dict):
+        fail("validation worker output integration must be an object")
+    require_exact_keys(
+        integration,
+        {
+            "archive_digest",
+            "archive_size",
+            "created",
+            "inventory_digest",
+            "inventory_size",
+            "manifest_digest",
+        },
+        "validation worker output integration",
+    )
+    for key in ("archive_digest", "inventory_digest", "manifest_digest"):
+        if not isinstance(integration[key], str) or not SHA256_RE.fullmatch(integration[key]):
+            fail(f"validation worker output integration.{key} is invalid")
+    for key, maximum in (
+        ("archive_size", MAX_INTEGRATION_ARCHIVE_SIZE),
+        ("inventory_size", MAX_INTEGRATION_INVENTORY_SIZE),
+    ):
+        if not is_int(integration[key]) or not 1 <= integration[key] <= maximum:
+            fail(f"validation worker output integration.{key} is outside the limit")
+    expected_integration_manifest = parse_digest_reference(
+        integration_reference,
+        INTEGRATION_REPOSITORY,
+        "platform integration reference",
+    )
+    if integration["manifest_digest"] != expected_integration_manifest:
+        fail("validation worker output integration manifest digest changed")
+    integration_contract = IntegrationContract(
+        manifest_digest=integration["manifest_digest"],
+        archive_digest=integration["archive_digest"],
+        archive_size=integration["archive_size"],
+        inventory_digest=integration["inventory_digest"],
+        inventory_size=integration["inventory_size"],
+        created=parse_created(integration["created"], "validation worker output integration.created"),
+    )
+    return contracts[0], contracts[1], integration_contract
+
+
+def validate_manifests_isolated(
+    profile: StaticProfile,
+    source_revision: str,
+    site_manifest_path: Path,
+    site_reference: str,
+    routes_manifest_path: Path,
+    routes_reference: str,
+    integration_manifest_path: Path,
+    integration_reference: str,
+    integration_revision: str,
+) -> tuple[LayerContract, LayerContract, IntegrationContract]:
+    worker_command = [
+        str(PYTHON_PATH),
+        str(Path(__file__)),
+        "--validate-manifests-worker",
+        profile.application,
+        source_revision,
+        str(site_manifest_path),
+        site_reference,
+        str(routes_manifest_path),
+        routes_reference,
+        str(integration_manifest_path),
+        integration_reference,
+        integration_revision,
+        "{STATE_DIRECTORY}/validated-manifests.json",
+    ]
+    state = run_isolated_worker(
+        "manifest",
+        worker_command,
+        inputs=(
+            Path(__file__),
+            SCRIPT_DIRECTORY / "lib/platform_integration.py",
+            site_manifest_path,
+            routes_manifest_path,
+            integration_manifest_path,
+        ),
+        runtime_seconds=60,
+        memory_max="256M",
+        memory_swap_max="256M",
+        file_size_max="1M",
+        network=False,
+    )
+    try:
+        output_path = state.physical_root / "validated-manifests.json"
+        site_layer, routes_layer, integration = read_validation_contract(
+            output_path,
+            profile,
+            site_reference,
+            routes_reference,
+            integration_reference,
+            expected_uid=state.uid,
+            expected_gid=state.gid,
+        )
+        bind_static_manifest_contract(
+            site_manifest_path,
+            site_reference,
+            profile,
+            source_revision,
+            site_layer,
+            kind="site",
+        )
+        bind_static_manifest_contract(
+            routes_manifest_path,
+            routes_reference,
+            profile,
+            source_revision,
+            routes_layer,
+            kind="routes",
+        )
+        bind_integration_manifest_contract(
+            integration_manifest_path,
+            integration_reference,
+            integration_revision,
+            integration,
+        )
+        return site_layer, routes_layer, integration
+    finally:
+        cleanup_isolated_worker_state(state)
+
+
+def run_integration_worker(
+    application: str,
+    source_revision: str,
+    caddy_image: str,
+    archive_path: Path,
+    inventory_path: Path,
+    contract_path: Path,
+    destination: Path,
+    output_path: Path,
+) -> None:
+    require_unprivileged_worker("platform integration worker")
+    if application not in PROFILES:
+        fail("integration worker received an invalid application")
+    if not CADDY_IMAGE_RE.fullmatch(caddy_image):
+        fail("integration worker received an invalid Caddy image")
+    worker_home = Path(os.environ.get("HOME", ""))
+    if (
+        destination.name != "untrusted-integration"
+        or destination.parent.resolve(strict=True) != worker_home.resolve(strict=True)
+        or output_path.parent.resolve(strict=True) != worker_home.resolve(strict=True)
+    ):
+        fail("integration worker outputs must stay inside its protected worker home")
+    try:
+        destination.mkdir(mode=0o700)
+    except OSError as exc:
+        fail(f"cannot create integration worker destination exclusively: {exc}")
+    destination_metadata = destination.lstat()
+    if (
+        not stat.S_ISDIR(destination_metadata.st_mode)
+        or destination_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(destination_metadata.st_mode) != 0o700
+        or any(destination.iterdir())
+    ):
+        fail("integration worker destination must be an owned empty 0700 directory")
+    contract_value = strict_json_bytes(
+        read_bounded_file(contract_path, 8192, "integration worker contract"),
+        "integration worker contract",
+        canonical=True,
+    )
+    if not isinstance(contract_value, dict):
+        fail("integration worker contract must be an object")
+    require_exact_keys(
+        contract_value,
+        {
+            "archive_digest",
+            "archive_size",
+            "created",
+            "inventory_digest",
+            "inventory_size",
+            "manifest_digest",
+        },
+        "integration worker contract",
+    )
+    contract = IntegrationContract(**contract_value)
+    if (
+        not SHA256_RE.fullmatch(contract.archive_digest)
+        or not SHA256_RE.fullmatch(contract.inventory_digest)
+        or not SHA256_RE.fullmatch(contract.manifest_digest)
+        or not is_int(contract.archive_size)
+        or contract.archive_size < 1
+        or not is_int(contract.inventory_size)
+        or contract.inventory_size < 1
+    ):
+        fail("integration worker contract contains invalid values")
+    parse_created(contract.created, "integration worker contract created")
+    archive_bytes = read_bounded_file(
+        archive_path,
+        contract.archive_size,
+        "platform integration archive",
+    )
+    inventory_bytes = read_bounded_file(
+        inventory_path,
+        contract.inventory_size,
+        "platform integration inventory",
+    )
+    if len(archive_bytes) != contract.archive_size:
+        fail("platform integration archive size changed")
+    if len(inventory_bytes) != contract.inventory_size:
+        fail("platform integration inventory size changed")
+    if f"sha256:{hashlib.sha256(archive_bytes).hexdigest()}" != contract.archive_digest:
+        fail("platform integration archive digest changed")
+    if f"sha256:{hashlib.sha256(inventory_bytes).hexdigest()}" != contract.inventory_digest:
+        fail("platform integration inventory digest changed")
+    try:
+        verify_integration_package(
+            archive_bytes,
+            inventory_bytes,
+            expected_revision=source_revision,
+            expected_created=contract.created,
+        )
+        _, files = validate_integration_inventory(
+            inventory_bytes,
+            expected_revision=source_revision,
+            expected_created=contract.created,
+        )
+    except IntegrationError as exc:
+        fail(f"platform integration package is invalid: {exc}")
+
+    root_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz", errorlevel=2) as archive:
+            for item in files:
+                path = validate_relative_path(item["path"], "platform integration file")
+                member = archive.getmember(path)
+                source = archive.extractfile(member)
+                if source is None:
+                    fail(f"cannot extract platform integration file {path!r}")
+                parts = path.split("/")
+                with opened_directory(root_fd, parts[:-1]) as parent_fd:
+                    output_fd = os.open(
+                        parts[-1],
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    digest = hashlib.sha256()
+                    written = 0
+                    try:
+                        while chunk := source.read(READ_CHUNK):
+                            written += len(chunk)
+                            digest.update(chunk)
+                            view = memoryview(chunk)
+                            while view:
+                                count = os.write(output_fd, view)
+                                view = view[count:]
+                        if (
+                            written != item["size"]
+                            or f"sha256:{digest.hexdigest()}" != item["sha256"]
+                        ):
+                            fail(f"platform integration file {path!r} changed during extraction")
+                        os.fchmod(output_fd, 0o444)
+                        os.fsync(output_fd)
+                    finally:
+                        os.close(output_fd)
+        integration_directories = required_directories(iter(item["path"] for item in files))
+        for directory in sorted(
+            integration_directories,
+            key=lambda value: (value.count("/"), value),
+            reverse=True,
+        ):
+            parts = directory.split("/") if directory else []
+            with opened_existing_directory(
+                root_fd,
+                parts,
+                "platform integration worker",
+            ) as directory_fd:
+                os.fchmod(directory_fd, 0o555)
+                os.fsync(directory_fd)
+        os.fchmod(root_fd, 0o555)
+        os.fsync(root_fd)
+    except (OSError, tarfile.TarError) as exc:
+        fail(f"cannot extract platform integration package: {exc}")
+    finally:
+        os.close(root_fd)
+
+    disabled_route = (
+        destination
+        / "platform/caddy/routes"
+        / f"{application}.caddy.disabled"
+    )
+    active_route = disabled_route.with_suffix("")
+    if (
+        not disabled_route.is_file()
+        or disabled_route.is_symlink()
+        or active_route.exists()
+        or active_route.is_symlink()
+    ):
+        fail("platform integration package does not contain one disabled route candidate")
+    packaged_caddy_image = read_promoted_caddy_image(
+        destination / "platform/.env.example",
+        require_root_owner=False,
+    )
+    if packaged_caddy_image != caddy_image:
+        fail("platform integration package does not bind the promoted Caddy image")
+    write_worker_result(
+        output_path,
+        {
+            "archive_digest": contract.archive_digest,
+            "created": contract.created,
+            "files": files,
+            "inventory_digest": contract.inventory_digest,
+            "source_revision": source_revision,
+        },
+        "platform integration worker result",
+    )
+
+
+def read_integration_worker_result(
+    path: Path,
+    contract: IntegrationContract,
+    source_revision: str,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> tuple[IntegrationFileContract, ...]:
+    value = strict_json_bytes(
+        read_worker_result(
+            path,
+            MAX_INTEGRATION_INVENTORY_SIZE,
+            "platform integration worker result",
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        ),
+        "platform integration worker result",
+        canonical=True,
+    )
+    if not isinstance(value, dict):
+        fail("platform integration worker result must be an object")
+    require_exact_keys(
+        value,
+        {"archive_digest", "created", "files", "inventory_digest", "source_revision"},
+        "platform integration worker result",
+    )
+    if (
+        value["archive_digest"] != contract.archive_digest
+        or value["inventory_digest"] != contract.inventory_digest
+        or value["created"] != contract.created
+        or value["source_revision"] != source_revision
+    ):
+        fail("platform integration worker result is not bound to the requested package")
+    raw_files = value["files"]
+    if not isinstance(raw_files, list) or len(raw_files) != len(INTEGRATION_RUNTIME_PATHS):
+        fail("platform integration worker result has an invalid file count")
+    files: list[IntegrationFileContract] = []
+    total_size = 0
+    for index, (item, expected_path) in enumerate(
+        zip(raw_files, INTEGRATION_RUNTIME_PATHS, strict=True)
+    ):
+        if not isinstance(item, dict):
+            fail(f"platform integration worker file {index} must be an object")
+        require_exact_keys(
+            item,
+            {"mode", "path", "sha256", "size"},
+            f"platform integration worker file {index}",
+        )
+        if item["path"] != expected_path or item["mode"] != "0644":
+            fail(f"platform integration worker file {index} violates the exact allowlist")
+        validate_relative_path(item["path"], f"platform integration worker file {index}.path")
+        if (
+            not is_int(item["size"])
+            or item["size"] < 0
+            or item["size"] > MAX_INTEGRATION_FILE_SIZE
+            or not isinstance(item["sha256"], str)
+            or not SHA256_RE.fullmatch(item["sha256"])
+        ):
+            fail(f"platform integration worker file {index} contains invalid metadata")
+        total_size += item["size"]
+        if total_size > MAX_INTEGRATION_INVENTORY_SIZE:
+            fail("platform integration worker files exceed the total size limit")
+        files.append(
+            IntegrationFileContract(
+                path=item["path"],
+                size=item["size"],
+                sha256=item["sha256"],
+            )
+        )
+    return tuple(files)
+
+
+def canonical_integration_inventory_bytes(
+    files: tuple[IntegrationFileContract, ...],
+    source_revision: str,
+    created: str,
+) -> bytes:
+    value = {
+        "archive_media_type": INTEGRATION_ARCHIVE_MEDIA_TYPE,
+        "artifact_type": INTEGRATION_ARTIFACT_TYPE,
+        "created": created,
+        "files": [
+            {
+                "mode": "0644",
+                "path": item.path,
+                "sha256": item.sha256,
+                "size": item.size,
+            }
+            for item in files
+        ],
+        "inventory_media_type": INTEGRATION_INVENTORY_MEDIA_TYPE,
+        "schema": 1,
+        "source": INTEGRATION_SOURCE_URL,
+        "source_revision": source_revision,
+    }
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+
+
+def bind_integration_inventory_contract(
+    path: Path,
+    files: tuple[IntegrationFileContract, ...],
+    source_revision: str,
+    contract: IntegrationContract,
+) -> None:
+    expected = canonical_integration_inventory_bytes(
+        files,
+        source_revision,
+        contract.created,
+    )
+    bind_exact_signed_bytes(
+        path,
+        maximum_size=MAX_INTEGRATION_INVENTORY_SIZE,
+        expected_size=contract.inventory_size,
+        expected_digest=contract.inventory_digest,
+        expected_bytes=expected,
+        label="platform integration inventory",
+    )
+
+
+def rebuild_trusted_integration_archive(
+    root: Path,
+    files: tuple[IntegrationFileContract, ...],
+    created: str,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> bytes:
+    by_path = {item.path: item for item in files}
+    if tuple(by_path) != INTEGRATION_RUNTIME_PATHS:
+        fail("platform integration archive contract is outside the exact runtime allowlist")
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        fail(f"cannot open trusted platform integration root: {exc}")
+    runtime_files: list[IntegrationRuntimeFile] = []
+    try:
+        root_metadata = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != expected_uid
+            or root_metadata.st_gid != expected_gid
+            or stat.S_IMODE(root_metadata.st_mode) != 0o555
+        ):
+            fail("trusted platform integration root is unsafe for archive reconstruction")
+        for path in INTEGRATION_RUNTIME_PATHS:
+            contract = by_path[path]
+            parts = path.split("/")
+            with opened_existing_directory(
+                root_fd,
+                parts[:-1],
+                "trusted platform integration",
+            ) as parent_fd:
+                try:
+                    descriptor = os.open(
+                        parts[-1],
+                        os.O_RDONLY | os.O_NOFOLLOW,
+                        dir_fd=parent_fd,
+                    )
+                except OSError as exc:
+                    fail(f"cannot open trusted platform integration file {path!r}: {exc}")
+                try:
+                    before = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(before.st_mode)
+                        or before.st_uid != expected_uid
+                        or before.st_gid != expected_gid
+                        or before.st_nlink != 1
+                        or stat.S_IMODE(before.st_mode) != 0o444
+                        or before.st_size != contract.size
+                    ):
+                        fail(f"trusted platform integration file {path!r} is unsafe")
+                    content = bytearray()
+                    digest = hashlib.sha256()
+                    while len(content) <= contract.size:
+                        chunk = os.read(
+                            descriptor,
+                            min(READ_CHUNK, contract.size - len(content) + 1),
+                        )
+                        if not chunk:
+                            break
+                        content.extend(chunk)
+                        digest.update(chunk)
+                    after = os.fstat(descriptor)
+                    if stable_file_identity(after) != stable_file_identity(before):
+                        fail(f"trusted platform integration file {path!r} changed while read")
+                    if (
+                        len(content) != contract.size
+                        or f"sha256:{digest.hexdigest()}" != contract.sha256
+                    ):
+                        fail(f"trusted platform integration file {path!r} violates its contract")
+                    runtime_files.append(
+                        IntegrationRuntimeFile(
+                            path=path,
+                            mode=0o644,
+                            content=bytes(content),
+                        )
+                    )
+                finally:
+                    os.close(descriptor)
+    finally:
+        os.close(root_fd)
+    try:
+        epoch = integration_epoch_from_created(created)
+        return build_integration_archive(runtime_files, epoch=epoch)
+    except IntegrationError as exc:
+        fail(f"cannot reconstruct canonical platform integration archive: {exc}")
+
+
+def bind_integration_archive_contract(
+    archive_path: Path,
+    trusted_root: Path,
+    files: tuple[IntegrationFileContract, ...],
+    contract: IntegrationContract,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    expected = rebuild_trusted_integration_archive(
+        trusted_root,
+        files,
+        contract.created,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    bind_exact_signed_bytes(
+        archive_path,
+        maximum_size=MAX_INTEGRATION_ARCHIVE_SIZE,
+        expected_size=contract.archive_size,
+        expected_digest=contract.archive_digest,
+        expected_bytes=expected,
+        label="platform integration archive",
+    )
+
+
+@contextlib.contextmanager
+def opened_existing_directory(
+    root_fd: int,
+    parts: list[str],
+    label: str,
+) -> Iterator[int]:
+    """Open an existing directory chain without following any path component."""
+
+    current_fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=current_fd,
+                )
+            except OSError as exc:
+                fail(f"cannot open {label} directory component {part!r}: {exc}")
+            os.close(current_fd)
+            current_fd = next_fd
+        yield current_fd
+    finally:
+        os.close(current_fd)
+
+
+def stable_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def trusted_tree_children(paths: tuple[str, ...]) -> tuple[set[str], dict[str, set[str]]]:
+    directories = required_directories(iter(paths))
+    children = {directory: set() for directory in directories}
+    for directory in directories - {""}:
+        parent, _, name = directory.rpartition("/")
+        children[parent].add(name)
+    for path in paths:
+        parent, _, name = path.rpartition("/")
+        children[parent].add(name)
+    return directories, children
+
+
+def validate_worker_tree_shape(
+    root_fd: int,
+    paths: tuple[str, ...],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_directory_mode: int,
+    label: str,
+) -> set[str]:
+    """Reject extra entries and unsafe directories in an untrusted worker tree."""
+
+    directories, children = trusted_tree_children(paths)
+    for directory in sorted(directories, key=lambda value: (value.count("/"), value)):
+        parts = directory.split("/") if directory else []
+        with opened_existing_directory(root_fd, parts, label) as directory_fd:
+            metadata = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+                or stat.S_IMODE(metadata.st_mode) != expected_directory_mode
+            ):
+                fail(f"{label} contains an unsafe directory {directory!r}")
+            try:
+                names = set(os.listdir(directory_fd))
+            except OSError as exc:
+                fail(f"cannot enumerate {label} directory {directory!r}: {exc}")
+            if names != children[directory]:
+                fail(f"{label} does not match its exact allowlist at {directory!r}")
+    return directories
+
+
+def copy_trusted_tree(
+    source: Path,
+    destination: Path,
+    files: tuple[tuple[str, int, str], ...],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    source_file_mode: int,
+    source_directory_mode: int,
+    trusted_file_mode: int,
+    trusted_directory_mode: int,
+    maximum_total_size: int,
+    label: str,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> None:
+    """Copy an exact worker allowlist into a separately-created trusted tree."""
+
+    if destination.name in {"", ".", ".."} or source.name in {"", ".", ".."}:
+        fail(f"{label} root name is invalid")
+    paths = tuple(item[0] for item in files)
+    if not paths or len(paths) != len(set(paths)):
+        fail(f"{label} copy contract contains duplicate or empty paths")
+    total_size = 0
+    normalized: dict[str, tuple[int, str]] = {}
+    for path, size, digest in files:
+        validate_relative_path(path, f"{label} copy path")
+        if not is_int(size) or size < 0:
+            fail(f"{label} copy contract contains an invalid size")
+        normalized_digest = digest.removeprefix("sha256:")
+        if not HEX_SHA256_RE.fullmatch(normalized_digest):
+            fail(f"{label} copy contract contains an invalid digest")
+        total_size += size
+        if total_size > maximum_total_size:
+            fail(f"{label} copy contract exceeds its total size limit")
+        normalized[path] = (size, normalized_digest)
+
+    try:
+        source_parent_fd = os.open(
+            source.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        fail(f"cannot open {label} worker parent: {exc}")
+    try:
+        source_parent = os.fstat(source_parent_fd)
+        if (
+            not stat.S_ISDIR(source_parent.st_mode)
+            or source_parent.st_uid != expected_uid
+            or source_parent.st_gid != expected_gid
+            or stat.S_IMODE(source_parent.st_mode) != 0o700
+        ):
+            fail(f"{label} worker parent is not a protected 0700 directory")
+        try:
+            source_fd = os.open(
+                source.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=source_parent_fd,
+            )
+        except OSError as exc:
+            fail(f"cannot open {label} worker tree: {exc}")
+    finally:
+        os.close(source_parent_fd)
+
+    try:
+        validate_worker_tree_shape(
+            source_fd,
+            paths,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            expected_directory_mode=source_directory_mode,
+            label=label,
+        )
+        directories, _ = trusted_tree_children(paths)
+        try:
+            destination_parent_fd = os.open(
+                destination.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+        except OSError as exc:
+            fail(f"cannot open {label} trusted parent: {exc}")
+        created = False
+        try:
+            parent = os.fstat(destination_parent_fd)
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid != trusted_uid
+                or parent.st_gid != trusted_gid
+                or parent.st_mode & 0o022
+            ):
+                fail(f"{label} trusted parent is not protected")
+            try:
+                os.mkdir(destination.name, mode=0o700, dir_fd=destination_parent_fd)
+                created = True
+            except OSError as exc:
+                fail(f"cannot create {label} trusted tree exclusively: {exc}")
+            destination_fd = os.open(
+                destination.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=destination_parent_fd,
+            )
+            try:
+                destination_metadata = os.fstat(destination_fd)
+                if (
+                    destination_metadata.st_uid != trusted_uid
+                    or destination_metadata.st_gid != trusted_gid
+                ):
+                    os.fchown(destination_fd, trusted_uid, trusted_gid)
+                os.fchmod(destination_fd, 0o700)
+                for directory in sorted(
+                    directories - {""},
+                    key=lambda value: (value.count("/"), value),
+                ):
+                    parent_name, _, name = directory.rpartition("/")
+                    parent_parts = parent_name.split("/") if parent_name else []
+                    with opened_existing_directory(
+                        destination_fd,
+                        parent_parts,
+                        f"{label} trusted",
+                    ) as parent_fd:
+                        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+                        child_fd = os.open(
+                            name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=parent_fd,
+                        )
+                        try:
+                            child_metadata = os.fstat(child_fd)
+                            if (
+                                child_metadata.st_uid != trusted_uid
+                                or child_metadata.st_gid != trusted_gid
+                            ):
+                                os.fchown(child_fd, trusted_uid, trusted_gid)
+                            os.fchmod(child_fd, 0o700)
+                        finally:
+                            os.close(child_fd)
+
+                for path in paths:
+                    size, expected_digest = normalized[path]
+                    parts = path.split("/")
+                    with opened_existing_directory(
+                        source_fd,
+                        parts[:-1],
+                        f"{label} worker",
+                    ) as source_directory_fd, opened_existing_directory(
+                        destination_fd,
+                        parts[:-1],
+                        f"{label} trusted",
+                    ) as destination_directory_fd:
+                        try:
+                            input_fd = os.open(
+                                parts[-1],
+                                os.O_RDONLY | os.O_NOFOLLOW,
+                                dir_fd=source_directory_fd,
+                            )
+                        except OSError as exc:
+                            fail(f"cannot open {label} worker file {path!r}: {exc}")
+                        try:
+                            before = os.fstat(input_fd)
+                            if (
+                                not stat.S_ISREG(before.st_mode)
+                                or before.st_uid != expected_uid
+                                or before.st_gid != expected_gid
+                                or before.st_nlink != 1
+                                or stat.S_IMODE(before.st_mode) != source_file_mode
+                                or before.st_size != size
+                            ):
+                                fail(f"{label} worker file {path!r} is unsafe")
+                            output_fd = os.open(
+                                parts[-1],
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600,
+                                dir_fd=destination_directory_fd,
+                            )
+                            try:
+                                digest = hashlib.sha256()
+                                copied = 0
+                                while True:
+                                    chunk = os.read(input_fd, min(READ_CHUNK, size - copied + 1))
+                                    if not chunk:
+                                        break
+                                    copied += len(chunk)
+                                    if copied > size:
+                                        fail(f"{label} worker file {path!r} grew during copy")
+                                    digest.update(chunk)
+                                    view = memoryview(chunk)
+                                    while view:
+                                        written = os.write(output_fd, view)
+                                        view = view[written:]
+                                after = os.fstat(input_fd)
+                                if stable_file_identity(after) != stable_file_identity(before):
+                                    fail(f"{label} worker file {path!r} changed during copy")
+                                if copied != size or digest.hexdigest() != expected_digest:
+                                    fail(f"{label} worker file {path!r} violates its contract")
+                                output_metadata = os.fstat(output_fd)
+                                if (
+                                    output_metadata.st_uid != trusted_uid
+                                    or output_metadata.st_gid != trusted_gid
+                                ):
+                                    os.fchown(output_fd, trusted_uid, trusted_gid)
+                                os.fchmod(output_fd, trusted_file_mode)
+                                os.fsync(output_fd)
+                                trusted = os.fstat(output_fd)
+                                if (
+                                    not stat.S_ISREG(trusted.st_mode)
+                                    or trusted.st_uid != trusted_uid
+                                    or trusted.st_gid != trusted_gid
+                                    or trusted.st_nlink != 1
+                                    or stat.S_IMODE(trusted.st_mode) != trusted_file_mode
+                                    or trusted.st_size != size
+                                ):
+                                    fail(f"{label} trusted file {path!r} was not normalized")
+                            finally:
+                                os.close(output_fd)
+                        finally:
+                            os.close(input_fd)
+
+                validate_worker_tree_shape(
+                    source_fd,
+                    paths,
+                    expected_uid=expected_uid,
+                    expected_gid=expected_gid,
+                    expected_directory_mode=source_directory_mode,
+                    label=label,
+                )
+                for directory in sorted(
+                    directories,
+                    key=lambda value: (value.count("/"), value),
+                    reverse=True,
+                ):
+                    parts = directory.split("/") if directory else []
+                    with opened_existing_directory(
+                        destination_fd,
+                        parts,
+                        f"{label} trusted",
+                    ) as directory_fd:
+                        directory_metadata = os.fstat(directory_fd)
+                        if (
+                            directory_metadata.st_uid != trusted_uid
+                            or directory_metadata.st_gid != trusted_gid
+                        ):
+                            os.fchown(directory_fd, trusted_uid, trusted_gid)
+                        os.fchmod(directory_fd, trusted_directory_mode)
+                        os.fsync(directory_fd)
+                os.fsync(destination_parent_fd)
+            finally:
+                os.close(destination_fd)
+        except BaseException:
+            if created:
+                shutil.rmtree(destination, ignore_errors=True)
+                with contextlib.suppress(OSError):
+                    os.fsync(destination_parent_fd)
+            raise
+        finally:
+            os.close(destination_parent_fd)
+    finally:
+        os.close(source_fd)
+
+
+def copy_trusted_release(
+    source: Path,
+    destination: Path,
+    inventory: InventoryContract,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> None:
+    files = tuple((item.file, item.size, item.sha256) for item in inventory.files)
+    copy_trusted_tree(
+        source,
+        destination,
+        files,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        source_file_mode=0o644,
+        source_directory_mode=0o755,
+        trusted_file_mode=0o644,
+        trusted_directory_mode=0o755,
+        maximum_total_size=inventory.uncompressed_bytes,
+        label="static release",
+        trusted_uid=trusted_uid,
+        trusted_gid=trusted_gid,
+    )
+    filesystem_inventory(
+        destination,
+        inventory,
+        expected_uid=trusted_uid,
+        expected_gid=trusted_gid,
+    )
+
+
+def copy_trusted_integration(
+    source: Path,
+    destination: Path,
+    files: tuple[IntegrationFileContract, ...],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> None:
+    contracts = tuple((item.path, item.size, item.sha256) for item in files)
+    copy_trusted_tree(
+        source,
+        destination,
+        contracts,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        source_file_mode=0o444,
+        source_directory_mode=0o555,
+        trusted_file_mode=0o444,
+        trusted_directory_mode=0o555,
+        maximum_total_size=MAX_INTEGRATION_INVENTORY_SIZE,
+        label="platform integration",
+        trusted_uid=trusted_uid,
+        trusted_gid=trusted_gid,
+    )
+    integration_filesystem_inventory(
+        destination,
+        files,
+        expected_uid=trusted_uid,
+        expected_gid=trusted_gid,
+        expected_file_mode=0o444,
+        expected_directory_mode=0o555,
+    )
+
+
+def integration_filesystem_inventory(
+    root: Path,
+    files: tuple[IntegrationFileContract, ...],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_file_mode: int,
+    expected_directory_mode: int,
+) -> None:
+    expected = {item.path: (item.size, item.sha256) for item in files}
+    actual: dict[str, tuple[int, str]] = {}
+    actual_directories: set[str] = {""}
+    for current, directories, names in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        metadata = current_path.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or stat.S_IMODE(metadata.st_mode) != expected_directory_mode
+        ):
+            fail(f"platform integration directory is unsafe: {current_path}")
+        if current_path != root:
+            actual_directories.add(current_path.relative_to(root).as_posix())
+        for name in directories:
+            child = current_path / name
+            child_metadata = child.lstat()
+            if not stat.S_ISDIR(child_metadata.st_mode) or stat.S_ISLNK(child_metadata.st_mode):
+                fail(f"platform integration contains an unsafe directory: {child}")
+        for name in names:
+            child = current_path / name
+            child_metadata = child.lstat()
+            if (
+                not stat.S_ISREG(child_metadata.st_mode)
+                or stat.S_ISLNK(child_metadata.st_mode)
+                or child_metadata.st_uid != expected_uid
+                or child_metadata.st_gid != expected_gid
+                or stat.S_IMODE(child_metadata.st_mode) != expected_file_mode
+            ):
+                fail(f"platform integration contains an unsafe file: {child}")
+            relative = child.relative_to(root).as_posix()
+            digest, size = sha256_file(child, max_bytes=MAX_INTEGRATION_FILE_SIZE)
+            actual[relative] = (size, f"sha256:{digest}")
+    if actual != expected:
+        fail("platform integration filesystem does not match its validated inventory")
+    if actual_directories != required_directories(iter(expected)):
+        fail("platform integration directories do not match its validated inventory")
+
+
+def extract_integration_isolated(
+    application: str,
+    source_revision: str,
+    caddy_image: str,
+    archive_path: Path,
+    inventory_path: Path,
+    contract: IntegrationContract,
+    trusted_destination: Path,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> tuple[IntegrationFileContract, ...]:
+    contract_path = archive_path.parent / f".integration-contract-{secrets.token_hex(8)}.json"
+    write_worker_result(
+        contract_path,
+        dataclasses.asdict(contract),
+        "root integration contract",
+    )
+    worker_command = [
+        str(PYTHON_PATH),
+        str(Path(__file__)),
+        "--integration-worker",
+        application,
+        source_revision,
+        caddy_image,
+        str(archive_path),
+        str(inventory_path),
+        str(contract_path),
+        "{STATE_DIRECTORY}/untrusted-integration",
+        "{STATE_DIRECTORY}/validated-integration.json",
+    ]
+    try:
+        state = run_isolated_worker(
+            "integration",
+            worker_command,
+            inputs=(
+                Path(__file__),
+                SCRIPT_DIRECTORY / "lib/platform_integration.py",
+                archive_path,
+                inventory_path,
+                contract_path,
+            ),
+            runtime_seconds=300,
+            memory_max="256M",
+            memory_swap_max="64M",
+            file_size_max=f"{MAX_INTEGRATION_FILE_SIZE}",
+            network=False,
+        )
+        try:
+            files = read_integration_worker_result(
+                state.physical_root / "validated-integration.json",
+                contract,
+                source_revision,
+                expected_uid=state.uid,
+                expected_gid=state.gid,
+            )
+            bind_integration_inventory_contract(
+                inventory_path,
+                files,
+                source_revision,
+                contract,
+            )
+            copy_trusted_integration(
+                state.physical_root / "untrusted-integration",
+                trusted_destination,
+                files,
+                expected_uid=state.uid,
+                expected_gid=state.gid,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            bind_integration_archive_contract(
+                archive_path,
+                trusted_destination,
+                files,
+                contract,
+                expected_uid=trusted_uid,
+                expected_gid=trusted_gid,
+            )
+            return files
+        finally:
+            cleanup_isolated_worker_state(state)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            contract_path.unlink()
 
 
 def write_layer_contract(path: Path, contract: LayerContract) -> None:
-    value = dataclasses.asdict(contract)
-    path.write_text(
-        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n",
-        encoding="ascii",
+    write_worker_result(
+        path,
+        dataclasses.asdict(contract),
+        "root site layer contract",
     )
-    path.chmod(0o444)
 
 
-def create_release_as_static_user(
+def create_release_isolated(
     profile: StaticProfile,
     source_revision: str,
     archive: Path,
     inventory_path: Path,
     site_layer: LayerContract,
+    routes_layer: LayerContract,
     staging: Path,
-    uid: int,
-    gid: int,
-    home: Path,
-) -> None:
-    os.mkdir(staging, mode=0o700)
-    os.chown(staging, uid, gid)
-    layer_contract_path = home / "site-layer.json"
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> InventoryContract:
+    layer_contract_path = archive.parent / f".site-layer-{secrets.token_hex(8)}.json"
     write_layer_contract(layer_contract_path, site_layer)
-    command = [
-        str(SETPRIV_PATH),
-        f"--reuid={uid}",
-        f"--regid={gid}",
-        "--clear-groups",
-        "--no-new-privs",
-        "--inh-caps=-all",
-        "--ambient-caps=-all",
-        "--bounding-set=-all",
+    worker_command = [
         str(PYTHON_PATH),
         str(Path(__file__)),
         "--extract-worker",
@@ -1082,179 +4453,740 @@ def create_release_as_static_user(
         str(archive),
         str(inventory_path),
         str(layer_contract_path),
-        str(staging),
+        "{STATE_DIRECTORY}/untrusted-site",
+        "{STATE_DIRECTORY}/validated-inventory.json",
     ]
-    run_checked(command, environment=safe_environment(home), timeout=300)
+    try:
+        state = run_isolated_worker(
+            "extract",
+            worker_command,
+            inputs=(
+                Path(__file__),
+                SCRIPT_DIRECTORY / "lib/platform_integration.py",
+                archive,
+                inventory_path,
+                layer_contract_path,
+            ),
+            runtime_seconds=300,
+            memory_max="256M",
+            memory_swap_max="64M",
+            file_size_max=f"{profile.max_uncompressed_bytes}",
+            network=False,
+        )
+        try:
+            inventory = read_validated_inventory(
+                state.physical_root / "validated-inventory.json",
+                profile,
+                site_layer,
+                expected_uid=state.uid,
+                expected_gid=state.gid,
+            )
+            bind_route_inventory_contract(
+                inventory_path,
+                inventory,
+                profile,
+                source_revision,
+                routes_layer,
+            )
+            copy_trusted_release(
+                state.physical_root / "untrusted-site",
+                staging,
+                inventory,
+                expected_uid=state.uid,
+                expected_gid=state.gid,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            return inventory
+        finally:
+            cleanup_isolated_worker_state(state)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            layer_contract_path.unlink()
+
+
+def prepare_probe_integration(
+    integration_root: Path,
+    application: str,
+    release: Path,
+    probe_root: Path,
+) -> tuple[Path, Path]:
+    source_caddy = integration_root / "platform/caddy"
+    if source_caddy.is_symlink() or not source_caddy.is_dir():
+        fail("platform integration Caddy root is invalid")
+    caddy_root = probe_root / "caddy"
+    routes_root = caddy_root / "routes"
+    routes_root.mkdir(parents=True, mode=0o755)
+    source_caddyfile = source_caddy / "Caddyfile"
+    source_caddyfile_metadata = source_caddyfile.lstat()
+    if stat.S_ISLNK(source_caddyfile_metadata.st_mode) or not stat.S_ISREG(
+        source_caddyfile_metadata.st_mode
+    ):
+        fail("platform integration Caddyfile is not a regular file")
+    source_routes = source_caddy / "routes"
+    source_routes_metadata = source_routes.lstat()
+    if stat.S_ISLNK(source_routes_metadata.st_mode) or not stat.S_ISDIR(
+        source_routes_metadata.st_mode
+    ):
+        fail("platform integration Caddy routes root is not a directory")
+    caddyfile = caddy_root / "Caddyfile"
+    original = read_bounded_file(
+        source_caddyfile,
+        256 * 1024,
+        "integration Caddyfile",
+    ).decode("utf-8", errors="strict")
+    marker = "{\n\tadmin off\n"
+    local_certs_directive = re.compile(r"(?m)^[ \t]*local_certs[ \t]*(?:#.*)?$")
+    auto_https_off_directive = re.compile(
+        r"(?m)^[ \t]*auto_https[ \t]+off(?:[ \t]*(?:#.*)?)?$"
+    )
+    if original.count(marker) != 1 or local_certs_directive.search(original):
+        fail("integration Caddyfile has no unique safe global-options injection point")
+    transformed = original.replace(marker, f"{marker}\tlocal_certs\n", 1)
+    if (
+        len(local_certs_directive.findall(transformed)) != 1
+        or auto_https_off_directive.search(transformed)
+    ):
+        fail("probe Caddyfile local certificate injection is invalid")
+    caddyfile.write_bytes(transformed.encode("utf-8"))
+    for candidate in sorted(source_routes.iterdir(), key=lambda path: path.name):
+        metadata = candidate.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            fail("platform integration route candidate is not a regular file")
+        if candidate.name == f"{application}.caddy.disabled":
+            target_name = f"{application}.caddy"
+        elif candidate.name.endswith(".disabled"):
+            continue
+        else:
+            fail("platform integration contains an unexpected active route")
+        target = routes_root / target_name
+        target.write_bytes(read_bounded_file(candidate, 256 * 1024, "integration route candidate"))
+        target.chmod(0o444)
+    active = routes_root / f"{application}.caddy"
+    if not active.is_file() or active.is_symlink():
+        fail("platform integration has no exact route candidate for the application")
+    caddyfile.chmod(0o444)
+    for directory in (probe_root, caddy_root, routes_root):
+        directory.chmod(0o755)
+    release_metadata = release.lstat()
+    if (
+        not stat.S_ISDIR(release_metadata.st_mode)
+        or stat.S_ISLNK(release_metadata.st_mode)
+        or stat.S_IMODE(release_metadata.st_mode) & 0o005 != 0o005
+    ):
+        fail("trusted release root is not traversable and readable for the probe")
+    return caddyfile, routes_root
+
+
+def remaining_probe_seconds(deadline: float, label: str, *, cap: int = 10) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        fail(f"temporary Caddy {label} exceeded its total time limit")
+    return max(1, min(cap, int(remaining + 0.999)))
+
+
+def require_probe_bind_source(path: Path, label: str, *, directory: bool) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        fail(f"temporary Caddy {label} cannot be inspected: {exc}")
+    expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if stat.S_ISLNK(metadata.st_mode) or not expected_kind(metadata.st_mode):
+        fail(f"temporary Caddy {label} is not a real {'directory' if directory else 'file'}")
+    mode = stat.S_IMODE(metadata.st_mode)
+    required_other_bits = 0o005 if directory else 0o004
+    if mode & required_other_bits != required_other_bits:
+        fail(f"temporary Caddy {label} is not accessible to uid 65534")
+    if mode & 0o022:
+        fail(f"temporary Caddy {label} is writable outside its owner")
+
+
+def require_probe_bind_tree(root: Path, label: str) -> None:
+    require_probe_bind_source(root, label, directory=True)
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        require_probe_bind_source(current_path, label, directory=True)
+        for name in directories:
+            require_probe_bind_source(current_path / name, label, directory=True)
+        for name in files:
+            require_probe_bind_source(current_path / name, label, directory=False)
+
+
+def wait_for_probe(
+    host: str,
+    port: int,
+    work_directory: Path,
+    deadline: float,
+) -> None:
+    environment = safe_environment(work_directory)
+    while True:
+        timeout = remaining_probe_seconds(deadline, "readiness probe", cap=2)
+        try:
+            ready = subprocess.run(
+                [
+                    str(CURL_PATH),
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--insecure",
+                    "--resolve",
+                    f"{host}:{port}:127.0.0.1",
+                    "--max-time",
+                    str(timeout),
+                    "--output",
+                    "/dev/null",
+                    f"https://{host}:{port}/",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=timeout + 1,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            ready = None
+        if ready is not None and ready.returncode == 0:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("temporary Caddy did not become ready within its total time limit")
+        time.sleep(min(0.2, remaining))
+
+
+def probe_container_ids(name: str, environment: dict[str, str], timeout: int) -> str:
+    try:
+        result = subprocess.run(
+            [
+                str(DOCKER_PATH),
+                "container",
+                "ls",
+                "--all",
+                "--filter",
+                f"name=^/{name}$",
+                "--quiet",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"temporary Caddy container state cannot be verified: {exc}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        fail(f"temporary Caddy container state cannot be verified: {detail[:1000]}")
+    return result.stdout.strip()
+
+
+def cleanup_probe_container(name: str, environment: dict[str, str]) -> None:
+    try:
+        subprocess.run(
+            [str(DOCKER_PATH), "rm", "--force", name],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if probe_container_ids(name, environment, 30):
+        fail("temporary Caddy container cleanup left a container behind")
+
+
+def assert_probe_response(
+    host: str,
+    port: int,
+    route: str,
+    work_directory: Path,
+    deadline: float,
+    *,
+    expected_status: int,
+    expected_sha256: str | None = None,
+    expected_location: str | None = None,
+    expected_cache_control: str | None = None,
+    accept_encoding: str | None = None,
+    expected_content_encoding: str | None = None,
+) -> None:
+    response = work_directory / f"response-{secrets.token_hex(8)}"
+    headers = work_directory / f"headers-{secrets.token_hex(8)}"
+    command = [
+        str(CURL_PATH),
+        "--silent",
+        "--show-error",
+        "--insecure",
+        "--path-as-is",
+        "--resolve",
+        f"{host}:{port}:127.0.0.1",
+        "--max-time",
+        str(remaining_probe_seconds(deadline, "route probe")),
+        "--dump-header",
+        str(headers),
+        "--output",
+        str(response),
+        "--write-out",
+        "%{http_code}",
+    ]
+    if accept_encoding is not None:
+        command.extend(["--header", f"Accept-Encoding: {accept_encoding}"])
+    command.append(f"https://{host}:{port}{route}")
+    try:
+        result = run_checked(
+            command,
+            environment=safe_environment(work_directory),
+            timeout=remaining_probe_seconds(deadline, "route probe", cap=15),
+        )
+        if result.stdout != str(expected_status):
+            fail(f"production Caddy probe returned HTTP {result.stdout!r} for {host}{route}")
+        header_bytes = read_bounded_file(headers, 64 * 1024, "Caddy response headers")
+        header_text = header_bytes.decode("latin-1")
+        normalized_headers = header_text.lower()
+        required_headers = (
+            "\r\nstrict-transport-security: max-age=31536000; includesubdomains\r\n",
+            "\r\nx-content-type-options: nosniff\r\n",
+            "\r\nx-frame-options: sameorigin\r\n",
+            "\r\nreferrer-policy: strict-origin-when-cross-origin\r\n",
+            "\r\npermissions-policy: camera=(), microphone=(), geolocation=()\r\n",
+        )
+        if any(header not in normalized_headers for header in required_headers):
+            fail("production Caddy probe omitted the security headers")
+        if "\r\nserver:" in normalized_headers:
+            fail("production Caddy probe exposed the Server header")
+        if expected_location is not None:
+            if f"\r\nlocation: {expected_location.lower()}\r\n" not in normalized_headers:
+                fail("production Caddy probe returned an unexpected redirect location")
+        if expected_cache_control is not None:
+            if f"\r\ncache-control: {expected_cache_control.lower()}\r\n" not in normalized_headers:
+                fail("production Caddy probe returned an unexpected cache policy")
+        if expected_content_encoding is not None:
+            if f"\r\ncontent-encoding: {expected_content_encoding.lower()}\r\n" not in normalized_headers:
+                fail("production Caddy probe returned an unexpected content encoding")
+        if expected_sha256 is not None:
+            digest, _ = sha256_file(response)
+            if digest != expected_sha256:
+                fail(f"production Caddy probe returned unexpected content for {host}{route}")
+    finally:
+        for path in (response, headers):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
 
 
 def probe_release(
     release: Path,
     inventory: InventoryContract,
     caddy_image: str,
+    integration_root: Path,
+    profile: StaticProfile,
     work_directory: Path,
     max_probe_seconds: int,
 ) -> None:
     if not CADDY_IMAGE_RE.fullmatch(caddy_image):
         fail("Caddy image must be an immutable vps-infra/caddy GHCR reference")
     environment = safe_environment(work_directory)
-    run_checked([str(DOCKER_PATH), "pull", caddy_image], environment=environment, timeout=300)
+    probe_deadline = time.monotonic() + max_probe_seconds
+    run_checked(
+        [str(DOCKER_PATH), "pull", caddy_image],
+        environment=environment,
+        timeout=remaining_probe_seconds(
+            probe_deadline,
+            "image pull",
+            cap=max_probe_seconds,
+        ),
+    )
+    probe_root = work_directory / f"probe-{secrets.token_hex(8)}"
+    probe_root.mkdir(mode=0o755)
+    caddyfile, routes_root = prepare_probe_integration(
+        integration_root,
+        profile.application,
+        release,
+        probe_root,
+    )
     name = f"vps-static-probe-{secrets.token_hex(8)}"
-    command = [
-        str(DOCKER_PATH),
-        "run",
-        "--detach",
-        "--name",
-        name,
-        "--pull",
-        "never",
-        "--read-only",
-        "--user",
-        "65534:65534",
-        "--cap-drop",
-        "ALL",
-        "--cap-add",
-        "NET_BIND_SERVICE",
-        "--security-opt",
-        "no-new-privileges:true",
-        "--pids-limit",
-        "64",
-        "--memory",
-        "128m",
-        "--cpus",
-        "1",
-        "--tmpfs",
-        "/data:rw,noexec,nosuid,nodev,mode=0777,size=1m",
-        "--tmpfs",
-        "/config:rw,noexec,nosuid,nodev,mode=0777,size=1m",
-        "--env",
-        "XDG_CONFIG_HOME=/config",
-        "--env",
-        "XDG_DATA_HOME=/data",
-        "--publish",
-        "127.0.0.1::8080",
-        "--volume",
-        f"{release}:/srv/site:ro",
-        "--entrypoint",
-        "/usr/bin/caddy",
-        caddy_image,
-        "file-server",
-        "--root",
-        "/srv/site",
-        "--listen",
-        ":8080",
-    ]
-    started = False
+    failure: BaseException | None = None
     try:
-        run_checked(command, environment=environment, timeout=60)
-        started = True
-        port_result = run_checked(
-            [str(DOCKER_PATH), "port", name, "8080/tcp"],
+        require_probe_bind_source(caddyfile, "Caddyfile", directory=False)
+        require_probe_bind_tree(routes_root, "route root")
+        require_probe_bind_tree(release, "release root")
+        if probe_container_ids(
+            name,
+            environment,
+            remaining_probe_seconds(probe_deadline, "container preflight"),
+        ):
+            fail("temporary Caddy container name already exists")
+        validate_command = [
+            str(DOCKER_PATH),
+            "run",
+            "--rm",
+            "--name",
+            name,
+            "--read-only",
+            "--user",
+            "65534:65534",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--tmpfs",
+            "/data:rw,noexec,nosuid,nodev,mode=0700,uid=65534,gid=65534,size=16m",
+            "--tmpfs",
+            "/config:rw,noexec,nosuid,nodev,mode=0700,uid=65534,gid=65534,size=16m",
+            "--env",
+            "XDG_CONFIG_HOME=/config",
+            "--env",
+            "XDG_DATA_HOME=/data",
+            "--volume",
+            f"{caddyfile}:/etc/caddy/Caddyfile:ro",
+            "--volume",
+            f"{routes_root}:/etc/caddy/routes:ro",
+            "--volume",
+            f"{release}:/srv/www/{profile.application}/current:ro",
+            "--entrypoint",
+            "/usr/bin/caddy",
+            caddy_image,
+            "validate",
+            "--config",
+            "/etc/caddy/Caddyfile",
+            "--adapter",
+            "caddyfile",
+        ]
+        run_checked(
+            validate_command,
             environment=environment,
-            timeout=10,
+            timeout=remaining_probe_seconds(probe_deadline, "configuration validation", cap=60),
+        )
+        if probe_container_ids(
+            name,
+            environment,
+            remaining_probe_seconds(probe_deadline, "validation cleanup"),
+        ):
+            fail("temporary Caddy validation container was not removed")
+
+        command = [
+            str(DOCKER_PATH),
+            "run",
+            "--detach",
+            "--name",
+            name,
+            "--pull",
+            "never",
+            "--read-only",
+            "--user",
+            "65534:65534",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_BIND_SERVICE",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--pids-limit",
+            "64",
+            "--memory",
+            "128m",
+            "--cpus",
+            "1",
+            "--tmpfs",
+            "/data:rw,noexec,nosuid,nodev,mode=0700,uid=65534,gid=65534,size=16m",
+            "--tmpfs",
+            "/config:rw,noexec,nosuid,nodev,mode=0700,uid=65534,gid=65534,size=16m",
+            "--env",
+            "XDG_CONFIG_HOME=/config",
+            "--env",
+            "XDG_DATA_HOME=/data",
+            "--publish",
+            "127.0.0.1::443",
+            "--volume",
+            f"{caddyfile}:/etc/caddy/Caddyfile:ro",
+            "--volume",
+            f"{routes_root}:/etc/caddy/routes:ro",
+            "--volume",
+            f"{release}:/srv/www/{profile.application}/current:ro",
+            caddy_image,
+        ]
+        run_checked(
+            command,
+            environment=environment,
+            timeout=remaining_probe_seconds(probe_deadline, "container start", cap=60),
+        )
+        port_result = run_checked(
+            [str(DOCKER_PATH), "port", name, "443/tcp"],
+            environment=environment,
+            timeout=remaining_probe_seconds(probe_deadline, "port discovery"),
         )
         match = re.fullmatch(r"127\.0\.0\.1:([1-9][0-9]{0,4})\n?", port_result.stdout)
         if match is None or int(match.group(1)) > 65535:
             fail("temporary Caddy returned an invalid loopback port")
-        base_url = f"http://127.0.0.1:{match.group(1)}"
-        deadline = time.monotonic() + 15
-        while True:
-            ready = subprocess.run(
-                [
-                    str(CURL_PATH),
-                    "--fail",
-                    "--silent",
-                    "--output",
-                    "/dev/null",
-                    "--max-time",
-                    "2",
-                    f"{base_url}/",
-                ],
-                check=False,
-                env=environment,
-            )
-            if ready.returncode == 0:
-                break
-            if time.monotonic() >= deadline:
-                fail("temporary Caddy did not become ready")
-            time.sleep(0.2)
-
-        response_path = work_directory / "probe-response"
-        probe_deadline = time.monotonic() + max_probe_seconds
+        port = int(match.group(1))
+        wait_for_probe(profile.canonical_domain, port, work_directory, probe_deadline)
         for item in inventory.files:
-            remaining_seconds = probe_deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                fail("temporary Caddy route probe exceeded its total time limit")
-            route_timeout = max(1, min(10, int(remaining_seconds)))
-            result = run_checked(
-                [
-                    str(CURL_PATH),
-                    "--silent",
-                    "--show-error",
-                    "--path-as-is",
-                    "--max-time",
-                    str(route_timeout),
-                    "--max-filesize",
-                    str(max(1, item.size)),
-                    "--output",
-                    str(response_path),
-                    "--write-out",
-                    "%{http_code}",
-                    f"{base_url}{item.route}",
-                ],
-                environment=environment,
-                timeout=route_timeout + 5,
+            if item.route.startswith("/assets/"):
+                cache_control = "public, max-age=3600"
+            elif item.route == "/" or item.route.endswith(".html") or item.route.endswith("/"):
+                cache_control = "no-cache"
+            else:
+                cache_control = None
+            assert_probe_response(
+                profile.canonical_domain,
+                port,
+                item.route,
+                work_directory,
+                probe_deadline,
+                expected_status=200,
+                expected_sha256=item.sha256,
+                expected_cache_control=cache_control,
             )
-            if result.stdout != "200":
-                fail(f"temporary Caddy returned HTTP {result.stdout!r} for {item.route}")
-            digest, size = sha256_file(response_path, max_bytes=item.size)
-            if size != item.size or digest != item.sha256:
-                fail(f"temporary Caddy response for {item.route} does not match the inventory")
+        not_found = next((item for item in inventory.files if item.file == "404.html"), None)
+        if not_found is None:
+            fail("route inventory must contain 404.html for production Caddy error handling")
+        assert_probe_response(
+            profile.canonical_domain,
+            port,
+            f"/.vps-probe-missing-{secrets.token_hex(8)}",
+            work_directory,
+            probe_deadline,
+            expected_status=404,
+            expected_sha256=not_found.sha256,
+            expected_cache_control="no-cache",
+        )
+        html_item = next(
+            (item for item in inventory.files if item.file.endswith(".html") and item.size > 1024),
+            None,
+        )
+        if html_item is None:
+            fail("route inventory must contain an HTML item larger than 1024 bytes")
+        assert_probe_response(
+            profile.canonical_domain,
+            port,
+            html_item.route,
+            work_directory,
+            probe_deadline,
+            expected_status=200,
+            accept_encoding="gzip",
+            expected_content_encoding="gzip",
+        )
+        for redirect_domain in profile.redirect_domains:
+            assert_probe_response(
+                redirect_domain,
+                port,
+                "/probe?value=1",
+                work_directory,
+                probe_deadline,
+                expected_status=308,
+                expected_location=f"https://{profile.canonical_domain}/probe?value=1",
+            )
+    except BaseException as exc:
+        failure = exc
     finally:
-        if started:
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                subprocess.run(
-                    [str(DOCKER_PATH), "rm", "--force", name],
-                    check=False,
-                    capture_output=True,
-                    env=environment,
-                    timeout=30,
-                )
+        cleanup_failure: BaseException | None = None
+        try:
+            cleanup_probe_container(name, environment)
+        except BaseException as exc:
+            cleanup_failure = exc
+        try:
+            shutil.rmtree(probe_root)
+        except BaseException as exc:
+            if cleanup_failure is None:
+                cleanup_failure = exc
+        if probe_root.exists() or probe_root.is_symlink():
+            cleanup_failure = StaticDeploymentError(
+                "temporary Caddy integration package cleanup left files behind"
+            )
+        if cleanup_failure is not None:
+            if failure is not None:
+                raise StaticDeploymentError(
+                    f"{failure}; temporary Caddy cleanup also failed: {cleanup_failure}"
+                ) from cleanup_failure
+            raise cleanup_failure
+    if failure is not None:
+        raise failure
 
 
-def validate_current_link(current: Path, releases: Path) -> None:
+def require_safe_directory_fd(descriptor: int, label: str, *, expected_uid: int) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_mode & 0o022
+    ):
+        fail(f"{label} must be a protected owned directory")
+
+
+def open_release_directory(
+    releases_fd: int,
+    release_name: str,
+    *,
+    expected_uid: int,
+) -> int:
+    if re.fullmatch(r"sha256-[0-9a-f]{64}", release_name) is None:
+        fail("release directory name is invalid")
     try:
-        metadata = current.lstat()
+        descriptor = os.open(
+            release_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=releases_fd,
+        )
+    except OSError as exc:
+        fail(f"release directory is not a real directory: {exc}")
+    try:
+        require_safe_directory_fd(
+            descriptor,
+            "release directory",
+            expected_uid=expected_uid,
+        )
+        metadata = os.fstat(descriptor)
+        if stat.S_IMODE(metadata.st_mode) != 0o755:
+            fail("release directory must use mode 0755")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def read_current_target(
+    app_fd: int,
+    releases_fd: int,
+    *,
+    expected_uid: int,
+) -> str | None:
+    try:
+        metadata = os.stat("current", dir_fd=app_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return
+        return None
     if not stat.S_ISLNK(metadata.st_mode):
         fail("current activation path exists and is not a symlink")
-    target = os.readlink(current)
-    if not re.fullmatch(r"releases/sha256-[0-9a-f]{64}", target):
+    target = os.readlink("current", dir_fd=app_fd)
+    match = re.fullmatch(r"releases/(sha256-[0-9a-f]{64})", target)
+    if match is None:
         fail("current symlink has an unsafe or unexpected target")
-    resolved = (current.parent / target).resolve(strict=True)
-    if resolved.parent != releases.resolve(strict=True) or not resolved.is_dir():
-        fail("current symlink target is outside the application release root")
+    descriptor = open_release_directory(
+        releases_fd,
+        match.group(1),
+        expected_uid=expected_uid,
+    )
+    os.close(descriptor)
+    return target
 
 
-def activate_release(current: Path, release_name: str, releases: Path) -> None:
-    validate_current_link(current, releases)
-    temporary = current.parent / f".current-{secrets.token_hex(8)}"
+def validate_current_link(
+    current: Path,
+    releases: Path,
+    *,
+    expected_uid: int = 0,
+) -> None:
+    app_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        os.symlink(f"releases/{release_name}", temporary, target_is_directory=True)
-        os.replace(temporary, current)
-        directory_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY)
+        require_safe_directory_fd(
+            app_fd,
+            "application root",
+            expected_uid=expected_uid,
+        )
+        releases_fd = os.open(
+            releases.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=app_fd,
+        )
         try:
-            os.fsync(directory_fd)
+            require_safe_directory_fd(
+                releases_fd,
+                "release root",
+                expected_uid=expected_uid,
+            )
+            read_current_target(
+                app_fd,
+                releases_fd,
+                expected_uid=expected_uid,
+            )
         finally:
-            os.close(directory_fd)
+            os.close(releases_fd)
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            temporary.unlink()
+        os.close(app_fd)
+
+
+def activate_release(
+    current: Path,
+    release_name: str,
+    releases: Path,
+    *,
+    expected_uid: int = 0,
+) -> None:
+    app_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary_name = f".current-{secrets.token_hex(8)}"
+    rollback_name = f".current-rollback-{secrets.token_hex(8)}"
+    old_target: str | None = None
+    try:
+        require_safe_directory_fd(
+            app_fd,
+            "application root",
+            expected_uid=expected_uid,
+        )
+        releases_fd = os.open(
+            releases.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=app_fd,
+        )
+        try:
+            require_safe_directory_fd(
+                releases_fd,
+                "release root",
+                expected_uid=expected_uid,
+            )
+            destination_fd = open_release_directory(
+                releases_fd,
+                release_name,
+                expected_uid=expected_uid,
+            )
+            os.close(destination_fd)
+            old_target = read_current_target(
+                app_fd,
+                releases_fd,
+                expected_uid=expected_uid,
+            )
+            new_target = f"releases/{release_name}"
+            if old_target == new_target:
+                os.fsync(app_fd)
+                return
+            os.symlink(new_target, temporary_name, dir_fd=app_fd)
+            os.fsync(app_fd)
+            os.replace(
+                temporary_name,
+                "current",
+                src_dir_fd=app_fd,
+                dst_dir_fd=app_fd,
+            )
+            try:
+                os.fsync(app_fd)
+            except OSError as activation_error:
+                try:
+                    if old_target is None:
+                        os.unlink("current", dir_fd=app_fd)
+                    else:
+                        os.symlink(old_target, rollback_name, dir_fd=app_fd)
+                        os.fsync(app_fd)
+                        os.replace(
+                            rollback_name,
+                            "current",
+                            src_dir_fd=app_fd,
+                            dst_dir_fd=app_fd,
+                        )
+                    os.fsync(app_fd)
+                except OSError as rollback_error:
+                    fail(
+                        "activation fsync failed and rollback could not be made durable: "
+                        f"{activation_error}; {rollback_error}"
+                    )
+                fail(f"activation fsync failed; previous current was restored: {activation_error}")
+        finally:
+            os.close(releases_fd)
+    finally:
+        for name in (temporary_name, rollback_name):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=app_fd)
+        os.close(app_fd)
 
 
 @contextlib.contextmanager
-def deployment_lock(application: str) -> Iterator[None]:
-    lock_path = Path("/run/lock") / f"vps-static-{application}.lock"
+def deployment_lock() -> Iterator[None]:
+    lock_path = Path("/run/lock/vps-static.lock")
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         metadata = os.fstat(descriptor)
@@ -1274,11 +5206,86 @@ def deployment_lock(application: str) -> Iterator[None]:
         os.close(descriptor)
 
 
+def refuse_isolated_worker_residue_locked() -> None:
+    """Fail closed if a previous or concurrent vpsw controller left any state."""
+
+    environment = safe_environment(Path("/nonexistent"))
+    command = [
+        str(SYSTEMCTL_PATH),
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--no-pager",
+        "--full",
+        "--type=service",
+        "vpsw-*.service",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"cannot enumerate isolated worker units: {exc}")
+    if result.returncode != 0 or result.stderr.strip():
+        fail("cannot enumerate isolated worker units exactly")
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) < 4:
+            fail("systemd returned a malformed isolated worker unit record")
+        unit, load_state, active_state, sub_state = fields[:4]
+        if re.fullmatch(r"vpsw-[a-z0-9-]+\.service", unit) is None:
+            fail("systemd returned an unexpected isolated worker unit name")
+        fail(
+            "refusing deployment with residual isolated worker unit "
+            f"{unit} ({load_state}/{active_state}/{sub_state})"
+        )
+
+    try:
+        cgroups = tuple(SYSTEMD_CGROUP_ROOT.glob("vpsw-*.service"))
+        private_entries = tuple(SYSTEMD_WORKER_PRIVATE_ROOT.iterdir())
+    except OSError as exc:
+        fail(f"cannot enumerate isolated worker residue: {exc}")
+    try:
+        logical_metadata = SYSTEMD_WORKER_LOGICAL_ROOT.lstat()
+    except FileNotFoundError:
+        logical_entries: tuple[Path, ...] = ()
+    except OSError as exc:
+        fail(f"cannot inspect isolated worker logical root: {exc}")
+    else:
+        if (
+            not stat.S_ISDIR(logical_metadata.st_mode)
+            or stat.S_ISLNK(logical_metadata.st_mode)
+            or logical_metadata.st_uid != 0
+            or logical_metadata.st_gid != 0
+            or logical_metadata.st_mode & 0o022
+        ):
+            fail("isolated worker logical root is unsafe")
+        try:
+            logical_entries = tuple(SYSTEMD_WORKER_LOGICAL_ROOT.iterdir())
+        except OSError as exc:
+            fail(f"cannot enumerate isolated worker logical residue: {exc}")
+    if cgroups:
+        fail("refusing deployment with residual isolated worker cgroups")
+    if private_entries or logical_entries:
+        fail("refusing deployment with residual isolated worker runtime state")
+
+
 def deploy(
     application: str,
     source_revision: str,
     site_reference: str,
     routes_reference: str,
+    integration_revision: str,
+    integration_reference: str,
     caddy_image: str,
 ) -> None:
     profile = PROFILES.get(application)
@@ -1286,8 +5293,15 @@ def deploy(
         fail(f"application {application!r} is outside the static-site allowlist")
     if not SHA40_RE.fullmatch(source_revision):
         fail("source revision must be one full lowercase Git SHA")
+    if not SHA40_RE.fullmatch(integration_revision):
+        fail("platform integration revision must be one full lowercase Git SHA")
     parse_digest_reference(site_reference, profile.site_repository, "site reference")
     parse_digest_reference(routes_reference, profile.routes_repository, "routes reference")
+    parse_digest_reference(
+        integration_reference,
+        INTEGRATION_REPOSITORY,
+        "platform integration reference",
+    )
     if not CADDY_IMAGE_RE.fullmatch(caddy_image):
         fail("Caddy image must be an immutable vps-infra/caddy GHCR reference")
     validate_runtime()
@@ -1298,9 +5312,6 @@ def deploy(
     if caddy_image != promoted_caddy_image:
         fail("Caddy image does not match the protected platform promotion point")
 
-    static_account = pwd.getpwnam(STATIC_USER)
-    if static_account.pw_uid == 0 or static_account.pw_gid == 0:
-        fail("static extraction account must be unprivileged")
     app_root = PRODUCTION_ROOT / profile.application
     releases = app_root / "releases"
     for path in (PRODUCTION_ROOT, app_root, releases):
@@ -1310,47 +5321,148 @@ def deploy(
         if metadata.st_mode & 0o022:
             fail(f"static release root {path} must not be writable by group or others")
 
-    with deployment_lock(application), tempfile.TemporaryDirectory(
-        prefix=f"vps-static-{application}-",
-        dir="/var/tmp",
-    ) as temporary_name:
-        temporary = Path(temporary_name)
+    with deployment_lock():
+        refuse_isolated_worker_residue_locked()
+        with tempfile.TemporaryDirectory(
+            prefix=f"vps-static-{application}-",
+            dir="/var/tmp",
+        ) as temporary_name:
+            deploy_locked(
+                profile,
+                source_revision,
+                site_reference,
+                routes_reference,
+                integration_revision,
+                integration_reference,
+                caddy_image,
+                Path(temporary_name),
+                releases,
+                app_root,
+            )
+
+
+def deploy_locked(
+    profile: StaticProfile,
+    source_revision: str,
+    site_reference: str,
+    routes_reference: str,
+    integration_revision: str,
+    integration_reference: str,
+    caddy_image: str,
+    temporary: Path,
+    releases: Path,
+    app_root: Path,
+) -> None:
+        application = profile.application
         temporary.chmod(0o755)
-        registry_config = temporary / "registry.json"
-        registry_config.write_text("{}\n", encoding="ascii")
-        registry_config.chmod(0o600)
+        download_root = temporary / "downloads"
+        download_root.mkdir(mode=0o755)
         environment = safe_environment(temporary)
-        site_manifest_path = temporary / "site-manifest.json"
-        routes_manifest_path = temporary / "routes-manifest.json"
-        fetch_manifest(site_reference, site_manifest_path, registry_config, environment)
-        fetch_manifest(routes_reference, routes_manifest_path, registry_config, environment)
-        site_layer = validate_manifest(
+        site_manifest_path = download_root / "site-manifest.json"
+        routes_manifest_path = download_root / "routes-manifest.json"
+        integration_manifest_path = download_root / "integration-manifest.json"
+        fetch_manifest(
+            site_reference,
+            profile.site_repository,
+            site_manifest_path,
+            environment,
+        )
+        fetch_manifest(
+            routes_reference,
+            profile.routes_repository,
+            routes_manifest_path,
+            environment,
+        )
+        fetch_manifest(
+            integration_reference,
+            INTEGRATION_REPOSITORY,
+            integration_manifest_path,
+            environment,
+        )
+        site_layer, routes_layer, integration = validate_manifests_isolated(
+            profile,
+            source_revision,
             site_manifest_path,
             site_reference,
-            profile,
-            source_revision,
-            kind="site",
-        )
-        routes_layer = validate_manifest(
             routes_manifest_path,
             routes_reference,
-            profile,
-            source_revision,
-            kind="routes",
+            integration_manifest_path,
+            integration_reference,
+            integration_revision,
         )
-        if routes_layer.created != site_layer.created:
-            fail("site and route manifests must use the same creation timestamp")
 
-        archive_path = temporary / "site.tar.gz"
-        inventory_path = temporary / "routes.json"
-        fetch_blob(profile.site_repository, site_layer, archive_path, registry_config, environment)
-        fetch_blob(profile.routes_repository, routes_layer, inventory_path, registry_config, environment)
-        inventory = validate_bundle(
+        for reference, subject_path in (
+            (site_reference, site_manifest_path),
+            (routes_reference, routes_manifest_path),
+        ):
+            verify_github_provenance_isolated(
+                reference,
+                subject_path=subject_path,
+                repository=profile.source_repository,
+                source_revision=source_revision,
+                source_ref=profile.source_ref,
+                signer_workflow=profile.signer_workflow,
+                trusted_directory=download_root,
+            )
+        verify_github_provenance_isolated(
+            integration_reference,
+            subject_path=integration_manifest_path,
+            repository="nclsppr/vps-infra",
+            source_revision=integration_revision,
+            source_ref=INTEGRATION_SOURCE_REF,
+            signer_workflow=INTEGRATION_SIGNER_WORKFLOW,
+            trusted_directory=download_root,
+        )
+
+        archive_path = download_root / "site.tar.gz"
+        inventory_path = download_root / "routes.json"
+        integration_archive_path = download_root / INTEGRATION_ARCHIVE_NAME
+        integration_inventory_path = download_root / INTEGRATION_INVENTORY_NAME
+        fetch_blob(
+            profile.site_repository,
+            site_layer.layer_digest,
+            site_layer.layer_size,
             archive_path,
+            environment,
+        )
+        fetch_blob(
+            profile.routes_repository,
+            routes_layer.layer_digest,
+            routes_layer.layer_size,
             inventory_path,
-            profile,
-            source_revision,
-            site_layer,
+            environment,
+        )
+        fetch_blob(
+            INTEGRATION_REPOSITORY,
+            integration.archive_digest,
+            integration.archive_size,
+            integration_archive_path,
+            environment,
+        )
+        fetch_blob(
+            INTEGRATION_REPOSITORY,
+            integration.inventory_digest,
+            integration.inventory_size,
+            integration_inventory_path,
+            environment,
+        )
+        integration_root = temporary / "integration"
+        integration_files = extract_integration_isolated(
+            application,
+            integration_revision,
+            caddy_image,
+            integration_archive_path,
+            integration_inventory_path,
+            integration,
+            integration_root,
+        )
+        integration_filesystem_inventory(
+            integration_root,
+            integration_files,
+            expected_uid=0,
+            expected_gid=0,
+            expected_file_mode=0o444,
+            expected_directory_mode=0o555,
         )
         release_name = f"sha256-{site_layer.manifest_digest.removeprefix('sha256:')}"
         release = releases / release_name
@@ -1361,49 +5473,68 @@ def deploy(
             except FileNotFoundError:
                 metadata = None
             if metadata is not None:
-                if not stat.S_ISDIR(metadata.st_mode):
+                if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                     fail("digest-named release path exists and is not a directory")
-                filesystem_inventory(release, inventory, expected_uid=0, expected_gid=0)
-            else:
                 staging = releases / f".{release_name}-{secrets.token_hex(8)}"
-                create_release_as_static_user(
+                inventory = create_release_isolated(
                     profile,
                     source_revision,
                     archive_path,
                     inventory_path,
                     site_layer,
+                    routes_layer,
                     staging,
-                    static_account.pw_uid,
-                    static_account.pw_gid,
-                    temporary,
+                )
+                shutil.rmtree(staging)
+                staging = None
+                filesystem_inventory(release, inventory, expected_uid=0, expected_gid=0)
+            else:
+                staging = releases / f".{release_name}-{secrets.token_hex(8)}"
+                inventory = create_release_isolated(
+                    profile,
+                    source_revision,
+                    archive_path,
+                    inventory_path,
+                    site_layer,
+                    routes_layer,
+                    staging,
                 )
                 filesystem_inventory(
                     staging,
                     inventory,
-                    expected_uid=static_account.pw_uid,
-                    expected_gid=static_account.pw_gid,
+                    expected_uid=0,
+                    expected_gid=0,
                 )
-                lock_down_release(staging)
-                filesystem_inventory(staging, inventory, expected_uid=0, expected_gid=0)
+                fsync_release_tree(staging)
                 probe_release(
                     staging,
                     inventory,
                     caddy_image,
+                    integration_root,
+                    profile,
                     temporary,
                     profile.probe_timeout_seconds,
                 )
-                os.rename(staging, release)
-                staging = None
-                directory_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY)
+                releases_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 try:
-                    os.fsync(directory_fd)
+                    require_safe_directory_fd(
+                        releases_fd,
+                        "release root",
+                        expected_uid=0,
+                    )
+                    os.fsync(releases_fd)
+                    os.rename(staging.name, release.name, src_dir_fd=releases_fd, dst_dir_fd=releases_fd)
+                    os.fsync(releases_fd)
                 finally:
-                    os.close(directory_fd)
+                    os.close(releases_fd)
+                staging = None
             if metadata is not None:
                 probe_release(
                     release,
                     inventory,
                     caddy_image,
+                    integration_root,
+                    profile,
                     temporary,
                     profile.probe_timeout_seconds,
                 )
@@ -1411,10 +5542,11 @@ def deploy(
         finally:
             if staging is not None:
                 shutil.rmtree(staging, ignore_errors=True)
-    print(
-        f"static release active: {application} {site_layer.manifest_digest} "
-        f"source {source_revision}"
-    )
+        print(
+            f"static current link updated after local HTTPS probe: {application} "
+            f"{site_layer.manifest_digest} source {source_revision}; "
+            "public TLS was not tested"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1423,6 +5555,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("source_revision")
     parser.add_argument("site_reference")
     parser.add_argument("routes_reference")
+    parser.add_argument("integration_revision")
+    parser.add_argument("integration_reference")
     parser.add_argument("caddy_image")
     return parser
 
@@ -1431,9 +5565,9 @@ def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     try:
         if arguments and arguments[0] == "--extract-worker":
-            if len(arguments) != 7:
+            if len(arguments) != 8:
                 fail("extract worker received an invalid argument count")
-            _, application, revision, archive, inventory, layer, destination = arguments
+            _, application, revision, archive, inventory, layer, destination, output = arguments
             profile = PROFILES.get(application)
             if profile is None or not SHA40_RE.fullmatch(revision):
                 fail("extract worker received an invalid application or revision")
@@ -1444,7 +5578,72 @@ def main(argv: list[str] | None = None) -> int:
                 Path(inventory),
                 Path(layer),
                 Path(destination),
+                Path(output),
             )
+            return 0
+        if arguments and arguments[0] == "--validate-manifests-worker":
+            if len(arguments) != 11:
+                fail("manifest validation worker received an invalid argument count")
+            (
+                _, application, revision, site_manifest, site_reference,
+                routes_manifest, routes_reference, integration_manifest,
+                integration_reference, integration_revision, output,
+            ) = arguments
+            profile = PROFILES.get(application)
+            if (
+                profile is None
+                or not SHA40_RE.fullmatch(revision)
+                or not SHA40_RE.fullmatch(integration_revision)
+            ):
+                fail("manifest validation worker received invalid revisions")
+            run_validation_worker(
+                profile,
+                revision,
+                Path(site_manifest),
+                site_reference,
+                Path(routes_manifest),
+                routes_reference,
+                Path(integration_manifest),
+                integration_reference,
+                integration_revision,
+                Path(output),
+            )
+            return 0
+        if arguments and arguments[0] == "--integration-worker":
+            if len(arguments) != 9:
+                fail("integration worker received an invalid argument count")
+            (
+                _, application, revision, caddy_image, archive,
+                inventory, contract, destination, output,
+            ) = arguments
+            if application not in PROFILES or not SHA40_RE.fullmatch(revision):
+                fail("integration worker received invalid application or revision")
+            run_integration_worker(
+                application,
+                revision,
+                caddy_image,
+                Path(archive),
+                Path(inventory),
+                Path(contract),
+                Path(destination),
+                Path(output),
+            )
+            return 0
+        if arguments and arguments[0] == "--attestation-fetch-worker":
+            if len(arguments) != 3:
+                fail("attestation fetch worker received an invalid argument count")
+            _, reference, output = arguments
+            repository, separator, _ = reference.rpartition("@")
+            if not separator:
+                fail("attestation fetch worker received a mutable reference")
+            parse_digest_reference(reference, repository, "attestation reference")
+            run_attestation_fetch_worker(reference, Path(output))
+            return 0
+        if arguments and arguments[0] == "--registry-fetch-worker":
+            if len(arguments) != 3:
+                fail("registry fetch worker received an invalid argument count")
+            _, request, output = arguments
+            run_registry_fetch_worker(Path(request), Path(output))
             return 0
         args = build_parser().parse_args(arguments)
         deploy(
@@ -1452,6 +5651,8 @@ def main(argv: list[str] | None = None) -> int:
             args.source_revision,
             args.site_reference,
             args.routes_reference,
+            args.integration_revision,
+            args.integration_reference,
             args.caddy_image,
         )
     except (OSError, KeyError, StaticDeploymentError) as exc:

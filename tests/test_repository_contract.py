@@ -552,6 +552,157 @@ class SupplyChainContractTests(unittest.TestCase):
 
 
 class SecurityBoundaryContractTests(unittest.TestCase):
+    def test_dynamic_static_jobs_use_one_bounded_persistent_tmpfs(self) -> None:
+        defaults = yaml.safe_load(
+            (ROOT / "ansible/roles/layout/defaults/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            defaults["vps_static_jobs_backing_path"],
+            "/run/private/vps-static-jobs",
+        )
+        self.assertEqual(
+            defaults["vps_static_jobs_mount_unit"],
+            r"run-private-vps\x2dstatic\x2djobs.mount",
+        )
+        self.assertEqual(defaults["vps_static_jobs_tmpfs_size_mib"], 384)
+        self.assertEqual(defaults["vps_static_jobs_tmpfs_inodes"], 16384)
+
+        unit_template = (
+            ROOT
+            / "ansible/roles/layout/templates/run-private-vps-static-jobs.mount.j2"
+        ).read_text(encoding="utf-8")
+        rendered_unit = Templar(
+            loader=DataLoader(), variables=defaults
+        ).template(trust_as_template(unit_template))
+        self.assertIn("What=tmpfs\n", rendered_unit)
+        self.assertIn(
+            "Where=/run/private/vps-static-jobs\n",
+            rendered_unit,
+        )
+        self.assertIn("Type=tmpfs\n", rendered_unit)
+        self.assertIn(
+            "Options=nodev,nosuid,noexec,mode=0700,size=384M,"
+            "nr_inodes=16384\n",
+            rendered_unit,
+        )
+        self.assertIn("DirectoryMode=0700\n", rendered_unit)
+        self.assertIn("WantedBy=local-fs.target\n", rendered_unit)
+
+        tasks = yaml.safe_load(
+            (ROOT / "ansible/roles/layout/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        by_name = {task["name"]: task for task in tasks}
+        content_probe = by_name[
+            "Inspect content that would be shadowed by the static job mount"
+        ]["ansible.builtin.command"]["argv"]
+        self.assertEqual(
+            content_probe[:2],
+            ["/usr/bin/find", "{{ vps_static_jobs_backing_path }}"],
+        )
+        self.assertIn("-mindepth", content_probe)
+        self.assertIn("-maxdepth", content_probe)
+        self.assertIn("-quit", content_probe)
+        required_options = by_name[
+            "Define the required static job backing mount options"
+        ]["ansible.builtin.set_fact"]["vps_static_jobs_required_options"]
+        divergence = json.dumps(
+            [
+                required_options,
+                by_name["Refuse a divergent active static job backing mount"],
+            ],
+            sort_keys=True,
+        )
+        for required in (
+            "rw",
+            "nosuid",
+            "nodev",
+            "noexec",
+            "nr_inodes=",
+            "mode=700",
+        ):
+            self.assertIn(required, divergence)
+        mount_assertions = by_name[
+            "Refuse a divergent active static job backing mount"
+        ]["ansible.builtin.assert"]["that"]
+        options_assertion = mount_assertions[3]
+        live_options = [
+            "rw",
+            "nosuid",
+            "nodev",
+            "noexec",
+            "relatime",
+            "size=393216k",
+            "nr_inodes=16384",
+            "mode=700",
+            "inode64",
+        ]
+        options_templar = Templar(
+            loader=DataLoader(),
+            variables={
+                **defaults,
+                "vps_static_jobs_active_options": live_options,
+                "vps_static_jobs_required_options": live_options[:-1],
+            },
+        )
+        self.assertIs(
+            options_templar.template(
+                trust_as_template("{{ " + options_assertion + " }}")
+            ),
+            True,
+        )
+        options_templar.available_variables[
+            "vps_static_jobs_active_options"
+        ] = [option for option in live_options if option != "noexec"] + ["exec"]
+        self.assertIs(
+            options_templar.template(
+                trust_as_template("{{ " + options_assertion + " }}")
+            ),
+            False,
+        )
+        shadow_refusal = json.dumps(
+            by_name["Refuse unsafe or shadowed static job backing content"],
+            sort_keys=True,
+        )
+        self.assertIn("backing_content.stdout", shadow_refusal)
+        self.assertIn("explicit migration", shadow_refusal)
+
+        template_task = by_name[
+            "Install the persistent static job tmpfs mount unit"
+        ]["ansible.builtin.template"]
+        self.assertEqual(
+            template_task["dest"],
+            "/etc/systemd/system/{{ vps_static_jobs_mount_unit }}",
+        )
+
+        mount_index = next(
+            index
+            for index, task in enumerate(tasks)
+            if task["name"]
+            == "Enable and start the static job tmpfs before installing the deploy controller"
+        )
+        retire_index = next(
+            index
+            for index, task in enumerate(tasks)
+            if task["name"] == "Remove the obsolete fixed static worker account"
+        )
+        self.assertLess(mount_index, retire_index)
+        mount_task = tasks[mount_index]["ansible.builtin.systemd_service"]
+        self.assertEqual(mount_task["name"], "{{ vps_static_jobs_mount_unit }}")
+        self.assertIs(mount_task["enabled"], True)
+        self.assertEqual(mount_task["state"], "started")
+        self.assertIs(mount_task["daemon_reload"], True)
+        self.assertEqual(tasks[mount_index]["when"], "not ansible_check_mode")
+
+        site = yaml.safe_load(
+            (ROOT / "ansible/playbooks/site.yml").read_text(encoding="utf-8")
+        )
+        roles = [entry["role"] for entry in site[0]["roles"]]
+        self.assertLess(roles.index("layout"), roles.index("deploy"))
+
     def test_repository_check_anchors_platform_candidate_to_full_git_history(self) -> None:
         workflow = yaml.safe_load(
             (ROOT / ".github/workflows/validate.yml").read_text(encoding="utf-8")
@@ -864,6 +1015,27 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "network",
                 "inspect",
                 "{{ item.name }}",
+            ],
+            ("layout", "Inspect an active static job backing mount"): [
+                "/usr/bin/findmnt",
+                "--json",
+                "--mountpoint",
+                "{{ vps_static_jobs_backing_path }}",
+                "--output",
+                "TARGET,SOURCE,FSTYPE,OPTIONS",
+            ],
+            (
+                "layout",
+                "Inspect content that would be shadowed by the static job mount",
+            ): [
+                "/usr/bin/find",
+                "{{ vps_static_jobs_backing_path }}",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-print",
+                "-quit",
             ],
             ("ssh", "Read effective deploy SSH policy"): [
                 "/usr/sbin/sshd",

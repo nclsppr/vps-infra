@@ -120,7 +120,7 @@ Le playbook `site.yml` :
 6. crée les réseaux externes ;
 7. installe le wrapper de déploiement root-owned depuis un SHA `vps-infra`
    prouvé sur `origin/main` ;
-8. installe l’outil OCI utilisé pour les sites statiques ;
+8. installs the attestation client used for static sites;
 9. installe les fichiers déchiffrés avec les propriétaires et modes attendus ;
 10. configure la clé GHCR en lecture seule ;
 11. configure l’origine HTTPS publique de `vps-infra`, ou une deploy key si sa
@@ -131,9 +131,23 @@ Le playbook `site.yml` :
 
 The current tranche delivers points 1 to 8 and 11 to 13. It uses the public
 HTTPS repository and installs a trigger key only when the operator supplies
-one. ORAS 1.3.0 is pinned by release archive and executable checksums. Personal
-and Papers Empire are public GHCR packages, so their materializer uses
-anonymous access and an empty registry configuration.
+one. GitHub CLI 2.97.0 is pinned by release archive and executable checksums.
+Personal, Papers Empire, and platform integration are public GHCR packages.
+Their materializer uses anonymous bounded registry downloads in short-lived
+systemd `DynamicUser` executions. One execution fetches each attestation bundle
+set. The root orchestrator copies that set and removes the fetch state. A new
+sequential offline execution of the same fixed transient unit gives the local
+bundle and digest-bound OCI manifest to GitHub CLI. The fixed unit name
+prevents concurrent worker creation. No execution receives an operator token.
+ORAS remains in the locked local and
+CI toolchain; reconstruction does not install it on Atlas.
+
+Before a static activation, supply the exact application source revision, site
+digest, route digest, platform integration revision, integration digest, and
+Caddy image digest. The integration package and the protected infrastructure
+mirror must name the same Caddy image. An attestation proves the exact source
+ref and workflow. It does not prove branch protection. Restore the repository
+rulesets as a separate reconstruction step before production activation.
 
 The role creates the private secret root but does not materialize a secret. A
 GHCR credential for private application images, decrypted secrets, the live
@@ -209,9 +223,9 @@ fichier hosts :
 
 - validation TLS stricte si les certificats ont été obtenus par DNS-01 avant la
   bascule ;
-- inventaire complet des fichiers `personal` : EN/FR, Work, CV, Blog et
-  articles, Dashboard, Claude, archive, erreurs et assets ;
-- probes séparées des redirections de domaines, dont le domaine historique ;
+- complete `personal` file inventory: EN/FR, Work, CV, Blog, articles,
+  Dashboard, Claude, archive, error pages, and assets;
+- separate probes for domain redirects, including the historical domain;
 - jeu, langues, Dashboard et documentation de Papers Empire ;
 - santé Backend, Onboarding, Commande, Dashboard et documentation Surplasse ;
 - fermeture publique des métriques, Swagger et interfaces internes ;

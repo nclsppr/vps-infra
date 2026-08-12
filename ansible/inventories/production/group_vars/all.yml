@@ -8,7 +8,6 @@ vps_hostname: "{{ inventory_hostname }}"
 vps_timezone: Europe/Paris
 vps_admin_user: vpsadmin
 vps_deploy_user: deploy
-vps_static_user: vps-static
 # A port change requires a two-connection migration. This baseline keeps port
 # 22 and does not simulate that migration.
 vps_ssh_port: 22
