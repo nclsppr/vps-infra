@@ -52,11 +52,26 @@ Le premier socle exécutable est livré :
   allowlist. The workflow verifies the manifest and both GHCR layer payloads
   before it creates and verifies GitHub provenance.
 
-The Atlas host is now provisioned from this repository. It passed bootstrap,
-repeated convergence, a bounded predictive check, and a complete reboot. No
-DNS zone, application release, platform service, or production data was
-changed. The manifest keeps every unit at `enabled: false`. Its root policy
-rejects activation, and the controller still has no live applicator.
+The Atlas host is provisioned from this repository. It passed bootstrap,
+repeated convergence, a bounded predictive check, and a complete reboot. The
+controlled operator rollout now has this live state:
+
+- the public static edge serves `nicolaspieper.com`, `papersempire.com`, and the
+  static Parkventory demo over HTTPS;
+- the apex and `www` DNS records for these three sites point to Atlas by IPv4,
+  with no public AAAA record;
+- PostgreSQL, Prometheus, Grafana, Node Exporter, and PostgreSQL Exporter run as
+  the private internal platform;
+- only SSH, HTTP, and HTTPS use public host ports. Grafana binds to loopback.
+  PostgreSQL and the metrics endpoints have no host port;
+- the local PostgreSQL backup and isolated restore-rehearsal timers are active.
+
+This bounded rollout does not enable the release manifest or install the live
+release applicator. The manifest keeps every dynamic application at
+`enabled: false`, its root policy rejects activation, and the runtime doctor
+reports the missing desired and active release records as expected warnings.
+`parkventory.com` is a static demonstration only. `surplasse.com` keeps its
+previous DNS target and Atlas does not serve a Surplasse application.
 
 The release contract can validate a complete immutable candidate declaration
 while the platform stays disabled. Candidate evidence is checked before the
