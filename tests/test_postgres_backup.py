@@ -177,7 +177,11 @@ elif arguments[0] == "exec":
         )
         sys.stdout.buffer.write(b"PGDMP" + database.encode("utf-8"))
     elif executable == "pg_restore":
-        sys.stdin.buffer.read()
+        archive = sys.stdin.buffer.read()
+        if not archive.startswith(b"PGDMP"):
+            raise SystemExit(12)
+        if "--list" in command and command != ["pg_restore", "--list"]:
+            raise SystemExit(13)
         if failure_marker.exists() and "--create" in command:
             raise SystemExit(9)
     elif executable == "psql":
@@ -272,6 +276,18 @@ else:
             self.assertEqual(verified.returncode, 0, verified.stderr)
             commands = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
             self.assertTrue(any(command[:1] == ["ps"] for command in commands))
+            archive_verifications = [
+                command
+                for command in commands
+                if "pg_restore" in command and "--list" in command
+            ]
+            self.assertEqual(
+                archive_verifications,
+                [
+                    ["exec", "--interactive", "a" * 64, "pg_restore", "--list"],
+                    ["exec", "--interactive", "a" * 64, "pg_restore", "--list"],
+                ],
+            )
             self.assertFalse(any(command[:1] in (["rm"], ["volume"]) for command in commands))
 
     def test_verifier_rejects_modified_archive_and_symlink(self) -> None:
