@@ -120,6 +120,13 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
   visibilité du dépôt.
 - [GitHub — usage sécurisé des Actions](https://docs.github.com/en/actions/reference/security/secure-use) :
   risques des runners auto-hébergés persistants et recommandations de sécurité.
+- [GitHub — permissions des packages](https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages) :
+  téléchargement d'un package associé au dépôt avec le `GITHUB_TOKEN` du
+  workflow, y compris lorsqu'il est privé.
+- [Trivy - container image scanning](https://trivy.dev/docs/latest/guide/target/container_image/) :
+  scan strict d’une image locale ou distante par digest.
+- [Trivy - private registries](https://trivy.dev/docs/latest/advanced/private-registries/) :
+  authentification limitée au registre via la configuration Docker.
 - [ORAS — registres OCI compatibles](https://oras.land/docs/compatible_oci_registries/) :
   push et pull de fichiers dans GHCR.
 

@@ -266,6 +266,15 @@ Pour commencer sans jeton inter-dépôts, l’opérateur peut lancer manuellemen
 La phase suivante utilise un GitHub App ou un jeton finement limité au seul
 dépôt d’infrastructure pour ouvrir automatiquement la pull request.
 
+The shared Caddy image has an additional fail-closed gate. A pull request builds
+native `linux/amd64` and `linux/arm64` images from the committed Go graph. It
+verifies the OVH module and Caddy configuration, then rejects every HIGH or
+CRITICAL finding with the digest-pinned Trivy scanner. A `main` build can push
+an image before the remote scan, but it cannot attest or propose that image for
+promotion until both exact child manifest digests pass the same policy. The
+workflow then verifies OCI source and revision labels and GitHub provenance.
+There is no initial vulnerability ignore list.
+
 Le futur workflow de promotion d’infrastructure ne devra jamais faire confiance
 au seul payload reçu. Avant déverrouillage, il devra vérifier :
 

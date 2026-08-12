@@ -156,10 +156,14 @@ The Surplasse route candidate must preserve these requirements:
   Swagger) ;
 - healthcheck public dédié.
 
-Le module DNS est compilé une seule fois dans l’image Caddy plateforme, avec une
-version ou un commit explicite. Le fournisseur et le jeton limité à la zone
-restent une porte de mise en œuvre ; ils ne doivent pas être déduits de
-l’environnement local.
+The platform Caddy image compiles the DNS module once. The generated entry
+point, full `go.mod`, and `go.sum` lock the complete graph. The build rejects a
+graph change with `-mod=readonly`. Architecture-specific Alpine fixes use exact
+URLs and SHA-256 values, then install with network access disabled. The pull
+request workflow scans native `amd64` and `arm64` images. The publication
+workflow scans both exact child manifest digests before it creates GitHub
+provenance. The zone-scoped provider identity remains a separate implementation
+gate. It must not be inferred from a local environment or a build credential.
 
 La stratégie TLS de bascule doit éviter un cercle vicieux. La préférence est
 DNS-01 pour chaque zone de production, avec un jeton distinct et limité par

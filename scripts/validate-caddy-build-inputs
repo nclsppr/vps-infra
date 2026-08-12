@@ -24,10 +24,8 @@ source_path=$1
 
 builder=
 runtime=
-module=
 builder_seen=false
 runtime_seen=false
-module_seen=false
 
 while IFS= read -r line || [[ -n "$line" ]]; do
   case "$line" in
@@ -48,22 +46,15 @@ while IFS= read -r line || [[ -n "$line" ]]; do
       runtime=$value
       runtime_seen=true
       ;;
-    CADDY_DNS_MODULE)
-      [[ "$module_seen" == false ]] || fail "duplicate key: $key"
-      module=$value
-      module_seen=true
-      ;;
     *) fail "unexpected key: $key" ;;
   esac
 done <"$source_path"
 
 [[ "$builder_seen" == true ]] || fail "missing key: CADDY_BUILDER_IMAGE"
 [[ "$runtime_seen" == true ]] || fail "missing key: CADDY_RUNTIME_IMAGE"
-[[ "$module_seen" == true ]] || fail "missing key: CADDY_DNS_MODULE"
 
 builder_pattern='^docker\.io/library/caddy:([0-9]+\.[0-9]+\.[0-9]+)-builder-alpine@sha256:[0-9a-f]{64}$'
 runtime_pattern='^docker\.io/library/caddy:([0-9]+\.[0-9]+\.[0-9]+)-alpine@sha256:[0-9a-f]{64}$'
-module_pattern='^github\.com/caddy-dns/ovh@[0-9a-f]{40}$'
 
 [[ "$builder" =~ $builder_pattern ]] || fail "invalid CADDY_BUILDER_IMAGE"
 builder_version=${BASH_REMATCH[1]}
@@ -72,14 +63,53 @@ runtime_version=${BASH_REMATCH[1]}
 [[ "$builder_version" == "$runtime_version" ]] || {
   fail "builder and runtime Caddy versions differ"
 }
-[[ "$module" =~ $module_pattern ]] || fail "invalid CADDY_DNS_MODULE"
+
+build_directory=$(dirname -- "$source_path")/build
+main_file=$build_directory/main.go
+go_mod=$build_directory/go.mod
+go_sum=$build_directory/go.sum
+[[ -f "$main_file" ]] || fail "missing generated main.go"
+[[ -f "$go_mod" ]] || fail "missing go.mod"
+[[ -f "$go_sum" ]] || fail "missing go.sum"
+
+[[ $(grep -Fxc $'\t_ "github.com/caddyserver/caddy/v2/modules/standard"' "$main_file") -eq 1 ]] || {
+  fail "generated main.go must import the Caddy standard modules once"
+}
+[[ $(grep -Fxc $'\t_ "github.com/caddy-dns/ovh"' "$main_file") -eq 1 ]] || {
+  fail "generated main.go must import the OVH module once"
+}
+
+caddy_version=$(awk '$1 == "github.com/caddyserver/caddy/v2" { print $2 }' "$go_mod")
+ovh_version=$(awk '$1 == "github.com/caddy-dns/ovh" { print $2 }' "$go_mod")
+text_version=$(awk '$1 == "replace" && $2 == "golang.org/x/text" && $3 == "=>" && $4 == "golang.org/x/text" { print $5 }' "$go_mod")
+grpc_version=$(awk '$1 == "replace" && $2 == "google.golang.org/grpc" && $3 == "=>" && $4 == "google.golang.org/grpc" { print $5 }' "$go_mod")
+version_pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
+[[ "$caddy_version" =~ $version_pattern ]] || fail "invalid locked Caddy version"
+[[ "$ovh_version" =~ $version_pattern ]] || fail "invalid locked OVH module version"
+[[ "$text_version" =~ $version_pattern ]] || fail "invalid x/text replacement"
+[[ "$grpc_version" =~ $version_pattern ]] || fail "invalid gRPC replacement"
+[[ $(grep -c '^replace ' "$go_mod") -eq 2 ]] || {
+  fail "go.mod must contain only the reviewed x/text and gRPC replacements"
+}
+[[ "${caddy_version#v}" == "$builder_version" ]] || {
+  fail "locked Caddy version differs from the base images"
+}
+
+for locked_module in \
+  "github.com/caddyserver/caddy/v2 $caddy_version" \
+  "github.com/caddy-dns/ovh $ovh_version" \
+  "golang.org/x/text $text_version" \
+  "google.golang.org/grpc $grpc_version"; do
+  grep -Fq "$locked_module h1:" "$go_sum" || {
+    fail "go.sum does not lock $locked_module"
+  }
+done
 
 if [[ -n "$github_output" ]]; then
   [[ -f "$github_output" ]] || fail "GitHub output is not a file: $github_output"
   {
     printf 'builder=%s\n' "$builder"
     printf 'runtime=%s\n' "$runtime"
-    printf 'module=%s\n' "$module"
   } >>"$github_output"
 else
   printf 'Caddy build inputs valid: %s\n' "$source_path"

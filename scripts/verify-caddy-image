@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  printf 'usage: %s IMAGE\n' "${0##*/}" >&2
+  exit 2
+}
+
+fail() {
+  printf 'Caddy image verification failed: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+image=$1
+[[ -n "$image" ]] || usage
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd -P)
+go_mod=$repository_root/platform/caddy/build/go.mod
+
+caddy_version=$(awk '$1 == "github.com/caddyserver/caddy/v2" { print $2 }' "$go_mod")
+ovh_version=$(awk '$1 == "github.com/caddy-dns/ovh" { print $2 }' "$go_mod")
+text_version=$(awk '$1 == "replace" && $2 == "golang.org/x/text" { print $5 }' "$go_mod")
+grpc_version=$(awk '$1 == "replace" && $2 == "google.golang.org/grpc" { print $5 }' "$go_mod")
+
+docker_run=(docker run --rm)
+if [[ -n ${CADDY_DOCKER_PLATFORM:-} ]]; then
+  [[ $CADDY_DOCKER_PLATFORM =~ ^linux/(amd64|arm64)$ ]] || {
+    fail "unsupported CADDY_DOCKER_PLATFORM"
+  }
+  docker_run+=(--platform "$CADDY_DOCKER_PLATFORM")
+fi
+
+# The single-quoted program runs inside the verified image.
+# shellcheck disable=SC2016
+"${docker_run[@]}" \
+  --entrypoint /bin/sh \
+  --env "EXPECTED_CADDY_VERSION=$caddy_version" \
+  --env "EXPECTED_OVH_VERSION=$ovh_version" \
+  --env "EXPECTED_TEXT_VERSION=$text_version" \
+  --env "EXPECTED_GRPC_VERSION=$grpc_version" \
+  "$image" -eu -c '
+    case "$(caddy version)" in
+      "${EXPECTED_CADDY_VERSION} "*) ;;
+      *) exit 1 ;;
+    esac
+    modules=$(caddy list-modules --packages)
+    printf "%s\n" "$modules" \
+      | grep -Fqx "dns.providers.ovh github.com/caddy-dns/ovh"
+    build_info=$(caddy build-info)
+    tab=$(printf "\t")
+    printf "%s\n" "$build_info" \
+      | grep -Fq "github.com/caddyserver/caddy/v2${tab}${EXPECTED_CADDY_VERSION}"
+    printf "%s\n" "$build_info" \
+      | grep -Fq "github.com/caddy-dns/ovh${tab}${EXPECTED_OVH_VERSION}"
+    printf "%s\n" "$build_info" \
+      | grep -Fq "golang.org/x/text${tab}${EXPECTED_TEXT_VERSION}"
+    printf "%s\n" "$build_info" \
+      | grep -Fq "google.golang.org/grpc${tab}${EXPECTED_GRPC_VERSION}"
+    installed=$(apk list --installed)
+    printf "%s\n" "$installed" | grep -Eq "^c-ares-1\\.34\\.8-r0 "
+    printf "%s\n" "$installed" | grep -Eq "^curl-8\\.20\\.0-r0 "
+    printf "%s\n" "$installed" | grep -Eq "^libcurl-8\\.20\\.0-r0 "
+  ' || fail "binary or package contract failed for $image"
+
+secrets=$(mktemp -d)
+candidate_routes=$(mktemp -d)
+trap 'rm -rf -- "$secrets" "$candidate_routes"' EXIT
+
+route_sources=("$repository_root"/platform/caddy/routes/*.caddy.disabled)
+[[ -f ${route_sources[0]} ]] || fail "no Caddy route candidate exists"
+for source in "${route_sources[@]}"; do
+  target=$candidate_routes/$(basename -- "${source%.disabled}")
+  cp -- "$source" "$target"
+done
+
+"${docker_run[@]}" \
+  --volume "$repository_root/platform/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  --volume "$repository_root/platform/caddy/routes:/etc/caddy/routes:ro" \
+  "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
+  || fail "inactive Caddy configuration is invalid"
+
+for name in application-key application-secret consumer-key; do
+  printf 'validation-placeholder\n' >"$secrets/$name"
+done
+
+"${docker_run[@]}" \
+  --env OVH_APPLICATION_KEY_FILE=/run/secrets/ovh-application-key \
+  --env OVH_APPLICATION_SECRET_FILE=/run/secrets/ovh-application-secret \
+  --env OVH_CONSUMER_KEY_FILE=/run/secrets/ovh-consumer-key \
+  --volume "$secrets/application-key:/run/secrets/ovh-application-key:ro" \
+  --volume "$secrets/application-secret:/run/secrets/ovh-application-secret:ro" \
+  --volume "$secrets/consumer-key:/run/secrets/ovh-consumer-key:ro" \
+  --volume "$repository_root/platform/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  --volume "$candidate_routes:/etc/caddy/routes:ro" \
+  "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
+  || fail "candidate Caddy configuration is invalid"
+
+printf 'Caddy image verified: %s\n' "$image"

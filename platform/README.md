@@ -22,13 +22,48 @@ The upstream Caddy image does not contain an OVH DNS provider. CI builds one
 Caddy image with `caddy-dns/ovh` v1.1.0 at commit
 `17fd665136b593153167bf9dfee9a3c0bd2c7ac0`.
 
-`platform/caddy/build.env` defines the immutable upstream images and module
-commit used to build that custom image. `CADDY_PLATFORM_IMAGE` in
-`platform/.env.example` is the promotion point for an already published and
-attested output. It remains an upstream structural-validation placeholder in
-this locked baseline. Promote a verified custom-image digest in a separate
-pull request. A promotion does not rebuild the image. Production must use the
-custom image by digest.
+`platform/caddy/build.env` defines the immutable upstream images. The generated
+entry point and complete Go graph are in `platform/caddy/build/`. The graph
+locks Caddy v2.11.4, the OVH module v1.1.0, `golang.org/x/text` v0.39.0, and
+`google.golang.org/grpc` v1.82.1. The build uses `go build -mod=readonly` and
+the committed `go.sum`. It does not let `xcaddy` resolve a new graph during a
+production build.
+
+The runtime layer installs the reviewed Alpine 3.23 fixes for `c-ares`, `curl`,
+and `libcurl`. The Dockerfile downloads each architecture-specific APK from an
+exact URL with a BuildKit SHA-256 check. `apk` then installs only these local
+files with network access disabled. A missing file, changed payload, missing
+dependency, or checksum mismatch fails the build.
+
+`CADDY_PLATFORM_IMAGE` in `platform/.env.example` is the promotion point for an
+already published and attested output. It remains an upstream
+structural-validation placeholder in this locked baseline. Promote a verified
+custom-image digest in a separate pull request. A promotion does not rebuild
+the image. Production must use the custom image by digest.
+
+## Caddy publication gate
+
+The Caddy image workflow fails closed at two points:
+
+1. Each pull request builds and loads native `linux/amd64` and `linux/arm64`
+   images. It verifies the OVH module, both route sets, locked package versions,
+   and the Caddy dependency graph. Trivy 0.73.0 then rejects every HIGH or
+   CRITICAL vulnerability, including findings without a published fix. The
+   workflow has no vulnerability ignore file or ignore flag.
+2. A `main` build publishes a multi-architecture image without GitHub
+   provenance. The workflow resolves both child manifest digests, verifies the
+   OCI source and revision labels, verifies both exact images, and scans both
+   child digests directly from GHCR. Trivy creates an ephemeral, GHCR-scoped
+   registry login with the job's `GITHUB_TOKEN` and `--password-stdin`, then
+   mounts that configuration read-only for each scan. The Trivy containers run
+   with the runner UID and GID so their temporary authentication and shared
+   database cache remain removable. They do not require a Docker socket. Public
+   packages also remain anonymously readable. Only a successful scan can create
+   and verify GitHub build provenance or show a digest for a separate promotion
+   pull request.
+
+The pushed package can exist when a post-push gate fails. Such a package has no
+verified GitHub provenance and must not be promoted.
 
 ## Application state
 
@@ -138,6 +173,8 @@ The contract performs these platform checks:
 - It validates each inactive Prometheus rule candidate.
 - It validates Caddy with the inactive route set.
 - It validates all Caddy route candidates with placeholder OVH credentials.
+- It verifies the Caddy version, OVH module, Go replacements, and fixed Alpine
+  package versions in the locally built image.
 
 The checks do not start the platform. They do not call the OVH API. The
 `--structural-only` Compose mode is valid only for local analysis. A production
