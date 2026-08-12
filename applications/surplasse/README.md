@@ -68,27 +68,80 @@ The Backend always receives `QUARKUS_FLYWAY_MIGRATE_AT_START=false`. It uses
 each versioned migration from V1 through V14. It does not include the repeatable
 development seed.
 
-## Secret file contract
+## Operator input contract
 
-The future applicator must create these files under
-`/etc/vps/secrets/surplasse` as `root:10001` with mode `0440`. GID `10001` is
-the dedicated group of the Backend and migrator containers. Docker Compose
-file secrets preserve the host file ownership; they do not remap it:
+The preparation controller installs a root-only helper at
+`/usr/local/libexec/vps/materialize-surplasse-secrets`. It creates the two
+database passwords, but it never creates an operator value. The operator must
+stage the following files in a separate `root:root 0700` directory. Each source
+file must be root-owned, regular, single-linked, and inaccessible to group and
+other users:
 
 ```text
 surplasse-jwt-jwks
 surplasse-jwt-private-key
-surplasse-postgres-migrator-password
-surplasse-postgres-runtime-password
+surplasse-jwt-key-id
+surplasse-smtp-host
+surplasse-smtp-port
 surplasse-smtp-password
 surplasse-smtp-username
 surplasse-stripe-account-webhook-secret
 surplasse-stripe-payment-webhook-secret
 surplasse-stripe-secret-key
+ovh-application-key
+ovh-application-secret
+ovh-consumer-key
 ```
 
-The repository contains only file paths. It contains no value for these
-secrets.
+Every single-line input must end with one newline. The Stripe key must be a
+live secret key. Both webhook values must have the Stripe signing-secret
+prefix. The OVH values must match their documented token lengths. The SMTP
+host must be a DNS name and the port must be in the TCP port range.
+
+The helper parses the JWKS as strict UTF-8 JSON. It rejects duplicate JSON
+keys, private RSA parameters, keys other than RS256 signing keys, an RSA key
+shorter than 2048 bits, and an exponent other than 65537. It uses OpenSSL to
+validate the unencrypted RSA private key. It then proves that the private key
+matches the public key selected by `surplasse-jwt-key-id`.
+
+After the complete source bundle passes, install it without putting a value on
+the command line:
+
+```bash
+sudo /usr/local/libexec/vps/materialize-surplasse-secrets \
+  --install-operator-from /run/surplasse-operator-inputs
+sudo /usr/local/libexec/vps/materialize-surplasse-secrets --operator-only
+```
+
+The destination is `/etc/vps/secrets/surplasse`. Values mounted in the Backend
+are `root:10001 0440`. The OVH values and the three controller-only inputs
+(`surplasse-jwt-key-id`, `surplasse-smtp-host`, and
+`surplasse-smtp-port`) are `root:root 0400`. The helper stages each replacement
+in the destination, calls `fsync`, and uses an atomic rename. It does not print
+a value. Repeating the command with the same valid bundle is safe.
+
+The rename is atomic for each file. It is not a multi-file transaction. A
+future activation controller must validate the complete installed bundle again
+immediately before its first mutation. An interrupted rotation can then leave
+only a fail-closed mixed bundle. A directory-version and symlink switch would
+need different Compose source paths and belongs in a separate reviewed change.
+
+The helper also owns these generated files in the same destination:
+
+```text
+surplasse-postgres-migrator-password
+surplasse-postgres-runtime-password
+```
+
+GID `10001` is the dedicated group of the Backend and migrator containers.
+Docker Compose file secrets preserve the host file ownership; they do not
+remap it. The repository contains only file names and validation rules. It
+contains no value.
+
+Offline token validation cannot prove OVH IAM scope. Activation must still
+verify that the permanent Caddy identity is limited to the `surplasse.com`
+DNS-01 operations. Never reuse an OVH credential after it appeared in a chat,
+issue, log, or commit.
 
 ## Local validation
 

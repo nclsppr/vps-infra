@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.machinery
 import importlib.util
 import json
@@ -15,7 +16,6 @@ import unittest
 from pathlib import Path
 
 import yaml
-
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
@@ -41,6 +41,79 @@ PROVISIONER = load_script(
 
 
 class SurplasseControllerTests(unittest.TestCase):
+    def write_operator_bundle(self, root: Path) -> dict[str, bytes]:
+        root.mkdir(mode=0o700)
+        signing_material = subprocess.run(
+            [
+                "openssl",
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        modulus_output = (
+            subprocess.run(
+                ["openssl", "rsa", "-noout", "-modulus"],
+                input=signing_material,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            .stdout.decode("ascii")
+            .strip()
+        )
+        self.assertTrue(modulus_output.startswith("Modulus="))
+        modulus = bytes.fromhex(modulus_output.removeprefix("Modulus="))
+
+        def base64url(value: bytes) -> str:
+            return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+        key_id = "atlas-2026-08"
+        jwks = (
+            json.dumps(
+                {
+                    "keys": [
+                        {
+                            "alg": "RS256",
+                            "e": base64url((65537).to_bytes(3, "big")),
+                            "kid": key_id,
+                            "kty": "RSA",
+                            "n": base64url(modulus),
+                            "use": "sig",
+                        }
+                    ]
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        values = {
+            "surplasse-jwt-jwks": jwks,
+            "surplasse-jwt-private-key": signing_material,
+            "surplasse-jwt-key-id": key_id.encode("ascii") + b"\n",
+            "surplasse-smtp-host": b"smtp.example.invalid\n",
+            "surplasse-smtp-port": b"587\n",
+            "surplasse-smtp-password": b"smtp-password-for-test-only\n",
+            "surplasse-smtp-username": b"surplasse-test\n",
+            "surplasse-stripe-account-webhook-secret": b"whsec_" + b"A" * 32 + b"\n",
+            "surplasse-stripe-payment-webhook-secret": b"whsec_" + b"B" * 32 + b"\n",
+            "surplasse-stripe-secret-key": b"sk_" + b"live_" + b"C" * 32 + b"\n",
+            "ovh-application-key": b"D" * 16 + b"\n",
+            "ovh-application-secret": b"E" * 32 + b"\n",
+            "ovh-consumer-key": b"F" * 32 + b"\n",
+        }
+        for name, value in values.items():
+            path = root / name
+            path.write_bytes(value)
+            path.chmod(0o600)
+        return values
+
     def rendered_compose(self, root: Path) -> Path:
         output = root / "compose.json"
         result = subprocess.run(
@@ -128,28 +201,182 @@ class SurplasseControllerTests(unittest.TestCase):
                 env=environment,
             )
             self.assertNotEqual(complete.returncode, 0)
-            self.assertIn("operator-supplied secret surplasse-jwt-jwks is missing", complete.stderr)
+            self.assertIn(
+                "operator-supplied secret surplasse-jwt-jwks is missing",
+                complete.stderr,
+            )
+
+    def test_operator_bundle_is_validated_materialized_and_idempotent(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            values = self.write_operator_bundle(root / "source")
+            environment = os.environ.copy()
+            environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
+            command = [
+                str(SCRIPTS / "materialize-surplasse-secrets"),
+                "--install-operator-from",
+                str(root / "source"),
+                "--test-root",
+                str(protected_root),
+            ]
+            first = subprocess.run(
+                command, check=False, capture_output=True, text=True, env=environment
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            combined_output = (first.stdout + first.stderr).encode("utf-8")
+            for value in values.values():
+                self.assertNotIn(value.strip(), combined_output)
+            for name, value in values.items():
+                path = protected_root / name
+                self.assertEqual(path.read_bytes(), value)
+                expected_mode = (
+                    0o400
+                    if name
+                    in {
+                        "ovh-application-key",
+                        "ovh-application-secret",
+                        "ovh-consumer-key",
+                        "surplasse-jwt-key-id",
+                        "surplasse-smtp-host",
+                        "surplasse-smtp-port",
+                    }
+                    else 0o440
+                )
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
+            inode_contract = {
+                name: (protected_root / name).stat().st_ino for name in values
+            }
+
+            second = subprocess.run(
+                command, check=False, capture_output=True, text=True, env=environment
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(
+                values,
+                {name: (protected_root / name).read_bytes() for name in values},
+            )
+            self.assertEqual(
+                inode_contract,
+                {name: (protected_root / name).stat().st_ino for name in values},
+            )
+            validation = subprocess.run(
+                [
+                    str(SCRIPTS / "materialize-surplasse-secrets"),
+                    "--operator-only",
+                    "--test-root",
+                    str(protected_root),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(validation.returncode, 0, validation.stderr)
+
+    def test_invalid_operator_bundle_is_rejected_without_materialization(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source = root / "source"
+            self.write_operator_bundle(source)
+            invalid = source / "surplasse-stripe-secret-key"
+            invalid.write_bytes(b"sk_" + b"test_" + b"X" * 32 + b"\n")
+            invalid.chmod(0o600)
+            sentinel = protected_root / "surplasse-smtp-host"
+            sentinel.write_bytes(b"existing.example.invalid\n")
+            sentinel.chmod(0o400)
+            before = {
+                path.name: (path.read_bytes(), path.stat().st_ino)
+                for path in protected_root.iterdir()
+            }
+            environment = os.environ.copy()
+            environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
+            result = subprocess.run(
+                [
+                    str(SCRIPTS / "materialize-surplasse-secrets"),
+                    "--install-operator-from",
+                    str(source),
+                    "--test-root",
+                    str(protected_root),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("stripe-secret-key format", result.stderr)
+            self.assertEqual(
+                before,
+                {
+                    path.name: (path.read_bytes(), path.stat().st_ino)
+                    for path in protected_root.iterdir()
+                },
+            )
+
+    def test_operator_bundle_rejects_a_jwt_kid_mismatch(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source = root / "source"
+            self.write_operator_bundle(source)
+            key_id = source / "surplasse-jwt-key-id"
+            key_id.write_bytes(b"different-active-key\n")
+            key_id.chmod(0o600)
+            environment = os.environ.copy()
+            environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
+            result = subprocess.run(
+                [
+                    str(SCRIPTS / "materialize-surplasse-secrets"),
+                    "--install-operator-from",
+                    str(source),
+                    "--test-root",
+                    str(protected_root),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("active kid exactly once", result.stderr)
+            self.assertEqual(list(protected_root.iterdir()), [])
 
     def test_postgres_provisioning_sql_separates_roles(self) -> None:
         statements: list[tuple[str, str]] = []
         original_psql = PROVISIONER.psql
         original_command = PROVISIONER.command
         try:
-            PROVISIONER.psql = lambda container, database, sql: statements.append(
-                (database, sql)
-            ) or ""
-            PROVISIONER.command = lambda arguments, input_text=None: subprocess.CompletedProcess(
-                arguments,
-                0,
-                "false|true|true|surplasse_owner|true|true|false\n",
-                "",
+            PROVISIONER.psql = (
+                lambda container, database, sql: statements.append((database, sql))
+                or ""
+            )
+            PROVISIONER.command = (
+                lambda arguments, input_text=None: subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    "false|true|true|surplasse_owner|true|true|false\n",
+                    "",
+                )
             )
             PROVISIONER.provision("postgres-container", "A" * 64, "B" * 64)
         finally:
             PROVISIONER.psql = original_psql
             PROVISIONER.command = original_command
 
-        self.assertEqual([database for database, _ in statements], ["postgres", "surplasse"])
+        self.assertEqual(
+            [database for database, _ in statements], ["postgres", "surplasse"]
+        )
         sql = "\n".join(statement for _, statement in statements)
         self.assertIn("CREATE ROLE surplasse_owner NOLOGIN", sql)
         self.assertIn("GRANT surplasse_owner TO surplasse_migrator", sql)
@@ -178,7 +405,9 @@ class SurplasseControllerTests(unittest.TestCase):
     def test_platform_attachment_candidates_are_minimal(self) -> None:
         integration = ROOT / "applications/surplasse/integration"
         internal = yaml.safe_load(
-            (integration / "internal-platform.override.yaml").read_text(encoding="utf-8")
+            (integration / "internal-platform.override.yaml").read_text(
+                encoding="utf-8"
+            )
         )
         self.assertEqual(set(internal["services"]), {"postgresql", "prometheus"})
         self.assertEqual(
@@ -200,6 +429,31 @@ class SurplasseControllerTests(unittest.TestCase):
         self.assertEqual(
             set(edge["services"]["caddy"]["networks"]),
             {"edge", "app_surplasse"},
+        )
+
+    def test_operator_input_inventory_is_exact(self) -> None:
+        defaults = yaml.safe_load(
+            (ROOT / "ansible/roles/surplasse/defaults/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            set(defaults["vps_surplasse_operator_inputs"]),
+            {
+                "ovh-application-key",
+                "ovh-application-secret",
+                "ovh-consumer-key",
+                "surplasse-jwt-jwks",
+                "surplasse-jwt-key-id",
+                "surplasse-jwt-private-key",
+                "surplasse-smtp-host",
+                "surplasse-smtp-password",
+                "surplasse-smtp-port",
+                "surplasse-smtp-username",
+                "surplasse-stripe-account-webhook-secret",
+                "surplasse-stripe-payment-webhook-secret",
+                "surplasse-stripe-secret-key",
+            },
         )
 
 
