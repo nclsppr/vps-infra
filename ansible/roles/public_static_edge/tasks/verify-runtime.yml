@@ -105,6 +105,7 @@
   loop:
     - nicolaspieper.com
     - papersempire.com
+    - parkventory.com
   become: false
   delegate_to: localhost
   when: vps_public_static_edge_state == 'activate'
@@ -123,6 +124,7 @@
   loop:
     - www.nicolaspieper.com
     - www.papersempire.com
+    - www.parkventory.com
   become: false
   delegate_to: localhost
   when: vps_public_static_edge_state == 'activate'

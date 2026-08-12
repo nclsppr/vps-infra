@@ -1,4 +1,4 @@
-parkventory.com {
+http://parkventory.com, http://www.parkventory.com {
 	log
 	root * /srv/www/parkventory/current
 	import static_site
@@ -9,9 +9,4 @@ parkventory.com {
 		rewrite @not_found /404.html
 		file_server
 	}
-}
-
-www.parkventory.com {
-	import security_headers
-	redir https://parkventory.com{uri} 308
 }

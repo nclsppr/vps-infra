@@ -142,15 +142,16 @@ platform/caddy/
 ```
 
 The first live unit is `vps-public-static-edge`. It is a separate Compose
-project with exactly one Caddy service and exactly two static route files. It
-mounts the verified `current` roots for Personal and Papers Empire read-only.
+project with exactly one Caddy service and exactly three static route files. It
+mounts the verified `current` roots for Personal, Papers Empire, and the
+Parkventory demo read-only.
 It keeps separate ACME volumes and does not receive a DNS provider credential.
 It joins only the dedicated external `edge` bridge. It does not join the
 internal observability network `ops`.
 The bounded deployment playbook does not enable the locked release applicator
 or start any internal platform service.
 
-The edge has two immutable route releases. Preparation is HTTP-only and can be
+The edge has three immutable route releases. Preparation is HTTP-only and can be
 probed directly against the Atlas address before DNS changes. HTTPS activation
 is allowed only after every authoritative A answer contains Atlas and all old
 AAAA answers are gone. A root-owned symlink switches between revisioned
@@ -208,7 +209,7 @@ Avant tout rechargement :
 
 ## Sites statiques sans runtime dupliqué
 
-`personal` et `papersempire` sont servis directement par Caddy :
+Personal, Papers Empire, and the Parkventory demo are served directly by Caddy:
 
 ```text
 /srv/www/
@@ -218,7 +219,14 @@ Avant tout rechargement :
   papersempire/
     releases/sha256-<site-manifest-digest>/
     current -> releases/sha256-<site-manifest-digest>
+  parkventory/
+    releases/sha256-<site-manifest-digest>/
+    current -> releases/sha256-<site-manifest-digest>
 ```
+
+The Parkventory static release contains only the explicitly labeled demo. Its
+Compose application remains disabled. The static route has no proxy or API
+handler and does not prove backend readiness.
 
 Each CI workflow creates a static archive, calculates its checksum, and
 publishes it as an OCI artifact in GHCR. The VPS manifest references its digest,

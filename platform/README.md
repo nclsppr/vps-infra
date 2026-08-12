@@ -209,6 +209,11 @@ application. A reviewed integration package must update the validator and
 activate each required file as part of the same versioned release change. An
 environment variable cannot activate a file.
 
+The Parkventory candidate now describes only the static demo route. The static
+materializer uses it for the pre-activation HTTPS proof. The isolated public
+edge uses its own reviewed active copy. This does not enable the Parkventory
+Compose application, add an application network, or satisfy a backend gate.
+
 The base Caddy service does not receive an OVH credential or an application
 network. The Caddy entry point requires the three OVH credential files only
 when `surplasse.caddy` is active. This requirement makes an incomplete

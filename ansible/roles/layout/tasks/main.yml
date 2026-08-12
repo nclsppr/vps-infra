@@ -2,7 +2,9 @@
 - name: Validate managed directory and network names
   ansible.builtin.assert:
     that:
-      - vps_static_sites | list | sort == ['papersempire', 'personal']
+      - >-
+        vps_static_sites | list | sort ==
+        ['papersempire', 'parkventory', 'personal']
       - >-
         vps_docker_networks | map(attribute='name') | list | sort ==
         ['app_parkventory', 'app_surplasse', 'db_monitoring',

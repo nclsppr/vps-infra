@@ -449,8 +449,9 @@ déploiement de code courant ne les transporte pas depuis GitHub Actions.
 
 ## Déployer un site statique
 
-`personal` and `papersempire` publish complete archives as OCI artifacts in
-GHCR. The producer workflows use ORAS to publish and attest these artifacts.
+Personal, Papers Empire, and the Parkventory demo publish complete archives as
+OCI artifacts in GHCR. The producer workflows use ORAS to publish and attest
+these artifacts.
 The VPS materializer downloads the site, route, and integration manifests and
 payloads through HTTPS with transfer limits and digest references. The common
 contract defines media types, deterministic archives, source SHA annotations,
@@ -493,6 +494,18 @@ L’archive contient exactement le même `site/` que l’artefact Pages, pas la
 racine du dépôt. `papersempire.com` reste l’apex canonique ; aucune redirection
 vers `www` ne doit changer l’origine de son `localStorage`.
 
+### Parkventory demo
+
+The Parkventory workflow runs the frontend tests and builds the explicit demo
+at the root path. It does not build or publish the development backend. It
+creates deterministic site and route artifacts with direct entries for `/`,
+`/app/`, `/app/partager/`, `/app/trouver/`, and `/auth/callback/`.
+
+The Atlas route serves only `/srv/www/parkventory/current`. It contains no
+`reverse_proxy`, API handler, application port, secret, or database access. The
+production Compose application remains disabled until its separate readiness
+gates pass.
+
 ### Activation
 
 Ansible installs checksum-verified GitHub CLI 2.97.0. ORAS remains a locked
@@ -501,7 +514,7 @@ The operator-facing deployment form of `deploy-static` accepts seven bounded
 arguments:
 
 ```text
-deploy-static <personal|papersempire> <source-sha40> \
+deploy-static <personal|papersempire|parkventory> <source-sha40> \
   <site-ref@sha256> <routes-ref@sha256> \
   <integration-sha40> <integration-ref@sha256> \
   <caddy-image@sha256>
@@ -535,8 +548,9 @@ with `--bundle` and `--custom-trusted-root`. The fixed unit name prevents
 concurrent worker creation. GitHub CLI receives no operator credential.
 
 This provenance check does not prove branch protection. Protect the canonical
-branches of `vps-infra`, Personal, and Papers Empire with repository rulesets as
-a separate gate. Do not replace this control with an attested source ref.
+branches of `vps-infra`, Personal, Papers Empire, and Parkventory with
+repository rulesets as a separate gate. Do not replace this control with an
+attested source ref.
 
 Every registry token response, OCI manifest, payload layer, and attestation
 object has an explicit maximum size. Bounded readers also limit each untrusted

@@ -833,7 +833,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         for route_directory in ("routes-prepare", "routes-activate"):
             self.assertEqual(
                 {path.name for path in (edge_root / route_directory).iterdir()},
-                {"personal.caddy", "papersempire.caddy"},
+                {"personal.caddy", "papersempire.caddy", "parkventory.caddy"},
             )
         route_text = "\n".join(
             path.read_text(encoding="utf-8")
@@ -842,8 +842,8 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertIn("nicolaspieper.com", route_text)
         self.assertIn("papersempire.com", route_text)
+        self.assertIn("parkventory.com", route_text)
         self.assertNotIn("surplasse", route_text.lower())
-        self.assertNotIn("parkventory", route_text.lower())
         self.assertNotIn("grafana", route_text.lower())
         self.assertNotIn("nicolas.pieper.fr", route_text)
         prepare_routes = "\n".join(
@@ -859,10 +859,13 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "www.nicolaspieper.com",
             "papersempire.com",
             "www.papersempire.com",
+            "parkventory.com",
+            "www.parkventory.com",
         ):
             self.assertIn(f"http://{domain}", prepare_routes)
         self.assertNotIn("http://nicolaspieper.com", activate_routes)
         self.assertNotIn("http://papersempire.com", activate_routes)
+        self.assertNotIn("http://parkventory.com", activate_routes)
         caddyfile = (edge_root / "Caddyfile").read_text(encoding="utf-8")
         self.assertIn("metrics /metrics", caddyfile)
         self.assertIn('respond "Not found.\\n" 404', caddyfile)

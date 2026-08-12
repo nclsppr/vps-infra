@@ -254,6 +254,26 @@ PROFILES = {
         require_pax_revision=False,
         probe_timeout_seconds=600,
     ),
+    "parkventory": StaticProfile(
+        application="parkventory",
+        source_repository="nclsppr/parkventory",
+        source_url="https://github.com/nclsppr/parkventory",
+        source_ref="refs/heads/main",
+        signer_workflow="nclsppr/parkventory/.github/workflows/vps-release.yml",
+        canonical_domain="parkventory.com",
+        redirect_domains=("www.parkventory.com",),
+        site_repository="ghcr.io/nclsppr/parkventory/site",
+        routes_repository="ghcr.io/nclsppr/parkventory/routes",
+        max_archive_bytes=50 * MIB,
+        max_uncompressed_bytes=100 * MIB,
+        max_files=2_000,
+        max_members=4_001,
+        max_tar_stream_bytes=128 * MIB,
+        file_mode=0o644,
+        directory_mode=0o755,
+        require_pax_revision=False,
+        probe_timeout_seconds=300,
+    ),
 }
 
 
@@ -1106,7 +1126,7 @@ def scan_raw_tar(path: Path, profile: StaticProfile, source_revision: str) -> No
             if profile.require_pax_revision and pax_headers != 1:
                 fail("personal site archive must contain one source-revision PAX header")
             if not profile.require_pax_revision and pax_headers:
-                fail("Papers Empire archive must not contain a PAX header")
+                fail("site archive must not contain a PAX header")
     except (OSError, EOFError) as exc:
         fail(f"cannot scan site tar stream: {exc}")
 

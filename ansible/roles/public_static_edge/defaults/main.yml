@@ -16,6 +16,7 @@ vps_public_static_edge_files:
   - validate-compose
 vps_public_static_edge_routes:
   - papersempire.caddy
+  - parkventory.caddy
   - personal.caddy
 vps_public_static_edge_route_sources:
   prepare: routes-prepare
@@ -25,6 +26,8 @@ vps_public_static_edge_domains:
   - www.nicolaspieper.com
   - papersempire.com
   - www.papersempire.com
+  - parkventory.com
+  - www.parkventory.com
 vps_public_static_edge_dns_zones:
   - zone: nicolaspieper.com
     names:
@@ -34,3 +37,7 @@ vps_public_static_edge_dns_zones:
     names:
       - papersempire.com
       - www.papersempire.com
+  - zone: parkventory.com
+    names:
+      - parkventory.com
+      - www.parkventory.com

@@ -6,7 +6,8 @@ hébergeant :
 - `personal` (`nicolaspieper.com`) ;
 - `papersempire` (`papersempire.com`) ;
 - `surplasse` et ses frontends ;
-- `parkventory`, maintenu désactivé jusqu’à ses preuves de readiness.
+- the static Parkventory demo (`parkventory.com`), separate from its disabled
+  backend application.
 
 ## Architecture retenue
 
@@ -21,11 +22,11 @@ Le socle reste volontairement simple :
 6. le VPS tire uniquement un commit `vps-infra` autorisé et des digests déjà
    validés. Il ne compile jamais les dépôts applicatifs.
 
-`personal` et `papersempire` seront servis comme releases statiques par le
-Caddy commun. Surplasse conservera ses images applicatives, mais plus sa copie
-de Caddy, PostgreSQL, Prometheus ou Grafana. Un cluster PostgreSQL physique est
-mutualisé ; bases, rôles, secrets, réseaux et migrations restent séparés par
-projet.
+Personal, Papers Empire, and the Parkventory demo are static releases served by
+the common Caddy service. The Parkventory backend stays disabled. Surplasse
+keeps its application images, but not its copy of Caddy, PostgreSQL,
+Prometheus, or Grafana. One physical PostgreSQL cluster is shared. Each project
+keeps separate databases, roles, secrets, networks, and migrations.
 
 ## État actuel
 
@@ -36,7 +37,8 @@ Le premier socle exécutable est livré :
 - Compose plateforme durci et images amont épinglées par digest ;
 - Caddy with a generated, checksum-locked Go graph and the OVH DNS provider;
 - GitHub CLI 2.97.0 with archive and executable checksums, plus a fail-closed
-  static OCI materializer for Personal and Papers Empire;
+  static OCI materializer for Personal, Papers Empire, and the Parkventory
+  demo;
 - PostgreSQL 17, observabilité commune et provisioning Grafana ;
 - manifeste de production, schéma, vérificateur de preuves GitHub et contrôleur
   de déploiement borné ;
@@ -151,6 +153,7 @@ Cette décision est détaillée dans
 - [ADR-0001 — Ansible et Compose](docs/decisions/0001-ansible-compose-plateforme-partagee.md)
 - [ADR-0002 — dépôt public](docs/decisions/0002-depot-public-sans-etat-sensible.md)
 - [ADR-0003 — builds hors production](docs/decisions/0003-builds-hors-du-vps-de-production.md)
+- [ADR-0004 - Parkventory static demo](docs/decisions/0004-parkventory-static-demo.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas
