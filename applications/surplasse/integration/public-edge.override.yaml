@@ -1,0 +1,38 @@
+---
+services:
+  caddy:
+    environment:
+      OVH_APPLICATION_KEY_FILE: /run/secrets/surplasse_ovh_application_key
+      OVH_APPLICATION_SECRET_FILE: /run/secrets/surplasse_ovh_application_secret
+      OVH_CONSUMER_KEY_FILE: /run/secrets/surplasse_ovh_consumer_key
+    secrets:
+      - surplasse_ovh_application_key
+      - surplasse_ovh_application_secret
+      - surplasse_ovh_consumer_key
+    volumes:
+      - type: bind
+        source: /srv/vps/runtime/surplasse/integration/caddy/surplasse.caddy
+        target: /etc/caddy/routes/surplasse.caddy
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      edge: {}
+      app_surplasse:
+        ipv4_address: 172.30.10.254
+
+networks:
+  app_surplasse:
+    external: true
+    name: app_surplasse
+
+secrets:
+  surplasse_ovh_application_key:
+    name: surplasse_ovh_application_key
+    file: /etc/vps/secrets/surplasse/ovh-application-key
+  surplasse_ovh_application_secret:
+    name: surplasse_ovh_application_secret
+    file: /etc/vps/secrets/surplasse/ovh-application-secret
+  surplasse_ovh_consumer_key:
+    name: surplasse_ovh_consumer_key
+    file: /etc/vps/secrets/surplasse/ovh-consumer-key

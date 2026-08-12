@@ -2101,6 +2101,32 @@ fi
                     r"playbooks/postgres-backup\.yml$",
                 )
 
+            for mode, state in (
+                ("--prepare-surplasse", "prepare"),
+                ("--activate-surplasse", "activate"),
+                ("--stop-surplasse", "stopped"),
+            ):
+                log.unlink()
+                surplasse_result = subprocess.run(
+                    [converge, mode],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(
+                    surplasse_result.returncode, 0, surplasse_result.stderr
+                )
+                surplasse_execution = log.read_text(encoding="utf-8")
+                self.assertRegex(
+                    surplasse_execution,
+                    rf"(?m)^arguments=.*vps_infra_revision={remote_sha} "
+                    rf"--extra-vars vps_surplasse_state={state} "
+                    r"playbooks/surplasse\.yml$",
+                )
+
             log.unlink()
             for unsupported_arguments in (
                 ["--check"],
