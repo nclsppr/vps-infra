@@ -65,6 +65,7 @@ services:
   postgresql:
     <<: *common-hardening
     image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
+    user: "70:70"
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: platform_admin
@@ -108,15 +109,9 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
-      - /var/run/postgresql:size=16m,mode=2775,uid=999,gid=999
+      - /var/run/postgresql:size=16m,mode=2775,uid=70,gid=70
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - SETGID
-      - SETUID
     pids_limit: 256
     cpus: "1.50"
     mem_limit: 1536m
@@ -227,7 +222,7 @@ services:
     mem_limit: 384m
     stop_grace_period: 30s
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:3000/api/health"]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -283,10 +278,10 @@ services:
   postgres-exporter:
     <<: *common-hardening
     image: ${POSTGRES_EXPORTER_IMAGE:?POSTGRES_EXPORTER_IMAGE is required}
-    # The shared password file is root:999 0440: PostgreSQL init runs as
-    # UID/GID 999, while the exporter keeps its unprivileged UID and joins only
+    # The shared password file is root:70 0440: PostgreSQL init runs as
+    # UID/GID 70, while the exporter keeps its unprivileged UID and joins only
     # that read-only group.
-    user: "65534:999"
+    user: "65534:70"
     environment:
       DATA_SOURCE_URI: postgresql:5432/postgres?sslmode=disable
       DATA_SOURCE_USER: postgres_exporter

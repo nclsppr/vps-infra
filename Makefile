@@ -15,6 +15,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	activate-public-static-edge stop-public-static-edge \
+	start-internal-platform stop-internal-platform \
 	doctor-local
 
 help: ## Show the available commands.
@@ -48,6 +49,9 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/public-static-edge.yml
+	cd ansible && ../.venv/bin/ansible-playbook \
+		--inventory inventories/production/hosts.example.yml \
+		--syntax-check playbooks/internal-platform.yml
 
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
@@ -76,7 +80,7 @@ check-platform-config: ## Render Compose and apply the production policy.
 	$(COMPOSE) --env-file "$(PLATFORM_ENV)" --file platform/compose.yaml \
 		config --format json >"$$rendered"; \
 	./scripts/validate-compose \
-		--structural-only \
+		--expected-images platform/expected-images.json \
 		--repository-root "$(CURDIR)" \
 		vps-platform "$$rendered"
 
@@ -166,6 +170,16 @@ stop-public-static-edge: ## Stop only the static Caddy edge and preserve its dat
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --stop-public-static-edge
+
+start-internal-platform: ## Start PostgreSQL and observability without Caddy.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --start-internal-platform
+
+stop-internal-platform: ## Stop internal services and preserve their data volumes.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --stop-internal-platform
 
 doctor-local: ## Audit the local checkout without contact with the VPS.
 	./scripts/doctor --local

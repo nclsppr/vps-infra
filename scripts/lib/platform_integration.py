@@ -46,6 +46,7 @@ RUNTIME_PATHS = (
     "platform/caddy/routes/personal.caddy.disabled",
     "platform/caddy/routes/surplasse.caddy.disabled",
     "platform/compose.yaml",
+    "platform/expected-images.json",
     "platform/observability/grafana/dashboards/platform/overview.json",
     "platform/observability/grafana/provisioning/dashboards/dashboards.yml",
     "platform/observability/grafana/provisioning/datasources/prometheus.yml",
@@ -64,6 +65,7 @@ RUNTIME_PATHS = (
 RUNTIME_PATHS_TO_SCAN = (
     "platform/.env.example",
     "platform/compose.yaml",
+    "platform/expected-images.json",
     "platform/caddy/Caddyfile",
     "platform/caddy/routes",
     "platform/observability",

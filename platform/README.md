@@ -31,10 +31,10 @@ The platform uses the following service versions:
 | Service | Version |
 |---|---|
 | Caddy | `2.11.4-alpine` |
-| PostgreSQL | `17.10-bookworm` |
-| Prometheus | `3.13.1-busybox` |
-| Grafana | `13.1.1` |
-| Node Exporter | `1.12.1` |
+| PostgreSQL | `17.10-alpine3.24` |
+| Prometheus | `3.13.2-busybox` |
+| Grafana | `13.1.3-slim` |
+| Node Exporter | `1.12.1-busybox` |
 | PostgreSQL Exporter | `0.20.1` |
 
 Each Compose image reference contains a readable tag and an immutable digest.
@@ -72,6 +72,16 @@ digest, and created and verified GitHub provenance for the exact
 multi-architecture manifest. A promotion does not rebuild the image.
 Production uses the custom image by digest.
 
+`POSTGRES_IMAGE` uses the custom non-root PostgreSQL manifest
+`sha256:f26c37a44c6d2286fe6794a2bc7d18c23907c8bdb9ffc3e0890e07be713d6095`.
+Workflow run
+[`31608847601`](https://github.com/nclsppr/vps-infra/actions/runs/31608847601)
+built both native images from infrastructure revision
+`e45dc731d1db291a2b14d7db46eb95d90a06750c`, verified PostgreSQL startup and
+data persistence as UID and GID `70`, passed the strict published-manifest
+scan, and verified GitHub provenance. The runtime does not add Linux
+capabilities to PostgreSQL.
+
 ## Caddy publication gate
 
 The Caddy image workflow fails closed at two points:
@@ -105,13 +115,14 @@ host.
 
 The builder reads one exact Git commit. It includes only these runtime roots:
 
-- `platform/.env.example` and `platform/compose.yaml`;
+- `platform/.env.example`, `platform/compose.yaml`, and the exact image
+  contract in `platform/expected-images.json`;
 - the base Caddyfile and the four reviewed route candidates;
 - the Prometheus, Grafana, and exporter configuration;
 - the PostgreSQL configuration and initialization script.
 
 It excludes the Caddy Dockerfile, Go graph, build inputs, entry point, and
-documentation. The exact 20-file allowlist rejects a missing path, an extra
+documentation. The exact 21-file allowlist rejects a missing path, an extra
 path in a runtime root, a symbolic link, a submodule, an executable file, a
 special file, invalid UTF-8, and an oversized payload.
 
@@ -200,6 +211,11 @@ database authorization boundary.
 The isolated public static edge does not join `ops`. The exact Compose policy
 rejects an `ops` attachment for this unit.
 
+The reviewed `targets/caddy.yml` file remains inert. The active Prometheus
+configuration does not reference it because the public Caddy service exists
+only on `edge`. Do not attach Prometheus to `edge` to make this target work.
+A future Caddy scrape requires a separate one-way telemetry boundary.
+
 Caddy publishes `80/tcp`, `443/tcp`, and `443/udp`. Grafana binds to
 `127.0.0.1:3000` for an SSH tunnel. No other platform service publishes a host
 port. The public bindings use IPv4. Do not publish an `AAAA` record for this
@@ -213,14 +229,14 @@ base platform files under `/etc/vps/secrets/platform`:
 | File | Container reader |
 |---|---|
 | `postgres-superuser-password` | PostgreSQL startup process |
-| `postgres-exporter-password` | Numeric group `999` |
+| `postgres-exporter-password` | Numeric group `70` |
 | `grafana-admin-password` | UID `472` |
 | `grafana-secret-key` | UID `472` |
 
 The parent directory has mode `0700` and owner `root`. A secret with one reader
 has mode `0400`. The PostgreSQL Exporter password has mode `0440` and owner
-`root:999`. The PostgreSQL initialization process runs as `999:999`. The
-exporter runs as `65534:999`.
+`root:70`. The PostgreSQL initialization process runs as `70:70`. The exporter
+runs as `65534:70`.
 
 An active Surplasse integration also requires three scoped OVH DNS credential
 files. The integration package must add those Compose secrets and the related
@@ -250,7 +266,8 @@ make check
 
 The contract performs these platform checks:
 
-- It renders Compose and applies the structural production policy.
+- It renders Compose and binds every service to
+  `platform/expected-images.json` before it applies the production policy.
 - It validates the active Prometheus configuration.
 - It validates each inactive Prometheus rule candidate.
 - It validates Caddy with the inactive route set.
@@ -259,9 +276,9 @@ The contract performs these platform checks:
   package versions in the locally built image.
 
 The checks do not start the platform. They do not call the OVH API. The
-`--structural-only` Compose mode is valid only for local analysis. A production
-controller must use the exact references from the release manifest and the
-verified integration package.
+`--structural-only` Compose mode is valid only for isolated policy tests. The
+normal platform check uses the versioned exact image contract. A production
+controller must also verify the integration artifact and its provenance.
 
 Prometheus alert rules have no configured Alertmanager or notification
 channel. Production activation requires a tested external alert path.

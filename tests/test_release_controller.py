@@ -642,11 +642,10 @@ def platform_caddy() -> dict:
 def platform_document(*, include_grafana: bool = True) -> dict:
     del include_grafana
     postgresql = hardened_service(
-        image("docker.io/library/postgres"),
+        image("ghcr.io/nclsppr/vps-infra/postgres"),
         {"db_monitoring"},
-        user=None,
+        user="70:70",
     )
-    postgresql["cap_add"] = ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
     postgresql["secrets"] = [
         {"source": "postgres_superuser_password"},
         {"source": "postgres_exporter_password"},
@@ -707,6 +706,9 @@ def platform_document(*, include_grafana: bool = True) -> dict:
         {"source": "grafana_admin_password"},
         {"source": "grafana_secret_key"},
     ]
+    grafana["healthcheck"]["test"] = list(
+        COMPOSE_POLICY.PLATFORM_HEALTHCHECK_TESTS["grafana"]
+    )
     grafana["ports"] = [
         {"target": 3000, "published": "3000", "protocol": "tcp", "host_ip": "127.0.0.1"}
     ]
@@ -739,7 +741,7 @@ def platform_document(*, include_grafana: bool = True) -> dict:
     postgres_exporter = hardened_service(
         image("docker.io/prometheuscommunity/postgres-exporter"),
         {"ops", "db_monitoring"},
-        user="65534:999",
+        user="65534:70",
     )
     postgres_exporter["secrets"] = [{"source": "postgres_exporter_password"}]
     services = {
@@ -1100,6 +1102,58 @@ class ComposePolicyTests(unittest.TestCase):
     def test_platform_ports_are_narrowly_allowed(self) -> None:
         document = platform_document(include_grafana=True)
         validate_platform_document(document)
+
+    def test_postgresql_identity_and_grafana_probe_are_exact(self) -> None:
+        mutations = (
+            (
+                "postgres-root-entrypoint",
+                lambda document: document["services"]["postgresql"].update(user=None),
+                "audited platform image contract",
+            ),
+            (
+                "postgres-capability",
+                lambda document: document["services"]["postgresql"].update(
+                    cap_add=["CHOWN"]
+                ),
+                "capabilities outside",
+            ),
+            (
+                "postgres-runtime-directory-owner",
+                lambda document: document["services"]["postgresql"]["tmpfs"].__setitem__(
+                    1,
+                    "/var/run/postgresql:size=16m,mode=2775,uid=999,gid=999",
+                ),
+                "audited platform allowlist",
+            ),
+            (
+                "exporter-group",
+                lambda document: document["services"]["postgres-exporter"].update(
+                    user="65534:999"
+                ),
+                "audited platform image contract",
+            ),
+            (
+                "grafana-probe",
+                lambda document: document["services"]["grafana"]["healthcheck"].update(
+                    test=[
+                        "CMD",
+                        "wget",
+                        "--spider",
+                        "http://127.0.0.1:3000/api/health",
+                    ]
+                ),
+                "audited platform probe",
+            ),
+        )
+        for label, mutate, expected_message in mutations:
+            with self.subTest(label=label):
+                document = platform_document()
+                mutate(document)
+                with self.assertRaisesRegex(
+                    COMPOSE_POLICY.ComposePolicyError,
+                    expected_message,
+                ):
+                    validate_platform_document(document)
 
     def test_platform_images_require_a_verified_binding_outside_structural_lint(self) -> None:
         document = platform_document()

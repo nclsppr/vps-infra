@@ -32,11 +32,11 @@ platform:
   blocked_by: []
   images:
     caddy: ghcr.io/nclsppr/vps-infra/caddy:2.11.4@sha256:<digest>
-    postgres: docker.io/library/postgres:17.10-bookworm@sha256:<digest>
-    prometheus: docker.io/prom/prometheus:v3.13.1@sha256:<digest>
-    grafana: docker.io/grafana/grafana:13.1.1@sha256:<digest>
-    node_exporter: docker.io/prom/node-exporter:<version>@sha256:<digest>
-    postgres_exporter: docker.io/prometheuscommunity/postgres-exporter:<version>@sha256:<digest>
+    postgres: ghcr.io/nclsppr/vps-infra/postgres:sha-<revision>@sha256:<digest>
+    prometheus: docker.io/prom/prometheus:v3.13.2-busybox@sha256:<digest>
+    grafana: docker.io/grafana/grafana:13.1.3-slim@sha256:<digest>
+    node_exporter: docker.io/prom/node-exporter:v1.12.1-busybox@sha256:<digest>
+    postgres_exporter: docker.io/prometheuscommunity/postgres-exporter:v0.20.1@sha256:<digest>
   integration:
     source_revision: <sha-config-plateforme>
     artifact: ghcr.io/nclsppr/vps-infra/platform-integration@sha256:<digest>
@@ -616,6 +616,48 @@ This deployment does not waive or cancel the internal platform. PostgreSQL and
 Grafana are still required for Surplasse and Parkventory. They are admitted and
 started in a separate unit so their private image risk cannot block a clean
 public Caddy image and non-executable static content.
+
+## Start the internal platform
+
+The internal controller starts exactly PostgreSQL, Prometheus, Grafana, Node
+Exporter, and PostgreSQL Exporter. It never starts or stops Caddy. It validates
+all six image references from `platform/expected-images.json`, but it pulls
+only the five selected internal service images. It also refuses a pre-existing
+unselected container in the `vps-platform` Compose project before
+`--remove-orphans` can change that project.
+
+Run host convergence first. Then start the internal unit from the immutable
+`origin/main` snapshot:
+
+```bash
+make start-internal-platform \
+  ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
+```
+
+The controller creates four random file-based secrets when they do not exist.
+It keeps PostgreSQL files at `root:70 0440` and Grafana files at
+`root:472 0440`. An existing value is never replaced. A symlink, hard link,
+unexpected mode, owner, length, or character set stops the deployment.
+
+The release directory is immutable and a root-owned symlink switches it
+atomically. Failed systemd reconciliation or a failed functional probe restores
+the previous release and reconciles the same five-service set. The rollback
+does not use `docker compose down`, remove a named volume, or delete a secret.
+
+The success proof requires all five containers to use their expected registry
+digests and expected networks. It also requires PostgreSQL 17 with data
+checksums, the exporter role membership, live exporter metrics, exactly three
+healthy Prometheus scrape targets, and a healthy Grafana database response.
+Grafana binds only `127.0.0.1:3000`. PostgreSQL and all metrics endpoints bind
+no host port.
+
+The bounded stop operation preserves the three named data volumes and all four
+secrets:
+
+```bash
+make stop-internal-platform \
+  ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
+```
 
 ## Déployer une application Compose
 

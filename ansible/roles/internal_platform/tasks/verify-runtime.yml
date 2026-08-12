@@ -1,0 +1,351 @@
+---
+- name: Read the active internal platform image contract
+  ansible.builtin.slurp:
+    src: >-
+      {{ vps_internal_platform_runtime_link ~ '/' ~
+         vps_internal_platform_expected_images_file }}
+  register: vps_internal_platform_runtime_image_contract
+
+- name: Parse the active internal platform image contract
+  ansible.builtin.set_fact:
+    vps_internal_platform_runtime_expected_images: >-
+      {{ vps_internal_platform_runtime_image_contract.content |
+         b64decode | from_json }}
+
+- name: Prove the active image contract is complete
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_internal_platform_runtime_expected_images.keys() | list | sort ==
+        vps_internal_platform_all_image_services | sort
+      - >-
+        vps_internal_platform_runtime_expected_images.values() |
+        select('match', '^[a-z0-9./_-]+:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$') |
+        list | length == vps_internal_platform_all_image_services | length
+    fail_msg: The active internal platform image contract is incomplete.
+
+- name: Read the internal platform unit activity
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - "{{ vps_internal_platform_unit }}"
+  register: vps_internal_platform_unit_activity
+  changed_when: false
+
+- name: Read the internal platform unit enablement
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-enabled
+      - "{{ vps_internal_platform_unit }}"
+  register: vps_internal_platform_unit_enablement
+  changed_when: false
+
+- name: List the running selected Compose services
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - compose
+      - --project-directory
+      - "{{ vps_internal_platform_runtime_dir }}"
+      - --env-file
+      - "{{ vps_internal_platform_runtime_dir }}/.env.example"
+      - --file
+      - "{{ vps_internal_platform_runtime_dir }}/compose.yaml"
+      - ps
+      - --status
+      - running
+      - --services
+  register: vps_internal_platform_running_services
+  changed_when: false
+
+- name: List all running containers owned by the shared project
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - ps
+      - --quiet
+      - --filter
+      - label=com.docker.compose.project={{ vps_internal_platform_project }}
+  register: vps_internal_platform_running_container_ids
+  changed_when: false
+
+- name: Resolve each selected service container
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - compose
+      - --project-directory
+      - "{{ vps_internal_platform_runtime_dir }}"
+      - --env-file
+      - "{{ vps_internal_platform_runtime_dir }}/.env.example"
+      - --file
+      - "{{ vps_internal_platform_runtime_dir }}/compose.yaml"
+      - ps
+      - --quiet
+      - "{{ item }}"
+  register: vps_internal_platform_service_container_ids
+  changed_when: false
+  loop: "{{ vps_internal_platform_services }}"
+
+- name: Prove the exact internal service set is running
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_internal_platform_running_services.stdout_lines | sort ==
+        vps_internal_platform_services | sort
+      - >-
+        vps_internal_platform_running_container_ids.stdout_lines | length ==
+        vps_internal_platform_services | length
+      - >-
+        vps_internal_platform_service_container_ids.results |
+        map(attribute='stdout_lines') | map('length') |
+        select('equalto', 1) | list | length ==
+        vps_internal_platform_services | length
+      - vps_internal_platform_unit_activity.stdout == 'active'
+      - vps_internal_platform_unit_enablement.stdout == 'enabled'
+    fail_msg: The systemd unit does not own exactly the five internal services.
+
+- name: Inspect each running internal service container
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - inspect
+      - "{{ item.stdout }}"
+  register: vps_internal_platform_container_inspections
+  changed_when: false
+  loop: "{{ vps_internal_platform_service_container_ids.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Inspect each active internal service image
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - image
+      - inspect
+      - "{{ vps_internal_platform_runtime_expected_images[item] }}"
+  register: vps_internal_platform_runtime_image_inspections
+  changed_when: false
+  loop: "{{ vps_internal_platform_services }}"
+
+- name: Prove each internal service health, image, and network boundary
+  ansible.builtin.assert:
+    that:
+      - (item.stdout | from_json) | length == 1
+      - >-
+        ((item.stdout | from_json) | first).State.Status == 'running'
+      - >-
+        ((item.stdout | from_json) | first).State.Health.Status == 'healthy'
+      - >-
+        ((item.stdout | from_json) | first).Config.Image ==
+        vps_internal_platform_runtime_expected_images[item.item.item]
+      - >-
+        ((item.stdout | from_json) | first).Image ==
+        ((vps_internal_platform_runtime_image_inspections.results[
+          vps_internal_platform_service_index].stdout | from_json) | first).Id
+      - >-
+        (vps_internal_platform_runtime_expected_images[item.item.item] |
+         regex_replace(':[^/@]+@sha256:', '@sha256:') |
+         regex_replace('^docker\\.io/', '')) in
+        ((vps_internal_platform_runtime_image_inspections.results[
+          vps_internal_platform_service_index].stdout | from_json) |
+         first).RepoDigests
+      - >-
+        ((item.stdout | from_json) |
+         first).Config.Labels['com.docker.compose.project'] ==
+        vps_internal_platform_project
+      - >-
+        ((item.stdout | from_json) |
+         first).Config.Labels['com.docker.compose.service'] == item.item.item
+      - >-
+        ((item.stdout | from_json) |
+         first).NetworkSettings.Networks.keys() | list | sort ==
+        vps_internal_platform_network_contract[item.item.item] | sort
+      - >-
+        item.item.item == 'grafana' or
+        (((item.stdout | from_json) | first).NetworkSettings.Ports |
+         dict2items | rejectattr('value', 'equalto', none) | list | length == 0)
+      - >-
+        item.item.item != 'grafana' or
+        (((item.stdout | from_json) |
+          first).NetworkSettings.Ports['3000/tcp'] | length == 1 and
+         ((item.stdout | from_json) |
+          first).NetworkSettings.Ports['3000/tcp'][0].HostIp == '127.0.0.1' and
+         ((item.stdout | from_json) |
+          first).NetworkSettings.Ports['3000/tcp'][0].HostPort == '3000')
+    fail_msg: >-
+      An internal service differs from its health, image, port, or network
+      contract.
+  loop: "{{ vps_internal_platform_container_inspections.results }}"
+  loop_control:
+    label: "{{ item.item.item }}"
+    index_var: vps_internal_platform_service_index
+
+- name: Read host listeners for the internal service ports
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ss
+      - -H
+      - -lntup
+  register: vps_internal_platform_host_listeners
+  changed_when: false
+
+- name: Select host listeners owned by the internal platform contract
+  ansible.builtin.set_fact:
+    vps_internal_platform_bounded_listener_lines: >-
+      {{ vps_internal_platform_host_listeners.stdout_lines |
+         select('search', ':(?:3000|5432|9090|9100|9187)\\b') | list }}
+
+- name: Prove Grafana is the sole loopback host listener
+  ansible.builtin.assert:
+    that:
+      - vps_internal_platform_bounded_listener_lines | length == 1
+      - >-
+        vps_internal_platform_bounded_listener_lines[0] is
+        search('127\\.0\\.0\\.1:3000\\b')
+    fail_msg: >-
+      PostgreSQL or a metrics endpoint is public, or Grafana is not bound only
+      to IPv4 loopback.
+
+- name: Read the PostgreSQL runtime version
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - exec
+      - >-
+        {{ vps_internal_platform_service_container_ids.results |
+           selectattr('item', 'equalto', 'postgresql') |
+           map(attribute='stdout') | first }}
+      - postgres
+      - --version
+  register: vps_internal_platform_postgres_version
+  changed_when: false
+
+- name: Prove PostgreSQL checksums and exporter role membership
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - exec
+      - >-
+        {{ vps_internal_platform_service_container_ids.results |
+           selectattr('item', 'equalto', 'postgresql') |
+           map(attribute='stdout') | first }}
+      - psql
+      - --no-password
+      - --username
+      - platform_admin
+      - --dbname
+      - postgres
+      - --tuples-only
+      - --no-align
+      - --command
+      - >-
+        SELECT current_setting('data_checksums'),
+        pg_has_role('postgres_exporter', 'pg_monitor', 'member');
+  register: vps_internal_platform_postgres_contract
+  changed_when: false
+
+- name: Read PostgreSQL Exporter metrics from its container
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - exec
+      - >-
+        {{ vps_internal_platform_service_container_ids.results |
+           selectattr('item', 'equalto', 'postgres-exporter') |
+           map(attribute='stdout') | first }}
+      - wget
+      - --quiet
+      - --output-document=-
+      - http://127.0.0.1:9187/metrics
+  register: vps_internal_platform_postgres_exporter_metrics
+  changed_when: false
+
+- name: Read Node Exporter metrics from its container
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - exec
+      - >-
+        {{ vps_internal_platform_service_container_ids.results |
+           selectattr('item', 'equalto', 'node-exporter') |
+           map(attribute='stdout') | first }}
+      - wget
+      - --quiet
+      - --output-document=-
+      - http://127.0.0.1:9100/metrics
+  register: vps_internal_platform_node_exporter_metrics
+  changed_when: false
+
+- name: Read the active Prometheus target API
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - exec
+      - >-
+        {{ vps_internal_platform_service_container_ids.results |
+           selectattr('item', 'equalto', 'prometheus') |
+           map(attribute='stdout') | first }}
+      - wget
+      - --quiet
+      - --output-document=-
+      - http://127.0.0.1:9090/api/v1/targets?state=active
+  register: vps_internal_platform_prometheus_target_response
+  changed_when: false
+
+- name: Parse the active Prometheus targets
+  ansible.builtin.set_fact:
+    vps_internal_platform_prometheus_targets: >-
+      {{ (vps_internal_platform_prometheus_target_response.stdout |
+          from_json).data.activeTargets }}
+
+- name: Prove the functional database and metrics contracts
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_internal_platform_postgres_version.stdout is
+        match('^postgres \(PostgreSQL\) 17(?:\\.[0-9]+)?$')
+      - vps_internal_platform_postgres_contract.stdout | trim == 'on|t'
+      - >-
+        vps_internal_platform_postgres_exporter_metrics.stdout is
+        regex('(?m)^pg_up 1(?:\\.0)?$')
+      - >-
+        vps_internal_platform_node_exporter_metrics.stdout is
+        regex('(?m)^node_uname_info\\{')
+      - >-
+        vps_internal_platform_prometheus_targets | length == 3
+      - >-
+        vps_internal_platform_prometheus_targets |
+        map(attribute='labels.job') | list | sort ==
+        ['node-exporter', 'postgres-exporter', 'prometheus']
+      - >-
+        vps_internal_platform_prometheus_targets |
+        map(attribute='health') | unique | list == ['up']
+      - >-
+        vps_internal_platform_prometheus_targets |
+        selectattr('labels.job', 'equalto', 'caddy') | list | length == 0
+    fail_msg: >-
+      PostgreSQL, an exporter, or the exact Prometheus target set is not ready.
+
+- name: Probe Grafana through the loopback boundary
+  ansible.builtin.uri:
+    url: http://127.0.0.1:3000/api/health
+    follow_redirects: none
+    status_code: 200
+    return_content: true
+  register: vps_internal_platform_grafana_probe
+  until: vps_internal_platform_grafana_probe.status == 200
+  retries: 6
+  delay: 5
+
+- name: Prove Grafana reports a healthy database when the field is present
+  ansible.builtin.assert:
+    that:
+      - >-
+        'database' not in (vps_internal_platform_grafana_probe.content |
+                           from_json) or
+        (vps_internal_platform_grafana_probe.content |
+         from_json).database == 'ok'
+    fail_msg: Grafana reports an unhealthy internal database.

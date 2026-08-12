@@ -226,7 +226,16 @@ controller validates candidate evidence and applies artifact quarantine before
 it records desired state. Candidate metadata does not publish a port, create a
 runtime reference in the reconciliation plan, or authorize a service start.
 
-Application Compose validation requires an exact image contract:
+Infrastructure and application Compose validation require an exact image
+contract. The shared platform uses its versioned contract directly:
+
+```text
+validate-compose --expected-images platform/expected-images.json \
+  --repository-root /path/to/vps-infra \
+  vps-platform /path/to/rendered-compose.json
+```
+
+Application integration uses a contract from its verified bundle:
 
 ```text
 validate-compose --expected-images /path/to/expected-images.json \
@@ -240,10 +249,11 @@ and image differences fail validation. The `--expected-images` option and
 `--structural-only` are mutually exclusive.
 
 This option binds the rendered Compose document to exact image references. It
-does not authenticate the JSON file or prove image provenance. The caller must
-derive the file from an integration artifact and release manifest that were
-verified through independent trust roots. Environment variable allowlists and
-declared `_FILE` secret bindings remain required before application activation.
+does not authenticate the JSON file or prove image provenance. The versioned
+platform contract is included in the integration artifact. A production caller
+must verify that artifact and the release manifest through independent trust
+roots. Environment variable allowlists and declared `_FILE` secret bindings
+remain required before application activation.
 
 `verify-github-evidence` confirms the repository, branch, commit, run attempt,
 and exact `.github/workflows/vps-release.yml` workflow through the public GitHub
