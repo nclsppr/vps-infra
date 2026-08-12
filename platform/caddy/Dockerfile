@@ -29,8 +29,19 @@ ENV GOTOOLCHAIN=local \
 
 WORKDIR /src
 COPY build/main.go build/go.mod build/go.sum ./
+COPY patches/caddy-cel-go-v0.29.patch /tmp/caddy-cel-go-v0.29.patch
 RUN go mod download \
     && go mod verify \
+    && caddy_source="$(go env GOMODCACHE)/github.com/caddyserver/caddy/v2@v2.11.4" \
+    && chmod u+w "${caddy_source}/modules/caddyhttp/celmatcher.go" \
+    && cd "${caddy_source}" \
+    && git apply --check --unidiff-zero /tmp/caddy-cel-go-v0.29.patch \
+    && git apply --unidiff-zero /tmp/caddy-cel-go-v0.29.patch \
+    && printf '%s  %s\n' \
+       'e4a3578e3307cb0d97b3d140aff2a8d14fb2147d0fd5122c1d94e523c3ed89bb' \
+       'modules/caddyhttp/celmatcher.go' \
+       | sha256sum -c - \
+    && cd /src \
     && CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
        go build -mod=readonly -o /usr/bin/vps-caddy \
        -ldflags '-w -s' -trimpath -tags nobadger,nomysql,nopgx

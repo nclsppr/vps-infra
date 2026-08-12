@@ -68,9 +68,17 @@ build_directory=$(dirname -- "$source_path")/build
 main_file=$build_directory/main.go
 go_mod=$build_directory/go.mod
 go_sum=$build_directory/go.sum
+cel_patch=$build_directory/../patches/caddy-cel-go-v0.29.patch
 [[ -f "$main_file" ]] || fail "missing generated main.go"
 [[ -f "$go_mod" ]] || fail "missing go.mod"
 [[ -f "$go_sum" ]] || fail "missing go.sum"
+[[ -f "$cel_patch" ]] || fail "missing Caddy cel-go compatibility patch"
+
+expected_patch_sha256=beebb555ffcbc67382b173119b067b1a1035351827c3b3cf0989e12200a30daa
+actual_patch_sha256=$(shasum -a 256 "$cel_patch" | awk '{ print $1 }')
+[[ "$actual_patch_sha256" == "$expected_patch_sha256" ]] || {
+  fail "unexpected Caddy cel-go compatibility patch content"
+}
 
 [[ $(grep -Fxc $'\t_ "github.com/caddyserver/caddy/v2/modules/standard"' "$main_file") -eq 1 ]] || {
   fail "generated main.go must import the Caddy standard modules once"
@@ -81,11 +89,13 @@ go_sum=$build_directory/go.sum
 
 caddy_version=$(awk '$1 == "github.com/caddyserver/caddy/v2" { print $2 }' "$go_mod")
 ovh_version=$(awk '$1 == "github.com/caddy-dns/ovh" { print $2 }' "$go_mod")
+cel_version=$(awk '$1 == "github.com/google/cel-go" { print $2 }' "$go_mod")
 text_version=$(awk '$1 == "replace" && $2 == "golang.org/x/text" && $3 == "=>" && $4 == "golang.org/x/text" { print $5 }' "$go_mod")
 grpc_version=$(awk '$1 == "replace" && $2 == "google.golang.org/grpc" && $3 == "=>" && $4 == "google.golang.org/grpc" { print $5 }' "$go_mod")
 version_pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
 [[ "$caddy_version" =~ $version_pattern ]] || fail "invalid locked Caddy version"
 [[ "$ovh_version" =~ $version_pattern ]] || fail "invalid locked OVH module version"
+[[ "$cel_version" == v0.29.2 ]] || fail "unexpected locked cel-go version"
 [[ "$text_version" =~ $version_pattern ]] || fail "invalid x/text replacement"
 [[ "$grpc_version" =~ $version_pattern ]] || fail "invalid gRPC replacement"
 [[ $(grep -c '^replace ' "$go_mod") -eq 2 ]] || {
@@ -98,6 +108,7 @@ version_pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
 for locked_module in \
   "github.com/caddyserver/caddy/v2 $caddy_version" \
   "github.com/caddy-dns/ovh $ovh_version" \
+  "github.com/google/cel-go $cel_version" \
   "golang.org/x/text $text_version" \
   "google.golang.org/grpc $grpc_version"; do
   grep -Fq "$locked_module h1:" "$go_sum" || {

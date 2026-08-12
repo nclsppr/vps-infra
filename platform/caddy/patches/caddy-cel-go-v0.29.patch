@@ -1,0 +1,12 @@
+Upstream: https://github.com/caddyserver/caddy/commit/b2693fb63a30e6d7be0972c3645e9a2c0a500e93
+Reason: retain the Caddy v2.11.4 release baseline while using the patched cel-go v0.29.2 API.
+
+diff --git a/modules/caddyhttp/celmatcher.go b/modules/caddyhttp/celmatcher.go
+--- a/modules/caddyhttp/celmatcher.go
++++ b/modules/caddyhttp/celmatcher.go
+@@ -506 +506 @@ func CELMatcherDecorator(funcName string, fac any) interpreter.InterpretableDeco
+-				[]interpreter.Interpretable{reqAttr},
++				[]interpreter.InterpretableV2{reqAttr},
+@@ -529 +529 @@ func CELMatcherDecorator(funcName string, fac any) interpreter.InterpretableDeco
+-				[]interpreter.Interpretable{reqAttr},
++				[]interpreter.InterpretableV2{reqAttr},
