@@ -44,6 +44,9 @@ Le premier socle exécutable est livré :
 - Caddy multi-architecture workflow with a native PR build and Trivy gate for
   each architecture. A `main` build scans both published child manifests by
   digest before it creates and verifies GitHub provenance.
+- deterministic platform integration publication from an exact runtime
+  allowlist. The workflow verifies the manifest and both GHCR layer payloads
+  before it creates and verifies GitHub provenance.
 
 The Atlas host is now provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. No

@@ -1,0 +1,298 @@
+---
+name: Platform integration artifact
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/platform-integration.yml
+      - platform/.env.example
+      - platform/compose.yaml
+      - platform/caddy/Caddyfile
+      - platform/caddy/routes/**
+      - platform/observability/**
+      - platform/postgres/**
+      - mise.lock
+      - mise.toml
+      - scripts/build-platform-integration
+      - scripts/lib/platform_integration.py
+      - scripts/verify-platform-integration
+      - scripts/verify-platform-integration-manifest
+      - scripts/write-platform-integration-evidence
+      - tests/test_platform_integration.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish immutable platform integration
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      ARCHIVE_MEDIA_TYPE: application/vnd.vps-infra.platform-integration.v1+tar+gzip
+      ARTIFACT_TYPE: application/vnd.vps-infra.platform-integration.v1
+      INVENTORY_MEDIA_TYPE: application/vnd.vps-infra.platform-integration.inventory.v1+json
+      PACKAGE_REPOSITORY: ghcr.io/${{ github.repository }}/platform-integration
+      SOURCE_URL: https://github.com/${{ github.repository }}
+    steps:
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install locked publication tools
+        uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+        with:
+          version: 2026.7.13
+          cache: true
+        env:
+          MISE_GITHUB_ATTESTATIONS: "true"
+          MISE_GITHUB_SLSA: "true"
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reject secrets and private inventory
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ./scripts/check-public-safe --root .
+
+      - name: Build the deterministic package
+        id: package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          package_directory="${RUNNER_TEMP}/platform-integration-package"
+          ./scripts/build-platform-integration \
+            --revision "${GITHUB_SHA}" \
+            --output-directory "${package_directory}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Verify the local package
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          CREATED: ${{ steps.package.outputs.created }}
+          INVENTORY: ${{ steps.package.outputs.inventory }}
+        run: |
+          set -Eeuo pipefail
+          ./scripts/verify-platform-integration \
+            --archive "${ARCHIVE}" \
+            --inventory "${INVENTORY}" \
+            --expected-revision "${GITHUB_SHA}" \
+            --expected-created "${CREATED}"
+
+      - name: Authenticate ORAS to GHCR
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          docker_config="${RUNNER_TEMP}/platform-integration-registry-auth"
+          install -d -m 0700 "${docker_config}"
+          printf '%s' "${GHCR_TOKEN}" | oras login \
+            --registry-config "${docker_config}/config.json" \
+            --username "${GITHUB_ACTOR}" \
+            --password-stdin \
+            ghcr.io
+          printf 'DOCKER_CONFIG=%s\n' "${docker_config}" >>"${GITHUB_ENV}"
+
+      - name: Push the source revision tag
+        id: published
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          CREATED: ${{ steps.package.outputs.created }}
+          INVENTORY: ${{ steps.package.outputs.inventory }}
+        run: |
+          set -Eeuo pipefail
+          package_directory=$(dirname -- "${ARCHIVE}")
+          test "${package_directory}" = "$(dirname -- "${INVENTORY}")"
+          push_result=$(
+            cd -- "${package_directory}"
+            oras push \
+              --registry-config "${DOCKER_CONFIG}/config.json" \
+              --no-tty \
+              --format json \
+              --artifact-type "${ARTIFACT_TYPE}" \
+              --annotation "org.opencontainers.image.source=${SOURCE_URL}" \
+              --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --annotation "org.opencontainers.image.created=${CREATED}" \
+              "${PACKAGE_REPOSITORY}:sha-${GITHUB_SHA}" \
+              "platform-integration.tar.gz:${ARCHIVE_MEDIA_TYPE}" \
+              "platform-integration.inventory.json:${INVENTORY_MEDIA_TYPE}"
+          )
+          artifact_digest=$(python3 -c '
+          import json, re, sys
+          value = json.load(sys.stdin).get("digest")
+          if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+              raise SystemExit("ORAS did not return an immutable digest")
+          print(value)
+          ' <<<"${push_result}")
+          {
+            printf 'digest=%s\n' "${artifact_digest}"
+            printf 'reference=%s@%s\n' "${PACKAGE_REPOSITORY}" "${artifact_digest}"
+            printf 'tag=%s:sha-%s\n' "${PACKAGE_REPOSITORY}" "${GITHUB_SHA}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Validate the published manifest, layers, annotations, and content
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          ARCHIVE_DIGEST: ${{ steps.package.outputs.archive_digest }}
+          ARTIFACT_DIGEST: ${{ steps.published.outputs.digest }}
+          CREATED: ${{ steps.package.outputs.created }}
+          INVENTORY: ${{ steps.package.outputs.inventory }}
+          INVENTORY_DIGEST: ${{ steps.package.outputs.inventory_digest }}
+          TAG: ${{ steps.published.outputs.tag }}
+        run: |
+          set -Eeuo pipefail
+          remote_directory=$(mktemp -d "${RUNNER_TEMP}/platform-integration-remote.XXXXXX")
+          remote_manifest="${remote_directory}/manifest.json"
+          remote_archive="${remote_directory}/platform-integration.tar.gz"
+          remote_inventory="${remote_directory}/platform-integration.inventory.json"
+
+          oras manifest fetch \
+            --registry-config "${DOCKER_CONFIG}/config.json" \
+            --output "${remote_manifest}" \
+            "${TAG}"
+          ./scripts/verify-platform-integration-manifest \
+            --manifest "${remote_manifest}" \
+            --expected-digest "${ARTIFACT_DIGEST}" \
+            --archive "${ARCHIVE}" \
+            --inventory "${INVENTORY}" \
+            --expected-revision "${GITHUB_SHA}" \
+            --expected-created "${CREATED}"
+
+          oras blob fetch \
+            --registry-config "${DOCKER_CONFIG}/config.json" \
+            --output "${remote_archive}" \
+            "${PACKAGE_REPOSITORY}@${ARCHIVE_DIGEST}"
+          oras blob fetch \
+            --registry-config "${DOCKER_CONFIG}/config.json" \
+            --output "${remote_inventory}" \
+            "${PACKAGE_REPOSITORY}@${INVENTORY_DIGEST}"
+          cmp -- "${ARCHIVE}" "${remote_archive}"
+          cmp -- "${INVENTORY}" "${remote_inventory}"
+          ./scripts/verify-platform-integration \
+            --archive "${remote_archive}" \
+            --inventory "${remote_inventory}" \
+            --expected-revision "${GITHUB_SHA}" \
+            --expected-created "${CREATED}"
+
+      # No provenance exists until the registry round trip above succeeds.
+      - name: Attest the verified OCI artifact
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}/platform-integration
+          subject-digest: ${{ steps.published.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify exact GitHub provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REFERENCE: ${{ steps.published.outputs.reference }}
+        run: |
+          set -Eeuo pipefail
+          verification=$(
+            gh attestation verify "oci://${REFERENCE}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --source-digest "${GITHUB_SHA}" \
+              --source-ref refs/heads/main \
+              --signer-workflow \
+                "${GITHUB_REPOSITORY}/.github/workflows/platform-integration.yml" \
+              --deny-self-hosted-runners \
+              --format json
+          )
+          python3 -c '
+          import json, sys
+          value = json.load(sys.stdin)
+          if not isinstance(value, list) or not value:
+              raise SystemExit("GitHub returned no verified attestation")
+          ' <<<"${verification}"
+
+      - name: Write the raw verification record
+        id: evidence
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          ARTIFACT_DIGEST: ${{ steps.published.outputs.digest }}
+          CREATED: ${{ steps.package.outputs.created }}
+          INVENTORY: ${{ steps.package.outputs.inventory }}
+        run: |
+          set -Eeuo pipefail
+          digest_value=${ARTIFACT_DIGEST#sha256:}
+          evidence_name="platform-integration-evidence-v1-${digest_value}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          evidence_file="${RUNNER_TEMP}/${evidence_name}"
+          ./scripts/write-platform-integration-evidence \
+            --artifact-reference "${PACKAGE_REPOSITORY}@${ARTIFACT_DIGEST}" \
+            --archive "${ARCHIVE}" \
+            --inventory "${INVENTORY}" \
+            --revision "${GITHUB_SHA}" \
+            --created "${CREATED}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --output "${evidence_file}"
+          evidence_digest=$(sha256sum "${evidence_file}" | awk '{print $1}')
+          evidence_size=$(wc -c <"${evidence_file}" | tr -d ' ')
+          {
+            printf 'digest=sha256:%s\n' "${evidence_digest}"
+            printf 'file=%s\n' "${evidence_file}"
+            printf 'name=%s\n' "${evidence_name}"
+            printf 'size=%s\n' "${evidence_size}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Upload the raw verification record
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.evidence.outputs.name }}
+          path: ${{ steps.evidence.outputs.file }}
+          archive: false
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 90
+
+      - name: Verify evidence metadata and publish the result
+        shell: bash
+        env:
+          ARTIFACT_DIGEST: ${{ steps.published.outputs.digest }}
+          EVIDENCE_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          EVIDENCE_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          EVIDENCE_DIGEST: ${{ steps.evidence.outputs.digest }}
+          EVIDENCE_NAME: ${{ steps.evidence.outputs.name }}
+          EVIDENCE_SIZE: ${{ steps.evidence.outputs.size }}
+          REFERENCE: ${{ steps.published.outputs.reference }}
+        run: |
+          set -Eeuo pipefail
+          normalized_digest="sha256:${EVIDENCE_ARTIFACT_DIGEST#sha256:}"
+          test "${normalized_digest}" = "${EVIDENCE_DIGEST}"
+          [[ ${EVIDENCE_ARTIFACT_ID} =~ ^[1-9][0-9]*$ ]]
+          [[ ${EVIDENCE_SIZE} =~ ^[1-9][0-9]*$ ]]
+          {
+            echo '### Published platform integration'
+            echo
+            echo "Artifact: \`${REFERENCE}\`"
+            echo "Manifest digest: \`${ARTIFACT_DIGEST}\`"
+            echo "Evidence artifact ID: \`${EVIDENCE_ARTIFACT_ID}\`"
+            echo "Evidence name: \`${EVIDENCE_NAME}\`"
+            echo "Evidence digest: \`${EVIDENCE_DIGEST}\`"
+            echo "Evidence bytes: \`${EVIDENCE_SIZE}\`"
+            echo
+            echo 'Create a separate pull request to promote this digest.'
+            echo 'The production activation policy remains locked.'
+          } >>"${GITHUB_STEP_SUMMARY}"
