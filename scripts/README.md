@@ -208,10 +208,24 @@ controller validates candidate evidence and applies artifact quarantine before
 it records desired state. Candidate metadata does not publish a port, create a
 runtime reference in the reconciliation plan, or authorize a service start.
 
-Les projets Compose applicatifs sont également refusés par la CLI tant qu'un
-bundle d'intégration vérifié ne fournit pas le set exact des services et leurs
-références d'images. Il faudra alors ajouter une allowlist exacte des variables
-d'environnement et lier les secrets `_FILE` aux secrets déclarés.
+Application Compose validation requires an exact image contract:
+
+```text
+validate-compose --expected-images /path/to/expected-images.json \
+  <surplasse|parkventory> /path/to/rendered-compose.json
+```
+
+The image contract is a strict JSON object. Each key is a Compose service name.
+Each value is an immutable image reference with a SHA-256 digest. The file is
+limited to 64 KiB. Duplicate keys, mutable references, incomplete service sets,
+and image differences fail validation. The `--expected-images` option and
+`--structural-only` are mutually exclusive.
+
+This option binds the rendered Compose document to exact image references. It
+does not authenticate the JSON file or prove image provenance. The caller must
+derive the file from an integration artifact and release manifest that were
+verified through independent trust roots. Environment variable allowlists and
+declared `_FILE` secret bindings remain required before application activation.
 
 `verify-github-evidence` confirms the repository, branch, commit, run attempt,
 and exact `.github/workflows/vps-release.yml` workflow through the public GitHub
