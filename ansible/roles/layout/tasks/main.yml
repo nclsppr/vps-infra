@@ -40,7 +40,7 @@
       - vps_static_jobs_backing_path == '/run/private/vps-static-jobs'
       - >-
         vps_static_jobs_mount_unit ==
-        'run-private-vps\x2dstatic\x2djobs.mount'
+        'run-private-vps\\x2dstatic\\x2djobs.mount'
       - vps_static_jobs_tmpfs_size_mib | int == 384
       - vps_static_jobs_tmpfs_inodes | int == 16384
     fail_msg: >-

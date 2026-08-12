@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 from ansible.parsing.dataloader import DataLoader
 from ansible.template import Templar, trust_as_template
+from jinja2 import Environment
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -596,6 +597,18 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             )
         )
         by_name = {task["name"]: task for task in tasks}
+        contract_assertions = by_name[
+            "Validate managed directory and network names"
+        ]["ansible.builtin.assert"]["that"]
+        mount_unit_assertion = next(
+            assertion
+            for assertion in contract_assertions
+            if "vps_static_jobs_mount_unit" in assertion
+        )
+        self.assertIs(
+            Environment().compile_expression(mount_unit_assertion)(**defaults),
+            True,
+        )
         content_probe = by_name[
             "Inspect content that would be shadowed by the static job mount"
         ]["ansible.builtin.command"]["argv"]
