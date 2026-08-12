@@ -1056,6 +1056,118 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn('SecretSpec("postgres-superuser-password", 70)', helper_text)
         self.assertIn('SecretSpec("grafana-secret-key", 472)', helper_text)
 
+    def test_surplasse_guard_accepts_the_active_oneshot_platform_unit(self) -> None:
+        unit = (
+            ROOT
+            / "ansible/roles/internal_platform/templates/vps-internal-platform.service.j2"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Type=oneshot", unit)
+        self.assertIn("RemainAfterExit=yes", unit)
+
+        role = yaml.safe_load(
+            (ROOT / "ansible/roles/surplasse/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        stage = next(
+            task
+            for task in role
+            if task["name"] == "Stage a fail-closed Surplasse release"
+        )
+        preparation_tasks = {task["name"]: task for task in stage["block"]}
+
+        activity = preparation_tasks["Read the internal platform unit activity"]
+        self.assertEqual(
+            activity["ansible.builtin.command"]["argv"],
+            [
+                "/usr/bin/systemctl",
+                "is-active",
+                "{{ vps_surplasse_internal_platform_unit }}",
+            ],
+        )
+        self.assertEqual(
+            activity["register"],
+            "vps_surplasse_internal_platform_unit_activity",
+        )
+        self.assertFalse(activity["changed_when"])
+
+        guard = preparation_tasks[
+            "Require the active and enabled shared internal platform"
+        ]["ansible.builtin.assert"]["that"]
+        self.assertIn(
+            "vps_surplasse_internal_platform_unit_activity.stdout == 'active'",
+            guard,
+        )
+        self.assertIn(
+            "ansible_facts.services[vps_surplasse_internal_platform_unit].status "
+            "== 'enabled'",
+            guard,
+        )
+        self.assertNotIn(
+            "ansible_facts.services[vps_surplasse_internal_platform_unit].state "
+            "== 'running'",
+            guard,
+        )
+
+        environment = Environment()
+        platform_unit = "vps-internal-platform.service"
+
+        def guard_results(
+            *, activity_stdout: str, platform_status: str, docker_state: str
+        ) -> list[bool]:
+            variables = {
+                "ansible_facts": {
+                    "services": {
+                        "docker.service": {"state": docker_state},
+                        platform_unit: {
+                            "state": "stopped",
+                            "status": platform_status,
+                        },
+                    }
+                },
+                "vps_surplasse_internal_platform_unit": platform_unit,
+                "vps_surplasse_internal_platform_unit_activity": {
+                    "stdout": activity_stdout
+                },
+            }
+            return [
+                bool(environment.compile_expression(assertion)(**variables))
+                for assertion in guard
+            ]
+
+        self.assertTrue(
+            all(
+                guard_results(
+                    activity_stdout="active",
+                    platform_status="enabled",
+                    docker_state="running",
+                )
+            )
+        )
+        for inactive_boundary in (
+            {
+                "activity_stdout": "inactive",
+                "platform_status": "enabled",
+                "docker_state": "running",
+            },
+            {
+                "activity_stdout": "active",
+                "platform_status": "disabled",
+                "docker_state": "running",
+            },
+            {
+                "activity_stdout": "active",
+                "platform_status": "enabled",
+                "docker_state": "stopped",
+            },
+        ):
+            self.assertFalse(all(guard_results(**inactive_boundary)))
+
+        runtime_verification = (
+            ROOT / "ansible/roles/internal_platform/tasks/verify-runtime.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(".State.Health.Status == 'healthy'", runtime_verification)
+
     def test_internal_platform_secret_materialization_is_idempotent(self) -> None:
         helper = ROOT / "scripts/materialize-internal-platform-secrets"
         with tempfile.TemporaryDirectory() as temporary_directory:
