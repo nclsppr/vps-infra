@@ -647,6 +647,11 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertIn("Pull the exact verified Caddy image", role_text)
         self.assertIn("Validate Caddy with the staged production files", role_text)
+        self.assertIn("Read the effective Docker ingress firewall activity", role_text)
+        self.assertIn(
+            "vps_public_static_edge_ingress_firewall_activity.stdout == 'active'",
+            role_text,
+        )
         self.assertIn("Remove an interrupted public edge staging tree", role_text)
         self.assertIn("Atomically install the immutable public edge release", role_text)
         self.assertIn("Atomically activate the staged public edge release", role_text)

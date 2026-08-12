@@ -147,13 +147,23 @@
     - name: Read baseline service state
       ansible.builtin.service_facts:
 
+    - name: Read the effective Docker ingress firewall activity
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - vps-docker-ingress-firewall.service
+      register: vps_public_static_edge_ingress_firewall_activity
+      changed_when: false
+
     - name: Require the converged Docker and ingress firewall services
       ansible.builtin.assert:
         that:
           - ansible_facts.services['docker.service'].state == 'running'
           - >-
-            ansible_facts.services['vps-docker-ingress-firewall.service'].state
-            == 'running'
+            ansible_facts.services['vps-docker-ingress-firewall.service'].status
+            == 'enabled'
+          - vps_public_static_edge_ingress_firewall_activity.stdout == 'active'
         fail_msg: Run the host convergence before starting the public edge.
 
     - name: Inspect the dedicated public edge network
