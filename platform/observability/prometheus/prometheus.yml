@@ -17,11 +17,6 @@ scrape_configs:
         labels:
           project: platform
 
-  - job_name: caddy
-    file_sd_configs:
-      - files:
-          - /etc/prometheus/targets/caddy.yml
-
   - job_name: node-exporter
     file_sd_configs:
       - files:

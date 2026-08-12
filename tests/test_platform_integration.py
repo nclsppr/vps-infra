@@ -390,6 +390,7 @@ class PlatformIntegrationWorkflowTests(unittest.TestCase):
                 ".github/workflows/platform-integration.yml",
                 "platform/.env.example",
                 "platform/compose.yaml",
+                "platform/expected-images.json",
                 "platform/caddy/Caddyfile",
                 "platform/caddy/routes/**",
                 "platform/observability/**",
@@ -534,6 +535,7 @@ class PlatformIntegrationRepositoryContractTests(unittest.TestCase):
         expected = {
             "platform/.env.example",
             "platform/compose.yaml",
+            "platform/expected-images.json",
             "platform/caddy/Caddyfile",
             *(
                 path.relative_to(ROOT).as_posix()

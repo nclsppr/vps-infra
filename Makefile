@@ -76,7 +76,7 @@ check-platform-config: ## Render Compose and apply the production policy.
 	$(COMPOSE) --env-file "$(PLATFORM_ENV)" --file platform/compose.yaml \
 		config --format json >"$$rendered"; \
 	./scripts/validate-compose \
-		--structural-only \
+		--expected-images platform/expected-images.json \
 		--repository-root "$(CURDIR)" \
 		vps-platform "$$rendered"
 

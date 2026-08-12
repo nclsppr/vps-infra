@@ -32,11 +32,11 @@ platform:
   blocked_by: []
   images:
     caddy: ghcr.io/nclsppr/vps-infra/caddy:2.11.4@sha256:<digest>
-    postgres: docker.io/library/postgres:17.10-bookworm@sha256:<digest>
-    prometheus: docker.io/prom/prometheus:v3.13.1@sha256:<digest>
-    grafana: docker.io/grafana/grafana:13.1.1@sha256:<digest>
-    node_exporter: docker.io/prom/node-exporter:<version>@sha256:<digest>
-    postgres_exporter: docker.io/prometheuscommunity/postgres-exporter:<version>@sha256:<digest>
+    postgres: ghcr.io/nclsppr/vps-infra/postgres:sha-<revision>@sha256:<digest>
+    prometheus: docker.io/prom/prometheus:v3.13.2-busybox@sha256:<digest>
+    grafana: docker.io/grafana/grafana:13.1.3-slim@sha256:<digest>
+    node_exporter: docker.io/prom/node-exporter:v1.12.1-busybox@sha256:<digest>
+    postgres_exporter: docker.io/prometheuscommunity/postgres-exporter:v0.20.1@sha256:<digest>
   integration:
     source_revision: <sha-config-plateforme>
     artifact: ghcr.io/nclsppr/vps-infra/platform-integration@sha256:<digest>

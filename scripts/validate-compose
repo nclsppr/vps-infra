@@ -43,15 +43,14 @@ PUBLIC_STATIC_EDGE_SERVICES = frozenset({"caddy"})
 PUBLIC_STATIC_EDGE_NETWORKS = frozenset({"edge"})
 PLATFORM_ALLOWED_CAPABILITIES = {
     "caddy": frozenset({"NET_BIND_SERVICE"}),
-    "postgresql": frozenset({"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}),
 }
 PLATFORM_USERS = {
     "caddy": None,
-    "postgresql": None,
+    "postgresql": "70:70",
     "prometheus": None,
     "grafana": "472:472",
     "node-exporter": None,
-    "postgres-exporter": "65534:999",
+    "postgres-exporter": "65534:70",
 }
 PLATFORM_VOLUME_TARGETS = {
     "caddy": frozenset({"/etc/caddy/Caddyfile", "/etc/caddy/routes", "/srv/www", "/data", "/config"}),
@@ -251,7 +250,7 @@ PLATFORM_TMPFS = {
     "caddy": ["/tmp:size=32m,mode=1777", "/run:size=8m,mode=0755"],
     "postgresql": [
         "/tmp:size=64m,mode=1777",
-        "/var/run/postgresql:size=16m,mode=2775,uid=999,gid=999",
+        "/var/run/postgresql:size=16m,mode=2775,uid=70,gid=70",
     ],
     "prometheus": ["/tmp:size=32m,mode=1777"],
     "grafana": [
@@ -260,6 +259,15 @@ PLATFORM_TMPFS = {
     ],
     "node-exporter": ["/tmp:size=8m,mode=1777"],
     "postgres-exporter": ["/tmp:size=8m,mode=1777"],
+}
+PLATFORM_HEALTHCHECK_TESTS = {
+    "grafana": [
+        "CMD",
+        "curl",
+        "--fail",
+        "--silent",
+        "http://127.0.0.1:3000/api/health",
+    ],
 }
 
 
@@ -809,6 +817,16 @@ def validate_healthcheck(project: str, service_name: str, service: dict[str, Any
     if healthcheck.get("disable") is True:
         fail(f"services.{service_name}.healthcheck: may not be disabled")
     test = healthcheck.get("test")
+    expected_test = (
+        PLATFORM_HEALTHCHECK_TESTS.get(service_name)
+        if project == "vps-platform"
+        else None
+    )
+    if expected_test is not None and test != expected_test:
+        fail(
+            f"services.{service_name}.healthcheck.test: differs from the audited "
+            "platform probe"
+        )
     if isinstance(test, list):
         command_text = " ".join(str(part) for part in test)
         if not test or test[0] not in {"CMD", "CMD-SHELL", "NONE"}:

@@ -715,6 +715,81 @@ class SupplyChainContractTests(unittest.TestCase):
 
 
 class SecurityBoundaryContractTests(unittest.TestCase):
+    def test_shared_platform_images_and_non_root_database_are_exact(self) -> None:
+        environment = {}
+        for raw_line in (ROOT / "platform/.env.example").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, value = line.split("=", maxsplit=1)
+            self.assertNotIn(key, environment)
+            environment[key] = value
+
+        expected_images = json.loads(
+            (ROOT / "platform/expected-images.json").read_text(encoding="utf-8")
+        )
+        image_variables = {
+            "caddy": "CADDY_PLATFORM_IMAGE",
+            "grafana": "GRAFANA_IMAGE",
+            "node-exporter": "NODE_EXPORTER_IMAGE",
+            "postgres-exporter": "POSTGRES_EXPORTER_IMAGE",
+            "postgresql": "POSTGRES_IMAGE",
+            "prometheus": "PROMETHEUS_IMAGE",
+        }
+        self.assertEqual(set(expected_images), set(image_variables))
+        for service_name, variable_name in image_variables.items():
+            reference = expected_images[service_name]
+            self.assertEqual(reference, environment[variable_name])
+            self.assertRegex(reference, r"^[^\s]+@sha256:[0-9a-f]{64}$")
+
+        compose = yaml.safe_load(
+            (ROOT / "platform/compose.yaml").read_text(encoding="utf-8")
+        )
+        postgresql = compose["services"]["postgresql"]
+        self.assertEqual(postgresql["user"], "70:70")
+        self.assertNotIn("cap_add", postgresql)
+        self.assertIn(
+            "/var/run/postgresql:size=16m,mode=2775,uid=70,gid=70",
+            postgresql["tmpfs"],
+        )
+        self.assertEqual(
+            compose["services"]["postgres-exporter"]["user"],
+            "65534:70",
+        )
+        self.assertEqual(
+            compose["services"]["grafana"]["healthcheck"]["test"],
+            [
+                "CMD",
+                "curl",
+                "--fail",
+                "--silent",
+                "http://127.0.0.1:3000/api/health",
+            ],
+        )
+
+        prometheus = yaml.safe_load(
+            (
+                ROOT
+                / "platform/observability/prometheus/prometheus.yml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertNotIn(
+            "caddy",
+            {job["job_name"] for job in prometheus["scrape_configs"]},
+        )
+
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        platform_check = makefile.split("check-platform-config:", maxsplit=1)[1].split(
+            "check-public-static-edge:", maxsplit=1
+        )[0]
+        self.assertIn(
+            "--expected-images platform/expected-images.json",
+            platform_check,
+        )
+        self.assertNotIn("--structural-only", platform_check)
+
     def test_public_static_edge_is_caddy_only_and_reversible(self) -> None:
         edge_root = ROOT / "platform/public-static-edge"
         compose = yaml.safe_load((edge_root / "compose.yaml").read_text(encoding="utf-8"))
