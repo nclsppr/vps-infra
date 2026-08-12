@@ -189,25 +189,30 @@
       - /usr/bin/ss
       - -H
       - -lntup
+      - "sport = :{{ item }}"
   register: vps_internal_platform_host_listeners
   changed_when: false
-
-- name: Select host listeners owned by the internal platform contract
-  ansible.builtin.set_fact:
-    vps_internal_platform_bounded_listener_lines: >-
-      {{ vps_internal_platform_host_listeners.stdout_lines |
-         select('search', ':(?:3000|5432|9090|9100|9187)\\b') | list }}
+  loop:
+    - 3000
+    - 5432
+    - 9090
+    - 9100
+    - 9187
 
 - name: Prove Grafana is the sole loopback host listener
   ansible.builtin.assert:
     that:
-      - vps_internal_platform_bounded_listener_lines | length == 1
       - >-
-        vps_internal_platform_bounded_listener_lines[0] is
-        search('127\\.0\\.0\\.1:3000\\b')
+        item.item != 3000 or
+        (item.stdout_lines | length == 1 and
+         item.stdout_lines[0] is search('127[.]0[.]0[.]1:3000[ \t]'))
+      - item.item == 3000 or item.stdout | trim == ''
     fail_msg: >-
       PostgreSQL or a metrics endpoint is public, or Grafana is not bound only
       to IPv4 loopback.
+  loop: "{{ vps_internal_platform_host_listeners.results }}"
+  loop_control:
+    label: "{{ item.item }}"
 
 - name: Read the PostgreSQL runtime version
   ansible.builtin.command:
