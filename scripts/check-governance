@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Validate repository governance and generate the Markdown catalog."""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path, PurePosixPath
+
+import yaml
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "documentation.json"
+CATALOG = ROOT / "DOCUMENTATION-CATALOG.md"
+VISIBILITIES = {"public", "internal", "reference", "archive"}
+SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+DOCKER_DIGEST_PATTERN = re.compile(r"^docker://[^\s@]+@sha256:[0-9a-f]{64}$")
+EXPECTED_FOUNDATION = {
+    "source": "https://github.com/nclsppr/project-foundation.git",
+    "tag": "v0.5.2",
+    "tagObject": "d9eadc7ebf5ac74b6bef2180fbdf9eb538f4ecf6",
+    "commit": "708d7374f87060809a805c57abc2cf7e7b66c182",
+    "mode": "selected-practices",
+}
+REQUIRED_FILES = (
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "DOCUMENTATION.md",
+    "PROJECT.md",
+    "STATUS.md",
+    "docs/decisions/0004-alignement-selectif-project-foundation.md",
+)
+
+
+class GovernanceError(ValueError):
+    """A deterministic repository-governance failure."""
+
+
+def validate_pattern(value: object, location: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise GovernanceError(f"{location} doit être un glob non vide")
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts or "\\" in value:
+        raise GovernanceError(f"{location} sort du dépôt : {value!r}")
+    return value
+
+
+def load_manifest() -> dict[str, object]:
+    try:
+        data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise GovernanceError(f"documentation.json invalide : {error}") from error
+
+    if not isinstance(data, dict) or data.get("schemaVersion") != 1:
+        raise GovernanceError("documentation.json doit utiliser schemaVersion 1")
+
+    renderer = data.get("renderer")
+    if not isinstance(renderer, dict):
+        raise GovernanceError("renderer doit être un objet")
+    for field in ("name", "config"):
+        if not isinstance(renderer.get(field), str) or not renderer[field].strip():
+            raise GovernanceError(f"renderer.{field} est requis")
+
+    foundation = data.get("foundationEvaluation")
+    if not isinstance(foundation, dict):
+        raise GovernanceError("foundationEvaluation doit être un objet")
+    if foundation != EXPECTED_FOUNDATION:
+        raise GovernanceError(
+            "foundationEvaluation doit correspondre exactement à la provenance "
+            "Foundation acceptée dans l'ADR-0004"
+        )
+
+    collections = data.get("collections")
+    if not isinstance(collections, list) or not collections:
+        raise GovernanceError("au moins une collection documentaire est requise")
+    identifiers: set[str] = set()
+    for index, collection in enumerate(collections):
+        location = f"collections[{index}]"
+        if not isinstance(collection, dict):
+            raise GovernanceError(f"{location} doit être un objet")
+        identifier = collection.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise GovernanceError(f"{location}.id est requis")
+        if identifier in identifiers:
+            raise GovernanceError(f"collection dupliquée : {identifier}")
+        identifiers.add(identifier)
+        if not isinstance(collection.get("title"), str) or not collection["title"]:
+            raise GovernanceError(f"{location}.title est requis")
+        if collection.get("visibility") not in VISIBILITIES:
+            raise GovernanceError(f"{location}.visibility est invalide")
+        patterns = collection.get("include")
+        if not isinstance(patterns, list) or not patterns:
+            raise GovernanceError(f"{location}.include doit contenir des globs")
+        for pattern_index, pattern in enumerate(patterns):
+            validate_pattern(pattern, f"{location}.include[{pattern_index}]")
+
+    ignored = data.get("ignored", [])
+    if not isinstance(ignored, list):
+        raise GovernanceError("ignored doit être une liste")
+    for index, item in enumerate(ignored):
+        if not isinstance(item, dict):
+            raise GovernanceError(f"ignored[{index}] doit être un objet")
+        validate_pattern(item.get("pattern"), f"ignored[{index}].pattern")
+        if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+            raise GovernanceError(f"ignored[{index}].reason est requis")
+    return data
+
+
+def markdown_files() -> set[Path]:
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ROOT),
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            "*.md",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise GovernanceError(f"impossible d'énumérer les Markdown Git : {detail}")
+    return {
+        ROOT / name.decode("utf-8")
+        for name in result.stdout.split(b"\0")
+        if name
+        and (
+            (ROOT / name.decode("utf-8")).is_file()
+            or (ROOT / name.decode("utf-8")).is_symlink()
+        )
+    }
+
+
+def tracked_markdown_files() -> set[Path]:
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "--cached", "-z", "--", "*.md"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise GovernanceError(
+            f"impossible d'énumérer les Markdown suivis par Git : {detail}"
+        )
+    return {
+        ROOT / name.decode("utf-8")
+        for name in result.stdout.split(b"\0")
+        if name
+        and (
+            (ROOT / name.decode("utf-8")).is_file()
+            or (ROOT / name.decode("utf-8")).is_symlink()
+        )
+    }
+
+
+def expand(pattern: str, candidates: set[Path]) -> set[Path]:
+    return {
+        path
+        for path in ROOT.glob(pattern)
+        if (path.is_file() or path.is_symlink()) and path in candidates
+    }
+
+
+def classify(
+    manifest: dict[str, object],
+) -> tuple[list[tuple[dict[str, object], list[Path]]], list[dict[str, str]]]:
+    files = markdown_files()
+    tracked = tracked_markdown_files()
+    owners: dict[Path, list[str]] = {path: [] for path in files}
+    classified: list[tuple[dict[str, object], list[Path]]] = []
+    failures: list[str] = []
+
+    for path in sorted(files, key=lambda value: value.relative_to(ROOT).as_posix()):
+        if path.is_symlink():
+            failures.append(
+                "un Markdown ne peut pas être un lien symbolique : "
+                f"{path.relative_to(ROOT).as_posix()}"
+            )
+
+    for collection in manifest["collections"]:
+        matched: set[Path] = set()
+        for pattern in collection["include"]:
+            matched.update(expand(pattern, files))
+        for path in matched:
+            owners[path].append(f"collection:{collection['id']}")
+        classified.append(
+            (
+                collection,
+                sorted(matched, key=lambda path: path.relative_to(ROOT).as_posix()),
+            )
+        )
+
+    ignored = manifest.get("ignored", [])
+    for item in ignored:
+        ignored_paths = expand(item["pattern"], files)
+        for path in ignored_paths:
+            owners[path].append(f"ignored:{item['pattern']}")
+        for path in sorted(ignored_paths & tracked):
+            failures.append(
+                "un Markdown suivi par Git ne peut pas être ignoré : "
+                f"{path.relative_to(ROOT).as_posix()}"
+            )
+
+    for path in sorted(files, key=lambda value: value.relative_to(ROOT).as_posix()):
+        relative = path.relative_to(ROOT).as_posix()
+        path_owners = owners[path]
+        if not path_owners:
+            failures.append(f"Markdown orphelin : {relative}")
+        elif len(path_owners) > 1:
+            failures.append(
+                f"Markdown classé plusieurs fois : {relative} ({', '.join(path_owners)})"
+            )
+    if failures:
+        raise GovernanceError("\n".join(failures))
+    return classified, ignored
+
+
+def render_catalog(
+    manifest: dict[str, object],
+    classified: list[tuple[dict[str, object], list[Path]]],
+    ignored: list[dict[str, str]],
+) -> str:
+    foundation = manifest["foundationEvaluation"]
+    lines = [
+        "<!-- Généré par scripts/check-governance. Ne pas modifier à la main. -->",
+        "",
+        "# Catalogue documentaire",
+        "",
+        "Chaque Markdown maintenu est classé depuis `documentation.json`.",
+        "",
+        f"Rendu canonique : `{manifest['renderer']['name']}`.",
+        "",
+        "Project Foundation est évalué en mode sélectif, sans conformité formelle :",
+        f"`{foundation['tag']}` au commit `{foundation['commit']}`.",
+        "",
+        "| Collection | Visibilité | Fichiers |",
+        "| --- | --- | ---: |",
+    ]
+    for collection, paths in classified:
+        lines.append(
+            f"| {collection['title']} | `{collection['visibility']}` | {len(paths)} |"
+        )
+    for collection, paths in classified:
+        lines.extend(["", f"## {collection['title']}", ""])
+        lines.extend(
+            f"- [{path.relative_to(ROOT).as_posix()}]({path.relative_to(ROOT).as_posix()})"
+            for path in paths
+        )
+    if ignored:
+        lines.extend(
+            [
+                "",
+                "## Chemins ignorés",
+                "",
+                "| Glob | Raison |",
+                "| --- | --- |",
+            ]
+        )
+        lines.extend(f"| `{item['pattern']}` | {item['reason']} |" for item in ignored)
+    return "\n".join(lines) + "\n"
+
+
+def check_required_files() -> list[str]:
+    return [f"fichier de gouvernance absent : {path}" for path in REQUIRED_FILES if not (ROOT / path).is_file()]
+
+
+def action_references(node: Node) -> list[tuple[int, str | None]]:
+    references: list[tuple[int, str | None]] = []
+    if isinstance(node, MappingNode):
+        for key_node, value_node in node.value:
+            if isinstance(key_node, ScalarNode) and key_node.value == "uses":
+                reference = value_node.value if isinstance(value_node, ScalarNode) else None
+                references.append((value_node.start_mark.line + 1, reference))
+            references.extend(action_references(value_node))
+    elif isinstance(node, SequenceNode):
+        for child in node.value:
+            references.extend(action_references(child))
+    return references
+
+
+def check_action_pins() -> list[str]:
+    failures: list[str] = []
+    for workflow in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+        text = workflow.read_text(encoding="utf-8")
+        try:
+            document = yaml.compose(text, Loader=yaml.BaseLoader)
+        except yaml.YAMLError as error:
+            failures.append(f"{workflow.relative_to(ROOT)} : YAML invalide : {error}")
+            continue
+        if document is None:
+            continue
+        for line, reference in action_references(document):
+            if reference is None:
+                failures.append(
+                    f"{workflow.relative_to(ROOT)}:{line} : uses doit être une chaîne"
+                )
+                continue
+            if reference.startswith("./"):
+                continue
+            if reference.startswith("docker://"):
+                if not DOCKER_DIGEST_PATTERN.fullmatch(reference):
+                    failures.append(
+                        f"{workflow.relative_to(ROOT)}:{line} : image d'Action non épinglée par digest"
+                    )
+                continue
+            _action, separator, revision = reference.rpartition("@")
+            if not separator or not SHA_PATTERN.fullmatch(revision):
+                failures.append(
+                    f"{workflow.relative_to(ROOT)}:{line} : Action non épinglée par SHA complet : {reference}"
+                )
+    return failures
+
+
+def check_canonical_ci() -> list[str]:
+    workflow = ROOT / ".github/workflows/validate.yml"
+    text = workflow.read_text(encoding="utf-8") if workflow.is_file() else ""
+    matches = re.findall(r"(?m)^\s*run:\s*make check\s*$", text)
+    if len(matches) != 1:
+        return ["validate.yml doit appeler exactement une fois la commande canonique `make check`"]
+    return []
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--write-catalog",
+        action="store_true",
+        help="regenerate DOCUMENTATION-CATALOG.md before validating",
+    )
+    args = parser.parse_args()
+    try:
+        manifest = load_manifest()
+        classified, ignored = classify(manifest)
+        expected = render_catalog(manifest, classified, ignored)
+    except GovernanceError as error:
+        print(f"gouvernance invalide : {error}", file=sys.stderr)
+        return 1
+
+    if args.write_catalog:
+        CATALOG.write_text(expected, encoding="utf-8")
+        print("Catalogue documentaire régénéré.")
+    elif not CATALOG.is_file() or CATALOG.read_text(encoding="utf-8") != expected:
+        current = CATALOG.read_text(encoding="utf-8") if CATALOG.is_file() else ""
+        print("Catalogue documentaire obsolète :", file=sys.stderr)
+        print(
+            "".join(
+                difflib.unified_diff(
+                    current.splitlines(keepends=True),
+                    expected.splitlines(keepends=True),
+                    fromfile="DOCUMENTATION-CATALOG.md",
+                    tofile="catalogue attendu",
+                )
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    failures = check_required_files() + check_action_pins() + check_canonical_ci()
+    if failures:
+        print("\n".join(failures), file=sys.stderr)
+        return 1
+    count = sum(len(paths) for _collection, paths in classified)
+    print(f"Gouvernance valide : {count} Markdown classés et Actions épinglées.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

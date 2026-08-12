@@ -135,12 +135,13 @@ même avec des champs de preuve syntaxiquement complets. Le manifeste commité
 garde donc la plateforme et les quatre applications désactivées. Le marqueur
 hôte et l’applicateur live sont absents eux aussi.
 
-### Locked platform candidate declaration
+### Déclaration candidate de plateforme verrouillée
 
-The locked policy can record a complete candidate declaration before
-activation. This declaration is not provenance-complete. The platform stays
-disabled, publishes no port, and retains all current blockers. The four
-candidate fields are an all-or-nothing group:
+La politique verrouillée peut enregistrer une déclaration candidate complète
+avant activation. Cette déclaration ne possède pas encore une provenance
+complète. La plateforme reste désactivée, ne publie aucun port et conserve tous
+ses blocages actuels. Les quatre champs candidats forment un groupe tout ou
+rien :
 
 ```yaml
 platform:
@@ -158,31 +159,31 @@ platform:
   readiness_evidence: <all-platform-evidence>
 ```
 
-The validator rejects a partial candidate. It also rejects a mutable reference,
-an unexpected registry repository, a PostgreSQL major mismatch, and evidence
-that is not bound to the integration revision. The controller requires the
-integration revision to be an ancestor of the requested release commit. The
-online evidence check runs before desired state is written. Reconciliation
-returns `unchanged-disabled`, emits no applicable runtime reference, and still
-rejects a quarantined candidate digest.
+Le validateur refuse un candidat partiel, une référence mutable, un dépôt de
+registry inattendu, une version majeure PostgreSQL incohérente et toute preuve
+non liée à la révision d'intégration. Le contrôleur exige que cette révision
+soit un ancêtre du commit de release demandé. Le contrôle des preuves en ligne
+s'exécute avant l'écriture de l'état désiré. La réconciliation renvoie
+`unchanged-disabled`, n'émet aucune référence runtime applicable et refuse
+toujours le digest d'un candidat en quarantaine.
 
-Candidate metadata is not an activation request. While
-`activation_policy: locked` is the only accepted policy, the controller rejects
-the production marker even if an applicator exists. It cannot create active
-state.
+Les métadonnées candidates ne constituent pas une demande d'activation. Tant
+que `activation_policy: locked` reste l'unique politique acceptée, le
+contrôleur refuse le marqueur de production même si un applicateur existe. Il
+ne peut créer aucun état actif.
 
-The evidence run does not yet certify each declared OCI digest. The manifest
-therefore retains the provenance blockers. A later workflow must verify the
-digest, OCI labels, and attestation explicitly before those blockers can be
-removed.
+Le run de preuve ne certifie pas encore chaque digest OCI déclaré. Le manifeste
+conserve donc les blocages de provenance. Un futur workflow devra vérifier
+explicitement le digest, les labels OCI et l'attestation avant de retirer ces
+blocages.
 
-The schema stays at version 1 and still accepts the legacy manifest. An older
-controller does not understand the candidate fields. Before a controller
-downgrade, first use the current controller to record a legacy manifest that
-omits all four candidate fields. Verify that `desired/manifest.json` contains
-no candidate. Only then converge the older controller revision. Reverting the
-controller first makes the old validator fail closed on the persisted
-candidate.
+Le schéma reste en version 1 et accepte encore le manifeste historique. Un
+ancien contrôleur ne comprend pas les champs candidats. Avant de revenir à un
+ancien contrôleur, utiliser d'abord le contrôleur courant pour enregistrer un
+manifeste historique qui omet les quatre champs. Vérifier que
+`desired/manifest.json` ne contient aucun candidat, puis seulement converger
+l'ancienne révision. Revenir d'abord au contrôleur précédent fait échouer
+fermement son ancien validateur sur le candidat persisté.
 
 Les tags lisibles peuvent être conservés comme annotations, mais Compose
 consomme les digests. Une mise à jour est donc un diff Git relisible et un
@@ -339,24 +340,28 @@ Le compte SSH de livraison :
 - peut appeler uniquement un script root-owned via une règle `sudoers`
   explicite, avec chemins absolus et sans `SETENV`.
 
-The delivered `deploy` script accepts only a full Git commit ID. It:
+Le script `deploy` livré accepte uniquement un identifiant de commit Git
+complet. Il :
 
-1. acquires one atomic global lock;
-2. verifies the exact public HTTPS origin and fetches only `main`;
-3. verifies that the requested commit is reachable from `origin/main`;
-4. reads the manifest from that Git object and validates it;
-5. verifies that the platform integration revision is an ancestor of the
-   requested release commit;
-6. verifies declared GitHub evidence before it writes desired state;
-7. rejects quarantined digests and writes a non-mutating reconciliation plan;
-8. records desired state only after all previous checks succeed;
-9. rejects `/etc/vps/production-enabled` while `activation_policy` is locked.
+1. prend un verrou global atomique ;
+2. vérifie l'origine HTTPS publique exacte et récupère uniquement `main` ;
+3. vérifie que le commit demandé est atteignable depuis `origin/main` ;
+4. lit le manifeste depuis cet objet Git et le valide ;
+5. vérifie que la révision d'intégration de la plateforme est un ancêtre du
+   commit de release demandé ;
+6. vérifie les preuves GitHub déclarées avant d'écrire l'état désiré ;
+7. refuse les digests en quarantaine et produit un plan de réconciliation sans
+   mutation ;
+8. enregistre l'état désiré uniquement après le succès des contrôles précédents ;
+9. refuse `/etc/vps/production-enabled` tant que `activation_policy` est
+   verrouillée.
 
-The locked controller does not contain an applicator execution path. A future
-audited revision must add disk and Docker checks, an immutable checkout,
-configuration rendering, digest pulls, explicitly authorized migrations,
-targeted activation, probes, compatible rollback, and a durable journal. The
-production marker alone can never enable that future path.
+Le contrôleur verrouillé ne contient aucun chemin d'exécution d'un applicateur.
+Une future révision auditée devra ajouter les contrôles disque et Docker, un
+checkout immuable, le rendu de configuration, les pulls par digest, les
+migrations explicitement autorisées, l'activation ciblée, les probes, un
+rollback compatible et un journal durable. Le seul marqueur de production ne
+pourra jamais activer ce futur chemin.
 
 Les projets Compose ont des noms fixes (`vps-platform`, `surplasse` et
 `parkventory`) afin qu’un nouveau chemin de checkout ne crée pas de nouveaux

@@ -21,24 +21,26 @@ faut renseigner aucune valeur réelle dans ce dépôt public.
 La clé SSH **privée** ne doit jamais être copiée dans Git, une issue ou un log.
 Le bootstrap utilise la clé déjà détenue par l’opérateur.
 
-## Verified Atlas host layer
+## Socle hôte Atlas vérifié
 
-The operator completed the host procedure on 2026-08-12. Atlas runs Ubuntu
-26.04 LTS on `amd64`. It has six CPUs and more than 11 GiB of memory. Bootstrap,
-fresh administrator connections, SSH hardening, the exact UFW policy, Docker,
-repeated convergence, predictive check mode, and a complete reboot passed.
-Direct root SSH fails. No application toolchain, platform container, production
-secret, production marker, or live applicator is present.
+L'opérateur a terminé la procédure hôte le 2026-08-12. Atlas exécute Ubuntu
+26.04 LTS sur `amd64`, avec six CPU et plus de 11 Gio de mémoire. L'amorçage,
+les nouvelles connexions administrateur, le durcissement SSH, la politique UFW
+exacte, Docker, plusieurs convergences, le mode prédictif et un redémarrage
+complet sont validés. L'accès SSH direct de root échoue. Aucun outil
+applicatif, conteneur de plateforme, secret de production, marqueur de
+production ni applicateur live n'est présent.
 
-The installed controller and repository mirror record the exact approved
-`main` revision. A normal convergence and the bounded `--check --diff` mode
-both reported `changed=0` after the reboot.
+Le contrôleur installé et le miroir du dépôt enregistrent la révision `main`
+exacte approuvée. Une convergence normale et le mode borné `--check --diff` ont
+tous deux indiqué `changed=0` après le redémarrage.
 
-The first public release supports IPv4 only. Caddy binds to `0.0.0.0`. The
-managed `DOCKER-USER` chain matches each original published port after Docker
-DNAT and drops every other new public forwarding path. Do not point an `AAAA`
-record to the VPS until a reviewed change defines the equivalent IPv6 policy
-and verifies external IPv4 and IPv6 probes.
+La première release publique prend uniquement en charge IPv4. Caddy se lie à
+`0.0.0.0`. La chaîne `DOCKER-USER` gérée correspond à chaque port publié
+d'origine après le DNAT Docker et abandonne tout autre nouveau chemin de
+transfert public. Ne pas pointer d'enregistrement `AAAA` vers le VPS tant qu'un
+changement relu n'a pas défini la politique IPv6 équivalente et vérifié les
+probes externes IPv4 et IPv6.
 
 ## API OVHcloud : trois identités, jamais un jeton global
 
@@ -110,10 +112,11 @@ Pour chaque zone :
 L’automatisation comparera cet export à l’état API. Elle ne réécrira jamais les
 enregistrements mail implicitement.
 
-Public observation on 2026-08-12 confirmed that every declared zone uses OVH
-authoritative name servers. The application domains still point to their
-previous hosts. This observation does not replace an API export of A, AAAA,
-CNAME, MX, SPF, DKIM, DMARC, CAA, wildcard, redirect, and TTL state.
+L'observation publique du 2026-08-12 a confirmé que chaque zone déclarée utilise
+des serveurs de noms OVH autoritaires. Les domaines applicatifs pointent encore
+vers leurs hôtes précédents. Cette observation ne remplace pas un export API de
+l'état des enregistrements A, AAAA, CNAME, MX, SPF, DKIM, DMARC, CAA, wildcard,
+des redirections et des TTL.
 
 ## Activation GitHub
 
@@ -143,9 +146,10 @@ Lors de la remise des accès :
 3. lancer `bootstrap.yml` en gardant la session initiale ouverte ;
 4. prouver une seconde connexion avant de durcir SSH ;
 5. exécuter `site.yml` deux fois et exiger zéro changement au second passage ;
-6. run the bounded `make converge-check` mode and review every diff ;
+6. exécuter le mode borné `make converge-check` et examiner chaque diff ;
 7. garder `VPS_DEPLOY_ENABLED=false` tant que les probes ne sont pas validées.
 
-Check mode is not a bootstrap simulation. It runs only after successful normal
-convergence because command-based resource creation and some effective-state
-assertions cannot be predicted completely.
+Le mode check ne simule pas l'amorçage. Il s'exécute uniquement après une
+convergence normale réussie, car la création de ressources fondée sur des
+commandes et certaines assertions d'état effectif ne sont pas entièrement
+prévisibles.

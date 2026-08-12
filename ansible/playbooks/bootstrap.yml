@@ -32,6 +32,29 @@
         index_var: vps_admin_key_index
         label: "clé publique {{ vps_admin_key_index + 1 }}"
 
+    - name: Read the operating system release before any mutation
+      ansible.builtin.raw: cat /etc/os-release
+      register: bootstrap_os_release
+      changed_when: false
+
+    - name: Refuse an unsupported operating system before any mutation
+      ansible.builtin.assert:
+        that:
+          - bootstrap_os_ids == ['ubuntu']
+          - bootstrap_os_versions | length == 1
+          - bootstrap_os_versions[0] in vps_supported_ubuntu_releases
+        fail_msg: >-
+          Refus du bootstrap avant mutation : la cible doit être une version
+          Ubuntu explicitement validée :
+          {{ vps_supported_ubuntu_releases | join(', ') }}.
+      vars:
+        bootstrap_os_ids: >-
+          {{ bootstrap_os_release.stdout |
+             regex_findall('(?m)^ID="?([^"\r\n]+)"?\r?$') }}
+        bootstrap_os_versions: >-
+          {{ bootstrap_os_release.stdout |
+             regex_findall('(?m)^VERSION_ID="?([^"\r\n]+)"?\r?$') }}
+
     - name: Ensure Python is available on a minimal Ubuntu image
       ansible.builtin.raw: >-
         test -x /usr/bin/python3 ||
@@ -43,7 +66,7 @@
     - name: Gather facts after Python bootstrap
       ansible.builtin.setup:
 
-    - name: Refuse an unsupported operating system
+    - name: Confirm the operating system after gathering facts
       ansible.builtin.assert:
         that:
           - ansible_distribution == 'Ubuntu'

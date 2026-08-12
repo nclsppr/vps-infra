@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import ipaddress
+import os
+import re
+import socket
+import stat
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+import yaml
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
+
+
+MAX_INPUT_BYTES = 1024 * 1024
+ALLOWED_EXTRA_VARIABLES = {
+    "vps_admin_authorized_keys",
+    "vps_deploy_authorized_keys",
+}
+ALLOWED_HOST_VARIABLES = {
+    "ansible_connection",
+    "ansible_host",
+    "ansible_port",
+    "ansible_user",
+}
+PUBLIC_KEY_PATTERN = re.compile(
+    r"^(ssh-ed25519|sk-ssh-ed25519@openssh\.com|"
+    r"ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh\.com|ssh-rsa) "
+    r"([A-Za-z0-9+/]+={0,3})(?: [^\r\n]*)?$"
+)
+INVENTORY_ALIAS_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$")
+UNIX_USER_PATTERN = re.compile(r"^[a-z_][a-z0-9_-]{0,30}$")
+DNS_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+class InputValidationError(ValueError):
+    pass
+
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def construct_unique_mapping(
+    loader: UniqueKeyLoader,
+    node: MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    if not isinstance(node, MappingNode):
+        raise ConstructorError(
+            None,
+            None,
+            "un nœud de mapping est attendu",
+            node.start_mark,
+        )
+
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            raise ConstructorError(
+                "pendant la construction d'un mapping",
+                node.start_mark,
+                "les clés de fusion YAML ne sont pas acceptées",
+                key_node.start_mark,
+            )
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as error:
+            raise ConstructorError(
+                "pendant la construction d'un mapping",
+                node.start_mark,
+                "les clés d'un mapping doivent être des valeurs scalaires",
+                key_node.start_mark,
+            ) from error
+        if duplicate:
+            raise ConstructorError(
+                "pendant la construction d'un mapping",
+                node.start_mark,
+                f"clé de mapping dupliquée : {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    construct_unique_mapping,
+)
+
+
+def refuse(message: str) -> NoReturn:
+    raise InputValidationError(message)
+
+
+def read_document(path: Path, label: str) -> dict[object, object]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        refuse(f"{label} ne peut pas être ouvert comme fichier régulier non symbolique : {error}")
+
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            refuse(f"{label} n'est pas un fichier régulier")
+        if metadata.st_size > MAX_INPUT_BYTES:
+            refuse(f"{label} dépasse la limite de {MAX_INPUT_BYTES} octets")
+        with os.fdopen(descriptor, "r", encoding="utf-8", newline="") as stream:
+            descriptor = -1
+            documents = list(yaml.load_all(stream, Loader=UniqueKeyLoader))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        refuse(f"{label} n'est pas un YAML UTF-8 valide : {error}")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if len(documents) != 1:
+        refuse(f"{label} doit contenir exactement un document YAML")
+    document = documents[0]
+    if type(document) is not dict:
+        refuse(f"{label} doit contenir un objet YAML")
+    return document
+
+
+def require_mapping(value: object, location: str) -> dict[object, object]:
+    if type(value) is not dict:
+        refuse(f"{location} doit être un objet YAML")
+    return value
+
+
+def require_exact_keys(
+    mapping: dict[object, object],
+    expected: set[str],
+    location: str,
+) -> None:
+    keys = set(mapping)
+    if not all(type(key) is str for key in keys):
+        refuse(f"{location} contient une clé qui n'est pas une chaîne")
+    missing = sorted(expected - keys)
+    unexpected = sorted(keys - expected)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"clés absentes : {', '.join(missing)}")
+        if unexpected:
+            details.append(f"clés inattendues : {', '.join(unexpected)}")
+        refuse(f"{location} possède un schéma invalide ({'; '.join(details)})")
+
+
+def is_forbidden_endpoint(value: str) -> bool:
+    normalized = value.rstrip(".").lower()
+    forbidden_names = ("invalid", "localhost", "loopback")
+    if any(
+        normalized == name
+        or normalized.startswith(f"{name}.")
+        or normalized.endswith(f".{name}")
+        for name in forbidden_names
+    ):
+        return True
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        try:
+            socket.inet_aton(normalized)
+        except OSError:
+            return False
+        # Reject non-canonical IPv4 forms such as 127.1 and 0x7f000001.
+        return True
+    if address.is_loopback or address.is_unspecified:
+        return True
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped.is_loopback or address.ipv4_mapped.is_unspecified
+    return False
+
+
+def validate_inventory_alias(value: object) -> str:
+    if type(value) is not str or not INVENTORY_ALIAS_PATTERN.fullmatch(value):
+        refuse("le nom d'hôte de l'inventaire vps possède une syntaxe invalide")
+    if is_forbidden_endpoint(value):
+        refuse("le nom d'hôte de l'inventaire vps est une cible locale ou invalide interdite")
+    return value
+
+
+def validate_ansible_host(value: object) -> str:
+    if type(value) is not str or not value or value != value.strip():
+        refuse("ansible_host doit être une adresse IP ou un nom DNS unique")
+    if is_forbidden_endpoint(value):
+        refuse("ansible_host est une cible locale, de bouclage ou invalide interdite")
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+
+    dns_name = value.rstrip(".")
+    if len(dns_name) > 253 or not all(
+        DNS_LABEL_PATTERN.fullmatch(label) for label in dns_name.split(".")
+    ):
+        refuse("ansible_host doit être une adresse IP ou un nom DNS unique")
+    return value
+
+
+def validate_inventory(path: Path, mode: str) -> None:
+    document = read_document(path, "inventory")
+    require_exact_keys(document, {"all"}, "inventory root")
+    all_group = require_mapping(document["all"], "inventory all group")
+    require_exact_keys(all_group, {"children"}, "inventory all group")
+    children = require_mapping(all_group["children"], "inventory child groups")
+    require_exact_keys(children, {"vps"}, "inventory child groups")
+    vps_group = require_mapping(children["vps"], "inventory vps group")
+    require_exact_keys(vps_group, {"hosts"}, "inventory vps group")
+    hosts = require_mapping(vps_group["hosts"], "inventory vps hosts")
+    if len(hosts) != 1:
+        refuse("le groupe d'inventaire vps doit contenir exactement un hôte")
+
+    inventory_name, raw_host_variables = next(iter(hosts.items()))
+    validate_inventory_alias(inventory_name)
+    host_variables = require_mapping(
+        raw_host_variables,
+        "inventory vps host variables",
+    )
+    keys = set(host_variables)
+    if not all(type(key) is str for key in keys):
+        refuse("les variables d'hôte vps contiennent une clé qui n'est pas une chaîne")
+    required_keys = {"ansible_host", "ansible_port", "ansible_user"}
+    missing = sorted(required_keys - keys)
+    unexpected = sorted(keys - ALLOWED_HOST_VARIABLES)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"clés absentes : {', '.join(missing)}")
+        if unexpected:
+            details.append(f"clés inattendues : {', '.join(unexpected)}")
+        refuse(
+            "les variables d'hôte vps possèdent un schéma invalide "
+            f"({'; '.join(details)})"
+        )
+
+    validate_ansible_host(host_variables["ansible_host"])
+    port = host_variables["ansible_port"]
+    if type(port) is not int or not 1 <= port <= 65535:
+        refuse("ansible_port doit être un entier compris entre 1 et 65535")
+    user = host_variables["ansible_user"]
+    if type(user) is not str or not UNIX_USER_PATTERN.fullmatch(user):
+        refuse("ansible_user doit être un nom de compte local valide")
+    if mode == "bootstrap" and user == "deploy":
+        refuse("le compte deploy ne peut pas exécuter l'amorçage")
+    if mode == "converge" and user != "vpsadmin":
+        refuse("la convergence exige ansible_user vpsadmin")
+    connection = host_variables.get("ansible_connection", "smart")
+    if type(connection) is not str or connection not in {"smart", "ssh"}:
+        refuse("ansible_connection doit être ssh ou smart")
+
+
+def validate_public_key(value: object, location: str) -> str:
+    if type(value) is not str or value != value.strip():
+        refuse(f"{location} doit être une clé publique OpenSSH normalisée")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        refuse(f"{location} contient un caractère de contrôle")
+    match = PUBLIC_KEY_PATTERN.fullmatch(value)
+    if match is None:
+        refuse(f"{location} possède une syntaxe de clé publique OpenSSH invalide")
+    algorithm, encoded_blob = match.groups()
+    try:
+        blob = base64.b64decode(encoded_blob, validate=True)
+    except (binascii.Error, ValueError):
+        refuse(f"{location} contient des données de clé base64 invalides")
+    validate_ssh_blob(blob, algorithm, location)
+    return f"{algorithm} {encoded_blob}"
+
+
+def read_ssh_field(blob: bytes, offset: int, location: str) -> tuple[bytes, int]:
+    if len(blob) - offset < 4:
+        refuse(f"{location} contient des données de clé SSH tronquées")
+    length = int.from_bytes(blob[offset : offset + 4], byteorder="big")
+    offset += 4
+    end = offset + length
+    if end > len(blob):
+        refuse(f"{location} contient des données de clé SSH tronquées")
+    return blob[offset:end], end
+
+
+def validate_positive_mpint(value: bytes, location: str) -> int:
+    if not value or value == b"\x00":
+        refuse(f"{location} contient un entier SSH nul")
+    if value[0] & 0x80:
+        refuse(f"{location} contient un entier SSH négatif")
+    if len(value) > 1 and value[0] == 0 and not value[1] & 0x80:
+        refuse(f"{location} contient un entier SSH non canonique")
+    return int.from_bytes(value, byteorder="big")
+
+
+def validate_ssh_blob(blob: bytes, algorithm: str, location: str) -> None:
+    embedded_algorithm, offset = read_ssh_field(blob, 0, location)
+    if embedded_algorithm != algorithm.encode("ascii"):
+        refuse(f"{location} utilise un algorithme de clé SSH incohérent")
+
+    if algorithm in {"ssh-ed25519", "sk-ssh-ed25519@openssh.com"}:
+        public_key, offset = read_ssh_field(blob, offset, location)
+        if len(public_key) != 32:
+            refuse(f"{location} ne contient pas une clé Ed25519 de 32 octets")
+        if algorithm.startswith("sk-"):
+            application, offset = read_ssh_field(blob, offset, location)
+            if not application:
+                refuse(f"{location} possède une application de clé matérielle vide")
+    elif algorithm in {
+        "ecdsa-sha2-nistp256",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+    }:
+        curve, offset = read_ssh_field(blob, offset, location)
+        if curve != b"nistp256":
+            refuse(f"{location} n'utilise pas la courbe nistp256")
+        public_point, offset = read_ssh_field(blob, offset, location)
+        if len(public_point) != 65 or public_point[0] != 4:
+            refuse(f"{location} possède un point nistp256 non compressé invalide")
+        if algorithm.startswith("sk-"):
+            application, offset = read_ssh_field(blob, offset, location)
+            if not application:
+                refuse(f"{location} possède une application de clé matérielle vide")
+    elif algorithm == "ssh-rsa":
+        exponent_bytes, offset = read_ssh_field(blob, offset, location)
+        modulus_bytes, offset = read_ssh_field(blob, offset, location)
+        exponent = validate_positive_mpint(exponent_bytes, location)
+        modulus = validate_positive_mpint(modulus_bytes, location)
+        if exponent < 3 or exponent % 2 == 0:
+            refuse(f"{location} possède un exposant RSA invalide")
+        if modulus.bit_length() < 2048:
+            refuse(f"{location} possède un module RSA inférieur à 2048 bits")
+    else:  # pragma: no cover - the public token allowlist protects this branch.
+        refuse(f"{location} utilise un algorithme de clé SSH non pris en charge")
+
+    if offset != len(blob):
+        refuse(f"{location} contient des données de clé SSH supplémentaires")
+
+
+def validate_extra_vars(path: Path) -> None:
+    document = read_document(path, "extra-vars file")
+    require_exact_keys(document, ALLOWED_EXTRA_VARIABLES, "extra-vars object")
+    identities: dict[str, set[str]] = {}
+    for variable_name in sorted(ALLOWED_EXTRA_VARIABLES):
+        values = document[variable_name]
+        if type(values) is not list:
+            refuse(f"{variable_name} doit être une liste YAML")
+        if variable_name == "vps_admin_authorized_keys" and not values:
+            refuse("vps_admin_authorized_keys doit contenir au moins une clé publique")
+        normalized = [
+            validate_public_key(value, f"{variable_name}[{index}]")
+            for index, value in enumerate(values)
+        ]
+        if len(normalized) != len(set(normalized)):
+            refuse(f"{variable_name} contient une clé publique dupliquée")
+        identities[variable_name] = set(normalized)
+
+    shared = (
+        identities["vps_admin_authorized_keys"]
+        & identities["vps_deploy_authorized_keys"]
+    )
+    if shared:
+        refuse("les listes de clés administrateur et déploiement doivent être cryptographiquement disjointes")
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Valider les entrées opérateur bornées pour l'automatisation de l'hôte.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--mode", choices=("bootstrap", "converge"), required=True)
+    parser.add_argument("--inventory", type=Path, required=True)
+    parser.add_argument("--extra-vars", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        validate_inventory(arguments.inventory, arguments.mode)
+        validate_extra_vars(arguments.extra_vars)
+    except InputValidationError as error:
+        print(f"Validation des entrées Ansible refusée : {error}", file=sys.stderr)
+        return 78
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

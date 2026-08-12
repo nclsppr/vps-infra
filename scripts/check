@@ -15,24 +15,26 @@ platform_integration_revision=$("$SCRIPT_DIR/validate-release" \
 if [[ -n $platform_integration_revision ]]; then
   git -C "$REPOSITORY_ROOT" cat-file -e \
     "${platform_integration_revision}^{commit}" 2>/dev/null || {
-      echo "platform integration source revision is unavailable; fetch full Git history" >&2
+      echo "révision source de l'intégration plateforme indisponible ; récupérer l'historique Git complet" >&2
       exit 1
     }
   git -C "$REPOSITORY_ROOT" merge-base --is-ancestor \
     "$platform_integration_revision" HEAD || {
-      echo "platform integration source revision is not an ancestor of HEAD" >&2
+      echo "la révision source de l'intégration plateforme n'est pas un ancêtre de HEAD" >&2
       exit 1
     }
 fi
-echo "release manifest valid: $REPOSITORY_ROOT/releases/production.yaml"
+echo "manifeste de release valide : $REPOSITORY_ROOT/releases/production.yaml"
 "$SCRIPT_DIR/verify-github-evidence" \
   "$REPOSITORY_ROOT/releases/production.yaml"
 "$SCRIPT_DIR/check-public-safe" --root "$REPOSITORY_ROOT"
+"$SCRIPT_DIR/check-governance"
 "$SCRIPT_DIR/validate-application-state" --root "$REPOSITORY_ROOT"
 "$REPOSITORY_ROOT/tests/run"
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck \
+    "$SCRIPT_DIR/bootstrap" \
     "$SCRIPT_DIR/check" \
     "$SCRIPT_DIR/converge" \
     "$SCRIPT_DIR/deploy" \

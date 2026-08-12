@@ -42,40 +42,42 @@ Chaque paire `state.json`/`manifest.json` est revalidée par hash, par contenu G
 octet pour octet et par rattachement à `origin/main` avant toute nouvelle
 réconciliation. Les clés JSON dupliquées sont refusées.
 
-Persisted manifests are also revalidated with the installed Draft 2020-12 JSON
-Schema and the Python release policy. A controller update cannot silently use
-only one of these two trust roots.
+Les manifestes persistés sont aussi revalidés avec le schéma JSON Draft 2020-12
+installé et la politique de release Python. Une mise à jour du contrôleur ne
+peut pas utiliser silencieusement une seule de ces deux racines de confiance.
 
-## Current locks
+## Verrous actuels
 
-The manifest requires `activation_policy: locked`. The controller rejects each
-unit with `enabled: true`, even when its evidence is structurally valid. A
-separate audited revision of the schema, policy, and applicator is necessary to
-change this rule.
+Le manifeste exige `activation_policy: locked`. Le contrôleur refuse chaque
+unité à `enabled: true`, même lorsque ses preuves sont structurellement
+valides. Modifier cette règle exige une révision séparément auditée du schéma,
+de la politique et de l'applicateur.
 
-A disabled platform can contain a candidate declaration. The declaration
-consists of the `images`, `integration`, `postgres`, and `readiness_evidence`
-fields. The manifest must contain all four fields or none of them. Candidate
-images and artifacts must use immutable digests. The platform integration
-source revision must be an ancestor of the requested release commit. The
-controller validates candidate evidence and applies artifact quarantine before
-it records desired state. Candidate metadata does not publish a port, create a
-runtime reference in the reconciliation plan, or authorize a service start.
+Une plateforme désactivée peut contenir une déclaration candidate. Elle réunit
+les champs `images`, `integration`, `postgres` et `readiness_evidence`. Le
+manifeste doit contenir les quatre champs ou aucun. Les images et artefacts
+candidats utilisent des digests immuables. La révision source de l'intégration
+plateforme doit être un ancêtre du commit de release demandé. Le contrôleur
+valide les preuves candidates et applique la quarantaine des artefacts avant
+d'enregistrer l'état désiré. Les métadonnées candidates ne publient aucun port,
+ne créent aucune référence runtime dans le plan de réconciliation et
+n'autorisent aucun démarrage de service.
 
 Les projets Compose applicatifs sont également refusés par la CLI tant qu'un
 bundle d'intégration vérifié ne fournit pas le set exact des services et leurs
 références d'images. Il faudra alors ajouter une allowlist exacte des variables
 d'environnement et lier les secrets `_FILE` aux secrets déclarés.
 
-`verify-github-evidence` confirms the repository, branch, commit, run attempt,
-and exact `.github/workflows/vps-release.yml` workflow through the public GitHub
-API. This check does not yet provide a cryptographic link from the workflow run
-to each OCI digest. A complete candidate declaration is therefore not
-provenance-complete. The provenance link stays an explicit blocker.
+`verify-github-evidence` confirme le dépôt, la branche, le commit, la tentative
+du run et le workflow exact `.github/workflows/vps-release.yml` via l'API GitHub
+publique. Ce contrôle ne fournit pas encore de lien cryptographique entre le
+run et chaque digest OCI. Une déclaration candidate complète n'a donc pas une
+provenance complète. Ce lien reste un blocage explicite.
 
-Without `/etc/vps/production-enabled`, `deploy` stays in dry-run mode. It exits
-with code 78 after evidence verification, reconciliation, and desired-state
-recording. While the installed policy is locked, the controller rejects the
-production marker explicitly. It cannot invoke an applicator or create active
-state. The locked controller contains no applicator execution path. A future
-live path requires a separately audited policy revision.
+Sans `/etc/vps/production-enabled`, `deploy` reste en dry-run et termine avec le
+code 78 après vérification des preuves, réconciliation et enregistrement de
+l'état désiré. Tant que la politique installée est verrouillée, le contrôleur
+refuse explicitement le marqueur de production. Il ne peut appeler aucun
+applicateur ni créer d'état actif. Le contrôleur verrouillé ne contient aucun
+chemin d'exécution d'un applicateur. Un futur chemin live exige une révision de
+politique séparément auditée.

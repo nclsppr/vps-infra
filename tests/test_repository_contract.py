@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
@@ -25,6 +26,20 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 
 
+def test_public_key(algorithm: str = "ssh-ed25519") -> str:
+    encoded_algorithm = algorithm.encode("ascii")
+    blob = (
+        len(encoded_algorithm).to_bytes(4, byteorder="big")
+        + encoded_algorithm
+        + (32).to_bytes(4, byteorder="big")
+        + bytes(range(32))
+    )
+    return f"{algorithm} {base64.b64encode(blob).decode('ascii')} contract-test"
+
+
+VALID_PUBLIC_KEY = test_public_key()
+
+
 def load_script_module(name: str, path: Path):
     loader = SourceFileLoader(name, str(path))
     spec = importlib.util.spec_from_loader(name, loader)
@@ -42,7 +57,293 @@ APPLICATION_STATE = load_script_module(
 )
 
 
+class OperatorInputValidationTests(unittest.TestCase):
+    def valid_inventory(self, user: str = "vpsadmin") -> dict[str, object]:
+        return {
+            "all": {
+                "children": {
+                    "vps": {
+                        "hosts": {
+                            "atlas": {
+                                "ansible_host": "203.0.113.10",
+                                "ansible_port": 22,
+                                "ansible_user": user,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    def valid_extra_vars(self) -> dict[str, object]:
+        return {
+            "vps_admin_authorized_keys": [VALID_PUBLIC_KEY],
+            "vps_deploy_authorized_keys": [],
+        }
+
+    def run_validator(
+        self,
+        *,
+        mode: str = "converge",
+        inventory: object | str | None = None,
+        extra_vars: object | str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inventory_path = root / "inventory.yml"
+            extra_vars_path = root / "extra-vars.yml"
+            inventory_value = self.valid_inventory() if inventory is None else inventory
+            extra_vars_value = self.valid_extra_vars() if extra_vars is None else extra_vars
+            inventory_path.write_text(
+                inventory_value
+                if isinstance(inventory_value, str)
+                else yaml.safe_dump(inventory_value, sort_keys=False),
+                encoding="utf-8",
+            )
+            extra_vars_path.write_text(
+                extra_vars_value
+                if isinstance(extra_vars_value, str)
+                else yaml.safe_dump(extra_vars_value, sort_keys=False),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            return subprocess.run(
+                [
+                    sys.executable,
+                    SCRIPTS / "validate-ansible-inputs",
+                    "--mode",
+                    mode,
+                    "--inventory",
+                    inventory_path,
+                    "--extra-vars",
+                    extra_vars_path,
+                ],
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+    def assert_refused(self, **arguments: object) -> str:
+        result = self.run_validator(**arguments)
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("Validation des entrées Ansible refusée :", result.stderr)
+        return result.stderr
+
+    def test_accepts_only_one_explicit_remote_ssh_target(self) -> None:
+        bootstrap = self.run_validator(
+            mode="bootstrap",
+            inventory=self.valid_inventory(user="root"),
+        )
+        self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
+
+        converge_inventory = self.valid_inventory()
+        host_variables = converge_inventory["all"]["children"]["vps"]["hosts"][
+            "atlas"
+        ]
+        host_variables["ansible_connection"] = "ssh"
+        converge = self.run_validator(inventory=converge_inventory)
+        self.assertEqual(converge.returncode, 0, converge.stderr)
+
+    def test_rejects_inventory_scope_and_connection_bypasses(self) -> None:
+        additional_host = self.valid_inventory()
+        additional_host["all"]["children"]["vps"]["hosts"]["spare"] = {
+            "ansible_host": "203.0.113.11",
+            "ansible_port": 22,
+            "ansible_user": "vpsadmin",
+        }
+        self.assertIn(
+            "exactement un hôte",
+            self.assert_refused(inventory=additional_host),
+        )
+
+        additional_group = self.valid_inventory()
+        additional_group["all"]["children"]["unbounded"] = {"hosts": {}}
+        self.assertIn(
+            "clés inattendues : unbounded",
+            self.assert_refused(inventory=additional_group),
+        )
+
+        for target in (
+            "localhost",
+            "node.localhost",
+            "loopback",
+            "127.0.0.1",
+            "127.25.4.8",
+            "127.1",
+            "0x7f000001",
+            "::1",
+            "::ffff:127.0.0.1",
+            "vps.example.invalid",
+        ):
+            with self.subTest(target=target):
+                inventory = self.valid_inventory()
+                inventory["all"]["children"]["vps"]["hosts"]["atlas"][
+                    "ansible_host"
+                ] = target
+                self.assertIn(
+                    "cible locale, de bouclage ou invalide interdite",
+                    self.assert_refused(inventory=inventory),
+                )
+
+        for connection in ("local", "docker", "community.docker.docker"):
+            with self.subTest(connection=connection):
+                inventory = self.valid_inventory()
+                inventory["all"]["children"]["vps"]["hosts"]["atlas"][
+                    "ansible_connection"
+                ] = connection
+                self.assertIn(
+                    "ansible_connection doit être ssh ou smart",
+                    self.assert_refused(inventory=inventory),
+                )
+
+    def test_rejects_inventory_variables_that_override_execution_policy(self) -> None:
+        for variable_name, value in (
+            ("ansible_python_interpreter", "/tmp/operator-python"),
+            ("ansible_ssh_common_args", "-o ProxyCommand=operator-command"),
+            ("ansible_ssh_executable", "/tmp/operator-ssh"),
+            ("vps_admin_user", "operator"),
+            ("vps_ssh_port", 2022),
+        ):
+            with self.subTest(variable_name=variable_name):
+                inventory = self.valid_inventory()
+                inventory["all"]["children"]["vps"]["hosts"]["atlas"][
+                    variable_name
+                ] = value
+                self.assertIn(
+                    f"clés inattendues : {variable_name}",
+                    self.assert_refused(inventory=inventory),
+                )
+
+    def test_rejects_extra_vars_that_override_versions_paths_or_policy(self) -> None:
+        for variable_name, value in (
+            ("vps_infra_revision", "0" * 40),
+            ("vps_supported_ubuntu_releases", ["99.99"]),
+            ("vps_docker_packages", []),
+            ("vps_deploy_repository_dir", "/tmp/operator-repository"),
+            ("ansible_connection", "local"),
+        ):
+            with self.subTest(variable_name=variable_name):
+                extra_vars = self.valid_extra_vars()
+                extra_vars[variable_name] = value
+                self.assertIn(
+                    f"clés inattendues : {variable_name}",
+                    self.assert_refused(extra_vars=extra_vars),
+                )
+
+        self.assertIn(
+            "doit contenir un objet YAML",
+            self.assert_refused(extra_vars=[VALID_PUBLIC_KEY]),
+        )
+        self.assertIn(
+            "clé de mapping dupliquée",
+            self.assert_refused(
+                extra_vars=(
+                    "vps_admin_authorized_keys:\n"
+                    f"  - {VALID_PUBLIC_KEY}\n"
+                    "vps_admin_authorized_keys: []\n"
+                    "vps_deploy_authorized_keys: []\n"
+                )
+            ),
+        )
+        self.assertIn(
+            "clés de fusion YAML ne sont pas acceptées",
+            self.assert_refused(
+                extra_vars=(
+                    "defaults: &operator\n"
+                    "  vps_admin_authorized_keys: []\n"
+                    "<<: *operator\n"
+                    "vps_deploy_authorized_keys: []\n"
+                )
+            ),
+        )
+
+    def test_rejects_non_key_values_and_wrong_connection_phase(self) -> None:
+        extra_vars = self.valid_extra_vars()
+        extra_vars["vps_admin_authorized_keys"] = [
+            "{{ lookup('pipe', 'operator-command') }}"
+        ]
+        self.assertIn(
+            "syntaxe de clé publique OpenSSH invalide",
+            self.assert_refused(extra_vars=extra_vars),
+        )
+
+        algorithm = b"ssh-ed25519"
+        truncated_blob = len(algorithm).to_bytes(4, byteorder="big") + algorithm
+        extra_vars["vps_admin_authorized_keys"] = [
+            "ssh-ed25519 " + base64.b64encode(truncated_blob).decode("ascii")
+        ]
+        self.assertIn(
+            "données de clé SSH tronquées",
+            self.assert_refused(extra_vars=extra_vars),
+        )
+
+        rsa_algorithm = b"ssh-rsa"
+        rsa_exponent = b"\x01\x00\x01"
+        rsa_modulus = b"\x00\x80" + bytes(127)
+        rsa_blob = b"".join(
+            len(field).to_bytes(4, byteorder="big") + field
+            for field in (rsa_algorithm, rsa_exponent, rsa_modulus)
+        )
+        extra_vars["vps_admin_authorized_keys"] = [
+            "ssh-rsa " + base64.b64encode(rsa_blob).decode("ascii")
+        ]
+        self.assertIn(
+            "module RSA inférieur à 2048 bits",
+            self.assert_refused(extra_vars=extra_vars),
+        )
+
+        self.assertIn(
+            "convergence exige ansible_user vpsadmin",
+            self.assert_refused(inventory=self.valid_inventory(user="root")),
+        )
+        self.assertIn(
+            "compte deploy ne peut pas exécuter l'amorçage",
+            self.assert_refused(
+                mode="bootstrap",
+                inventory=self.valid_inventory(user="deploy"),
+            ),
+        )
+
+    def test_rejects_one_key_reused_for_admin_and_deploy(self) -> None:
+        extra_vars = self.valid_extra_vars()
+        key_without_comment = VALID_PUBLIC_KEY.rsplit(" ", maxsplit=1)[0]
+        extra_vars["vps_admin_authorized_keys"] = [
+            f"{key_without_comment} administrator"
+        ]
+        extra_vars["vps_deploy_authorized_keys"] = [
+            f"{key_without_comment} github-deploy"
+        ]
+        self.assertIn(
+            "cryptographiquement disjointes",
+            self.assert_refused(extra_vars=extra_vars),
+        )
+
+
 class SupplyChainContractTests(unittest.TestCase):
+    def test_bootstrap_refuses_an_unsupported_os_before_mutation(self) -> None:
+        playbook = yaml.safe_load(
+            (ROOT / "ansible/playbooks/bootstrap.yml").read_text(encoding="utf-8")
+        )[0]
+        pre_tasks = playbook["pre_tasks"]
+        names = [task["name"] for task in pre_tasks]
+        probe_index = names.index("Read the operating system release before any mutation")
+        refusal_index = names.index(
+            "Refuse an unsupported operating system before any mutation"
+        )
+        python_index = names.index("Ensure Python is available on a minimal Ubuntu image")
+        self.assertLess(probe_index, refusal_index)
+        self.assertLess(refusal_index, python_index)
+
+        probe = pre_tasks[probe_index]
+        self.assertEqual(probe["ansible.builtin.raw"], "cat /etc/os-release")
+        self.assertFalse(probe["changed_when"])
+        refusal = json.dumps(pre_tasks[refusal_index], sort_keys=True)
+        self.assertIn("bootstrap_os_release.stdout", refusal)
+        self.assertIn("vps_supported_ubuntu_releases", refusal)
+
     def test_engine_pin_is_fixed_and_held_packages_can_change(self) -> None:
         variables = yaml.safe_load(
             (ROOT / "ansible/inventories/production/group_vars/all.yml").read_text(
@@ -350,14 +651,35 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertLess(guard, first_mutation)
         self.assertIn("GIT_CONFIG_PARAMETERS", controller)
 
-    def test_convergence_uses_an_isolated_origin_main_archive(self) -> None:
+    def test_host_automation_uses_an_isolated_origin_main_archive(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
         converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
+        bootstrap = (SCRIPTS / "bootstrap").read_text(encoding="utf-8")
+        self.assertIn("./scripts/bootstrap", makefile)
         self.assertIn("./scripts/converge", makefile)
         self.assertIn("./scripts/converge --check --diff", makefile)
-        self.assertIn("+refs/heads/main:refs/remotes/origin/main", converge)
-        self.assertIn("archive --format=tar \"$revision\"", converge)
-        self.assertIn("cd \"$checkout\"", converge)
+        for wrapper in (bootstrap, converge):
+            self.assertIn("+refs/heads/main:refs/remotes/origin/main", wrapper)
+            self.assertIn("archive --format=tar \"$revision\"", wrapper)
+            self.assertIn("cd \"$checkout\"", wrapper)
+            self.assertIn("validate-ansible-inputs", wrapper)
+            self.assertLess(
+                wrapper.index(
+                    'validate_operator_inputs "$validator" "$operator_inventory"'
+                ),
+                wrapper.index("fetch \\\n"),
+            )
+            self.assertIn(
+                'snapshot_validator="$checkout/scripts/validate-ansible-inputs"',
+                wrapper,
+            )
+            self.assertLess(
+                wrapper.index('archive --format=tar "$revision"'),
+                wrapper.index(
+                    'validate_operator_inputs "$snapshot_validator" "$inventory"'
+                ),
+            )
+        self.assertIn("playbooks/bootstrap.yml", bootstrap)
         self.assertIn('--extra-vars "vps_infra_revision=$revision"', converge)
         self.assertIn('"${ansible_playbook_options[@]}"', converge)
 
@@ -451,34 +773,35 @@ class SecurityBoundaryContractTests(unittest.TestCase):
 
         self.assertEqual(observed, expected)
 
-    def test_convergence_keeps_the_ssh_control_path_short(self) -> None:
-        converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
-        self.assertIn("umask 077", converge)
-        self.assertIn(
-            'temporary_root=$("$mktemp_executable" -d '
-            "/tmp/vps-c.XXXXXXXX)",
-            converge,
-        )
-        representative_control_path = (
-            Path("/tmp").resolve()
-            / "vps-c.12345678/cp"
-            / (
-                # OpenSSH expands %C to a 40-character SHA-1 and briefly
-                # appends a dot plus 16 random characters before rename.
-                "0123456789abcdef0123456789abcdef01234567"
-                ".ABCDEFGHIJKLMNOP"
-            )
-        )
-        self.assertLess(len(os.fsencode(representative_control_path)), 104)
-        self.assertIn(
-            '"ANSIBLE_SSH_CONTROL_PATH_DIR=$control_path_dir"',
-            converge,
-        )
-        self.assertEqual(converge.count("ANSIBLE_SSH_CONTROL_PATH_DIR"), 1)
-        self.assertIn(
-            'mkdir -m 0700 -- "$checkout" "$isolated_home" "$control_path_dir"',
-            converge,
-        )
+    def test_host_wrappers_keep_the_ssh_control_path_short(self) -> None:
+        for wrapper_name, prefix in (("bootstrap", "vps-b"), ("converge", "vps-c")):
+            with self.subTest(wrapper=wrapper_name):
+                wrapper = (SCRIPTS / wrapper_name).read_text(encoding="utf-8")
+                self.assertIn("umask 077", wrapper)
+                self.assertIn(
+                    f'temporary_root=$("$mktemp_executable" -d /tmp/{prefix}.XXXXXXXX)',
+                    wrapper,
+                )
+                representative_control_path = (
+                    Path("/tmp").resolve()
+                    / f"{prefix}.12345678/cp"
+                    / (
+                        # OpenSSH expands %C to a 40-character SHA-1 and briefly
+                        # appends a dot plus 16 random characters before rename.
+                        "0123456789abcdef0123456789abcdef01234567"
+                        ".ABCDEFGHIJKLMNOP"
+                    )
+                )
+                self.assertLess(len(os.fsencode(representative_control_path)), 104)
+                self.assertIn(
+                    '"ANSIBLE_SSH_CONTROL_PATH_DIR=$control_path_dir"',
+                    wrapper,
+                )
+                self.assertEqual(
+                    wrapper.count("ANSIBLE_SSH_CONTROL_PATH_DIR"),
+                    1,
+                )
+                self.assertIn('"$control_path_dir" "$input_directory"', wrapper)
 
     def test_convergence_explicitly_trusts_the_captured_mise_config(self) -> None:
         converge = (SCRIPTS / "converge").read_text(encoding="utf-8")
@@ -495,12 +818,20 @@ class SecurityBoundaryContractTests(unittest.TestCase):
 
             (root / "ansible/collections").mkdir(parents=True)
             (root / "ansible/playbooks").mkdir(parents=True)
+            (root / "scripts").mkdir(parents=True)
+            remote_validator = root / "scripts/validate-ansible-inputs"
+            shutil.copy2(SCRIPTS / "validate-ansible-inputs", remote_validator)
+            remote_validator.chmod(0o755)
             (root / "ansible/ansible.cfg").write_text("[defaults]\n", encoding="utf-8")
             (root / "ansible/collections/requirements.yml").write_text(
                 "collections: []\n",
                 encoding="utf-8",
             )
             (root / "ansible/playbooks/site.yml").write_text(
+                "---\n- hosts: all\n  gather_facts: false\n",
+                encoding="utf-8",
+            )
+            (root / "ansible/playbooks/bootstrap.yml").write_text(
                 "---\n- hosts: all\n  gather_facts: false\n",
                 encoding="utf-8",
             )
@@ -580,10 +911,33 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             )
 
             scripts_dir = root / "scripts"
-            scripts_dir.mkdir()
+            scripts_dir.mkdir(exist_ok=True)
             converge = scripts_dir / "converge"
+            bootstrap = scripts_dir / "bootstrap"
+            validator = scripts_dir / "validate-ansible-inputs"
             shutil.copy2(SCRIPTS / "converge", converge)
-            converge.chmod(0o755)
+            shutil.copy2(SCRIPTS / "bootstrap", bootstrap)
+            shutil.copy2(SCRIPTS / "validate-ansible-inputs", validator)
+            for executable in (bootstrap, converge, validator):
+                executable.chmod(0o755)
+
+            locked_bin = root / ".venv/bin"
+            locked_bin.mkdir(parents=True)
+            locked_python = locked_bin / "python"
+            validator_log = shlex.quote(
+                str(Path(temporary) / "support/execution.log")
+            )
+            locked_python.write_text(
+                "#!/bin/sh\n"
+                "case \"${1:-}\" in\n"
+                "  /tmp/vps-b.*/checkout/scripts/validate-ansible-inputs|"
+                "/tmp/vps-c.*/checkout/scripts/validate-ansible-inputs)\n"
+                f"    printf 'snapshot_validator=%s\\n' \"$1\" >>{validator_log} ;;\n"
+                "esac\n"
+                f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+                encoding="utf-8",
+            )
+            locked_python.chmod(0o755)
 
             support = Path(temporary) / "support"
             fake_bin = support / "bin"
@@ -646,8 +1000,16 @@ printf 'galaxy=%s\\n' "$PWD $*" >>{quoted_log}
                 f"""#!/bin/sh
 set -eu
 [ -z "${{ANSIBLE_LIBRARY+x}}" ]
+[ -z "${{PYTHONPATH+x}}" ]
 [ -n "${{SSH_AUTH_SOCK+x}}" ]
 [ -d "$ANSIBLE_SSH_CONTROL_PATH_DIR" ]
+case "$ANSIBLE_CONFIG" in
+  /tmp/vps-b.*/checkout/ansible/ansible.cfg|/tmp/vps-c.*/checkout/ansible/ansible.cfg) ;;
+  *) exit 92 ;;
+esac
+case ":$PATH:" in
+  *":{shlex.quote(str(fake_bin))}:"*) exit 93 ;;
+esac
 IFS= read -r marker < ../marker.txt
 printf 'playbook_directory=%s\\n' "$PWD" >>{quoted_log}
 printf 'marker=%s\\n' "$marker" >>{quoted_log}
@@ -673,8 +1035,37 @@ fi
 
             inventory = support / "hosts.yml"
             extra_vars = support / "keys.yml"
-            inventory.write_text("all: {}\n", encoding="utf-8")
-            extra_vars.write_text("vps_admin_authorized_keys: []\n", encoding="utf-8")
+            inventory.write_text(
+                yaml.safe_dump(
+                    {
+                        "all": {
+                            "children": {
+                                "vps": {
+                                    "hosts": {
+                                        "atlas": {
+                                            "ansible_host": "203.0.113.10",
+                                            "ansible_port": 22,
+                                            "ansible_user": "vpsadmin",
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            extra_vars.write_text(
+                yaml.safe_dump(
+                    {
+                        "vps_admin_authorized_keys": [VALID_PUBLIC_KEY],
+                        "vps_deploy_authorized_keys": [],
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
             environment = os.environ.copy()
             environment.update(
                 {
@@ -702,7 +1093,7 @@ fi
                 check=False,
             )
             self.assertEqual(invalid_agent.returncode, 78)
-            self.assertIn("caller-owned Unix socket", invalid_agent.stderr)
+            self.assertIn("socket Unix appartenant à l'appelant", invalid_agent.stderr)
             self.assertFalse(log.exists())
 
             agent_socket_path = support / "agent.sock"
@@ -723,6 +1114,17 @@ fi
             execution = log.read_text(encoding="utf-8")
             self.assertIn("marker=remote-main", execution)
             self.assertNotIn("divergent-worktree", execution)
+            snapshot_validations = [
+                line
+                for line in execution.splitlines()
+                if line.startswith("snapshot_validator=")
+            ]
+            self.assertEqual(len(snapshot_validations), 1)
+            self.assertRegex(
+                snapshot_validations[0],
+                r"^snapshot_validator=/tmp/vps-c\.[A-Za-z0-9]+/checkout/"
+                r"scripts/validate-ansible-inputs$",
+            )
             self.assertIn(
                 f"ssh_auth_sock={agent_socket_path.resolve()}",
                 execution,
@@ -746,6 +1148,124 @@ fi
             )
 
             log.unlink()
+            extra_vars.write_text(
+                yaml.safe_dump(
+                    {
+                        "vps_admin_authorized_keys": [VALID_PUBLIC_KEY],
+                        "vps_deploy_authorized_keys": [],
+                        "vps_infra_revision": "0" * 40,
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            invalid_input = subprocess.run(
+                [converge],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(invalid_input.returncode, 78)
+            self.assertIn("clés inattendues : vps_infra_revision", invalid_input.stderr)
+            self.assertFalse(log.exists(), "invalid input reached Git fetch or setup")
+            extra_vars.write_text(
+                yaml.safe_dump(
+                    {
+                        "vps_admin_authorized_keys": [VALID_PUBLIC_KEY],
+                        "vps_deploy_authorized_keys": [],
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+
+            inventory.write_text(
+                yaml.safe_dump(
+                    {
+                        "all": {
+                            "children": {
+                                "vps": {
+                                    "hosts": {
+                                        "atlas": {
+                                            "ansible_host": "203.0.113.10",
+                                            "ansible_port": 22,
+                                            "ansible_user": "root",
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            bootstrap_result = subprocess.run(
+                [bootstrap],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(bootstrap_result.returncode, 0, bootstrap_result.stderr)
+            bootstrap_execution = log.read_text(encoding="utf-8")
+            self.assertIn("marker=remote-main", bootstrap_execution)
+            self.assertRegex(
+                bootstrap_execution,
+                r"(?m)^snapshot_validator=/tmp/vps-b\.[A-Za-z0-9]+/checkout/"
+                r"scripts/validate-ansible-inputs$",
+            )
+            self.assertRegex(
+                bootstrap_execution,
+                r"(?m)^control_path_dir=/tmp/vps-b\.[A-Za-z0-9]+/cp$",
+            )
+            self.assertRegex(
+                bootstrap_execution,
+                r"(?m)^arguments=--inventory .* --extra-vars @.* playbooks/bootstrap\.yml$",
+            )
+            log.unlink()
+            unsupported_bootstrap_argument = subprocess.run(
+                [bootstrap, "--check"],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(unsupported_bootstrap_argument.returncode, 64)
+            self.assertIn(
+                "arguments en ligne de commande ne sont pas acceptés",
+                unsupported_bootstrap_argument.stderr,
+            )
+            self.assertFalse(log.exists())
+
+            inventory.write_text(
+                yaml.safe_dump(
+                    {
+                        "all": {
+                            "children": {
+                                "vps": {
+                                    "hosts": {
+                                        "atlas": {
+                                            "ansible_host": "203.0.113.10",
+                                            "ansible_port": 22,
+                                            "ansible_user": "vpsadmin",
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
             check_result = subprocess.run(
                 [converge, "--check", "--diff"],
                 cwd=root,
@@ -779,7 +1299,7 @@ fi
                 )
                 self.assertEqual(refused.returncode, 64)
                 self.assertIn(
-                    "arguments must be empty or exactly: --check --diff",
+                    "arguments doivent être absents ou exactement : --check --diff",
                     refused.stderr,
                 )
                 self.assertFalse(log.exists())
@@ -806,7 +1326,10 @@ fi
                 check=False,
             )
             self.assertNotEqual(failed_fetch.returncode, 0)
-            self.assertIn("bounded fetch of origin/main failed", failed_fetch.stderr)
+            self.assertIn(
+                "récupération bornée de origin/main a échoué",
+                failed_fetch.stderr,
+            )
             self.assertNotIn("mise=", log.read_text(encoding="utf-8"))
 
 

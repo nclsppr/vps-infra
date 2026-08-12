@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "renderer": {
+    "name": "GitHub Markdown",
+    "config": "DOCUMENTATION.md"
+  },
+  "foundationEvaluation": {
+    "source": "https://github.com/nclsppr/project-foundation.git",
+    "tag": "v0.5.2",
+    "tagObject": "d9eadc7ebf5ac74b6bef2180fbdf9eb538f4ecf6",
+    "commit": "708d7374f87060809a805c57abc2cf7e7b66c182",
+    "mode": "selected-practices"
+  },
+  "collections": [
+    {
+      "id": "orientation",
+      "title": "Orientation",
+      "visibility": "public",
+      "include": [
+        "README.md",
+        "PROJECT.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "DOCUMENTATION.md"
+      ]
+    },
+    {
+      "id": "operations",
+      "title": "Architecture et opérations",
+      "visibility": "public",
+      "include": [
+        "VPS-SETUP.md",
+        "ansible/README.md",
+        "platform/README.md",
+        "scripts/README.md",
+        "secrets/README.md",
+        "docs/architecture.md",
+        "docs/deployment.md",
+        "docs/rebuild.md",
+        "docs/operations/*.md"
+      ]
+    },
+    {
+      "id": "governance",
+      "title": "Gouvernance et état",
+      "visibility": "internal",
+      "include": [
+        "AGENTS.md",
+        "CHANGELOG.md",
+        "STATUS.md",
+        ".github/pull_request_template.md",
+        "docs/decisions/*.md"
+      ]
+    },
+    {
+      "id": "references",
+      "title": "Références",
+      "visibility": "reference",
+      "include": [
+        "docs/references.md",
+        "DOCUMENTATION-CATALOG.md"
+      ]
+    },
+    {
+      "id": "archives",
+      "title": "Archives",
+      "visibility": "archive",
+      "include": [
+        "docs/archive/*.md"
+      ]
+    }
+  ],
+  "ignored": [
+    {
+      "pattern": ".agents/**/*.md",
+      "reason": "Compétences locales non versionnées, hors documentation du dépôt"
+    }
+  ]
+}

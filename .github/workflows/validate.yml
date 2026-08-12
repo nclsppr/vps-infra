@@ -43,4 +43,4 @@ jobs:
             --collections-path ../.cache/ansible/collections
 
       - name: Validate repository
-        run: make check-fast check-platform-config check-prometheus check-caddy
+        run: make check

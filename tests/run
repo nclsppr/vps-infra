@@ -65,6 +65,7 @@ fi
 
 python3 "$TESTS_DIR/test_release_controller.py"
 python3 "$TESTS_DIR/test_github_evidence.py"
+python3 "$TESTS_DIR/test_governance.py"
 python3 "$TESTS_DIR/test_repository_contract.py"
 
 parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "deploy $VALID_SHA")

@@ -44,16 +44,18 @@ Le premier socle exécutable est livré :
 - workflow multi-architecture Caddy : build de preuve en PR, publication GHCR
   et attestation uniquement depuis `main`.
 
-The Atlas host is now provisioned from this repository. It passed bootstrap,
-repeated convergence, a bounded predictive check, and a complete reboot. No
-DNS zone, application release, platform service, or production data was
-changed. The manifest keeps every unit at `enabled: false`. Its root policy
-rejects activation, and the controller still has no live applicator.
+L'hôte Atlas est désormais provisionné depuis ce dépôt. Il a passé l'amorçage,
+plusieurs convergences, un contrôle prédictif borné et un redémarrage complet.
+La preuve du socle n'a modifié aucune zone DNS, release applicative, service de
+plateforme ni donnée de production. Le manifeste conserve chaque unité à
+`enabled: false`, sa politique racine refuse l'activation et le contrôleur ne
+possède toujours aucun applicateur live.
 
-The release contract can validate a complete immutable candidate declaration
-while the platform stays disabled. Candidate evidence is checked before the
-controller records desired state. The evidence does not yet prove each digest.
-A candidate does not publish a port, start a container, or create active state.
+Le contrat de release sait valider une déclaration candidate immuable complète
+tout en gardant la plateforme désactivée. Les preuves candidates sont vérifiées
+avant que le contrôleur n'enregistre l'état désiré. Elles ne prouvent pas encore
+chaque digest. Un candidat ne publie aucun port, ne démarre aucun conteneur et
+ne crée aucun état actif.
 
 ## Démarrage local
 
@@ -86,7 +88,7 @@ make bootstrap \
 make converge \
   ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
 
-# After successful convergence, predict drift without remote mutation.
+# Après une convergence réussie, prévoir la dérive sans mutation distante.
 make converge-check \
   ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
 ```
@@ -112,6 +114,11 @@ Cette décision est détaillée dans
 
 ## Documentation
 
+- [Contrat stable et sources canoniques](PROJECT.md)
+- [État vérifié et limites actuelles](STATUS.md)
+- [Changements livrés](CHANGELOG.md)
+- [Contrat documentaire](DOCUMENTATION.md)
+- [Catalogue documentaire](DOCUMENTATION-CATALOG.md)
 - [Architecture cible](docs/architecture.md)
 - [Automatisation de l’hôte](ansible/README.md)
 - [Pile plateforme](platform/README.md)
@@ -125,6 +132,7 @@ Cette décision est détaillée dans
 - [ADR-0001 — Ansible et Compose](docs/decisions/0001-ansible-compose-plateforme-partagee.md)
 - [ADR-0002 — dépôt public](docs/decisions/0002-depot-public-sans-etat-sensible.md)
 - [ADR-0003 — builds hors production](docs/decisions/0003-builds-hors-du-vps-de-production.md)
+- [ADR-0004 — alignement sélectif sur Project Foundation](docs/decisions/0004-alignement-selectif-project-foundation.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas

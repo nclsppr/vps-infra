@@ -18,25 +18,13 @@ readonly REPOSITORY_ROOT
 fail() {
   local message=$1
   local status=${2:-1}
-  echo "convergence refusée : $message" >&2
+  echo "amorçage refusé : $message" >&2
   exit "$status"
 }
 
-ansible_playbook_options=()
-case $# in
-  0)
-    ;;
-  2)
-    if [[ $1 != --check || $2 != --diff ]]; then
-      fail "les arguments doivent être absents ou exactement : --check --diff" "$EX_USAGE"
-    fi
-    ansible_playbook_options=(--check --diff)
-    ;;
-  *)
-    fail "les arguments doivent être absents ou exactement : --check --diff" "$EX_USAGE"
-    ;;
-esac
-readonly -a ansible_playbook_options
+if (($# != 0)); then
+  fail "les arguments en ligne de commande ne sont pas acceptés" "$EX_USAGE"
+fi
 
 resolve_executable() {
   local name=$1
@@ -59,7 +47,7 @@ python_executable="$REPOSITORY_ROOT/.venv/bin/python"
 [[ -f $validator && ! -L $validator && -x $validator ]] || \
   fail "le validateur des entrées opérateur est indisponible" "$EX_CONFIG"
 [[ -x $python_executable ]] || \
-  fail "exécuter make setup avant la convergence" "$EX_CONFIG"
+  fail "exécuter make setup avant l'amorçage" "$EX_CONFIG"
 python_executable=$(realpath -- "$python_executable") || \
   fail "l'interpréteur Python verrouillé ne peut pas être résolu" "$EX_CONFIG"
 readonly validator python_executable
@@ -86,7 +74,7 @@ validate_operator_inputs() {
     PYTHONNOUSERSITE=1 \
     PYTHONSAFEPATH=1 \
     "$python_executable" "$validator_path" \
-      --mode converge \
+      --mode bootstrap \
       --inventory "$inventory_path" \
       --extra-vars "$extra_vars_path"
 }
@@ -103,7 +91,7 @@ if [[ -n $ssh_auth_sock ]]; then
 fi
 readonly ssh_auth_sock
 
-temporary_root=$("$mktemp_executable" -d /tmp/vps-c.XXXXXXXX)
+temporary_root=$("$mktemp_executable" -d /tmp/vps-b.XXXXXXXX)
 readonly temporary_root
 checkout="$temporary_root/checkout"
 isolated_home="$temporary_root/home"
@@ -165,6 +153,7 @@ revision=$(safe_git -C "$REPOSITORY_ROOT" rev-parse --verify \
   'refs/remotes/origin/main^{commit}') || fail "origin/main ne peut pas être résolu vers un commit"
 [[ $revision =~ ^[0-9a-f]{40}$ ]] || fail "origin/main n'a pas produit un SHA Git complet en minuscules"
 readonly revision
+
 ansible_environment=(
   "HOME=$isolated_home"
   "PATH=$checkout/.venv/bin:$system_path"
@@ -208,16 +197,9 @@ clean_command() {
   clean_command ../.venv/bin/ansible-galaxy collection install \
     --requirements-file collections/requirements.yml \
     --collections-path ../.cache/ansible/collections
-  ansible_playbook_command=(../.venv/bin/ansible-playbook)
-  if ((${#ansible_playbook_options[@]} > 0)); then
-    ansible_playbook_command+=("${ansible_playbook_options[@]}")
-  fi
-  ansible_playbook_command+=(
-    --inventory "$inventory"
-    --extra-vars "@$extra_vars"
-    --extra-vars "vps_infra_revision=$revision"
-    playbooks/site.yml
-  )
   "$env_executable" -i "${ansible_environment[@]}" \
-    "${ansible_playbook_command[@]}"
+    ../.venv/bin/ansible-playbook \
+      --inventory "$inventory" \
+      --extra-vars "@$extra_vars" \
+      playbooks/bootstrap.yml
 )

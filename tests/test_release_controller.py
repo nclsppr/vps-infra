@@ -1086,20 +1086,46 @@ class PublicSafetyTests(unittest.TestCase):
             self.assertIn("GitHub token", result.stderr)
 
     def test_generic_sensitive_assignments_are_rejected(self) -> None:
-        cases = {
-            "VPS_SSH_KEY": "unencrypted-private-material",
-            "POSTGRES_SUPERUSER_PASSWORD": "plaintext-password",
-            "GF_SECURITY_SECRET_KEY": "plaintext-secret-key",
-            "DEPLOY_TOKEN": "plaintext-deploy-token",
-            "DATABASE_URL": "postgresql://admin:plaintext@db/prod",
-            "FALLBACK_SECRET": "${FALLBACK_SECRET:-plaintext}",
-            "password": "lowercase-plaintext",
-            "JINJA_PASSWORD": "{{ 'plaintext' }}",
-        }
-        for key, value in cases.items():
+        cases = (
+            ("VPS_SSH_KEY", "unencrypted-private-material"),
+            ("POSTGRES_SUPERUSER_PASSWORD", "plaintext-password"),
+            ("GF_SECURITY_SECRET_KEY", "plaintext-secret-key"),
+            ("DEPLOY_TOKEN", "plaintext-deploy-token"),
+            ("DATABASE_URL", "postgresql://admin:plaintext@db/prod"),
+            ("FALLBACK_SECRET", "${FALLBACK_SECRET:-plaintext}"),
+            ("password", "lowercase-plaintext"),
+            ("JINJA_PASSWORD", "{{ 'plaintext' }}"),
+        )
+        for key, value in cases:
             with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 (root / "config.example").write_text(f"{key}={value}\n", encoding="utf-8")
+                result = self.run_check(root)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("credential-like assignment", result.stderr)
+
+    def test_structured_generic_credentials_are_rejected(self) -> None:
+        cases = (
+            (
+                "config.json",
+                "{" + '"pass' + 'word":\n"synthetic-plaintext-password"}',
+            ),
+            (
+                "config.toml",
+                '"client_' + 'secret_value" = "synthetic-credential"',
+            ),
+            (
+                "ovh.toml",
+                '"ovh_application_' + 'key" = "synthetic-ovh-key"',
+            ),
+        )
+        for filename, payload in cases:
+            with (
+                self.subTest(filename=filename),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                (root / filename).write_text(payload, encoding="utf-8")
                 result = self.run_check(root)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("credential-like assignment", result.stderr)

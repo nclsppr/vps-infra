@@ -1,9 +1,10 @@
 # Plan de mise en œuvre du VPS multi-projets
 
-> **Status: Atlas host layer proven, production locked.** Atlas passed
-> bootstrap, repeated convergence, predictive check mode, and a complete
-> reboot. No production secret, DNS change, platform service, application, or
-> live applicator is configured. Do not use the archived runbook.
+> **Statut : socle hôte Atlas prouvé, production verrouillée.** Atlas a passé
+> l'amorçage, plusieurs convergences, le mode prédictif et un redémarrage
+> complet. Aucun secret de production, changement DNS, service de plateforme,
+> application ni applicateur live n'est configuré. Ne pas utiliser le runbook
+> archivé.
 
 ## Décision recommandée
 
@@ -62,10 +63,10 @@ versionné ne peut pas être la preuve d’une reconstruction.
       sans DNS-01 ;
 - [ ] décider le domaine Parkventory.
 
-Public DNS observation on 2026-08-12 confirms OVH authoritative name servers
-for `nicolaspieper.com`, `papersempire.com`, `surplasse.com`, and the legacy
-`pieper.fr` zone. This observation does not prove OVH API access or replace the
-required full zone export.
+L'observation du DNS public le 2026-08-12 confirme les serveurs de noms OVH
+autoritaires pour `nicolaspieper.com`, `papersempire.com`, `surplasse.com` et la
+zone historique `pieper.fr`. Cette observation ne prouve pas l'accès à l'API
+OVH et ne remplace pas l'export complet requis des zones.
 
 ### Choisir la version PostgreSQL
 
@@ -126,15 +127,16 @@ Critères :
 - [x] aucune toolchain applicative sur l’hôte ;
 - [x] logs bornés, redémarrage et reboot vérifiés ;
 - [x] second passage Ansible sans changement ;
-- [x] bounded `--check --diff` invocation covered by CI and executed on the
-      converged host without a predicted change.
+- [x] invocation bornée `--check --diff` couverte par la CI et exécutée sur
+      l'hôte convergé sans changement prédit.
 
-Atlas host evidence was collected on 2026-08-12. Both independent
-administrator keys opened new sessions, direct root SSH failed, UFW exposed
-only the declared ports, Docker had no container, the reboot created a new boot
-identifier, normal convergence reported `changed=0`, and predictive check mode
-reported `changed=0`. A full disposable-host platform rehearsal remains in
-Phase 6.
+Les preuves de l'hôte Atlas ont été recueillies le 2026-08-12. Les deux clés
+administrateur indépendantes ont ouvert de nouvelles sessions, l'accès SSH
+direct de root a échoué, UFW n'exposait que les ports déclarés, Docker ne
+contenait aucun conteneur, le redémarrage a créé un nouvel identifiant de boot,
+et la convergence normale comme le mode prédictif ont indiqué `changed=0`. Une
+répétition complète de la plateforme sur un hôte jetable reste prévue en phase
+6.
 
 ## Phase 3 — extraire la plateforme commune
 

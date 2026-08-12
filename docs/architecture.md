@@ -125,11 +125,11 @@ Toutes les images amont portent un tag lisible et un digest. Renovate propose
 les mises à jour dans le dépôt VPS ; les versions majeures, Caddy et PostgreSQL
 ne sont jamais fusionnés automatiquement.
 
-## Shared Caddy service
+## Service Caddy commun
 
-Caddy is the only owner of public ports and TLS certificates. The locked base
-platform imports no application route. Each versioned route candidate has a
-`.disabled` suffix:
+Caddy est l'unique propriétaire des ports publics et des certificats TLS. La
+plateforme de base verrouillée n'importe aucune route applicative. Chaque route
+candidate versionnée porte un suffixe `.disabled` :
 
 ```text
 platform/caddy/
@@ -141,12 +141,12 @@ platform/caddy/
     surplasse.caddy.disabled
 ```
 
-`scripts/validate-application-state` rejects every enabled application in this
-baseline. A reviewed integration revision must replace that locked policy. It
-must activate the route, required network attachment, and required secret
-mounts in one versioned change.
+`scripts/validate-application-state` refuse toute application activée dans ce
+socle. Une révision d'intégration relue doit remplacer cette politique
+verrouillée. Elle doit activer la route, le rattachement réseau requis et les
+montages de secrets requis dans un même changement versionné.
 
-The Surplasse route candidate must preserve these requirements:
+La route candidate Surplasse doit préserver ces exigences :
 
 - domaine apex, API, Dashboard, documentation et sous-domaines établissements ;
 - certificat wildcard par DNS-01 ;
@@ -279,26 +279,26 @@ La production reste désactivée tant que le dépôt ne fournit pas :
 Mailpit, Vite et l’image Maven de développement ne rejoignent jamais le VPS de
 production.
 
-## Network isolation
+## Isolation réseau
 
-Ansible creates six external Docker networks. The locked base platform uses
-only these memberships:
+Ansible crée six réseaux Docker externes. La plateforme de base verrouillée
+utilise uniquement les rattachements suivants :
 
 ```text
-app_surplasse       empty
-db_surplasse        empty
-app_parkventory     empty
-db_parkventory      empty
+app_surplasse       vide
+db_surplasse        vide
+app_parkventory     vide
+db_parkventory      vide
 db_monitoring       PostgreSQL, PostgreSQL Exporter
-ops                 Caddy, Prometheus, Grafana, and exporters
+ops                 Caddy, Prometheus, Grafana et exporters
 ```
 
-A reviewed integration package attaches a platform service or an application
-service only to the required application network. PostgreSQL and PostgreSQL
-Exporter share the internal `db_monitoring` network. Only the exporter also
-joins `ops`. Caddy, Grafana, and Prometheus have no direct TCP path to
-PostgreSQL. The exporter role has only `pg_monitor` and `pg_hba.conf` limits it
-to the `db_monitoring` subnet.
+Un paquet d'intégration relu rattache un service de plateforme ou un service
+applicatif uniquement au réseau applicatif requis. PostgreSQL et PostgreSQL
+Exporter partagent le réseau interne `db_monitoring`. Seul l'exporter rejoint
+aussi `ops`. Caddy, Grafana et Prometheus n'ont aucun chemin TCP direct vers
+PostgreSQL. Le rôle de l'exporter possède uniquement `pg_monitor` et
+`pg_hba.conf` le limite au sous-réseau `db_monitoring`.
 
 Aucun service applicatif ne publie de port. Grafana peut écouter sur
 `127.0.0.1` seulement et s’ouvrir par tunnel SSH. Les endpoints de métriques,
@@ -356,10 +356,11 @@ valider les deux projets et répéter sauvegarde/restauration.
 Les mises à jour mineures sont des releases plateforme planifiées. Une mise à
 jour majeure n’est jamais un déploiement applicatif ordinaire.
 
-## Shared Prometheus and Grafana services
+## Services Prometheus et Grafana communs
 
-The locked platform loads only platform targets and platform rules. It keeps
-the Surplasse target and rule as inactive candidates:
+La plateforme verrouillée charge uniquement les cibles et règles de la
+plateforme. Elle conserve la cible et la règle Surplasse comme candidates
+inactives :
 
 ```text
 platform/observability/
@@ -380,9 +381,9 @@ platform/observability/
       surplasse/
 ```
 
-A reviewed Surplasse integration must activate both files and add the related
-Prometheus job in the same versioned change. The base platform must not produce
-an alert for a disabled application.
+Une intégration Surplasse relue doit activer les deux fichiers et ajouter le job
+Prometheus associé dans le même changement versionné. La plateforme de base ne
+doit produire aucune alerte pour une application désactivée.
 
 Les cibles utilisent des labels bornés comme `project` et `environment`, jamais
 un email, une commande, un établissement ou un jeton. Le dashboard Surplasse
