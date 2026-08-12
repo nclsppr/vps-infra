@@ -164,6 +164,9 @@ platform/
 - [ ] préserver wildcard, CORS, SSE et fermeture des métriques Surplasse ;
 - [ ] valider avant tout reload ;
 - [ ] publier uniquement 80/443.
+- [x] add a deterministic, secret-free OCI publisher for the exact shared
+      platform runtime configuration. It verifies both GHCR layers before
+      GitHub provenance and does not activate the platform.
 
 ### Configurer PostgreSQL commun
 

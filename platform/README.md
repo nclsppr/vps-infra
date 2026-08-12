@@ -67,6 +67,52 @@ The Caddy image workflow fails closed at two points:
 The pushed package can exist when a post-push gate fails. Such a package has no
 verified GitHub provenance and must not be promoted.
 
+## Platform integration artifact
+
+`.github/workflows/platform-integration.yml` publishes the secret-free runtime
+configuration as one OCI artifact. The artifact is not a deployment request.
+It does not change `releases/production.yaml`, enable a service, or contact a
+host.
+
+The builder reads one exact Git commit. It includes only these runtime roots:
+
+- `platform/.env.example` and `platform/compose.yaml`;
+- the base Caddyfile and the four reviewed route candidates;
+- the Prometheus, Grafana, and exporter configuration;
+- the PostgreSQL configuration and initialization script.
+
+It excludes the Caddy Dockerfile, Go graph, build inputs, entry point, and
+documentation. The exact 20-file allowlist rejects a missing path, an extra
+path in a runtime root, a symbolic link, a submodule, an executable file, a
+special file, invalid UTF-8, and an oversized payload.
+
+The artifact has these media types:
+
+| Object | Media type |
+|---|---|
+| OCI artifact | `application/vnd.vps-infra.platform-integration.v1` |
+| Deterministic archive | `application/vnd.vps-infra.platform-integration.v1+tar+gzip` |
+| Canonical inventory | `application/vnd.vps-infra.platform-integration.inventory.v1+json` |
+
+The archive uses sorted paths, regular files with mode `0644`, numeric owner
+`0:0`, the source commit timestamp, USTAR headers, and a deterministic gzip
+header. The canonical JSON inventory binds every path to its mode, size, and
+SHA-256 digest. It also binds the source URL, full source revision, creation
+time, and media types.
+
+The workflow pushes `sha-<source-revision>` to
+`ghcr.io/nclsppr/vps-infra/platform-integration`. It resolves the manifest
+digest, verifies the exact manifest shape and annotations, fetches both layer
+blobs by digest, compares their bytes with the local package, and verifies the
+downloaded package again. Only these successful checks can create provenance.
+The final verification requires this repository, the full source revision,
+`refs/heads/main`, the exact `platform-integration.yml` signer workflow, and a
+GitHub-hosted runner.
+
+The OCI artifact and its registry provenance are the durable records. The
+workflow also uploads a canonical raw JSON audit record for 90 days. It checks
+the raw artifact digest returned by GitHub before it publishes the result.
+
 ## Application state
 
 The production release manifest disables all four applications. Therefore,

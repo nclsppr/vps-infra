@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Verify the exact published OCI manifest for a platform integration package."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from platform_integration import IntegrationError, validate_manifest  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--expected-digest", required=True)
+    parser.add_argument("--archive", required=True)
+    parser.add_argument("--inventory", required=True)
+    parser.add_argument("--expected-revision", required=True)
+    parser.add_argument("--expected-created", required=True)
+    args = parser.parse_args()
+    try:
+        validate_manifest(
+            Path(args.manifest).read_bytes(),
+            expected_digest=args.expected_digest,
+            archive_bytes=Path(args.archive).read_bytes(),
+            inventory_bytes=Path(args.inventory).read_bytes(),
+            expected_revision=args.expected_revision,
+            expected_created=args.expected_created,
+        )
+    except (IntegrationError, OSError) as exc:
+        print(f"platform integration manifest verification failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"platform integration OCI manifest verified: {args.expected_digest}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

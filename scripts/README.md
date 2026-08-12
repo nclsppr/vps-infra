@@ -100,3 +100,21 @@ recording. While the installed policy is locked, the controller rejects the
 production marker explicitly. It cannot invoke an applicator or create active
 state. The locked controller contains no applicator execution path. A future
 live path requires a separately audited policy revision.
+
+## Platform integration publication tools
+
+`build-platform-integration` reads the exact runtime allowlist from one full
+Git commit. It writes `platform-integration.tar.gz` and
+`platform-integration.inventory.json` into an empty output directory.
+
+`verify-platform-integration` rejects a non-canonical archive, a non-canonical
+inventory, an unexpected path, a special file, an invalid mode, a digest
+mismatch, and every configured size limit violation.
+
+`verify-platform-integration-manifest` checks the raw OCI manifest bytes against
+the resolved digest and the two local layer payloads. The publication workflow
+then fetches both blobs from GHCR and runs the package verifier again.
+
+`write-platform-integration-evidence` writes the canonical raw audit record only
+after the workflow has verified GitHub provenance. These tools do not publish,
+promote, or activate a release when an operator runs them locally.
