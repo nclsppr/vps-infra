@@ -37,6 +37,24 @@ Le miroir autorisé est `/srv/vps/repository`, avec l'origine exacte
 `https://github.com/nclsppr/vps-infra.git`. Le contrôleur ne récupère que
 `refs/heads/main` et n'accepte depuis SSH que `deploy <sha40>`.
 
+## Public static edge convergence
+
+`converge` has three exact operator modes for the isolated static edge:
+
+```text
+--prepare-public-static-edge
+--activate-public-static-edge
+--stop-public-static-edge
+```
+
+Preparation starts only the HTTP routes. Activation first proves exact A and
+empty AAAA answers at every authoritative server and through the host resolver,
+then enables HTTPS and runs strict certificate probes. Stop discovers and
+stops every container carrying the fixed Compose project label even if its
+systemd unit is absent. Each active release contains the exact validator copied
+from the same archived Git revision; the host-installed controller cannot be
+silently reused at another policy revision.
+
 ## Static OCI materializer
 
 The operator-facing deployment form of `deploy-static` accepts seven bounded

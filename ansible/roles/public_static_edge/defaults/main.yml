@@ -1,0 +1,36 @@
+---
+vps_public_static_edge_state: prepare
+vps_public_static_edge_project: vps-public-static-edge
+vps_public_static_edge_release_root: /srv/vps/releases/public-static-edge
+vps_public_static_edge_runtime_dir: /srv/vps/runtime/public-static-edge
+vps_public_static_edge_unit: vps-public-static-edge.service
+vps_public_static_edge_container: vps-public-static-edge-caddy-1
+vps_public_static_edge_network: edge
+vps_public_static_edge_network_subnet: 172.30.32.0/24
+vps_public_static_edge_image: >-
+  ghcr.io/nclsppr/vps-infra/caddy:sha-755565642f71918134151921f8eae63935951ad6@sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f
+vps_public_static_edge_files:
+  - Caddyfile
+  - compose.yaml
+  - expected-images.json
+  - validate-compose
+vps_public_static_edge_routes:
+  - papersempire.caddy
+  - personal.caddy
+vps_public_static_edge_route_sources:
+  prepare: routes-prepare
+  activate: routes-activate
+vps_public_static_edge_domains:
+  - nicolaspieper.com
+  - www.nicolaspieper.com
+  - papersempire.com
+  - www.papersempire.com
+vps_public_static_edge_dns_zones:
+  - zone: nicolaspieper.com
+    names:
+      - nicolaspieper.com
+      - www.nicolaspieper.com
+  - zone: papersempire.com
+    names:
+      - papersempire.com
+      - www.papersempire.com

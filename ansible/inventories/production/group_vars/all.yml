@@ -68,3 +68,7 @@ vps_docker_networks:
     driver: bridge
     internal: true
     subnet: 172.30.31.0/24
+  - name: edge
+    driver: bridge
+    internal: false
+    subnet: 172.30.32.0/24

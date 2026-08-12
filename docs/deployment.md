@@ -564,6 +564,59 @@ policy stays locked and `apply-release` is absent. A future workflow will
 require a manifest revert; no reconciliation may retry the same digest before
 an explicit operator action.
 
+## Deploy the public static edge
+
+The static edge has a separate bounded deployment mode because static sites do
+not depend on the database or observability images:
+
+First run normal host convergence at the same approved `main` revision. It
+creates the managed external `edge` bridge on `172.30.32.0/24`. The static edge
+playbook refuses a missing or incompatible bridge. Its exact Compose contract
+joins Caddy only to `edge` and rejects an attachment to the internal `ops`
+network.
+
+```bash
+make prepare-public-static-edge \
+  ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
+```
+
+The command archives the exact `origin/main` commit into an isolated directory.
+It then stages an immutable Caddy-only release with the validator from the same
+commit, validates it without network access, switches one runtime symlink
+atomically, and starts exactly Caddy. Its preparation routes are explicitly
+HTTP-only so certificate issuance does not start while DNS still points to
+GitHub Pages.
+
+Capture the complete DNS records first. For both zones, change the apex and
+`www` A records to the single Atlas IPv4 address. Explicitly delete every old
+GitHub Pages AAAA record at the apex and `www`; merely avoiding a new Atlas
+AAAA record is insufficient. Do not change MX, TXT, CAA, or mail-related
+records. Verify the answers directly against every authoritative nameserver.
+Then activate HTTPS:
+
+```bash
+make activate-public-static-edge \
+  ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
+```
+
+The activation refuses to start while an authoritative or recursive A answer
+differs from Atlas or while any AAAA answer remains. It atomically switches to
+the HTTPS routes, waits for certificate issuance, and requires strict HTTPS
+responses for both apexes and both `www` redirects. The bounded rollback is:
+
+```bash
+make stop-public-static-edge \
+  ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
+```
+
+Stopping the edge preserves both static release trees and the ACME volumes.
+DNS rollback restores the exact records captured before the cutover.
+
+This deployment does not waive or cancel the internal platform. PostgreSQL and
+Grafana are still required for Surplasse and Parkventory. They are admitted and
+started in a separate unit so their private image risk cannot block a clean
+public Caddy image and non-executable static content.
+
 ## Déployer une application Compose
 
 Pour une application donnée :
