@@ -8,8 +8,10 @@ on:
       - platform/caddy/.dockerignore
       - platform/caddy/Dockerfile
       - platform/caddy/build.env
+      - platform/caddy/build/**
       - platform/caddy/entrypoint.sh
       - scripts/validate-caddy-build-inputs
+      - scripts/verify-caddy-image
   push:
     branches:
       - main
@@ -18,8 +20,10 @@ on:
       - platform/caddy/.dockerignore
       - platform/caddy/Dockerfile
       - platform/caddy/build.env
+      - platform/caddy/build/**
       - platform/caddy/entrypoint.sh
       - scripts/validate-caddy-build-inputs
+      - scripts/verify-caddy-image
   workflow_dispatch:
 
 permissions:
@@ -28,6 +32,7 @@ permissions:
 env:
   BUILDKIT_IMAGE: docker.io/moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
   BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.73.0@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c
   CADDY_BUILD_ENV: platform/caddy/build.env
 
 concurrency:
@@ -78,18 +83,45 @@ jobs:
           file: platform/caddy/Dockerfile
           platforms: ${{ matrix.platform }}
           push: false
+          load: true
           build-args: |
             CADDY_BUILDER_IMAGE=${{ steps.inputs.outputs.builder }}
             CADDY_RUNTIME_IMAGE=${{ steps.inputs.outputs.runtime }}
-            CADDY_DNS_MODULE=${{ steps.inputs.outputs.module }}
+          tags: vps-infra/caddy-verify:${{ matrix.architecture }}-${{ github.sha }}
           cache-from: type=gha,scope=caddy-platform-${{ matrix.architecture }}
           cache-to: type=gha,mode=max,scope=caddy-platform-pr-${{ matrix.architecture }}
+          provenance: false
+          sbom: false
+
+      - name: Verify the exact Caddy image
+        shell: bash
+        env:
+          CADDY_DOCKER_PLATFORM: ${{ matrix.platform }}
+          CADDY_VERIFY_IMAGE: vps-infra/caddy-verify:${{ matrix.architecture }}-${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          ./scripts/verify-caddy-image "${CADDY_VERIFY_IMAGE}"
+
+      - name: Reject high or critical vulnerabilities
+        shell: bash
+        env:
+          CADDY_VERIFY_IMAGE: vps-infra/caddy-verify:${{ matrix.architecture }}-${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            "${TRIVY_IMAGE}" image \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --no-progress \
+            "${CADDY_VERIFY_IMAGE}"
 
   publish:
     name: Publish immutable image
     if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     permissions:
       attestations: write
       contents: read
@@ -149,20 +181,135 @@ jobs:
           build-args: |
             CADDY_BUILDER_IMAGE=${{ steps.inputs.outputs.builder }}
             CADDY_RUNTIME_IMAGE=${{ steps.inputs.outputs.runtime }}
-            CADDY_DNS_MODULE=${{ steps.inputs.outputs.module }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha,scope=caddy-platform
           cache-to: type=gha,mode=max,scope=caddy-platform
-          provenance: mode=max
-          sbom: true
+          provenance: false
+          sbom: false
 
+      - name: Verify the published manifest and OCI labels
+        id: published
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_NAME: ghcr.io/${{ github.repository }}/caddy
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          reference="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          manifest=$(docker buildx imagetools inspect \
+            "${reference}" --format '{{json .Manifest}}')
+          jq -e --arg digest "${IMAGE_DIGEST}" '
+            .digest == $digest
+            and ([.manifests[] | select(
+              .platform.os == "linux"
+              and (.platform.architecture == "amd64"
+                or .platform.architecture == "arm64")
+            )] | length) == 2
+            and ([.manifests[] | select(
+              .platform.os == "linux" and .platform.architecture == "amd64"
+            )] | length) == 1
+            and ([.manifests[] | select(
+              .platform.os == "linux" and .platform.architecture == "arm64"
+            )] | length) == 1
+          ' <<<"${manifest}" >/dev/null
+          amd64_digest=$(jq -er '.manifests[] | select(
+            .platform.os == "linux" and .platform.architecture == "amd64"
+          ) | .digest' <<<"${manifest}")
+          arm64_digest=$(jq -er '.manifests[] | select(
+            .platform.os == "linux" and .platform.architecture == "arm64"
+          ) | .digest' <<<"${manifest}")
+
+          images=$(docker buildx imagetools inspect \
+            "${reference}" --format '{{json .Image}}')
+          for platform in linux/amd64 linux/arm64; do
+            jq -e \
+              --arg platform "${platform}" \
+              --arg revision "${EXPECTED_REVISION}" \
+              --arg source "${EXPECTED_SOURCE}" '
+                .[$platform].config.Labels["org.opencontainers.image.revision"]
+                  == $revision
+                and .[$platform].config.Labels["org.opencontainers.image.source"]
+                  == $source
+              ' <<<"${images}" >/dev/null
+          done
+
+          {
+            printf 'reference=%s\n' "${reference}"
+            printf 'amd64_digest=%s\n' "${amd64_digest}"
+            printf 'arm64_digest=%s\n' "${arm64_digest}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Verify both published Caddy images
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.published.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.published.outputs.arm64_digest }}
+          IMAGE_NAME: ghcr.io/${{ github.repository }}/caddy
+        run: |
+          set -Eeuo pipefail
+          CADDY_DOCKER_PLATFORM=linux/amd64 \
+            ./scripts/verify-caddy-image "${IMAGE_NAME}@${AMD64_DIGEST}"
+          CADDY_DOCKER_PLATFORM=linux/arm64 \
+            ./scripts/verify-caddy-image "${IMAGE_NAME}@${ARM64_DIGEST}"
+
+      - name: Scan both published manifests by digest
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.published.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.published.outputs.arm64_digest }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+          IMAGE_NAME: ghcr.io/${{ github.repository }}/caddy
+        run: |
+          set -Eeuo pipefail
+          trivy_auth_directory=$(mktemp -d)
+          trivy_cache_directory=$(mktemp -d)
+          trap 'rm -rf -- "${trivy_auth_directory}" "${trivy_cache_directory}"' EXIT
+          trivy_runner_identity="$(id -u):$(id -g)"
+          printf '%s' "${GHCR_TOKEN}" | docker run --rm --interactive \
+            --user "${trivy_runner_identity}" \
+            --volume "${trivy_auth_directory}:/tmp/trivy-auth" \
+            --env DOCKER_CONFIG=/tmp/trivy-auth \
+            "${TRIVY_IMAGE}" registry login \
+            --username "${GHCR_USERNAME}" \
+            --password-stdin \
+            ghcr.io
+          for digest in "${AMD64_DIGEST}" "${ARM64_DIGEST}"; do
+            docker run --rm \
+              --user "${trivy_runner_identity}" \
+              --volume "${trivy_auth_directory}:/tmp/trivy-auth:ro" \
+              --volume "${trivy_cache_directory}:/tmp/trivy-cache" \
+              --env DOCKER_CONFIG=/tmp/trivy-auth \
+              "${TRIVY_IMAGE}" image \
+              --cache-dir /tmp/trivy-cache \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --exit-code 1 \
+              --no-progress \
+              "${IMAGE_NAME}@${digest}"
+          done
+
+      # Both vulnerability scans have passed before any attestation is emitted.
       - name: Attest the pushed multi-architecture manifest
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        id: attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository }}/caddy
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+
+      - name: Verify GitHub provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REFERENCE: ${{ steps.published.outputs.reference }}
+        run: |
+          set -Eeuo pipefail
+          gh attestation verify "oci://${IMAGE_REFERENCE}" \
+            --repo "${GITHUB_REPOSITORY}"
 
       - name: Publish digest in the workflow summary
         shell: bash

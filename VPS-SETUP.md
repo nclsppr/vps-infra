@@ -153,7 +153,12 @@ platform/
 ### Caddy
 
 - [ ] partir de la version et du durcissement déjà validés par Surplasse ;
-- [ ] construire une image plateforme avec le module DNS épinglé ;
+- [x] build the platform image from the complete locked Go graph with the OVH
+      module and checksum-verified Alpine security packages;
+- [x] reject every HIGH or CRITICAL finding on native `amd64` and `arm64` pull
+      request builds, then scan both published child manifests by digest before
+      GitHub provenance;
+- [ ] publish and promote the first Caddy digest that passes the complete gate;
 - [ ] importer un fragment de routes par projet ;
 - [ ] servir les releases statiques depuis `/srv/www:ro` ;
 - [ ] préserver wildcard, CORS, SSE et fermeture des métriques Surplasse ;

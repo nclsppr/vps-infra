@@ -34,15 +34,16 @@ Le premier socle exécutable est livré :
 - bootstrap et convergence Ansible fail-closed ;
 - Docker et Compose épinglés, pare-feu, SSH, comptes et répertoires ;
 - Compose plateforme durci et images amont épinglées par digest ;
-- Caddy avec fournisseur DNS OVH compilé depuis un commit exact ;
+- Caddy with a generated, checksum-locked Go graph and the OVH DNS provider;
 - PostgreSQL 17, observabilité commune et provisioning Grafana ;
 - manifeste de production, schéma, vérificateur de preuves GitHub et contrôleur
   de déploiement borné ;
 - validations locales et CI, dont détection de secrets pour dépôt public ;
 - workflow de production manuel, désactivé tant que les portes de la plateforme
   et des releases ne sont pas éprouvées ;
-- workflow multi-architecture Caddy : build de preuve en PR, publication GHCR
-  et attestation uniquement depuis `main`.
+- Caddy multi-architecture workflow with a native PR build and Trivy gate for
+  each architecture. A `main` build scans both published child manifests by
+  digest before it creates and verifies GitHub provenance.
 
 The Atlas host is now provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. No

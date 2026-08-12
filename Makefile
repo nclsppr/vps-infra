@@ -45,6 +45,7 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
 	$(MISE_EXEC) shellcheck scripts/validate-caddy-build-inputs \
+		scripts/verify-caddy-image \
 		platform/caddy/entrypoint.sh platform/postgres/initdb/10-platform-exporter.sh
 
 check-public-safe: ## Reject secrets and production inventories in this public repository.
@@ -87,39 +88,14 @@ check-caddy: ## Build Caddy and validate the inactive and candidate route sets.
 	./scripts/validate-caddy-build-inputs "$(CADDY_BUILD_ENV)"; \
 	builder="$$(sed -n 's/^CADDY_BUILDER_IMAGE=//p' "$(CADDY_BUILD_ENV)")"; \
 	runtime="$$(sed -n 's/^CADDY_RUNTIME_IMAGE=//p' "$(CADDY_BUILD_ENV)")"; \
-	module="$$(sed -n 's/^CADDY_DNS_MODULE=//p' "$(CADDY_BUILD_ENV)")"; \
-	test -n "$$builder" && test -n "$$runtime" && test -n "$$module"; \
+	test -n "$$builder" && test -n "$$runtime"; \
 	image="vps-infra/caddy-check:$$(git rev-parse --short=12 HEAD 2>/dev/null || printf local)"; \
 	docker build \
 		--file platform/caddy/Dockerfile \
 		--build-arg "CADDY_BUILDER_IMAGE=$$builder" \
 		--build-arg "CADDY_RUNTIME_IMAGE=$$runtime" \
-		--build-arg "CADDY_DNS_MODULE=$$module" \
 		--tag "$$image" platform/caddy; \
-		secrets="$$(mktemp -d)"; \
-		candidate_routes="$$(mktemp -d)"; \
-		trap 'rm -rf -- "$$secrets" "$$candidate_routes"' EXIT; \
-		for source in "$(CURDIR)"/platform/caddy/routes/*.caddy.disabled; do \
-			test -f "$$source"; \
-			cp -- "$$source" "$$candidate_routes/$$(basename "$${source%.disabled}")"; \
-		done; \
-		docker run --rm \
-			--volume "$(CURDIR)/platform/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
-			--volume "$(CURDIR)/platform/caddy/routes:/etc/caddy/routes:ro" \
-			"$$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; \
-	for name in application-key application-secret consumer-key; do \
-		printf 'validation-placeholder\n' >"$$secrets/$$name"; \
-	done; \
-	docker run --rm \
-		--env OVH_APPLICATION_KEY_FILE=/run/secrets/ovh-application-key \
-		--env OVH_APPLICATION_SECRET_FILE=/run/secrets/ovh-application-secret \
-		--env OVH_CONSUMER_KEY_FILE=/run/secrets/ovh-consumer-key \
-		--volume "$$secrets/application-key:/run/secrets/ovh-application-key:ro" \
-		--volume "$$secrets/application-secret:/run/secrets/ovh-application-secret:ro" \
-			--volume "$$secrets/consumer-key:/run/secrets/ovh-consumer-key:ro" \
-			--volume "$(CURDIR)/platform/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
-			--volume "$$candidate_routes:/etc/caddy/routes:ro" \
-			"$$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+	./scripts/verify-caddy-image "$$image"
 
 bootstrap: ## Create the administrator account on a new OVHcloud Ubuntu host.
 	@test -f "$(ANSIBLE_INVENTORY)" || { \
