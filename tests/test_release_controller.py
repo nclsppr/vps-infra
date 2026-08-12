@@ -813,6 +813,9 @@ def platform_document(*, include_grafana: bool = True) -> dict:
         {"ops"},
         user=None,
     )
+    node_exporter["healthcheck"]["test"] = list(
+        COMPOSE_POLICY.PLATFORM_HEALTHCHECK_TESTS["node-exporter"]
+    )
     node_exporter["pid"] = "host"
     node_exporter["volumes"] = [
         {"type": "bind", "source": "/proc", "target": "/host/proc", "read_only": True},
@@ -1376,7 +1379,7 @@ class ComposePolicyTests(unittest.TestCase):
         document = platform_document(include_grafana=True)
         validate_platform_document(document)
 
-    def test_postgresql_identity_and_grafana_probe_are_exact(self) -> None:
+    def test_platform_identity_and_audited_probes_are_exact(self) -> None:
         mutations = (
             (
                 "postgres-root-entrypoint",
@@ -1413,6 +1416,19 @@ class ComposePolicyTests(unittest.TestCase):
                         "wget",
                         "--spider",
                         "http://127.0.0.1:3000/api/health",
+                    ]
+                ),
+                "audited platform probe",
+            ),
+            (
+                "node-exporter-metrics-probe",
+                lambda document: document["services"]["node-exporter"]["healthcheck"].update(
+                    test=[
+                        "CMD",
+                        "wget",
+                        "--quiet",
+                        "--spider",
+                        "http://127.0.0.1:9100/metrics",
                     ]
                 ),
                 "audited platform probe",

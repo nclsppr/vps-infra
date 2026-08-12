@@ -269,7 +269,9 @@ services:
     cpus: "0.25"
     mem_limit: 128m
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:9100/metrics"]
+      # The landing page proves the HTTP listener without starting a metrics
+      # scrape that wget --spider abandons and node_exporter logs as a reset.
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:9100/"]
       interval: 15s
       timeout: 5s
       retries: 6
