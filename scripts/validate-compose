@@ -18,7 +18,10 @@ IMAGE_REF_RE = re.compile(
     r"@sha256:[0-9a-f]{64}$"
 )
 MAX_EXPECTED_IMAGES_BYTES = 64 * 1024
-PROJECTS = frozenset({"vps-platform", "surplasse", "parkventory"})
+PROJECTS = frozenset(
+    {"vps-platform", "vps-public-static-edge", "surplasse", "parkventory"}
+)
+INFRASTRUCTURE_PROJECTS = frozenset({"vps-platform", "vps-public-static-edge"})
 APPLICATION_COMPONENTS = {
     "surplasse": frozenset({"backend", "onboarding", "commande", "dashboard", "docs"}),
     "parkventory": frozenset({"backend", "frontend"}),
@@ -36,6 +39,8 @@ PLATFORM_SERVICE_NETWORKS = {
     "postgres-exporter": frozenset({"ops", "db_monitoring"}),
 }
 PLATFORM_SERVICES = frozenset(PLATFORM_SERVICE_NETWORKS)
+PUBLIC_STATIC_EDGE_SERVICES = frozenset({"caddy"})
+PUBLIC_STATIC_EDGE_NETWORKS = frozenset({"edge"})
 PLATFORM_ALLOWED_CAPABILITIES = {
     "caddy": frozenset({"NET_BIND_SERVICE"}),
     "postgresql": frozenset({"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"}),
@@ -160,6 +165,42 @@ PLATFORM_NAMED_VOLUMES = {
     "grafana_data": "vps-platform-grafana-data",
     "postgresql_data": "vps-platform-postgresql-17-data",
     "prometheus_data": "vps-platform-prometheus-data",
+}
+PUBLIC_STATIC_EDGE_VOLUME_TARGETS = {
+    "caddy": frozenset({"/etc/caddy/Caddyfile", "/etc/caddy/routes", "/srv/www", "/data", "/config"}),
+}
+PUBLIC_STATIC_EDGE_WRITABLE_VOLUME_TARGETS = {
+    "caddy": frozenset({"/data", "/config"}),
+}
+PUBLIC_STATIC_EDGE_VOLUME_CONTRACTS = {
+    "caddy": {
+        "/etc/caddy/Caddyfile": (
+            "bind", "/srv/vps/runtime/public-static-edge/Caddyfile", True, {"create_host_path": False}
+        ),
+        "/etc/caddy/routes": (
+            "bind", "/srv/vps/runtime/public-static-edge/routes", True, {"create_host_path": False}
+        ),
+        "/srv/www": ("bind", "/srv/www", True, {"create_host_path": False}),
+        "/data": ("volume", "caddy_data", False, {}),
+        "/config": ("volume", "caddy_config", False, {}),
+    }
+}
+PUBLIC_STATIC_EDGE_NAMED_VOLUMES = {
+    "caddy_config": "vps-public-static-edge-caddy-config",
+    "caddy_data": "vps-public-static-edge-caddy-data",
+}
+PUBLIC_STATIC_EDGE_HEALTHCHECK = {
+    "test": [
+        "CMD",
+        "wget",
+        "--quiet",
+        "--spider",
+        "http://127.0.0.1:2019/healthz",
+    ],
+    "timeout": "5s",
+    "interval": "15s",
+    "retries": 6,
+    "start_period": "15s",
 }
 PLATFORM_SECRETS = {
     "caddy": frozenset(),
@@ -332,6 +373,17 @@ def duration_seconds(value: Any, path: str) -> float:
 
 def validate_runtime_contract(project: str, service_name: str, service: dict[str, Any]) -> None:
     path = f"services.{service_name}"
+    if project == "vps-public-static-edge":
+        forbidden_runtime_overrides = {
+            key
+            for key in ("entrypoint", "command", "environment")
+            if service.get(key) is not None
+        }
+        if forbidden_runtime_overrides:
+            fail(
+                f"{path}: public static edge forbids runtime overrides: "
+                f"{', '.join(sorted(forbidden_runtime_overrides))}"
+            )
     if any(key in service for key in ("post_start", "pre_stop")):
         fail(f"{path}: lifecycle hooks are forbidden")
     if "oom_kill_disable" in service:
@@ -364,7 +416,7 @@ def validate_runtime_contract(project: str, service_name: str, service: dict[str
         fail(f"{path}.mem_limit: a positive normalized byte limit is required")
     stop_value = service.get("stop_grace_period")
     stop_seconds = duration_seconds(stop_value, f"{path}.stop_grace_period") if stop_value is not None else None
-    if project == "vps-platform":
+    if project in INFRASTRUCTURE_PROJECTS:
         expected_cpu, expected_memory, expected_pids, expected_stop = PLATFORM_BUDGETS[service_name]
         if cpus != expected_cpu or memory != expected_memory or pids_limit != expected_pids:
             fail(f"{path}: resource limits differ from the audited platform budget")
@@ -425,6 +477,13 @@ def service_networks(project: str, service_name: str, service: dict[str, Any]) -
             fail(
                 f"services.{service_name}.networks: expected {', '.join(sorted(expected or [])) or 'no networks'}"
             )
+    elif project == "vps-public-static-edge":
+        expected = PUBLIC_STATIC_EDGE_SERVICES
+        if service_name not in expected or networks != PUBLIC_STATIC_EDGE_NETWORKS:
+            fail(
+                f"services.{service_name}.networks: expected "
+                f"{', '.join(sorted(PUBLIC_STATIC_EDGE_NETWORKS))}"
+            )
     else:
         app_network = f"app_{project}"
         db_network = f"db_{project}"
@@ -471,7 +530,11 @@ def validate_security(project: str, service_name: str, service: dict[str, Any]) 
     if not isinstance(cap_add_raw, list) or any(not isinstance(item, str) for item in cap_add_raw):
         fail(f"{path}.cap_add: must be an array")
     cap_add = {cap.upper() for cap in cap_add_raw}
-    allowed = PLATFORM_ALLOWED_CAPABILITIES.get(service_name, frozenset()) if project == "vps-platform" else frozenset()
+    allowed = (
+        PLATFORM_ALLOWED_CAPABILITIES.get(service_name, frozenset())
+        if project in INFRASTRUCTURE_PROJECTS
+        else frozenset()
+    )
     if cap_add - allowed:
         dangerous = cap_add & DANGEROUS_CAPABILITIES
         suffix = f" dangerous capabilities: {', '.join(sorted(dangerous))}" if dangerous else ""
@@ -480,7 +543,7 @@ def validate_security(project: str, service_name: str, service: dict[str, Any]) 
     user = service.get("user")
     if user in {0, "0", "0:0", "root", "root:root"}:
         fail(f"{path}.user: explicit root execution is forbidden")
-    if project == "vps-platform":
+    if project in INFRASTRUCTURE_PROJECTS:
         expected_user = PLATFORM_USERS.get(service_name)
         if service_name not in PLATFORM_USERS or user != expected_user:
             fail(f"{path}.user: does not match the audited platform image contract")
@@ -562,15 +625,30 @@ def validate_volumes(
             fail(f"{path}: source and target strings are required")
         if "/var/run/docker.sock" in source or "/run/docker.sock" in source:
             fail(f"{path}: Docker socket mounts are forbidden")
-        if project != "vps-platform":
+        if project not in INFRASTRUCTURE_PROJECTS:
             fail(f"{path}: application services may not use host or named-volume mounts")
-        allowed_targets = PLATFORM_VOLUME_TARGETS.get(service_name, frozenset())
+        volume_targets = (
+            PLATFORM_VOLUME_TARGETS
+            if project == "vps-platform"
+            else PUBLIC_STATIC_EDGE_VOLUME_TARGETS
+        )
+        volume_contracts = (
+            PLATFORM_VOLUME_CONTRACTS
+            if project == "vps-platform"
+            else PUBLIC_STATIC_EDGE_VOLUME_CONTRACTS
+        )
+        writable_volume_targets = (
+            PLATFORM_WRITABLE_VOLUME_TARGETS
+            if project == "vps-platform"
+            else PUBLIC_STATIC_EDGE_WRITABLE_VOLUME_TARGETS
+        )
+        allowed_targets = volume_targets.get(service_name, frozenset())
         if target not in allowed_targets:
             fail(f"{path}: target {target!r} is outside the service allowlist")
         if target in seen_targets:
             fail(f"{path}: duplicate target {target!r}")
         seen_targets.add(target)
-        expected_contract = PLATFORM_VOLUME_CONTRACTS[service_name][target]
+        expected_contract = volume_contracts[service_name][target]
         expected_type, expected_source_spec, expected_read_only, expected_options = expected_contract
         if expected_source_spec.startswith("repo:"):
             if repository_root is None:
@@ -605,13 +683,17 @@ def validate_volumes(
                 if expected_sources.get(target) != source:
                     fail(f"{path}: node-exporter source/target pair is not allowlisted")
         elif volume_type == "volume":
-            writable_targets = PLATFORM_WRITABLE_VOLUME_TARGETS.get(service_name, frozenset())
+            writable_targets = writable_volume_targets.get(service_name, frozenset())
             if target not in writable_targets:
                 fail(f"{path}: writable named volume target is outside the service allowlist")
         else:
             fail(f"{path}: only bind and named-volume mounts are allowed")
-    if project == "vps-platform":
-        required_targets = PLATFORM_VOLUME_TARGETS.get(service_name, frozenset())
+    if project in INFRASTRUCTURE_PROJECTS:
+        required_targets = (
+            PLATFORM_VOLUME_TARGETS
+            if project == "vps-platform"
+            else PUBLIC_STATIC_EDGE_VOLUME_TARGETS
+        ).get(service_name, frozenset())
         if seen_targets != required_targets:
             missing = required_targets - seen_targets
             extra = seen_targets - required_targets
@@ -651,6 +733,9 @@ def validate_secrets(project: str, service_name: str, service: dict[str, Any]) -
         expected = PLATFORM_SECRETS.get(service_name)
         if expected is None or sources != expected:
             fail(f"services.{service_name}.secrets: does not match the platform allowlist")
+    elif project == "vps-public-static-edge":
+        if sources:
+            fail("services.caddy.secrets: the public static edge must not receive secrets")
     else:
         prefix = f"{project}_"
         if any(not source.startswith(prefix) for source in sources):
@@ -684,7 +769,7 @@ def validate_ports(project: str, service_name: str, service: dict[str, Any]) -> 
         path = f"services.{service_name}.ports[{index}]"
         host_ip, published, target, protocol = normalized_port(raw_port, path)
         port_tuple = (published, target, protocol)
-        if project != "vps-platform":
+        if project not in INFRASTRUCTURE_PROJECTS:
             fail(f"{path}: application projects may not publish host ports")
         if service_name == "caddy":
             if port_tuple not in PUBLIC_CADDY_PORTS:
@@ -698,7 +783,7 @@ def validate_ports(project: str, service_name: str, service: dict[str, Any]) -> 
             fail(f"{path}: only caddy and loopback Grafana may publish host ports")
 
 
-def validate_healthcheck(service_name: str, service: dict[str, Any]) -> None:
+def validate_healthcheck(project: str, service_name: str, service: dict[str, Any]) -> None:
     is_migrator = service_name == "migrator" or service_name.endswith("_migrator")
     if is_migrator:
         profiles = service.get("profiles", [])
@@ -712,6 +797,11 @@ def validate_healthcheck(service_name: str, service: dict[str, Any]) -> None:
     healthcheck = service.get("healthcheck")
     if not isinstance(healthcheck, dict):
         fail(f"services.{service_name}.healthcheck: required for every long-running service")
+    if project == "vps-public-static-edge" and healthcheck != PUBLIC_STATIC_EDGE_HEALTHCHECK:
+        fail(
+            f"services.{service_name}.healthcheck: public static edge requires the exact "
+            "reviewed probe"
+        )
     required = {"test", "interval", "timeout", "retries", "start_period"}
     missing = required - set(healthcheck)
     if missing:
@@ -778,7 +868,7 @@ def validate_service(
     validate_volumes(project, service_name, value, repository_root)
     validate_secrets(project, service_name, value)
     validate_ports(project, service_name, value)
-    validate_healthcheck(service_name, value)
+    validate_healthcheck(project, service_name, value)
 
 
 def validate_top_level_resources(project: str, document: dict[str, Any]) -> None:
@@ -792,11 +882,12 @@ def validate_top_level_resources(project: str, document: dict[str, Any]) -> None
         fail(f"Compose document contains unsupported top-level keys: {', '.join(sorted(unknown_top_level))}")
     if document.get("name") != project:
         fail(f"name: Compose project name must be fixed to {project!r}")
-    expected_networks = (
-        set(PLATFORM_NETWORKS)
-        if project == "vps-platform"
-        else {f"app_{project}", f"db_{project}"}
-    )
+    if project == "vps-platform":
+        expected_networks = set(PLATFORM_NETWORKS)
+    elif project == "vps-public-static-edge":
+        expected_networks = set(PUBLIC_STATIC_EDGE_NETWORKS)
+    else:
+        expected_networks = {f"app_{project}", f"db_{project}"}
     networks = document.get("networks")
     if not isinstance(networks, dict) or set(networks) != expected_networks:
         fail(f"networks: expected exactly {', '.join(sorted(expected_networks))}")
@@ -809,11 +900,24 @@ def validate_top_level_resources(project: str, document: dict[str, Any]) -> None
     volumes = document.get("volumes", {})
     if not isinstance(volumes, dict):
         fail("volumes: must be an object")
-    expected_volumes = PLATFORM_NAMED_VOLUMES if project == "vps-platform" else {}
+    if project == "vps-platform":
+        expected_volumes = PLATFORM_NAMED_VOLUMES
+    elif project == "vps-public-static-edge":
+        expected_volumes = PUBLIC_STATIC_EDGE_NAMED_VOLUMES
+    else:
+        expected_volumes = {}
     if set(volumes) != set(expected_volumes):
         fail(f"volumes: expected exactly {', '.join(sorted(expected_volumes)) or 'no named volumes'}")
     for volume_name, expected_name in expected_volumes.items():
         definition = volumes[volume_name]
+        if (
+            project == "vps-public-static-edge"
+            and definition != {"name": expected_name}
+        ):
+            fail(
+                f"volumes.{volume_name}: public static edge requires exactly "
+                f"{{'name': {expected_name!r}}}"
+            )
         if not isinstance(definition, dict) or definition.get("name") != expected_name:
             fail(f"volumes.{volume_name}.name: must remain {expected_name!r}")
 
@@ -828,8 +932,16 @@ def validate_top_level_resources(project: str, document: dict[str, Any]) -> None
     }
     if set(secrets) != used_secrets:
         fail("secrets: definitions must match exactly the secrets referenced by services")
-    secret_path_prefix = "/etc/vps/secrets/platform/" if project == "vps-platform" else f"/etc/vps/secrets/{project}/"
-    secret_name_prefix = "vps-platform_" if project == "vps-platform" else f"{project}_"
+    secret_path_prefix = (
+        "/etc/vps/secrets/platform/"
+        if project in INFRASTRUCTURE_PROJECTS
+        else f"/etc/vps/secrets/{project}/"
+    )
+    secret_name_prefix = (
+        "vps-platform_"
+        if project in INFRASTRUCTURE_PROJECTS
+        else f"{project}_"
+    )
     for secret_name, definition in secrets.items():
         if not isinstance(definition, dict):
             fail(f"secrets.{secret_name}: must be an object")
@@ -875,22 +987,32 @@ def validate_compose(
         fail("services: must be a non-empty object")
     if project == "vps-platform" and set(services) != PLATFORM_SERVICES:
         fail(f"services: platform requires exactly {', '.join(sorted(PLATFORM_SERVICES))}")
-    if project == "vps-platform":
+    if (
+        project == "vps-public-static-edge"
+        and set(services) != PUBLIC_STATIC_EDGE_SERVICES
+    ):
+        fail("services: public static edge requires exactly caddy")
+    if project in INFRASTRUCTURE_PROJECTS:
         if expected_images is None and not structural_only:
             fail(
-                "services: platform production validation requires exact images from a "
+                "services: infrastructure production validation requires exact images from a "
                 "verified release manifest; use structural-only solely for local linting"
             )
         if expected_images is not None:
-            if set(expected_images) != PLATFORM_SERVICES:
-                fail("services: platform expected-image contract is incomplete")
+            expected_services = (
+                PLATFORM_SERVICES
+                if project == "vps-platform"
+                else PUBLIC_STATIC_EDGE_SERVICES
+            )
+            if set(expected_images) != expected_services:
+                fail("services: infrastructure expected-image contract is incomplete")
             for service_name, expected_image in expected_images.items():
                 if services[service_name].get("image") != expected_image:
                     fail(
                         f"services.{service_name}.image: differs from the verified "
                         "release-manifest reference"
                     )
-    if project != "vps-platform":
+    if project not in INFRASTRUCTURE_PROJECTS:
         expected_services = set(APPLICATION_COMPONENTS[project]) | {"migrator"}
         if set(services) != expected_services:
             fail(
@@ -915,7 +1037,7 @@ def validate_compose(
             fail(f"services: invalid service name {service_name!r}")
         validate_service(project, service_name, service, repository_root)
     validate_top_level_resources(project, document)
-    if project == "vps-platform":
+    if project in INFRASTRUCTURE_PROJECTS:
         caddy = services.get("caddy")
         if not isinstance(caddy, dict):
             fail("services.caddy: shared platform must contain the sole public edge")
@@ -929,6 +1051,11 @@ def validate_compose(
         required_public = {(80, 80, "tcp"), (443, 443, "tcp")}
         if not required_public.issubset(normalized):
             fail("services.caddy.ports: shared edge must publish matching 80/tcp and 443/tcp")
+        if project == "vps-public-static-edge" and normalized != PUBLIC_CADDY_PORTS:
+            fail(
+                "services.caddy.ports: public static edge requires exactly "
+                "80/tcp, 443/tcp, and 443/udp"
+            )
 
 
 def main() -> int:

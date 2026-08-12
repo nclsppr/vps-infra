@@ -59,6 +59,10 @@ make doctor-local
 make bootstrap ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
 make converge ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
 make converge-check ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
+
+# Static edge, before and after the reviewed DNS cutover
+make prepare-public-static-edge ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
+make activate-public-static-edge ANSIBLE_EXTRA_VARS=/chemin/prive/bootstrap-public.yml
 ```
 
 Run `converge-check` only after a successful normal convergence. It predicts
@@ -169,7 +173,7 @@ l’état canonique.
 
 La plateforme est restaurée avant les applications :
 
-1. Caddy, avec sa configuration validée mais sans basculer le DNS ;
+1. Caddy en mode HTTP-only, avec sa configuration validée mais sans basculer le DNS ;
 2. PostgreSQL et ses volumes ;
 3. création idempotente des bases, rôles et extensions attendus ;
 4. Prometheus et Grafana ;
@@ -243,16 +247,19 @@ Le DNS ne change qu’après une vérification complète. Les enregistrements ma
 sont jamais remplacés par une génération automatique sans comparaison exacte
 avec l’export.
 
-Cette séquence suppose DNS-01 pour chaque zone. Si une zone ne le permet pas,
-les probes pré-bascule utilisent un hostname de préproduction et une validation
-locale avec le bon en-tête `Host` ; l’émission HTTP-01 et la sonde TLS publique
-stricte ont alors lieu pendant une bascule contrôlée, avec retour rapide prévu.
+For Personal and Papers Empire, the first deployment uses HTTP-01 without an
+OVH credential. The preparation phase serves explicit HTTP routes. The cutover
+then points the apex and `www` A records to Atlas and removes all previous AAAA
+records before the HTTPS activation phase can start. Strict public TLS probes
+run during that controlled cutover, with the captured DNS state available for
+rollback.
 
 ## Phase 7 — basculer et observer
 
 1. réduire les TTL avant la fenêtre lorsque c’est possible ;
-2. basculer les A ou les nameservers décidés ; ne publier les AAAA qu’après
-   preuve explicite du pare-feu, des binds et des probes IPv6 ;
+2. basculer les A ou les nameservers décidés, supprimer explicitement les
+   anciens AAAA, puis ne publier un AAAA Atlas qu’après preuve explicite du
+   pare-feu, des binds et des probes IPv6 ;
 3. vérifier chaque zone auprès des serveurs autoritatifs ;
 4. exécuter les probes depuis au moins un réseau externe ;
 5. tester l’envoi et la réception mail pour les zones concernées ;

@@ -712,6 +712,199 @@ class SupplyChainContractTests(unittest.TestCase):
 
 
 class SecurityBoundaryContractTests(unittest.TestCase):
+    def test_public_static_edge_is_caddy_only_and_reversible(self) -> None:
+        edge_root = ROOT / "platform/public-static-edge"
+        compose = yaml.safe_load((edge_root / "compose.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(compose["name"], "vps-public-static-edge")
+        self.assertEqual(set(compose["services"]), {"caddy"})
+        caddy = compose["services"]["caddy"]
+        self.assertRegex(
+            caddy["image"],
+            r"^ghcr\.io/nclsppr/vps-infra/caddy:[^@]+@sha256:[0-9a-f]{64}$",
+        )
+        self.assertNotIn("environment", caddy)
+        self.assertNotIn("secrets", caddy)
+        self.assertEqual(set(compose["networks"]), {"edge"})
+        self.assertEqual(set(caddy["networks"]), {"edge"})
+        self.assertNotIn("ops", caddy["networks"])
+        self.assertEqual(
+            {
+                (port["host_ip"], int(port["published"]), port["protocol"])
+                for port in caddy["ports"]
+            },
+            {
+                ("0.0.0.0", 80, "tcp"),
+                ("0.0.0.0", 443, "tcp"),
+                ("0.0.0.0", 443, "udp"),
+            },
+        )
+
+        expected_images = json.loads(
+            (edge_root / "expected-images.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(expected_images, {"caddy": caddy["image"]})
+        self.assertEqual(
+            {
+                path.name
+                for path in edge_root.iterdir()
+                if path.is_dir() and path.name.startswith("routes-")
+            },
+            {"routes-prepare", "routes-activate"},
+        )
+        for route_directory in ("routes-prepare", "routes-activate"):
+            self.assertEqual(
+                {path.name for path in (edge_root / route_directory).iterdir()},
+                {"personal.caddy", "papersempire.caddy"},
+            )
+        route_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for route_directory in ("routes-prepare", "routes-activate")
+            for path in sorted((edge_root / route_directory).iterdir())
+        )
+        self.assertIn("nicolaspieper.com", route_text)
+        self.assertIn("papersempire.com", route_text)
+        self.assertNotIn("surplasse", route_text.lower())
+        self.assertNotIn("parkventory", route_text.lower())
+        self.assertNotIn("grafana", route_text.lower())
+        self.assertNotIn("nicolas.pieper.fr", route_text)
+        prepare_routes = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((edge_root / "routes-prepare").iterdir())
+        )
+        activate_routes = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((edge_root / "routes-activate").iterdir())
+        )
+        for domain in (
+            "nicolaspieper.com",
+            "www.nicolaspieper.com",
+            "papersempire.com",
+            "www.papersempire.com",
+        ):
+            self.assertIn(f"http://{domain}", prepare_routes)
+        self.assertNotIn("http://nicolaspieper.com", activate_routes)
+        self.assertNotIn("http://papersempire.com", activate_routes)
+        caddyfile = (edge_root / "Caddyfile").read_text(encoding="utf-8")
+        self.assertIn("metrics /metrics", caddyfile)
+
+        playbook = yaml.safe_load(
+            (ROOT / "ansible/playbooks/public-static-edge.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            [entry["role"] for entry in playbook[0]["roles"]],
+            ["public_static_edge"],
+        )
+        role_text = (
+            ROOT / "ansible/roles/public_static_edge/tasks/main.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("/usr/local/libexec/vps/validate-compose", role_text)
+        self.assertIn(
+            '"{{ vps_public_static_edge_release_dir }}/validate-compose"',
+            role_text,
+        )
+        self.assertIn("Pull the exact verified Caddy image", role_text)
+        self.assertIn("Validate Caddy with the staged production files", role_text)
+        self.assertIn(
+            "item.stat.lnk_target is match('^releases/sha256-[0-9a-f]{64}$')",
+            role_text,
+        )
+        self.assertNotIn(
+            "item.stat.lnk_source is match('^releases/sha256-[0-9a-f]{64}$')",
+            role_text,
+        )
+        self.assertIn("Read the effective Docker ingress firewall activity", role_text)
+        self.assertIn(
+            "vps_public_static_edge_ingress_firewall_activity.stdout == 'active'",
+            role_text,
+        )
+        self.assertIn("Remove an interrupted public edge staging tree", role_text)
+        self.assertIn("Atomically install the immutable public edge release", role_text)
+        self.assertIn("Atomically activate the staged public edge release", role_text)
+        self.assertIn(
+            "Verify the switched public static edge from host and operator networks",
+            role_text,
+        )
+        verification_position = role_text.index(
+            "Verify the switched public static edge from host and operator networks"
+        )
+        rescue_position = role_text.index("      rescue:", verification_position)
+        self.assertLess(verification_position, rescue_position)
+        self.assertIn(
+            "Unconditionally reconcile the public static edge Compose project",
+            role_text,
+        )
+        self.assertIn("Stop every residual public edge project container", role_text)
+        self.assertIn("failed_when: false", role_text)
+        self.assertNotIn("production-enabled", role_text)
+        self.assertNotIn("apply-release", role_text)
+        self.assertNotIn("OVH_", role_text)
+        self.assertIn("Inspect the dedicated public edge network", role_text)
+        self.assertIn("172.30.32.0/24", role_text)
+
+        runtime_verification = (
+            ROOT / "ansible/roles/public_static_edge/tasks/verify-runtime.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("NetworkSettings.Networks.keys()", runtime_verification)
+        self.assertIn("vps_public_static_edge_network", runtime_verification)
+
+        runtime_verification = (
+            ROOT / "ansible/roles/public_static_edge/tasks/verify-runtime.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("delegate_to: localhost", runtime_verification)
+        self.assertIn("validate_certs: true", runtime_verification)
+        self.assertIn("http://{{ ansible_default_ipv4.address }}/", runtime_verification)
+
+        authoritative_dns = (
+            ROOT
+            / "ansible/roles/public_static_edge/tasks/verify-authoritative-dns.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("+comments", authoritative_dns)
+        self.assertIn("status: NOERROR", authoritative_dns)
+        self.assertIn("AAAA", authoritative_dns)
+        self.assertNotIn("authoritative_aaaa.stdout | trim == ''", authoritative_dns)
+        base_defaults = (ROOT / "ansible/roles/base/defaults/main.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("bind9-dnsutils", base_defaults)
+
+        unit = (
+            ROOT
+            / "ansible/roles/public_static_edge/templates/vps-public-static-edge.service.j2"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ExecStop=/usr/bin/docker compose", unit)
+        self.assertIn(" stop --timeout 30 caddy", unit)
+        self.assertNotIn("--volumes", unit)
+
+    def test_public_static_edge_network_is_a_managed_host_boundary(self) -> None:
+        variables = yaml.safe_load(
+            (ROOT / "ansible/inventories/production/group_vars/all.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        networks = {
+            network["name"]: {
+                "driver": network["driver"],
+                "internal": network["internal"],
+                "subnet": network["subnet"],
+            }
+            for network in variables["vps_docker_networks"]
+        }
+        self.assertEqual(
+            networks["edge"],
+            {
+                "driver": "bridge",
+                "internal": False,
+                "subnet": "172.30.32.0/24",
+            },
+        )
+        self.assertEqual(len(networks), 7)
+        self.assertEqual(
+            len({network["subnet"] for network in networks.values()}),
+            len(networks),
+        )
+
     def test_dynamic_static_jobs_use_one_bounded_persistent_tmpfs(self) -> None:
         defaults = yaml.safe_load(
             (ROOT / "ansible/roles/layout/defaults/main.yml").read_text(
@@ -1550,9 +1743,34 @@ fi
                 rf"(?m)^arguments=--check --diff .*vps_infra_revision={remote_sha} .*playbooks/site\.yml$",
             )
 
+            for mode, state in (
+                ("--prepare-public-static-edge", "prepare"),
+                ("--activate-public-static-edge", "activate"),
+                ("--stop-public-static-edge", "stopped"),
+            ):
+                log.unlink()
+                edge_result = subprocess.run(
+                    [converge, mode],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(edge_result.returncode, 0, edge_result.stderr)
+                edge_execution = log.read_text(encoding="utf-8")
+                self.assertRegex(
+                    edge_execution,
+                    rf"(?m)^arguments=.*vps_infra_revision={remote_sha} "
+                    rf"--extra-vars vps_public_static_edge_state={state} "
+                    r"playbooks/public-static-edge\.yml$",
+                )
+
             log.unlink()
             for unsupported_arguments in (
                 ["--check"],
+                ["--public-static-edge"],
                 ["--diff", "--check"],
                 ["--check", "--diff", "--limit", "atlas"],
             ):
@@ -1566,10 +1784,7 @@ fi
                     check=False,
                 )
                 self.assertEqual(refused.returncode, 64)
-                self.assertIn(
-                    "arguments must be empty or exactly: --check --diff",
-                    refused.stderr,
-                )
+                self.assertIn("converge refused:", refused.stderr)
                 self.assertFalse(log.exists())
 
             result = subprocess.run(

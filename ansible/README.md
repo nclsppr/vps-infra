@@ -175,11 +175,41 @@ verifies a clean checkout before it installs root-owned controller files. The
 file `/usr/local/share/vps-infra/controller-revision` records the installed
 commit.
 
+## Public static edge playbook
+
+`playbooks/public-static-edge.yml` is the only current live service path. The
+local `converge` wrapper accepts `--prepare-public-static-edge`,
+`--activate-public-static-edge`, and `--stop-public-static-edge` as exact
+single-argument modes. All three modes execute from an isolated archive of
+`origin/main`.
+
+The preparation mode installs one root-owned Compose project, binds it to the
+exact promoted Caddy image, and serves the four hosts over HTTP without asking
+for a certificate. The activation mode first requires every authoritative and
+recursive A answer to contain only Atlas and every AAAA answer to be empty. It
+then switches atomically to the HTTPS release and runs strict certificate
+probes. Each phase uses an immutable revision directory and the matching
+Compose validator from that same checkout. The stop mode stops every container
+owned by this Compose project even if the unit is absent or inactive. It
+preserves the ACME volumes and static releases. None of these modes creates
+`apply-release`, writes the production marker, changes DNS, reads an OVH
+credential, or starts PostgreSQL, Grafana, Prometheus, exporters, Surplasse, or
+Parkventory.
+
+The project joins only the managed `edge` bridge on `172.30.32.0/24`. The
+playbook rejects a missing or incompatible bridge and verifies that the live
+Caddy container has no attachment to `ops`.
+
+The internal platform remains necessary for the application stacks. Its later
+activation keeps Grafana on loopback and every database or metrics endpoint off
+the public host interfaces.
+
 ## Prepared Docker networks
 
-Ansible creates six external Docker networks with fixed properties. The locked
-base platform joins only `ops` and `db_monitoring`. PostgreSQL joins only
-`db_monitoring`. Caddy and Prometheus join only `ops`.
+Ansible creates seven external Docker networks with fixed properties. The
+isolated public static edge joins only `edge`. The locked complete platform
+definition joins only `ops` and `db_monitoring`. PostgreSQL joins only
+`db_monitoring`. Its Caddy and Prometheus services join only `ops`.
 
 The four application networks remain empty until a reviewed application
 integration package attaches the required services. An existing network with
