@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -40,6 +41,9 @@ CONTROLLER = load_script(
 )
 PROVISIONER = load_script(
     "surplasse_postgres_provisioner", SCRIPTS / "provision-surplasse-postgres"
+)
+MATERIALIZER = load_script(
+    "surplasse_secret_materializer", SCRIPTS / "materialize-surplasse-secrets"
 )
 
 
@@ -503,6 +507,85 @@ class SurplasseControllerTests(unittest.TestCase):
             self.assertEqual(malformed.returncode, 78)
             self.assertIn("manifest does not match", malformed.stderr)
 
+    def test_unsafe_manifest_target_blocks_rotation_before_secret_changes(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        for unsafe_kind in ("directory", "symlink", "hardlink", "wrong-mode"):
+            with self.subTest(unsafe_kind=unsafe_kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                protected_root = root / "target"
+                protected_root.mkdir(mode=0o700)
+                source_a = root / "source-a"
+                source_b = root / "source-b"
+                values_a = self.write_operator_bundle(source_a)
+                self.write_operator_bundle(source_b)
+                install = self.run_secret_helper(
+                    protected_root, "--install-operator-from", str(source_a)
+                )
+                self.assertEqual(install.returncode, 0, install.stderr)
+                manifest = protected_root / OPERATOR_MANIFEST
+                if unsafe_kind == "directory":
+                    manifest.unlink()
+                    manifest.mkdir(mode=0o700)
+                elif unsafe_kind == "symlink":
+                    manifest.unlink()
+                    manifest.symlink_to(protected_root / "surplasse-smtp-host")
+                elif unsafe_kind == "hardlink":
+                    os.link(manifest, root / "external-manifest-link")
+                else:
+                    manifest.chmod(0o600)
+                before = {
+                    name: (
+                        (protected_root / name).read_bytes(),
+                        (protected_root / name).stat().st_ino,
+                    )
+                    for name in values_a
+                }
+
+                rotation = self.run_secret_helper(
+                    protected_root, "--install-operator-from", str(source_b)
+                )
+
+                self.assertEqual(rotation.returncode, 78)
+                self.assertIn("manifest", rotation.stderr)
+                self.assertIn("unsafe", rotation.stderr)
+                self.assertEqual(
+                    before,
+                    {
+                        name: (
+                            (protected_root / name).read_bytes(),
+                            (protected_root / name).stat().st_ino,
+                        )
+                        for name in values_a
+                    },
+                )
+
+    def test_manifest_metadata_rejects_unexpected_owner_and_group(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            protected_root = Path(directory) / "target"
+            protected_root.mkdir(mode=0o700)
+            manifest = protected_root / OPERATOR_MANIFEST
+            manifest.write_bytes(b"{}\n")
+            manifest.chmod(0o400)
+            descriptor = os.open(protected_root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(
+                    MATERIALIZER.SecretError, "unsafe metadata"
+                ):
+                    MATERIALIZER.validate_manifest_target_metadata(
+                        descriptor, os.geteuid() + 1, os.getegid()
+                    )
+                with self.assertRaisesRegex(
+                    MATERIALIZER.SecretError, "unsafe metadata"
+                ):
+                    MATERIALIZER.validate_manifest_target_metadata(
+                        descriptor, os.geteuid(), os.getegid() + 1
+                    )
+            finally:
+                os.close(descriptor)
+
     def test_unrecognized_pending_secret_copy_is_rejected(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("the helper intentionally forbids root test mode")
@@ -523,10 +606,34 @@ class SurplasseControllerTests(unittest.TestCase):
             pending.write_bytes(values["surplasse-stripe-secret-key"])
             pending.chmod(0o440)
 
-            validation = self.run_secret_helper(protected_root, "--operator-only")
+            source_b = root / "source-b"
+            self.write_operator_bundle(source_b)
+            rotated_value = b"blocked-rotation-password\n"
+            rotated_path = source_b / "surplasse-smtp-password"
+            rotated_path.write_bytes(rotated_value)
+            rotated_path.chmod(0o600)
+            before = {
+                path.name: (path.read_bytes(), path.stat().st_ino)
+                for path in protected_root.iterdir()
+            }
+
+            validation = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source_b)
+            )
 
             self.assertEqual(validation.returncode, 78)
             self.assertIn("unexpected entry", validation.stderr)
+            self.assertEqual(
+                before,
+                {
+                    path.name: (path.read_bytes(), path.stat().st_ino)
+                    for path in protected_root.iterdir()
+                },
+            )
+            self.assertNotEqual(
+                (protected_root / "surplasse-smtp-password").read_bytes(),
+                rotated_value,
+            )
 
     def test_concurrent_operator_installers_publish_one_complete_bundle(self) -> None:
         if os.geteuid() == 0:
@@ -586,6 +693,32 @@ class SurplasseControllerTests(unittest.TestCase):
             self.assertIn(installed, (values_a, values_b))
             validation = self.run_secret_helper(protected_root, "--operator-only")
             self.assertEqual(validation.returncode, 0, validation.stderr)
+
+    def test_operator_bundle_lock_timeout_is_bounded(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            protected_root = Path(directory) / "target"
+            protected_root.mkdir(mode=0o700)
+            directory_fd = os.open(protected_root, os.O_RDONLY | os.O_DIRECTORY)
+            first_lock = MATERIALIZER.acquire_bundle_lock(
+                directory_fd, os.geteuid(), os.getegid()
+            )
+            previous_timeout = MATERIALIZER.LOCK_TIMEOUT_SECONDS
+            MATERIALIZER.LOCK_TIMEOUT_SECONDS = 0.05
+            started = time.monotonic()
+            try:
+                with self.assertRaisesRegex(
+                    MATERIALIZER.SecretError, "operator bundle lock is busy"
+                ):
+                    MATERIALIZER.acquire_bundle_lock(
+                        directory_fd, os.geteuid(), os.getegid()
+                    )
+                self.assertLess(time.monotonic() - started, 1)
+            finally:
+                MATERIALIZER.LOCK_TIMEOUT_SECONDS = previous_timeout
+                os.close(first_lock)
+                os.close(directory_fd)
 
     def test_postgres_provisioning_sql_separates_roles(self) -> None:
         statements: list[tuple[str, str]] = []
