@@ -36,10 +36,12 @@ files with network access disabled. A missing file, changed payload, missing
 dependency, or checksum mismatch fails the build.
 
 `CADDY_PLATFORM_IMAGE` in `platform/.env.example` is the promotion point for an
-already published and attested output. It remains an upstream
-structural-validation placeholder in this locked baseline. Promote a verified
-custom-image digest in a separate pull request. A promotion does not rebuild
-the image. Production must use the custom image by digest.
+already published and attested output. It references the custom image built by
+the protected `main` workflow at infrastructure revision
+`dbbc1b8749670c107193de5b8ec623ac7a147555`, after both native child images
+passed the strict scan and the multi-architecture digest received verified
+GitHub provenance. A promotion does not rebuild the image. Production uses the
+custom image by digest.
 
 ## Caddy publication gate
 
