@@ -1028,7 +1028,11 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             self.assertIn(service, unit)
         self.assertNotIn(" down ", unit)
         self.assertNotIn("--volumes", unit)
-        self.assertIn("127\\\\.0\\\\.0\\\\.1:3000", runtime)
+        self.assertIn('"sport = :{{ item }}"', runtime)
+        for port in (3000, 5432, 9090, 9100, 9187):
+            self.assertIn(f"    - {port}", runtime)
+        self.assertIn("search('127[.]0[.]0[.]1:3000[ \\t]')", runtime)
+        self.assertNotIn("\\\\b", runtime)
         self.assertIn("pg_up 1", runtime)
         self.assertIn("node_uname_info", runtime)
         self.assertIn("labels.job', 'equalto', 'caddy'", runtime)
