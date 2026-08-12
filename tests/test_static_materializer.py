@@ -2724,11 +2724,11 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
         self.assertEqual(profile.redirect_domains, ("www.parkventory.com",))
         self.assertEqual(
             profile.site_repository,
-            "ghcr.io/nclsppr/parkventory/site",
+            "ghcr.io/nclsppr/parkventory-static-site",
         )
         self.assertEqual(
             profile.routes_repository,
-            "ghcr.io/nclsppr/parkventory/routes",
+            "ghcr.io/nclsppr/parkventory-static-routes",
         )
         route = (
             ROOT / "platform/caddy/routes/parkventory.caddy.disabled"
