@@ -22,12 +22,25 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Met à jour les tags lisibles et digests des images plateforme",
+      "description": "Update upstream runtime images without promoting Caddy",
       "managerFilePatterns": [
         "/^platform\\/\\.env\\.example$/"
       ],
       "matchStrings": [
-        "(?<envName>[A-Z0-9_]+_IMAGE)=(?<depName>[a-zA-Z0-9._/-]+):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+        "(?<envName>(?:POSTGRES|PROMETHEUS|GRAFANA|NODE_EXPORTER|POSTGRES_EXPORTER)_IMAGE)=(?<depName>[a-zA-Z0-9._/-]+):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker",
+      "autoReplaceStringTemplate": "{{{envName}}}={{{depName}}}:{{{newValue}}}@{{{newDigest}}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the upstream Caddy build images",
+      "managerFilePatterns": [
+        "/^platform\\/caddy\\/build\\.env$/"
+      ],
+      "matchStrings": [
+        "(?<envName>CADDY_(?:BUILDER|RUNTIME)_IMAGE)=(?<depName>docker\\.io/library/caddy):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker",
       "versioningTemplate": "docker",
@@ -43,12 +56,30 @@
       "dependencyDashboardApproval": true
     },
     {
-      "description": "PostgreSQL et Caddy ne sont jamais des mises à jour ordinaires",
+      "description": "PostgreSQL updates require operator approval",
       "matchPackageNames": [
-        "docker.io/library/caddy",
         "docker.io/library/postgres"
       ],
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Update both upstream Caddy images together after approval",
+      "matchFileNames": [
+        "platform/caddy/build.env"
+      ],
+      "matchPackageNames": [
+        "docker.io/library/caddy"
+      ],
+      "groupName": "Caddy build inputs",
+      "minimumGroupSize": 2,
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Promote the built Caddy image only in a dedicated pull request",
+      "matchPackageNames": [
+        "ghcr.io/nclsppr/vps-infra/caddy"
+      ],
+      "enabled": false
     }
   ]
 }

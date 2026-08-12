@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  printf 'usage: %s [--github-output PATH] BUILD_ENV\n' "${0##*/}" >&2
+  exit 2
+}
+
+fail() {
+  printf 'Caddy build input validation failed: %s\n' "$*" >&2
+  exit 2
+}
+
+github_output=
+if [[ "${1:-}" == "--github-output" ]]; then
+  [[ $# -eq 3 ]] || usage
+  github_output=$2
+  shift 2
+fi
+[[ $# -eq 1 ]] || usage
+
+source_path=$1
+[[ -f "$source_path" ]] || fail "not a file: $source_path"
+
+builder=
+runtime=
+module=
+builder_seen=false
+runtime_seen=false
+module_seen=false
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  case "$line" in
+    "" | \#*) continue ;;
+  esac
+  [[ "$line" == *=* ]] || fail "invalid line: $line"
+  key=${line%%=*}
+  value=${line#*=}
+  [[ -n "$value" ]] || fail "empty value: $key"
+  case "$key" in
+    CADDY_BUILDER_IMAGE)
+      [[ "$builder_seen" == false ]] || fail "duplicate key: $key"
+      builder=$value
+      builder_seen=true
+      ;;
+    CADDY_RUNTIME_IMAGE)
+      [[ "$runtime_seen" == false ]] || fail "duplicate key: $key"
+      runtime=$value
+      runtime_seen=true
+      ;;
+    CADDY_DNS_MODULE)
+      [[ "$module_seen" == false ]] || fail "duplicate key: $key"
+      module=$value
+      module_seen=true
+      ;;
+    *) fail "unexpected key: $key" ;;
+  esac
+done <"$source_path"
+
+[[ "$builder_seen" == true ]] || fail "missing key: CADDY_BUILDER_IMAGE"
+[[ "$runtime_seen" == true ]] || fail "missing key: CADDY_RUNTIME_IMAGE"
+[[ "$module_seen" == true ]] || fail "missing key: CADDY_DNS_MODULE"
+
+builder_pattern='^docker\.io/library/caddy:([0-9]+\.[0-9]+\.[0-9]+)-builder-alpine@sha256:[0-9a-f]{64}$'
+runtime_pattern='^docker\.io/library/caddy:([0-9]+\.[0-9]+\.[0-9]+)-alpine@sha256:[0-9a-f]{64}$'
+module_pattern='^github\.com/caddy-dns/ovh@[0-9a-f]{40}$'
+
+[[ "$builder" =~ $builder_pattern ]] || fail "invalid CADDY_BUILDER_IMAGE"
+builder_version=${BASH_REMATCH[1]}
+[[ "$runtime" =~ $runtime_pattern ]] || fail "invalid CADDY_RUNTIME_IMAGE"
+runtime_version=${BASH_REMATCH[1]}
+[[ "$builder_version" == "$runtime_version" ]] || {
+  fail "builder and runtime Caddy versions differ"
+}
+[[ "$module" =~ $module_pattern ]] || fail "invalid CADDY_DNS_MODULE"
+
+if [[ -n "$github_output" ]]; then
+  [[ -f "$github_output" ]] || fail "GitHub output is not a file: $github_output"
+  {
+    printf 'builder=%s\n' "$builder"
+    printf 'runtime=%s\n' "$runtime"
+    printf 'module=%s\n' "$module"
+  } >>"$github_output"
+else
+  printf 'Caddy build inputs valid: %s\n' "$source_path"
+fi

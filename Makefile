@@ -4,6 +4,7 @@ SHELL := /bin/bash
 ANSIBLE_INVENTORY ?= ansible/inventories/production/hosts.yml
 ANSIBLE_EXTRA_VARS ?=
 PLATFORM_ENV ?= platform/.env.example
+CADDY_BUILD_ENV ?= platform/caddy/build.env
 MISE_EXEC := mise exec --
 COMPOSE := $(MISE_EXEC) docker-compose
 
@@ -43,7 +44,8 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
-	$(MISE_EXEC) shellcheck platform/caddy/entrypoint.sh platform/postgres/initdb/10-platform-exporter.sh
+	$(MISE_EXEC) shellcheck scripts/validate-caddy-build-inputs \
+		platform/caddy/entrypoint.sh platform/postgres/initdb/10-platform-exporter.sh
 
 check-public-safe: ## Reject secrets and production inventories in this public repository.
 	./scripts/check-public-safe --root .
@@ -81,9 +83,11 @@ check-prometheus: ## Validate active and inactive Prometheus rules in the pinned
 		done
 
 check-caddy: ## Build Caddy and validate the inactive and candidate route sets.
-	@builder="$$(sed -n 's/^CADDY_BUILDER_IMAGE=//p' "$(PLATFORM_ENV)")"; \
-	runtime="$$(sed -n 's/^CADDY_RUNTIME_IMAGE=//p' "$(PLATFORM_ENV)")"; \
-	module="$$(sed -n 's/^CADDY_DNS_MODULE=//p' "$(PLATFORM_ENV)")"; \
+	@set -Eeuo pipefail; \
+	./scripts/validate-caddy-build-inputs "$(CADDY_BUILD_ENV)"; \
+	builder="$$(sed -n 's/^CADDY_BUILDER_IMAGE=//p' "$(CADDY_BUILD_ENV)")"; \
+	runtime="$$(sed -n 's/^CADDY_RUNTIME_IMAGE=//p' "$(CADDY_BUILD_ENV)")"; \
+	module="$$(sed -n 's/^CADDY_DNS_MODULE=//p' "$(CADDY_BUILD_ENV)")"; \
 	test -n "$$builder" && test -n "$$runtime" && test -n "$$module"; \
 	image="vps-infra/caddy-check:$$(git rev-parse --short=12 HEAD 2>/dev/null || printf local)"; \
 	docker build \

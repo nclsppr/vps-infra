@@ -37,8 +37,10 @@ La conception détaillée vit dans :
 - [x] ajouter un `CODEOWNERS` sur `platform/`,
       `ansible/`, `releases/` et les workflows ;
 - [x] épingler outils, Actions, paquets hôte et images ;
-- [x] configurer Renovate pour proposer les nouveaux digests de
-      `platform/.env.example` ;
+- [x] configure Renovate to propose upstream digests from
+      `platform/.env.example` and Caddy base images from
+      `platform/caddy/build.env` after each required approval. Renovate never
+      promotes the built Caddy image automatically.
 - [ ] confirmer/activer l’application Renovate sur `vps-infra` ; Dependabot
       couvre déjà Actions, Python et Docker chaque semaine, sans prétendre
       mettre à jour les variables d’images ;
