@@ -18,6 +18,16 @@
         ['surplasse-postgres-migrator-password',
          'surplasse-postgres-runtime-password']
       - >-
+        vps_surplasse_operator_inputs | sort ==
+        ['ovh-application-key', 'ovh-application-secret', 'ovh-consumer-key',
+         'surplasse-jwt-jwks', 'surplasse-jwt-key-id',
+         'surplasse-jwt-private-key', 'surplasse-smtp-host',
+         'surplasse-smtp-password', 'surplasse-smtp-port',
+         'surplasse-smtp-username',
+         'surplasse-stripe-account-webhook-secret',
+         'surplasse-stripe-payment-webhook-secret',
+         'surplasse-stripe-secret-key']
+      - >-
         vps_surplasse_network_contract ==
         {'app_surplasse': {'subnet': '172.30.10.0/24', 'internal': false},
          'db_surplasse': {'subnet': '172.30.11.0/24', 'internal': true}}

@@ -42,6 +42,15 @@ valide et ne l'écrit pas dans les sorties Ansible.
 - références Compose uniquement par fichiers sous `/run/secrets` ;
 - sauvegarde de récupération de la clé age testée avant toute activation.
 
-Les secrets Surplasse et Parkventory seront ajoutés à ce contrat seulement
-après séparation effective des rôles migrateur/runtime et suppression de leurs
-fallbacks de développement.
+## Surplasse
+
+The Surplasse preparation controller now creates separate migrator and runtime
+database passwords. It also installs a helper that validates and materializes
+the complete operator bundle under `/etc/vps/secrets/surplasse`. The exact file
+list, metadata, offline format checks, JWT key-pair proof, serialized install,
+and generation-manifest rules are in
+[`applications/surplasse/README.md`](../applications/surplasse/README.md).
+
+The adapter remains locked. A locally valid OVH token shape does not prove its
+IAM scope, and valid Stripe values do not prove the reviewed Connect release
+gate. Do not activate from the presence of files alone.
