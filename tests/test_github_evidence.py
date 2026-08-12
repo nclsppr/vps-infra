@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 
 
@@ -40,6 +41,18 @@ PLATFORM_PROOF = load_script_module(
     "github_evidence_platform_proof",
     SCRIPTS / "lib" / "platform_proof.py",
 )
+PLATFORM_VEX = load_script_module(
+    "github_evidence_platform_vex",
+    SCRIPTS / "lib" / "platform_vex.py",
+)
+
+
+def vex_metadata() -> dict[str, str]:
+    return PLATFORM_VEX.load_vex_policy(
+        ROOT / "policies/platform-vex-v1.json",
+        ROOT / "schemas/platform-vex-v1.schema.json",
+        on_date=date(2026, 8, 12),
+    ).metadata()
 
 
 def sample_manifest() -> dict:
@@ -91,7 +104,10 @@ def enable_platform(manifest: dict, run_id: str = "101") -> None:
         "blocked_by": [],
         "images": {
             "caddy": image("ghcr.io/nclsppr/vps-infra/caddy"),
-            "postgres": image("docker.io/library/postgres", tag="17"),
+            "postgres": image(
+                "ghcr.io/nclsppr/vps-infra/postgres",
+                tag=f"sha-{SHA_A}",
+            ),
             "prometheus": image("docker.io/prom/prometheus"),
             "grafana": image("docker.io/grafana/grafana"),
             "node_exporter": image("docker.io/prom/node-exporter"),
@@ -120,6 +136,7 @@ def add_platform_proof(manifest: dict, *, artifact_id: str = "909") -> dict:
         run_id="101",
         run_attempt=1,
         verified_gates=gates,
+        vulnerability_policy=vex_metadata(),
     )
     proof_metadata = {
         "subject_sha256": subject,
@@ -328,6 +345,28 @@ class GitHubEvidenceTests(unittest.TestCase):
                 fetch_artifact=lambda _repository, _artifact_id, _timeout: valid,
             )
 
+    def test_platform_proof_is_rejected_after_earliest_vex_expiry(self) -> None:
+        manifest = sample_manifest()
+        enable_platform(manifest)
+        proof = add_platform_proof(manifest)
+        self.assertEqual(
+            proof["vulnerability_policy"]["valid_until"],
+            "2026-08-26",
+        )
+        with self.assertRaisesRegex(VERIFY.EvidenceError, "expired VEX"):
+            VERIFY.verify_manifest(
+                manifest,
+                fetch_run=lambda _repository, _run_id, _timeout: api_run(
+                    "nclsppr/vps-infra", "main", SHA_A, "101"
+                ),
+                fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                    proof,
+                    artifact_id,
+                ),
+                verified_on=date(2026, 8, 27),
+            )
+
     def test_every_platform_artifact_identity_field_is_fail_closed(self) -> None:
         manifest = sample_manifest()
         enable_platform(manifest)
@@ -512,6 +551,7 @@ class GitHubEvidenceTests(unittest.TestCase):
             run_id="101",
             run_attempt=2,
             verified_gates=sorted(RELEASE_POLICY.PLATFORM_PROOF_BASELINE_GATES),
+            vulnerability_policy=vex_metadata(),
         )
         proof_metadata = {
             "artifact_name": proof["artifact_name"],

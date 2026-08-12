@@ -62,8 +62,15 @@ controller records desired state. The manual `vps-release.yml` workflow now
 proves the exact platform candidate subject for two review gates only. It
 verifies the seven OCI references, image labels, strict HIGH and CRITICAL
 vulnerability scans, the OVH DNS module, and workflow-bound GitHub
-attestations. All eight production blockers remain. A candidate does not
+attestations. It refuses every CRITICAL finding. It accepts a HIGH finding only
+when one unexpired, digest-bound VEX statement matches the service, image,
+platform, binary, package, installed version, and CVE exactly. All eight
+production blockers remain. A candidate does not
 publish a port, start a container, or create active state.
+
+The canonical proof binds the VEX policy digest and its earliest exception
+expiry. Evidence verification rejects the proof after that UTC date, even when
+the GitHub artifact itself is still retained.
 
 The deploy role installs the static materializer as a root-owned primitive. It
 binds each site, route inventory, and platform integration artifact to an exact

@@ -213,7 +213,7 @@
               "allOf": [
                 { "$ref": "#/$defs/imageReference" },
                 {
-                  "pattern": "^docker\\.io/library/postgres:17(?:[.-][A-Za-z0-9_.-]+)?@sha256:[0-9a-f]{64}$"
+                  "pattern": "^ghcr\\.io/nclsppr/vps-infra/postgres:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$"
                 }
               ]
             },

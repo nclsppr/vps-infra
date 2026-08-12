@@ -180,9 +180,28 @@ state.
 The manual `.github/workflows/vps-release.yml` workflow certifies the exact
 platform candidate subject for two review gates: `caddy-ovh-image` and
 `immutable-image-digests`. It resolves and hashes all seven OCI references,
-verifies supported labels, rejects every HIGH or CRITICAL image finding, checks
-the Caddy OVH module, and verifies workflow-bound GitHub attestations while
-rejecting self-hosted signers. It writes a canonical raw proof artifact.
+verifies supported labels, checks the Caddy OVH module, and verifies
+workflow-bound GitHub attestations while rejecting self-hosted signers. The
+custom PostgreSQL reference is restricted to
+`ghcr.io/nclsppr/vps-infra/postgres`. Its label revision and readable tag must
+match, and its provenance must come from `postgres-image.yml` on `main`.
+
+Trivy writes JSON even when it finds a HIGH or CRITICAL vulnerability. The
+proof engine then rejects every CRITICAL finding and every uncovered HIGH
+finding. `policies/platform-vex-v1.json` is the only exception input. Its
+versioned schema binds each `not_affected` statement to one service, full image
+reference and digest, platform, target binary, package identity, installed
+version, CVE, justification, and expiration date. The engine rejects an
+expired, changed, duplicate, or unused exception. It uses no global ignore
+file and no ignore flag.
+
+The proof workflow source revision binds the VEX policy and evaluator. The VEX
+policy is not runtime configuration, so the platform integration OCI artifact
+does not contain it. The canonical platform proof v2 also records the exact VEX
+file digest and the earliest expiry of its used statements. The evidence
+verifier rechecks that UTC date. It rejects the proof after the date even if
+GitHub still retains the artifact. The workflow writes a canonical raw proof
+artifact.
 `scripts/verify-github-evidence` reconstructs the same bytes and compares their
 digest and run identity with public GitHub artifact metadata. This prevents the
 reuse of a successful run after any candidate digest or run-attempt change.
@@ -191,6 +210,16 @@ This review proof removes no production blocker. The workflow requests 90-day
 artifact retention, subject to the repository retention policy, and the
 verifier rejects deleted or expired evidence. Keep `activation_policy: locked`
 until durable provenance and every semantic gate have separate evidence.
+
+The policy dated 2026-08-12 contains four temporary HIGH exceptions. Grafana
+13.1.3-slim embeds Tempo code for CVE-2026-21728 and CVE-2026-28377, but Grafana
+does not start the affected Tempo server path. These statements expire no later
+than 2026-09-11. Independent `govulncheck` analysis of postgres_exporter 0.20.1
+reports that its entry points do not call the vulnerable symbols for
+CVE-2026-56852 and CVE-2026-39822. These statements expire no later than
+2026-08-26. `govulncheck` also reports CVE-2026-42505 as separate information.
+Trivy 0.73.0 does not report that CVE for the locked image, so the VEX policy
+does not contain it. The proof will fail if a later Trivy database reports it.
 
 ### Platform integration publication
 

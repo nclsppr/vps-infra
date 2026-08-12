@@ -7,6 +7,7 @@ import argparse
 import ssl
 import sys
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -22,6 +23,7 @@ from platform_proof import (  # noqa: E402
     platform_proof_bytes,
     platform_proof_digest,
 )
+from platform_vex import VexError, load_vex_policy  # noqa: E402
 from release_policy import (  # noqa: E402
     PolicyError,
     load_manifest,
@@ -37,6 +39,8 @@ PLATFORM_REPOSITORY = "nclsppr/vps-infra"
 PLATFORM_BRANCH = "main"
 REQUIRED_WORKFLOW_PATH = ".github/workflows/vps-release.yml"
 ALLOWED_EVENTS = frozenset({"push", "workflow_dispatch"})
+VEX_POLICY_PATH = SCRIPT_DIR.parent / "policies/platform-vex-v1.json"
+VEX_SCHEMA_PATH = SCRIPT_DIR.parent / "schemas/platform-vex-v1.schema.json"
 
 
 class EvidenceError(ValueError):
@@ -374,6 +378,8 @@ def _verify_platform_artifact(
     evidence: Evidence,
     run: dict[str, Any],
     artifact: dict[str, Any],
+    vulnerability_policy: dict[str, str],
+    verified_on: date,
 ) -> None:
     if evidence.platform_candidate is None:
         return
@@ -386,7 +392,14 @@ def _verify_platform_artifact(
         run_id=evidence.run_id,
         run_attempt=evidence.run_attempt,
         verified_gates=evidence.artifact_gates,
+        vulnerability_policy=vulnerability_policy,
     )
+    valid_until = date.fromisoformat(proof["vulnerability_policy"]["valid_until"])
+    if verified_on > valid_until:
+        paths = ", ".join(evidence.paths)
+        raise EvidenceError(
+            f"{paths}: platform proof VEX expired on {valid_until.isoformat()}"
+        )
     expected_digest = platform_proof_digest(proof)
     expected_size = len(platform_proof_bytes(proof))
     if evidence.artifact_digest != expected_digest:
@@ -455,12 +468,24 @@ def verify_manifest(
     fetch_workflow: FetchWorkflow = fetch_github_workflow,
     fetch_artifact: FetchArtifact = fetch_github_artifact,
     timeout: float = 10.0,
+    verified_on: date | None = None,
 ) -> int:
     """Verify all unique online evidence and return the number of API runs checked."""
 
     if timeout <= 0 or timeout > 60:
         raise EvidenceError("le délai GitHub doit être compris entre 0 et 60 secondes")
     evidence_items = _collect_evidence(manifest)
+    effective_date = verified_on or datetime.now(timezone.utc).date()
+    vulnerability_policy: dict[str, str] | None = None
+    if any(item.platform_candidate is not None for item in evidence_items):
+        try:
+            vulnerability_policy = load_vex_policy(
+                VEX_POLICY_PATH,
+                VEX_SCHEMA_PATH,
+                on_date=effective_date,
+            ).metadata()
+        except VexError as exc:
+            raise EvidenceError(f"platform VEX policy rejected: {exc}") from exc
     workflow_cache: dict[tuple[str, str], dict[str, Any]] = {}
     for evidence in evidence_items:
         run = fetch_run(evidence.repository, evidence.run_id, timeout)
@@ -481,6 +506,7 @@ def verify_manifest(
             workflow_cache[workflow_key] = workflow
         _verify_workflow(evidence, workflow_url, workflow)
         if evidence.platform_candidate is not None:
+            assert vulnerability_policy is not None
             assert evidence.artifact_id is not None
             artifact = fetch_artifact(
                 evidence.repository,
@@ -491,7 +517,13 @@ def verify_manifest(
                 raise EvidenceError(
                     f"invalid simulated artifact response for {evidence.repository}"
                 )
-            _verify_platform_artifact(evidence, run, artifact)
+            _verify_platform_artifact(
+                evidence,
+                run,
+                artifact,
+                vulnerability_policy,
+                effective_date,
+            )
     return len(evidence_items)
 
 

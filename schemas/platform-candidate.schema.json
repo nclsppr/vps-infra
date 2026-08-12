@@ -29,7 +29,7 @@
         "postgres": {
           "allOf": [
             { "$ref": "#/$defs/image" },
-            { "pattern": "^docker\\.io/library/postgres:17(?:[.-][A-Za-z0-9_.-]+)?@" }
+            { "pattern": "^ghcr\\.io/nclsppr/vps-infra/postgres:sha-[0-9a-f]{40}@" }
           ]
         },
         "prometheus": {

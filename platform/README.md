@@ -82,6 +82,37 @@ data persistence as UID and GID `70`, passed the strict published-manifest
 scan, and verified GitHub provenance. The runtime does not add Linux
 capabilities to PostgreSQL.
 
+## Platform candidate vulnerability policy
+
+The candidate proof permits no global vulnerability ignore. Trivy always
+writes its HIGH and CRITICAL findings as JSON. The proof engine rejects every
+CRITICAL finding. A HIGH finding passes only when one statement in
+`policies/platform-vex-v1.json` matches the exact service, immutable image
+reference, platform, target binary, package name, package PURL, installed
+version, and CVE. The statement must have `not_affected` status, the approved
+execution-path justification, and an expiration date that has not passed. The
+engine also rejects an unused exception.
+
+The schema requires exactly four statements. The evaluator independently
+allowlists the four complete identities and their maximum expiry dates. A
+policy-only change cannot introduce a fifth exception or replace a reviewed
+identity. The canonical platform proof v2 binds the exact policy file digest
+and the earliest statement expiry. The evidence verifier rejects an otherwise
+valid retained artifact after that UTC date.
+
+The 2026-08-12 policy has four statements. The two Grafana statements cover
+CVE-2026-21728 and CVE-2026-28377 until at most 2026-09-11. Grafana embeds the
+Tempo code but does not start the affected Tempo server path. The two
+postgres_exporter statements cover CVE-2026-56852 and CVE-2026-39822 until at
+most 2026-08-26. An independent `govulncheck` scan confirms that the binary
+entry points do not call the affected symbols. CVE-2026-42505 is not a VEX
+exception because Trivy does not report it for the locked image. A future
+Trivy finding for it fails closed.
+
+The proof workflow source revision binds this policy and its evaluator. The
+policy is not runtime configuration and is intentionally absent from the
+platform integration OCI allowlist.
+
 ## Caddy publication gate
 
 The Caddy image workflow fails closed at two points:

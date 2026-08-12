@@ -265,11 +265,26 @@ artifact cannot prove a changed candidate or a repeated run attempt.
 
 `prove-platform-candidate` validates the secret-free candidate with both the
 JSON Schema and Python policy. It resolves each exact OCI manifest, hashes the
-registry bytes, verifies the supported OCI labels, rejects every HIGH and
-CRITICAL vulnerability, checks the Caddy OVH module, and verifies exact signer
-workflows while rejecting self-hosted signers. It writes one canonical JSON
-proof file. The workflow uploads that file as a raw Actions artifact. Use this
-local command to calculate the workflow input without registry access:
+registry bytes, verifies the supported OCI labels, checks the Caddy OVH module,
+and verifies exact signer workflows while rejecting self-hosted signers. The
+PostgreSQL image must use `ghcr.io/nclsppr/vps-infra/postgres`. Its source label,
+full revision label, readable `sha-<revision>` tag, and GitHub attestation must
+match `.github/workflows/postgres-image.yml` on `main`.
+
+Trivy always writes a JSON report when it finds a vulnerability. The proof
+engine rejects every CRITICAL finding. It rejects a HIGH finding unless one
+unexpired statement in `policies/platform-vex-v1.json` matches the service,
+complete image reference, platform, target binary, package name, package PURL,
+installed version, and CVE. It also rejects an unused exception. The VEX file
+has a strict versioned schema. There is no global ignore file or ignore flag.
+The evaluator permits only the four reviewed identities and their maximum
+expiry dates. The canonical platform proof v2 binds the exact VEX file digest
+and its earliest expiry. Evidence verification checks that expiry again in UTC.
+GitHub artifact retention cannot extend the validity of the exceptions.
+
+The tool writes one canonical JSON proof file. The workflow uploads that file
+as a raw Actions artifact. Use this local command to calculate the workflow
+input without registry access:
 
 ```bash
 ./scripts/prove-platform-candidate --print-subject candidate.json

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from importlib.machinery import SourceFileLoader
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -43,6 +45,7 @@ def load_script_module(name: str, path: Path):
 
 RELEASE_POLICY = load_script_module("platform_proof_release_policy", SCRIPTS / "lib/release_policy.py")
 PLATFORM_PROOF = load_script_module("platform_proof_contract", SCRIPTS / "lib/platform_proof.py")
+PLATFORM_VEX = load_script_module("platform_vex_contract", SCRIPTS / "lib/platform_vex.py")
 PROVER = load_script_module("platform_proof_prover", SCRIPTS / "prove-platform-candidate")
 
 
@@ -56,7 +59,10 @@ def candidate() -> dict:
         "compose_project": "vps-platform",
         "images": {
             "caddy": image("ghcr.io/nclsppr/vps-infra/caddy"),
-            "postgres": image("docker.io/library/postgres", tag="17.10-bookworm"),
+            "postgres": image(
+                "ghcr.io/nclsppr/vps-infra/postgres",
+                tag=f"sha-{SHA_A}",
+            ),
             "prometheus": image("docker.io/prom/prometheus"),
             "grafana": image("docker.io/grafana/grafana"),
             "node_exporter": image("docker.io/prom/node-exporter"),
@@ -78,6 +84,33 @@ def candidate() -> dict:
     }
 
 
+def trivy_report(statement: dict) -> dict:
+    return {
+        "Results": [
+            {
+                "Target": statement["target"],
+                "Vulnerabilities": [
+                    {
+                        "VulnerabilityID": statement["vulnerability_id"],
+                        "PkgName": statement["package"]["name"],
+                        "PkgIdentifier": {"PURL": statement["package"]["purl"]},
+                        "InstalledVersion": statement["package"]["installed_version"],
+                        "Severity": statement["severity"],
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def vex_metadata() -> dict[str, str]:
+    return PLATFORM_VEX.load_vex_policy(
+        ROOT / "policies/platform-vex-v1.json",
+        ROOT / "schemas/platform-vex-v1.schema.json",
+        on_date=date(2026, 8, 12),
+    ).metadata()
+
+
 class PlatformProofTests(unittest.TestCase):
     def test_subject_is_order_independent_and_binds_every_candidate_field(self) -> None:
         baseline = candidate()
@@ -95,7 +128,11 @@ class PlatformProofTests(unittest.TestCase):
             ),
             "postgres tag": lambda value: value["images"].__setitem__(
                 "postgres",
-                image("docker.io/library/postgres", DIGEST_A, "17.11-bookworm"),
+                image(
+                    "ghcr.io/nclsppr/vps-infra/postgres",
+                    DIGEST_A,
+                    f"sha-{'b' * 40}",
+                ),
             ),
         }
         for service, reference in baseline["images"].items():
@@ -132,13 +169,14 @@ class PlatformProofTests(unittest.TestCase):
             run_id="123",
             run_attempt=1,
             verified_gates=sorted(RELEASE_POLICY.PLATFORM_PROOF_BASELINE_GATES),
+            vulnerability_policy=vex_metadata(),
         )
         payload = PLATFORM_PROOF.platform_proof_bytes(proof)
         self.assertTrue(payload.endswith(b"\n"))
         self.assertEqual(payload.count(b"\n"), 1)
         self.assertEqual(
             PLATFORM_PROOF.platform_proof_digest(proof),
-            "sha256:89c569b2efed87c0d77aaba580284587b9d9c047b29e5e4b0473933695308428",
+            "sha256:e11281a595ffbcdf5784529b436daaeb3131e5da0739f93c7b73dae98c321dcb",
         )
         attempt_two = PLATFORM_PROOF.build_platform_proof(
             value,
@@ -146,6 +184,7 @@ class PlatformProofTests(unittest.TestCase):
             run_id="123",
             run_attempt=2,
             verified_gates=sorted(RELEASE_POLICY.PLATFORM_PROOF_BASELINE_GATES),
+            vulnerability_policy=vex_metadata(),
         )
         self.assertNotEqual(
             PLATFORM_PROOF.platform_proof_digest(attempt_two),
@@ -173,6 +212,7 @@ class PlatformProofTests(unittest.TestCase):
             run_id="123",
             run_attempt=1,
             verified_gates=sorted(RELEASE_POLICY.PLATFORM_PROOF_BASELINE_GATES),
+            vulnerability_policy=vex_metadata(),
         )
         validator = Draft202012Validator(proof_schema, registry=registry)
         validator.validate(proof)
@@ -180,7 +220,10 @@ class PlatformProofTests(unittest.TestCase):
         self.assertTrue(list(validator.iter_errors(proof)))
 
     def test_exact_manifest_verification_rejects_registry_digest_substitution(self) -> None:
-        reference = image("docker.io/library/postgres", tag="17.10-bookworm")
+        reference = image(
+            "ghcr.io/nclsppr/vps-infra/postgres",
+            tag=f"sha-{SHA_A}",
+        )
         descriptor = json.dumps(
             {
                 "digest": f"sha256:{DIGEST_B}",
@@ -227,7 +270,7 @@ class PlatformProofTests(unittest.TestCase):
             self.assertIn("cannot be combined", refused.stderr)
 
     def test_caddy_labels_require_exact_source_and_full_revision(self) -> None:
-        reference = image("ghcr.io/nclsppr/vps-infra/caddy")
+        reference = image("ghcr.io/nclsppr/vps-infra/caddy", tag=f"sha-{SHA_A}")
         config = {
             "config": {
                 "Labels": {
@@ -244,19 +287,23 @@ class PlatformProofTests(unittest.TestCase):
             PROVER._verify_labels("caddy", reference, config)
 
     def test_caddy_platform_revisions_must_match(self) -> None:
-        self.assertEqual(PROVER._single_caddy_revision({SHA_A}), SHA_A)
+        self.assertEqual(PROVER._single_image_revision("caddy", {SHA_A}), SHA_A)
         with self.assertRaisesRegex(PROVER.ProofError, "one source revision"):
-            PROVER._single_caddy_revision({SHA_A, "b" * 40})
+            PROVER._single_image_revision("caddy", {SHA_A, "b" * 40})
         with self.assertRaisesRegex(PROVER.ProofError, "one source revision"):
-            PROVER._single_caddy_revision(set())
+            PROVER._single_image_revision("caddy", set())
 
-    def test_trivy_command_is_digest_bound_and_rejects_findings(self) -> None:
-        reference = image("docker.io/library/postgres", tag="17.10-bookworm")
+    def test_trivy_command_is_digest_bound_and_always_writes_json(self) -> None:
+        reference = image(
+            "ghcr.io/nclsppr/vps-infra/postgres",
+            tag=f"sha-{SHA_A}",
+        )
 
         def fake_command(argv: list[str], **_kwargs) -> bytes:
             self.assertIn(reference, argv)
             self.assertNotIn("--ignore-unfixed", argv)
             self.assertIn("HIGH,CRITICAL", argv)
+            self.assertEqual(argv[argv.index("--exit-code") + 1], "0")
             report_path = Path(argv[argv.index("--output") + 1])
             report_path.write_text(
                 '{"Results":[{"Vulnerabilities":[]}]}',
@@ -266,20 +313,261 @@ class PlatformProofTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             report = Path(temporary) / "report.json"
+            policy = PROVER.VexPolicy(
+                {},
+                policy_digest=f"sha256:{DIGEST_A}",
+                valid_until=date(2026, 8, 26),
+            )
             with mock.patch.object(PROVER, "_command", side_effect=fake_command):
-                PROVER._scan(reference, "linux/amd64", report)
+                PROVER._scan(
+                    "postgres",
+                    reference,
+                    "linux/amd64",
+                    report,
+                    policy,
+                )
 
             def finding_command(argv: list[str], **_kwargs) -> bytes:
                 report_path = Path(argv[argv.index("--output") + 1])
                 report_path.write_text(
-                    '{"Results":[{"Vulnerabilities":[{"VulnerabilityID":"CVE-X"}]}]}',
+                    json.dumps(
+                        {
+                            "Results": [
+                                {
+                                    "Target": "bin/postgres",
+                                    "Vulnerabilities": [
+                                        {
+                                            "VulnerabilityID": "CVE-2026-99999",
+                                            "PkgName": "stdlib",
+                                            "PkgIdentifier": {
+                                                "PURL": "pkg:golang/stdlib@v1.26.4"
+                                            },
+                                            "InstalledVersion": "v1.26.4",
+                                            "Severity": "HIGH",
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 return b""
 
             with mock.patch.object(PROVER, "_command", side_effect=finding_command):
-                with self.assertRaisesRegex(PROVER.ProofError, "HIGH or CRITICAL"):
-                    PROVER._scan(reference, "linux/amd64", report)
+                with self.assertRaisesRegex(PROVER.ProofError, "uncovered HIGH"):
+                    PROVER._scan(
+                        "postgres",
+                        reference,
+                        "linux/amd64",
+                        report,
+                        policy,
+                    )
+
+    def test_vex_policy_matches_every_exact_current_finding(self) -> None:
+        policy_path = ROOT / "policies/platform-vex-v1.json"
+        schema_path = ROOT / "schemas/platform-vex-v1.schema.json"
+        raw_policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(raw_policy["statements"]), 4)
+        expected_expirations = {
+            ("grafana", "CVE-2026-21728"): date(2026, 9, 11),
+            ("grafana", "CVE-2026-28377"): date(2026, 9, 11),
+            ("postgres_exporter", "CVE-2026-56852"): date(2026, 8, 26),
+            ("postgres_exporter", "CVE-2026-39822"): date(2026, 8, 26),
+        }
+        self.assertEqual(
+            {
+                (statement["service"], statement["vulnerability_id"])
+                for statement in raw_policy["statements"]
+            },
+            set(expected_expirations),
+        )
+        for statement in raw_policy["statements"]:
+            key = (statement["service"], statement["vulnerability_id"])
+            self.assertLessEqual(
+                date.fromisoformat(statement["expires_on"]),
+                expected_expirations[key],
+            )
+        self.assertNotIn(
+            "CVE-2026-42505",
+            {
+                statement["vulnerability_id"]
+                for statement in raw_policy["statements"]
+            },
+        )
+        policy = PLATFORM_VEX.load_vex_policy(
+            policy_path,
+            schema_path,
+            on_date=date(2026, 8, 12),
+        )
+        for statement in raw_policy["statements"]:
+            policy.evaluate_report(
+                service=statement["service"],
+                image=statement["image"],
+                platform=statement["platform"],
+                report=trivy_report(statement),
+            )
+        metadata = policy.proof_metadata()
+        self.assertEqual(metadata["valid_until"], "2026-08-26")
+        self.assertEqual(
+            metadata["digest"],
+            "sha256:"
+            + hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+        )
+
+    def test_vex_policy_rejects_expiry_divergence_and_unused_exceptions(self) -> None:
+        source = json.loads(
+            (ROOT / "policies/platform-vex-v1.json").read_text(encoding="utf-8")
+        )
+        schema_path = ROOT / "schemas/platform-vex-v1.schema.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            policy_path = Path(temporary) / "policy.json"
+            policy_path.write_text(json.dumps(source), encoding="utf-8")
+            policy = PLATFORM_VEX.load_vex_policy(
+                policy_path,
+                schema_path,
+                on_date=date(2026, 8, 12),
+            )
+            with self.assertRaisesRegex(PLATFORM_VEX.VexError, "unused VEX"):
+                policy.assert_all_used()
+
+            with self.subTest("expired"):
+                source["statements"][0]["expires_on"] = "2026-08-11"
+                policy_path.write_text(json.dumps(source), encoding="utf-8")
+                with self.assertRaisesRegex(PLATFORM_VEX.VexError, "expired VEX"):
+                    PLATFORM_VEX.load_vex_policy(
+                        policy_path,
+                        schema_path,
+                        on_date=date(2026, 8, 12),
+                    )
+
+    def test_vex_schema_rejects_unknown_fields_status_and_justification(self) -> None:
+        baseline = json.loads(
+            (ROOT / "policies/platform-vex-v1.json").read_text(encoding="utf-8")
+        )
+        schema_path = ROOT / "schemas/platform-vex-v1.schema.json"
+        mutations = {
+            "unknown field": lambda value: value["statements"][0].__setitem__(
+                "ignore", True
+            ),
+            "status": lambda value: value["statements"][0].__setitem__(
+                "status", "affected"
+            ),
+            "justification": lambda value: value["statements"][0].__setitem__(
+                "justification", "component_not_present"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            policy_path = Path(temporary) / "policy.json"
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    changed = json.loads(json.dumps(baseline))
+                    mutate(changed)
+                    policy_path.write_text(json.dumps(changed), encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        PLATFORM_VEX.VexError,
+                        "does not match its schema",
+                    ):
+                        PLATFORM_VEX.load_vex_policy(
+                            policy_path,
+                            schema_path,
+                            on_date=date(2026, 8, 12),
+                        )
+
+            unapproved = json.loads(json.dumps(baseline))
+            unapproved["statements"][0]["vulnerability_id"] = "CVE-2026-99999"
+            policy_path.write_text(json.dumps(unapproved), encoding="utf-8")
+            with self.assertRaisesRegex(
+                PLATFORM_VEX.VexError,
+                "unapproved VEX exception",
+            ):
+                PLATFORM_VEX.load_vex_policy(
+                    policy_path,
+                    schema_path,
+                    on_date=date(2026, 8, 12),
+                )
+
+    def test_vex_policy_rejects_reference_package_cve_and_critical_divergence(self) -> None:
+        source = json.loads(
+            (ROOT / "policies/platform-vex-v1.json").read_text(encoding="utf-8")
+        )
+        statement = source["statements"][0]
+        schema_path = ROOT / "schemas/platform-vex-v1.schema.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            policy_path = Path(temporary) / "policy.json"
+            policy_path.write_text(json.dumps(source), encoding="utf-8")
+            for label, mutate in {
+                "reference": lambda report: None,
+                "package": lambda report: report["Results"][0]["Vulnerabilities"][0].__setitem__(
+                    "PkgName", "github.com/grafana/not-tempo"
+                ),
+                "CVE": lambda report: report["Results"][0]["Vulnerabilities"][0].__setitem__(
+                    "VulnerabilityID", "CVE-2026-99999"
+                ),
+            }.items():
+                with self.subTest(label=label):
+                    policy = PLATFORM_VEX.load_vex_policy(
+                        policy_path,
+                        schema_path,
+                        on_date=date(2026, 8, 12),
+                    )
+                    report = trivy_report(statement)
+                    mutate(report)
+                    evaluated_image = (
+                        statement["image"].rsplit("@", maxsplit=1)[0]
+                        + f"@sha256:{DIGEST_B}"
+                        if label == "reference"
+                        else statement["image"]
+                    )
+                    with self.assertRaisesRegex(PLATFORM_VEX.VexError, "uncovered HIGH"):
+                        policy.evaluate_report(
+                            service=statement["service"],
+                            image=evaluated_image,
+                            platform=statement["platform"],
+                            report=report,
+                        )
+
+            critical_policy = PLATFORM_VEX.load_vex_policy(
+                policy_path,
+                schema_path,
+                on_date=date(2026, 8, 12),
+            )
+            critical_report = trivy_report(statement)
+            critical_report["Results"][0]["Vulnerabilities"][0]["Severity"] = "CRITICAL"
+            with self.assertRaisesRegex(PLATFORM_VEX.VexError, "not eligible"):
+                critical_policy.evaluate_report(
+                    service=statement["service"],
+                    image=statement["image"],
+                    platform=statement["platform"],
+                    report=critical_report,
+                )
+
+    def test_postgres_labels_and_attestation_policy_are_first_party_bound(self) -> None:
+        reference = image(
+            "ghcr.io/nclsppr/vps-infra/postgres",
+            tag=f"sha-{SHA_A}",
+        )
+        config = {
+            "config": {
+                "Labels": {
+                    "org.opencontainers.image.source": (
+                        "https://github.com/nclsppr/vps-infra"
+                    ),
+                    "org.opencontainers.image.revision": SHA_A,
+                }
+            }
+        }
+        self.assertEqual(PROVER._verify_labels("postgres", reference, config), SHA_A)
+        wrong_tag = image(
+            "ghcr.io/nclsppr/vps-infra/postgres",
+            tag=f"sha-{'b' * 40}",
+        )
+        with self.assertRaisesRegex(PROVER.ProofError, "match its sha tag"):
+            PROVER._verify_labels("postgres", wrong_tag, config)
+        self.assertEqual(
+            PROVER.FIRST_PARTY_IMAGE_WORKFLOWS["postgres"],
+            "nclsppr/vps-infra/.github/workflows/postgres-image.yml",
+        )
 
     def test_attestations_are_workflow_bound_and_reject_self_hosted_runners(self) -> None:
         commands: list[list[str]] = []
@@ -298,6 +586,10 @@ class PlatformProofTests(unittest.TestCase):
             )
         command = commands[0]
         self.assertIn("--deny-self-hosted-runners", command)
+        self.assertEqual(
+            command[command.index("--source-ref") + 1],
+            "refs/heads/main",
+        )
         self.assertIn("--signer-workflow", command)
         self.assertIn(
             "nclsppr/vps-infra/.github/workflows/platform-integration.yml",

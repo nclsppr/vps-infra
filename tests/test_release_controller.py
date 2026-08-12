@@ -74,7 +74,11 @@ def enable_platform(manifest: dict) -> None:
         "blocked_by": [],
         "images": {
             "caddy": image("ghcr.io/nclsppr/vps-infra/caddy", DIGEST_C),
-            "postgres": image("docker.io/library/postgres", DIGEST_C, "17.10-bookworm"),
+            "postgres": image(
+                "ghcr.io/nclsppr/vps-infra/postgres",
+                DIGEST_C,
+                f"sha-{SHA_A}",
+            ),
             "prometheus": image("docker.io/prom/prometheus", DIGEST_C),
             "grafana": image("docker.io/grafana/grafana", DIGEST_C),
             "node_exporter": image("docker.io/prom/node-exporter", DIGEST_C),
@@ -335,13 +339,21 @@ class ReleasePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "/var/lib/postgresql/data/pgdata"):
             RELEASE_POLICY.validate_manifest(manifest)
 
-    def test_postgres_image_tag_major_must_match_postgres_metadata(self) -> None:
+    def test_postgres_image_must_use_custom_repository_and_revision_tag(self) -> None:
         manifest = sample_manifest()
         enable_platform(manifest)
         manifest["platform"]["images"]["postgres"] = image(
-            "docker.io/library/postgres", DIGEST_C, "18.3-bookworm"
+            "docker.io/library/postgres", DIGEST_C, "17.10-bookworm"
         )
-        with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "major must match"):
+        with self.assertRaisesRegex(
+            RELEASE_POLICY.PolicyError,
+            "ghcr.io/nclsppr/vps-infra/postgres",
+        ):
+            RELEASE_POLICY.validate_manifest(manifest)
+        manifest["platform"]["images"]["postgres"] = image(
+            "ghcr.io/nclsppr/vps-infra/postgres", DIGEST_C, "latest"
+        )
+        with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "source revision"):
             RELEASE_POLICY.validate_manifest(manifest)
 
     def test_enabled_platform_requires_every_readiness_gate(self) -> None:
