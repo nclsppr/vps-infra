@@ -4,6 +4,26 @@ This directory contains the shared platform baseline. Do not start it on a
 production host until the controller has validated every required secret,
 external network, and immutable image reference.
 
+## Public static edge
+
+`public-static-edge/` is an independently deployable Caddy-only unit. It serves
+the already materialized Personal and Papers Empire releases. It does not start
+PostgreSQL, Prometheus, Grafana, either exporter, Surplasse, or Parkventory.
+
+This unit is an ordered deployment step, not a replacement for the shared
+platform. PostgreSQL and the internal observability services remain required
+for the two application stacks. Their image admission and data controls can be
+completed without withholding the static sites from the Internet.
+
+The unit uses the promoted Caddy image by its exact digest. It receives no OVH
+credential. Its preparation routes are HTTP-only. After the A cutover and the
+explicit removal of every previous AAAA record, a separate activation phase
+enables HTTPS and requires strict public certificate probes. Only Caddy
+publishes public host ports. The complete shared platform continues to bind
+Grafana to `127.0.0.1:3000` and publishes no PostgreSQL, Prometheus, or exporter
+port. The public static edge joins only the dedicated `edge` network. It has no
+attachment to the internal observability network `ops`.
+
 ## Image versions
 
 The platform uses the following service versions:
@@ -154,12 +174,14 @@ Surplasse activation fail before Caddy starts.
 
 ## Network boundaries
 
-Ansible creates six external Docker networks. The base platform joins only the
-two platform networks:
+Ansible creates seven external Docker networks. The isolated public static
+edge joins only `edge`. The locked complete platform definition continues to
+use `ops` and `db_monitoring`:
 
-| Network | Subnet | Base platform members |
+| Network | Subnet | Reviewed members |
 |---|---|---|
-| `ops` | `172.30.30.0/24` | Caddy, Prometheus, Grafana, and exporters |
+| `edge` | `172.30.32.0/24` | Isolated public static edge Caddy |
+| `ops` | `172.30.30.0/24` | Locked complete platform Caddy, Prometheus, Grafana, and exporters |
 | `db_monitoring` | `172.30.31.0/24` | PostgreSQL and PostgreSQL Exporter |
 | `app_surplasse` | `172.30.10.0/24` | None |
 | `db_surplasse` | `172.30.11.0/24` | None |
@@ -174,6 +196,9 @@ PostgreSQL does not join `ops`. Caddy, Grafana, and Prometheus have no direct
 TCP path to PostgreSQL. PostgreSQL Exporter joins `db_monitoring` for SQL access
 and `ops` for metrics access. Database roles and `pg_hba.conf` enforce the
 database authorization boundary.
+
+The isolated public static edge does not join `ops`. The exact Compose policy
+rejects an `ops` attachment for this unit.
 
 Caddy publishes `80/tcp`, `443/tcp`, and `443/udp`. Grafana binds to
 `127.0.0.1:3000` for an SSH tunnel. No other platform service publishes a host

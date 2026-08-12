@@ -141,6 +141,27 @@ platform/caddy/
     surplasse.caddy.disabled
 ```
 
+The first live unit is `vps-public-static-edge`. It is a separate Compose
+project with exactly one Caddy service and exactly two static route files. It
+mounts the verified `current` roots for Personal and Papers Empire read-only.
+It keeps separate ACME volumes and does not receive a DNS provider credential.
+It joins only the dedicated external `edge` bridge. It does not join the
+internal observability network `ops`.
+The bounded deployment playbook does not enable the locked release applicator
+or start any internal platform service.
+
+The edge has two immutable route releases. Preparation is HTTP-only and can be
+probed directly against the Atlas address before DNS changes. HTTPS activation
+is allowed only after every authoritative A answer contains Atlas and all old
+AAAA answers are gone. A root-owned symlink switches between revisioned
+releases atomically; failed reconciliation restores the previous target.
+
+This sequencing does not remove the shared services. PostgreSQL, Prometheus,
+Grafana, Node Exporter, and PostgreSQL Exporter remain the internal platform
+for Surplasse and Parkventory. Grafana stays on host loopback and the other
+internal services publish no host port. Caddy remains the only Internet
+request entry point.
+
 `scripts/validate-application-state` rejects every enabled application in this
 baseline. A reviewed integration revision must replace that locked policy. It
 must activate the route, required network attachment, and required secret
@@ -169,14 +190,13 @@ creates GitHub provenance. The zone-scoped provider identity remains a separate
 implementation gate. It must not be inferred from a local environment or a
 build credential.
 
-La stratégie TLS de bascule doit éviter un cercle vicieux. La préférence est
-DNS-01 pour chaque zone de production, avec un jeton distinct et limité par
-zone : le certificat peut alors être émis avant de modifier A/AAAA. Le nouvel
-hôte est sondé avec `--resolve <domaine>:443:<nouvelle-ip>`. Si une zone ne
-permet pas DNS-01, il faut soit un hostname de préproduction, soit une bascule
-DNS contrôlée avant émission HTTP-01 avec un retour rapide vers l’ancien
-hébergement. Une probe publique normale avant bascule testerait encore GitHub
-Pages, pas le VPS.
+La stratégie TLS de bascule doit éviter un cercle vicieux. Personal et Papers
+Empire utilisent le chemin HTTP-01 à deux phases décrit plus haut : préparation
+HTTP, bascule contrôlée des A, suppression des anciens AAAA, puis activation
+HTTPS avec retour rapide vers l’ancien hébergement. DNS-01 reste prévu pour les
+routes qui exigent réellement un wildcard, notamment Surplasse, avec un jeton
+distinct et limité par zone. Une probe publique normale avant bascule testerait
+encore GitHub Pages, pas le VPS.
 
 Avant tout rechargement :
 
@@ -356,17 +376,22 @@ production.
 
 ## Network isolation
 
-Ansible creates six external Docker networks. The locked base platform uses
-only these memberships:
+Ansible creates seven external Docker networks. The isolated public edge and
+the locked complete platform definition use these memberships:
 
 ```text
 app_surplasse       empty
 db_surplasse        empty
 app_parkventory     empty
 db_parkventory      empty
+edge                isolated public static edge Caddy
 db_monitoring       PostgreSQL, PostgreSQL Exporter
-ops                 Caddy, Prometheus, Grafana, and exporters
+ops                 locked complete platform Caddy, Prometheus, Grafana, exporters
 ```
+
+The isolated public static edge has no `ops` attachment. The host layout owns
+`edge` as a managed non-internal bridge on `172.30.32.0/24`. The Compose policy
+and runtime inspection require this one-network membership.
 
 A reviewed integration package attaches a platform service or an application
 service only to the required application network. PostgreSQL and PostgreSQL

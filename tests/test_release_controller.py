@@ -794,6 +794,45 @@ def platform_document(*, include_grafana: bool = True) -> dict:
     }
 
 
+def public_static_edge_document() -> dict:
+    caddy = platform_caddy()
+    caddy["networks"] = {"edge": {}}
+    caddy["healthcheck"] = copy.deepcopy(
+        COMPOSE_POLICY.PUBLIC_STATIC_EDGE_HEALTHCHECK
+    )
+    caddy["ports"].append(
+        {
+            "target": 443,
+            "published": "443",
+            "protocol": "udp",
+            "host_ip": "0.0.0.0",
+        }
+    )
+    by_target = {volume["target"]: volume for volume in caddy["volumes"]}
+    for target, contract in COMPOSE_POLICY.PUBLIC_STATIC_EDGE_VOLUME_CONTRACTS[
+        "caddy"
+    ].items():
+        volume = by_target[target]
+        volume_type, source, read_only, options = contract
+        volume.update(type=volume_type, source=source)
+        if read_only:
+            volume["read_only"] = True
+        else:
+            volume.pop("read_only", None)
+        option_key = "bind" if volume_type == "bind" else "volume"
+        volume[option_key] = dict(options)
+    return {
+        "name": "vps-public-static-edge",
+        "services": {"caddy": caddy},
+        "networks": {"edge": {"external": True, "name": "edge"}},
+        "secrets": {},
+        "volumes": {
+            name: {"name": stable_name}
+            for name, stable_name in COMPOSE_POLICY.PUBLIC_STATIC_EDGE_NAMED_VOLUMES.items()
+        },
+    }
+
+
 class ComposePolicyTests(unittest.TestCase):
     def run_cli(
         self,
@@ -827,6 +866,132 @@ class ComposePolicyTests(unittest.TestCase):
     def test_application_without_host_ports_is_valid(self) -> None:
         document = app_document()
         validate_app_document(document)
+
+    def test_public_static_edge_is_a_caddy_only_verified_unit(self) -> None:
+        document = public_static_edge_document()
+        expected = {"caddy": document["services"]["caddy"]["image"]}
+        COMPOSE_POLICY.validate_compose(
+            "vps-public-static-edge",
+            document,
+            expected_images=expected,
+        )
+
+        document["services"]["grafana"] = copy.deepcopy(
+            document["services"]["caddy"]
+        )
+        with self.assertRaisesRegex(COMPOSE_POLICY.ComposePolicyError, "exactly caddy"):
+            COMPOSE_POLICY.validate_compose(
+                "vps-public-static-edge",
+                document,
+                expected_images=expected,
+            )
+
+    def test_public_static_edge_requires_exact_runtime_contract(self) -> None:
+        cases = (
+            (
+                lambda document: document["services"]["caddy"]["ports"].pop(),
+                "requires exactly 80/tcp, 443/tcp, and 443/udp",
+            ),
+            (
+                lambda document: document["services"]["caddy"]["volumes"][0].update(
+                    source="/tmp/Caddyfile"
+                ),
+                "expected exact bind source",
+            ),
+            (
+                lambda document: document["services"]["caddy"].update(
+                    secrets=[
+                        {
+                            "source": "ovh_application_secret",
+                            "target": "/run/secrets/ovh_application_secret",
+                        }
+                    ]
+                ),
+                "must not receive secrets",
+            ),
+            (
+                lambda document: document["services"]["caddy"].update(
+                    entrypoint=["/bin/sh"]
+                ),
+                "forbids runtime overrides: entrypoint",
+            ),
+            (
+                lambda document: document["services"]["caddy"].update(
+                    command=["caddy", "run"]
+                ),
+                "forbids runtime overrides: command",
+            ),
+            (
+                lambda document: document["services"]["caddy"].update(
+                    environment={"CADDY_DEBUG": "1"}
+                ),
+                "forbids runtime overrides: environment",
+            ),
+            (
+                lambda document: document["services"]["caddy"][
+                    "healthcheck"
+                ].update(interval="16s"),
+                "requires the exact reviewed probe",
+            ),
+            (
+                lambda document: document["services"]["caddy"][
+                    "healthcheck"
+                ].update(test=["CMD", "wget", "http://127.0.0.1/"]),
+                "requires the exact reviewed probe",
+            ),
+            (
+                lambda document: document["services"]["caddy"].update(
+                    networks={"ops": {}}
+                ),
+                "networks: expected edge",
+            ),
+        )
+        for mutation, message in cases:
+            with self.subTest(message=message):
+                document = public_static_edge_document()
+                expected = {"caddy": document["services"]["caddy"]["image"]}
+                mutation(document)
+                if document["services"]["caddy"].get("secrets"):
+                    document["secrets"] = {
+                        "ovh_application_secret": {
+                            "name": "vps-platform_ovh_application_secret",
+                            "file": "/etc/vps/secrets/platform/ovh-application-secret",
+                        }
+                    }
+                with self.assertRaisesRegex(COMPOSE_POLICY.ComposePolicyError, message):
+                    COMPOSE_POLICY.validate_compose(
+                        "vps-public-static-edge",
+                        document,
+                        expected_images=expected,
+                    )
+
+    def test_public_static_edge_rejects_named_volume_options(self) -> None:
+        cases = (
+            {
+                "driver": "local",
+                "driver_opts": {
+                    "type": "none",
+                    "o": "bind",
+                    "device": "/",
+                },
+            },
+            {"external": True},
+            {"labels": {"com.example.scope": "unexpected"}},
+        )
+        for extra_options in cases:
+            with self.subTest(extra_options=extra_options):
+                document = public_static_edge_document()
+                expected = {"caddy": document["services"]["caddy"]["image"]}
+                document["volumes"]["caddy_data"].update(extra_options)
+                with self.assertRaisesRegex(
+                    COMPOSE_POLICY.ComposePolicyError,
+                    "public static edge requires exactly",
+                ):
+                    COMPOSE_POLICY.validate_compose(
+                        "vps-public-static-edge",
+                        document,
+                        expected_images=expected,
+                    )
 
     def test_cli_accepts_verified_application_images(self) -> None:
         document = app_document()

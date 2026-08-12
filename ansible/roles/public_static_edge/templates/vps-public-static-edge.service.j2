@@ -1,0 +1,18 @@
+[Unit]
+Description=VPS public static Caddy edge
+Wants=network-online.target
+After=network-online.target docker.service vps-docker-ingress-firewall.service
+Requires=docker.service vps-docker-ingress-firewall.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{ vps_public_static_edge_runtime_dir }}
+ExecStartPre=/usr/bin/docker compose --project-directory {{ vps_public_static_edge_runtime_dir }} --file {{ vps_public_static_edge_runtime_dir }}/compose.yaml config --quiet
+ExecStart=/usr/bin/docker compose --project-directory {{ vps_public_static_edge_runtime_dir }} --file {{ vps_public_static_edge_runtime_dir }}/compose.yaml up --detach --wait --no-build --remove-orphans caddy
+ExecStop=/usr/bin/docker compose --project-directory {{ vps_public_static_edge_runtime_dir }} --file {{ vps_public_static_edge_runtime_dir }}/compose.yaml stop --timeout 30 caddy
+TimeoutStartSec=300
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -19,20 +19,42 @@ fail() {
 }
 
 ansible_playbook_options=()
+ansible_extra_options=()
+playbook=playbooks/site.yml
 case $# in
   0)
     ;;
+  1)
+    case $1 in
+      --prepare-public-static-edge)
+        playbook=playbooks/public-static-edge.yml
+        ansible_extra_options=(--extra-vars vps_public_static_edge_state=prepare)
+        ;;
+      --activate-public-static-edge)
+        playbook=playbooks/public-static-edge.yml
+        ansible_extra_options=(--extra-vars vps_public_static_edge_state=activate)
+        ;;
+      --stop-public-static-edge)
+        playbook=playbooks/public-static-edge.yml
+        ansible_extra_options=(--extra-vars vps_public_static_edge_state=stopped)
+        ;;
+      *)
+        fail "unsupported deployment mode" "$EX_USAGE"
+        ;;
+    esac
+    ;;
   2)
     if [[ $1 != --check || $2 != --diff ]]; then
-      fail "arguments must be empty or exactly: --check --diff" "$EX_USAGE"
+      fail "the two-argument mode must be exactly: --check --diff" "$EX_USAGE"
     fi
     ansible_playbook_options=(--check --diff)
     ;;
   *)
-    fail "arguments must be empty or exactly: --check --diff" "$EX_USAGE"
+    fail "unsupported deployment arguments" "$EX_USAGE"
     ;;
 esac
-readonly -a ansible_playbook_options
+readonly -a ansible_playbook_options ansible_extra_options
+readonly playbook
 
 resolve_executable() {
   local name=$1
@@ -164,8 +186,11 @@ clean_command() {
     --inventory "$inventory"
     --extra-vars "@$extra_vars"
     --extra-vars "vps_infra_revision=$revision"
-    playbooks/site.yml
   )
+  if ((${#ansible_extra_options[@]} > 0)); then
+    ansible_playbook_command+=("${ansible_extra_options[@]}")
+  fi
+  ansible_playbook_command+=("$playbook")
   "$env_executable" -i "${ansible_environment[@]}" \
     "${ansible_playbook_command[@]}"
 )

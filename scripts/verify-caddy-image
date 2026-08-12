@@ -85,6 +85,14 @@ done
   "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
   || fail "inactive Caddy configuration is invalid"
 
+for route_set in routes-prepare routes-activate; do
+  "${docker_run[@]}" \
+    --volume "$repository_root/platform/public-static-edge/Caddyfile:/etc/caddy/Caddyfile:ro" \
+    --volume "$repository_root/platform/public-static-edge/$route_set:/etc/caddy/routes:ro" \
+    "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
+    || fail "public static edge Caddy configuration is invalid: $route_set"
+done
+
 for name in application-key application-secret consumer-key; do
   printf 'validation-placeholder\n' >"$secrets/$name"
 done

@@ -2,6 +2,7 @@
 vps_base_packages:
   - acl
   - apt-transport-https
+  - bind9-dnsutils
   - ca-certificates
   - chrony
   - curl

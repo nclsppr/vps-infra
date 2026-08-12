@@ -1,0 +1,732 @@
+---
+- name: Validate the public static edge contract
+  ansible.builtin.assert:
+    that:
+      - vps_public_static_edge_state in ['prepare', 'activate', 'stopped']
+      - vps_public_static_edge_project == 'vps-public-static-edge'
+      - vps_public_static_edge_release_root == '/srv/vps/releases/public-static-edge'
+      - vps_public_static_edge_runtime_dir == '/srv/vps/runtime/public-static-edge'
+      - vps_public_static_edge_unit == 'vps-public-static-edge.service'
+      - vps_public_static_edge_container == 'vps-public-static-edge-caddy-1'
+      - vps_public_static_edge_network == 'edge'
+      - vps_public_static_edge_network_subnet == '172.30.32.0/24'
+      - >-
+        vps_public_static_edge_image ==
+        'ghcr.io/nclsppr/vps-infra/caddy:sha-755565642f71918134151921f8eae63935951ad6@sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f'
+      - >-
+        vps_public_static_edge_files | sort ==
+        ['Caddyfile', 'compose.yaml', 'expected-images.json', 'validate-compose']
+      - vps_public_static_edge_routes | sort == ['papersempire.caddy', 'personal.caddy']
+      - >-
+        vps_public_static_edge_route_sources ==
+        {'prepare': 'routes-prepare', 'activate': 'routes-activate'}
+      - >-
+        vps_public_static_edge_domains | sort ==
+        ['nicolaspieper.com', 'papersempire.com',
+         'www.nicolaspieper.com', 'www.papersempire.com']
+      - vps_public_static_edge_dns_zones | length == 2
+      - >-
+        vps_public_static_edge_dns_zones |
+        map(attribute='zone') | list | sort ==
+        ['nicolaspieper.com', 'papersempire.com']
+      - >-
+        vps_public_static_edge_dns_zones |
+        map(attribute='names') | flatten | list | sort ==
+        vps_public_static_edge_domains | sort
+    fail_msg: The public static edge inputs differ from the reviewed contract.
+
+- name: Inspect the public static edge unit
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ vps_public_static_edge_unit }}"
+    follow: false
+  register: vps_public_static_edge_unit_file
+
+- name: Stop and prove the isolated public static edge is absent
+  when: vps_public_static_edge_state == 'stopped'
+  block:
+    - name: Disable the public static edge unit when installed
+      ansible.builtin.systemd_service:
+        name: "{{ vps_public_static_edge_unit }}"
+        enabled: false
+        daemon_reload: true
+      register: vps_public_static_edge_disable
+      failed_when: false
+      when: vps_public_static_edge_unit_file.stat.exists
+
+    - name: Stop the public static edge unit on a best-effort basis
+      ansible.builtin.systemd_service:
+        name: "{{ vps_public_static_edge_unit }}"
+        state: stopped
+      register: vps_public_static_edge_unit_stop
+      failed_when: false
+      when: vps_public_static_edge_unit_file.stat.exists
+
+    - name: Find every container owned by the public edge project
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --all
+          - --quiet
+          - --filter
+          - label=com.docker.compose.project={{ vps_public_static_edge_project }}
+      register: vps_public_static_edge_all_container_ids
+      changed_when: false
+
+    - name: Stop every residual public edge project container
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - stop
+          - --time
+          - "30"
+          - "{{ item }}"
+      loop: "{{ vps_public_static_edge_all_container_ids.stdout_lines }}"
+      changed_when: true
+
+    - name: List running public edge project containers after stop
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --quiet
+          - --filter
+          - label=com.docker.compose.project={{ vps_public_static_edge_project }}
+      register: vps_public_static_edge_running_after_stop
+      changed_when: false
+
+    - name: Read host listeners after stopping the edge
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/ss
+          - -H
+          - -lntup
+      register: vps_public_static_edge_listeners_after_stop
+      changed_when: false
+
+    - name: Read public edge unit enablement after stop
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-enabled
+          - "{{ vps_public_static_edge_unit }}"
+      register: vps_public_static_edge_enablement_after_stop
+      changed_when: false
+      failed_when: false
+      when: vps_public_static_edge_unit_file.stat.exists
+
+    - name: Prove the public edge containers and listeners are stopped
+      ansible.builtin.assert:
+        that:
+          - vps_public_static_edge_running_after_stop.stdout_lines | length == 0
+          - >-
+            vps_public_static_edge_listeners_after_stop.stdout is not
+            regex('(?m):(?:80|443)\\b')
+          - >-
+            not vps_public_static_edge_unit_file.stat.exists or
+            vps_public_static_edge_enablement_after_stop.stdout != 'enabled'
+        fail_msg: The public static edge still owns a container or public listener.
+
+- name: Stage, switch, and verify the isolated public static edge
+  when: vps_public_static_edge_state in ['prepare', 'activate']
+  block:
+    - name: Derive the immutable public edge release paths
+      ansible.builtin.set_fact:
+        vps_public_static_edge_release_dir: >-
+          {{ vps_public_static_edge_release_root ~ '/' ~ vps_infra_revision ~
+             '-' ~ vps_public_static_edge_state }}
+        vps_public_static_edge_staging_dir: >-
+          {{ vps_public_static_edge_release_root ~ '/.' ~ vps_infra_revision ~
+             '-' ~ vps_public_static_edge_state ~ '.staging' }}
+        vps_public_static_edge_route_source: >-
+          {{ vps_public_static_edge_route_sources[vps_public_static_edge_state] }}
+        vps_public_static_edge_switch_link: >-
+          {{ '/srv/vps/runtime/.public-static-edge-' ~ vps_infra_revision ~
+             '-' ~ vps_public_static_edge_state }}
+
+    - name: Read baseline service state
+      ansible.builtin.service_facts:
+
+    - name: Require the converged Docker and ingress firewall services
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.services['docker.service'].state == 'running'
+          - >-
+            ansible_facts.services['vps-docker-ingress-firewall.service'].state
+            == 'running'
+        fail_msg: Run the host convergence before starting the public edge.
+
+    - name: Inspect the dedicated public edge network
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - network
+          - inspect
+          - "{{ vps_public_static_edge_network }}"
+      register: vps_public_static_edge_network_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Require the dedicated public edge network
+      ansible.builtin.assert:
+        that:
+          - vps_public_static_edge_network_inspect.rc == 0
+        fail_msg: >-
+          Run host convergence to create the dedicated public edge network.
+
+    - name: Parse the dedicated public edge network
+      ansible.builtin.set_fact:
+        vps_public_static_edge_network_state: >-
+          {{ vps_public_static_edge_network_inspect.stdout | from_json | first }}
+
+    - name: Prove the dedicated public edge network contract
+      ansible.builtin.assert:
+        that:
+          - vps_public_static_edge_network_state.Name == 'edge'
+          - vps_public_static_edge_network_state.Driver == 'bridge'
+          - not (vps_public_static_edge_network_state.Internal | bool)
+          - >-
+            vps_public_static_edge_network_state.IPAM.Config |
+            map(attribute='Subnet') | list ==
+            [vps_public_static_edge_network_subnet]
+          - >-
+            vps_public_static_edge_network_state.Labels[
+              'com.nclsppr.vps-infra.managed'] | default('') == 'true'
+        fail_msg: >-
+          The dedicated public edge network differs from the managed host
+          contract.
+
+    - name: Inspect active static release links
+      ansible.builtin.stat:
+        path: "/srv/www/{{ item }}/current"
+        follow: false
+      register: vps_public_static_edge_links
+      loop:
+        - personal
+        - papersempire
+
+    - name: Require protected relative static release links
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.islnk
+          - item.stat.uid == 0
+          - item.stat.gid == 0
+          - item.stat.lnk_source is match('^releases/sha256-[0-9a-f]{64}$')
+        fail_msg: >-
+          Each static site must have a root-owned digest release link before
+          the public edge can start.
+      loop: "{{ vps_public_static_edge_links.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Inspect resolved static release roots
+      ansible.builtin.stat:
+        path: "/srv/www/{{ item }}/current"
+        follow: true
+      register: vps_public_static_edge_roots
+      loop:
+        - personal
+        - papersempire
+
+    - name: Require protected static release directories
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isdir
+          - item.stat.uid == 0
+          - item.stat.gid == 0
+          - not item.stat.wgrp
+          - not item.stat.woth
+        fail_msg: The resolved static release root is not protected.
+      loop: "{{ vps_public_static_edge_roots.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Derive the exact Atlas IPv4 allowlist
+      ansible.builtin.set_fact:
+        vps_public_static_edge_atlas_ipv4:
+          - "{{ ansible_default_ipv4.address }}"
+      when: vps_public_static_edge_state == 'activate'
+
+    - name: Discover every authoritative DNS server before HTTPS activation
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dig
+          - +short
+          - +time=3
+          - +tries=2
+          - NS
+          - "{{ item.zone }}"
+      register: vps_public_static_edge_dns_authorities
+      changed_when: false
+      loop: "{{ vps_public_static_edge_dns_zones }}"
+      loop_control:
+        label: "{{ item.zone }}"
+      when: vps_public_static_edge_state == 'activate'
+
+    - name: Require at least one authority for every public DNS zone
+      ansible.builtin.assert:
+        that:
+          - item.stdout_lines | length > 0
+          - >-
+            item.stdout_lines |
+            select('match', '^[A-Za-z0-9.-]+\\.$') | list | length ==
+            item.stdout_lines | length
+        fail_msg: The public DNS zone did not return authoritative nameservers.
+      loop: "{{ vps_public_static_edge_dns_authorities.results }}"
+      loop_control:
+        label: "{{ item.item.zone }}"
+      when: vps_public_static_edge_state == 'activate'
+
+    - name: Verify the cutover at every authoritative DNS server
+      ansible.builtin.include_tasks: verify-authoritative-dns.yml
+      loop: >-
+        {{ query('subelements',
+                 (vps_public_static_edge_dns_authorities.results
+                  if vps_public_static_edge_state == 'activate' else []),
+                 'stdout_lines') }}
+      loop_control:
+        loop_var: vps_public_static_edge_authority
+        label: >-
+          {{ vps_public_static_edge_authority.0.item.zone }} at
+          {{ vps_public_static_edge_authority.1 }}
+      when: vps_public_static_edge_state == 'activate'
+
+    - name: Wait for exact recursive A answers before HTTPS activation
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dig
+          - +short
+          - +time=3
+          - +tries=2
+          - "{{ item }}"
+          - A
+      register: vps_public_static_edge_recursive_a
+      changed_when: false
+      until: >-
+        vps_public_static_edge_recursive_a.stdout_lines |
+        unique | list | sort == vps_public_static_edge_atlas_ipv4
+      retries: 30
+      delay: 10
+      loop: "{{ vps_public_static_edge_domains }}"
+      when: vps_public_static_edge_state == 'activate'
+
+    - name: Wait for empty recursive AAAA answers before HTTPS activation
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/dig
+          - +noall
+          - +comments
+          - +answer
+          - +time=3
+          - +tries=2
+          - "{{ item }}"
+          - AAAA
+      register: vps_public_static_edge_recursive_aaaa
+      changed_when: false
+      until: >-
+        vps_public_static_edge_recursive_aaaa.stdout is
+        search('status: NOERROR') and
+        vps_public_static_edge_recursive_aaaa.stdout is not
+        regex('(?m)\\sIN\\s+AAAA\\s')
+      retries: 30
+      delay: 10
+      loop: "{{ vps_public_static_edge_domains }}"
+      when: vps_public_static_edge_state == 'activate'
+
+    - name: Create root-owned public edge release parents
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ vps_public_static_edge_release_root }}"
+        - /srv/vps/runtime
+
+    - name: Inspect the immutable public edge release
+      ansible.builtin.stat:
+        path: "{{ vps_public_static_edge_release_dir }}"
+        follow: false
+      register: vps_public_static_edge_release
+
+    - name: Refuse a non-directory immutable release path
+      ansible.builtin.assert:
+        that:
+          - >-
+            not vps_public_static_edge_release.stat.exists or
+            (vps_public_static_edge_release.stat.isdir and
+             not vps_public_static_edge_release.stat.islnk)
+        fail_msg: The immutable public edge release path is not a directory.
+
+    - name: Create a new immutable public edge release tree
+      when: not vps_public_static_edge_release.stat.exists
+      block:
+        - name: Remove an interrupted public edge staging tree
+          ansible.builtin.file:
+            path: "{{ vps_public_static_edge_staging_dir }}"
+            state: absent
+
+        - name: Create the new release directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+          loop:
+            - "{{ vps_public_static_edge_staging_dir }}"
+            - "{{ vps_public_static_edge_staging_dir }}/routes"
+
+        - name: Copy the exact public edge release files
+          ansible.builtin.copy:
+            src: >-
+              {{ (playbook_dir ~ '/../../scripts/validate-compose')
+                 if item == 'validate-compose'
+                 else (playbook_dir ~ '/../../platform/public-static-edge/' ~ item) }}
+            dest: "{{ vps_public_static_edge_staging_dir }}/{{ item }}"
+            owner: root
+            group: root
+            mode: "{{ '0555' if item == 'validate-compose' else '0444' }}"
+          loop: "{{ vps_public_static_edge_files }}"
+
+        - name: Copy the exact public edge route set
+          ansible.builtin.copy:
+            src: >-
+              {{ playbook_dir ~ '/../../platform/public-static-edge/' ~
+                 vps_public_static_edge_route_source ~ '/' ~ item }}
+            dest: "{{ vps_public_static_edge_staging_dir }}/routes/{{ item }}"
+            owner: root
+            group: root
+            mode: "0444"
+          loop: "{{ vps_public_static_edge_routes }}"
+
+        - name: Record the exact public edge source revision
+          ansible.builtin.copy:
+            content: "{{ vps_infra_revision }}\n"
+            dest: "{{ vps_public_static_edge_staging_dir }}/source-revision"
+            owner: root
+            group: root
+            mode: "0444"
+
+        - name: Record the exact public edge activation phase
+          ansible.builtin.copy:
+            content: "{{ vps_public_static_edge_state }}\n"
+            dest: "{{ vps_public_static_edge_staging_dir }}/phase"
+            owner: root
+            group: root
+            mode: "0444"
+
+        - name: Seal the immutable public edge release directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0555"
+          loop:
+            - "{{ vps_public_static_edge_staging_dir }}/routes"
+            - "{{ vps_public_static_edge_staging_dir }}"
+
+        - name: Atomically install the immutable public edge release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/mv
+              - --no-target-directory
+              - "{{ vps_public_static_edge_staging_dir }}"
+              - "{{ vps_public_static_edge_release_dir }}"
+          changed_when: true
+
+    - name: Audit the immutable public edge release files against this checkout
+      ansible.builtin.copy:
+        src: >-
+          {{ (playbook_dir ~ '/../../scripts/validate-compose')
+             if item == 'validate-compose'
+             else (playbook_dir ~ '/../../platform/public-static-edge/' ~ item) }}
+        dest: "{{ vps_public_static_edge_release_dir }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "{{ '0555' if item == 'validate-compose' else '0444' }}"
+      check_mode: true
+      register: vps_public_static_edge_file_audit
+      loop: "{{ vps_public_static_edge_files }}"
+
+    - name: Audit the immutable public edge routes against this checkout
+      ansible.builtin.copy:
+        src: >-
+          {{ playbook_dir ~ '/../../platform/public-static-edge/' ~
+             vps_public_static_edge_route_source ~ '/' ~ item }}
+        dest: "{{ vps_public_static_edge_release_dir }}/routes/{{ item }}"
+        owner: root
+        group: root
+        mode: "0444"
+      check_mode: true
+      register: vps_public_static_edge_route_audit
+      loop: "{{ vps_public_static_edge_routes }}"
+
+    - name: Enumerate the immutable public edge release root
+      ansible.builtin.find:
+        paths: "{{ vps_public_static_edge_release_dir }}"
+        recurse: false
+        hidden: true
+        file_type: any
+      register: vps_public_static_edge_release_entries
+
+    - name: Enumerate the immutable public edge route set
+      ansible.builtin.find:
+        paths: "{{ vps_public_static_edge_release_dir }}/routes"
+        recurse: false
+        hidden: true
+        file_type: any
+      register: vps_public_static_edge_route_entries
+
+    - name: Read immutable release provenance
+      ansible.builtin.slurp:
+        src: "{{ vps_public_static_edge_release_dir }}/{{ item }}"
+      register: vps_public_static_edge_provenance
+      loop:
+        - source-revision
+        - phase
+
+    - name: Prove the staged release is exact and immutable
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_public_static_edge_file_audit.results |
+            selectattr('changed', 'equalto', true) | list | length == 0
+          - >-
+            vps_public_static_edge_route_audit.results |
+            selectattr('changed', 'equalto', true) | list | length == 0
+          - >-
+            vps_public_static_edge_release_entries.files |
+            map(attribute='path') | map('basename') | list | sort ==
+            ['Caddyfile', 'compose.yaml', 'expected-images.json', 'phase',
+             'routes', 'source-revision', 'validate-compose']
+          - >-
+            vps_public_static_edge_release_entries.files |
+            rejectattr('path', 'equalto', vps_public_static_edge_release_dir ~ '/routes') |
+            selectattr('isreg', 'equalto', true) | list | length == 6
+          - >-
+            vps_public_static_edge_release_entries.files |
+            selectattr('path', 'equalto', vps_public_static_edge_release_dir ~ '/routes') |
+            selectattr('isdir', 'equalto', true) | list | length == 1
+          - >-
+            vps_public_static_edge_route_entries.files |
+            map(attribute='path') | map('basename') | list | sort ==
+            ['papersempire.caddy', 'personal.caddy']
+          - >-
+            vps_public_static_edge_route_entries.files |
+            selectattr('isreg', 'equalto', true) | list | length == 2
+          - >-
+            (vps_public_static_edge_provenance.results[0].content |
+             b64decode | trim) == vps_infra_revision
+          - >-
+            (vps_public_static_edge_provenance.results[1].content |
+             b64decode | trim) == vps_public_static_edge_state
+        fail_msg: The immutable public edge release differs from this checkout.
+
+    - name: Render normalized public edge Compose JSON from the staged release
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - compose
+          - --project-directory
+          - "{{ vps_public_static_edge_release_dir }}"
+          - --file
+          - "{{ vps_public_static_edge_release_dir }}/compose.yaml"
+          - config
+          - --format
+          - json
+          - --output
+          - /run/vps-public-static-edge-compose.json
+      changed_when: false
+
+    - name: Bind the rendered edge to the verified Caddy image
+      ansible.builtin.command:
+        argv:
+          - "{{ vps_public_static_edge_release_dir }}/validate-compose"
+          - --expected-images
+          - "{{ vps_public_static_edge_release_dir }}/expected-images.json"
+          - vps-public-static-edge
+          - /run/vps-public-static-edge-compose.json
+      changed_when: false
+
+    - name: Remove the transient rendered Compose document
+      ansible.builtin.file:
+        path: /run/vps-public-static-edge-compose.json
+        state: absent
+
+    - name: Pull the exact verified Caddy image
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - compose
+          - --project-directory
+          - "{{ vps_public_static_edge_release_dir }}"
+          - --file
+          - "{{ vps_public_static_edge_release_dir }}/compose.yaml"
+          - pull
+          - --policy
+          - always
+          - caddy
+      changed_when: true
+
+    - name: Inspect the pulled Caddy image
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - image
+          - inspect
+          - "{{ vps_public_static_edge_image }}"
+      register: vps_public_static_edge_image_inspect
+      changed_when: false
+
+    - name: Prove the pulled image has the exact registry digest
+      ansible.builtin.assert:
+        that:
+          - (vps_public_static_edge_image_inspect.stdout | from_json) | length == 1
+          - >-
+            (vps_public_static_edge_image |
+             regex_replace(':[^/@]+@sha256:', '@sha256:')) in
+            (((vps_public_static_edge_image_inspect.stdout | from_json) |
+              first).RepoDigests)
+        fail_msg: Docker did not materialize the exact reviewed Caddy digest.
+
+    - name: Validate Caddy with the staged production files
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - run
+          - --rm
+          - --network
+          - none
+          - --read-only
+          - --cap-drop
+          - ALL
+          - --pids-limit
+          - "64"
+          - --memory
+          - 256m
+          - --volume
+          - "{{ vps_public_static_edge_release_dir }}/Caddyfile:/etc/caddy/Caddyfile:ro"
+          - --volume
+          - "{{ vps_public_static_edge_release_dir }}/routes:/etc/caddy/routes:ro"
+          - "{{ vps_public_static_edge_image }}"
+          - caddy
+          - validate
+          - --config
+          - /etc/caddy/Caddyfile
+          - --adapter
+          - caddyfile
+      changed_when: false
+
+    - name: Install the public static edge systemd unit
+      ansible.builtin.template:
+        src: vps-public-static-edge.service.j2
+        dest: "/etc/systemd/system/{{ vps_public_static_edge_unit }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Inspect the active public edge release link
+      ansible.builtin.stat:
+        path: "{{ vps_public_static_edge_runtime_dir }}"
+        follow: false
+      register: vps_public_static_edge_runtime_link
+
+    - name: Require the active release path to be absent or a symlink
+      ansible.builtin.assert:
+        that:
+          - >-
+            not vps_public_static_edge_runtime_link.stat.exists or
+            vps_public_static_edge_runtime_link.stat.islnk
+        fail_msg: The public edge runtime path is not an atomic release link.
+
+    - name: Remember the previous active public edge release
+      ansible.builtin.set_fact:
+        vps_public_static_edge_previous_release: >-
+          {{ vps_public_static_edge_runtime_link.stat.lnk_source |
+             default('') }}
+
+    - name: Switch and reconcile the public static edge
+      block:
+        - name: Create the next public edge release link
+          ansible.builtin.file:
+            src: "{{ vps_public_static_edge_release_dir }}"
+            dest: "{{ vps_public_static_edge_switch_link }}"
+            state: link
+            owner: root
+            group: root
+            force: true
+
+        - name: Atomically activate the staged public edge release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/mv
+              - --force
+              - --no-target-directory
+              - "{{ vps_public_static_edge_switch_link }}"
+              - "{{ vps_public_static_edge_runtime_dir }}"
+          changed_when: true
+
+        - name: Unconditionally reconcile the public static edge Compose project
+          ansible.builtin.systemd_service:
+            name: "{{ vps_public_static_edge_unit }}"
+            enabled: true
+            state: restarted
+            daemon_reload: true
+
+        - name: Verify the switched public static edge from host and operator networks
+          ansible.builtin.include_tasks: verify-runtime.yml
+
+      rescue:
+        - name: Create the previous public edge release link for rollback
+          ansible.builtin.file:
+            src: "{{ vps_public_static_edge_previous_release }}"
+            dest: "{{ vps_public_static_edge_switch_link }}"
+            state: link
+            owner: root
+            group: root
+            force: true
+          when: vps_public_static_edge_previous_release | length > 0
+
+        - name: Atomically restore the previous public edge release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/mv
+              - --force
+              - --no-target-directory
+              - "{{ vps_public_static_edge_switch_link }}"
+              - "{{ vps_public_static_edge_runtime_dir }}"
+          changed_when: true
+          when: vps_public_static_edge_previous_release | length > 0
+
+        - name: Reconcile the restored public static edge
+          ansible.builtin.systemd_service:
+            name: "{{ vps_public_static_edge_unit }}"
+            enabled: true
+            state: restarted
+            daemon_reload: true
+          when: vps_public_static_edge_previous_release | length > 0
+
+        - name: Stop a first failed public edge activation
+          ansible.builtin.systemd_service:
+            name: "{{ vps_public_static_edge_unit }}"
+            enabled: false
+            state: stopped
+            daemon_reload: true
+          when: vps_public_static_edge_previous_release | length == 0
+
+        - name: Remove the failed first active release link
+          ansible.builtin.file:
+            path: "{{ vps_public_static_edge_runtime_dir }}"
+            state: absent
+          when: vps_public_static_edge_previous_release | length == 0
+
+        - name: Refuse the failed public edge reconciliation
+          ansible.builtin.fail:
+            msg: >-
+              Public edge reconciliation failed and the previous release was
+              restored when one existed.

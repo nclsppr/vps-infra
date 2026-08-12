@@ -1,0 +1,67 @@
+---
+- name: Read authoritative A records
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +short
+      - +time=3
+      - +tries=2
+      - "@{{ vps_public_static_edge_authority.1 }}"
+      - "{{ item }}"
+      - A
+  register: vps_public_static_edge_authoritative_a
+  changed_when: false
+  until: >-
+    vps_public_static_edge_authoritative_a.stdout_lines |
+    unique | list | sort == vps_public_static_edge_atlas_ipv4
+  retries: 30
+  delay: 10
+  loop: "{{ vps_public_static_edge_authority.0.item.names }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Read authoritative AAAA records
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dig
+      - +noall
+      - +comments
+      - +answer
+      - +time=3
+      - +tries=2
+      - "@{{ vps_public_static_edge_authority.1 }}"
+      - "{{ item }}"
+      - AAAA
+  register: vps_public_static_edge_authoritative_aaaa
+  changed_when: false
+  until: >-
+    vps_public_static_edge_authoritative_aaaa.stdout is
+    search('status: NOERROR') and
+    vps_public_static_edge_authoritative_aaaa.stdout is not
+    regex('(?m)\\sIN\\s+AAAA\\s')
+  retries: 30
+  delay: 10
+  loop: "{{ vps_public_static_edge_authority.0.item.names }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Require exact authoritative A and empty AAAA answers
+  ansible.builtin.assert:
+    that:
+      - item.stdout_lines | unique | list | sort == vps_public_static_edge_atlas_ipv4
+      - >-
+        (vps_public_static_edge_authoritative_aaaa.results |
+         selectattr('item', 'equalto', item.item) |
+         map(attribute='stdout') | first) is search('status: NOERROR')
+      - >-
+        (vps_public_static_edge_authoritative_aaaa.results |
+         selectattr('item', 'equalto', item.item) |
+         map(attribute='stdout') | first) is not
+        regex('(?m)\\sIN\\s+AAAA\\s')
+    fail_msg: >-
+      HTTPS activation requires every authoritative A answer to contain only
+      Atlas and every previous authoritative AAAA answer to be empty.
+  loop: "{{ vps_public_static_edge_authoritative_a.results }}"
+  loop_control:
+    label: >-
+      {{ item.item }} at {{ vps_public_static_edge_authority.1 }}

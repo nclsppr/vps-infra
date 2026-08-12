@@ -58,12 +58,16 @@ défaut. Lorsque le client choisi le permet, préférer un compte de service OAu
 à un credential lié au compte humain, borner les ressources aux seuls VPS et
 zones concernés et ajouter une expiration.
 
-### 2. Identité ACME permanente de Caddy
+### 2. Identité ACME permanente de Caddy pour les routes DNS-01
 
-Le module `caddy-dns/ovh` retenu consomme actuellement un endpoint, une
-application key, une application secret et une consumer key. Ces trois valeurs
-sont créées uniquement pour Caddy et limitées à chaque zone qui doit émettre un
-certificat DNS-01.
+The first Personal and Papers Empire edge uses HTTP-01 and receives no OVH
+credential. The following identity is reserved for a later route that genuinely
+requires DNS-01, such as a Surplasse wildcard certificate.
+
+Le module `caddy-dns/ovh` retenu consomme alors un endpoint, une application
+key, une application secret et une consumer key. Ces trois valeurs sont créées
+uniquement pour Caddy et limitées à chaque zone qui doit émettre un certificat
+DNS-01.
 
 Le jeu de routes à confirmer par observation sur une zone de test est borné aux
 opérations nécessaires à libdns :
@@ -85,11 +89,12 @@ une zone technique dédiée plutôt que d’élargir le credential.
 
 ### 3. Identité de bascule DNS temporaire
 
-La modification contrôlée des A — puis des AAAA seulement après livraison de la
-porte IPv6 ci-dessus — utilise une autre identité, créée pour la fenêtre de
-migration puis révoquée. Elle lit l’export, modifie uniquement les records
-explicitement approuvés et rafraîchit la zone. Caddy ne reçoit jamais ce
-credential.
+La modification contrôlée des A utilise une autre identité, créée pour la
+fenêtre de migration puis révoquée. Pour la première bascule IPv4, elle supprime
+également les anciens AAAA qui pointent vers GitHub Pages. Un nouvel AAAA Atlas
+reste interdit jusqu’à la livraison de la porte IPv6 ci-dessus. L’identité lit
+l’export, modifie uniquement les records explicitement approuvés et rafraîchit
+la zone. Caddy ne reçoit jamais ce credential.
 
 Toutes les valeurs sont matérialisées hors Git. Il faudra confirmer l’endpoint
 OVHcloud (`ovh-eu` ou autre), les zones réellement hébergées chez OVHcloud et

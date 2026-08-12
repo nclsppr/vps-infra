@@ -1,0 +1,117 @@
+---
+- name: List every service in the public edge project
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - compose
+      - --project-directory
+      - "{{ vps_public_static_edge_runtime_dir }}"
+      - --file
+      - "{{ vps_public_static_edge_runtime_dir }}/compose.yaml"
+      - ps
+      - --all
+      - --services
+  register: vps_public_static_edge_services
+  changed_when: false
+
+- name: Inspect the running Caddy container
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - inspect
+      - "{{ vps_public_static_edge_container }}"
+  register: vps_public_static_edge_inspect
+  changed_when: false
+
+- name: Prove the sole service uses the exact image and is healthy
+  ansible.builtin.assert:
+    that:
+      - vps_public_static_edge_services.stdout_lines == ['caddy']
+      - (vps_public_static_edge_inspect.stdout | from_json) | length == 1
+      - >-
+        ((vps_public_static_edge_inspect.stdout | from_json) |
+         first).State.Status == 'running'
+      - >-
+        ((vps_public_static_edge_inspect.stdout | from_json) |
+         first).State.Health.Status == 'healthy'
+      - >-
+        ((vps_public_static_edge_inspect.stdout | from_json) |
+         first).Config.Image == vps_public_static_edge_image
+      - >-
+        ((vps_public_static_edge_inspect.stdout | from_json) |
+         first).Image ==
+        ((vps_public_static_edge_image_inspect.stdout | from_json) |
+         first).Id
+      - >-
+        (((vps_public_static_edge_inspect.stdout | from_json) |
+          first).NetworkSettings.Networks.keys() | list | sort) ==
+        [vps_public_static_edge_network]
+    fail_msg: The Caddy-only public edge did not match its runtime contract.
+
+- name: Wait for the HTTP listener
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 80
+    state: started
+    timeout: 10
+
+- name: Wait for the HTTPS listener after activation
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 443
+    state: started
+    timeout: 30
+  when: vps_public_static_edge_state == 'activate'
+
+- name: Probe every HTTP host from the operator network during preparation
+  ansible.builtin.uri:
+    url: "http://{{ ansible_default_ipv4.address }}/"
+    headers:
+      Host: "{{ item }}"
+    follow_redirects: none
+    status_code: 200
+    return_content: false
+  register: vps_public_static_edge_external_http_probe
+  until: vps_public_static_edge_external_http_probe.status == 200
+  retries: 6
+  delay: 5
+  loop: "{{ vps_public_static_edge_domains }}"
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_state == 'prepare'
+
+- name: Probe HTTPS apex sites from the operator network after DNS activation
+  ansible.builtin.uri:
+    url: "https://{{ item }}/"
+    follow_redirects: none
+    status_code: 200
+    return_content: false
+    validate_certs: true
+  register: vps_public_static_edge_external_https_apex_probe
+  until: vps_public_static_edge_external_https_apex_probe.status == 200
+  retries: 36
+  delay: 5
+  loop:
+    - nicolaspieper.com
+    - papersempire.com
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_state == 'activate'
+
+- name: Probe HTTPS redirects from the operator network after DNS activation
+  ansible.builtin.uri:
+    url: "https://{{ item }}/"
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+    validate_certs: true
+  register: vps_public_static_edge_external_https_redirect_probe
+  until: vps_public_static_edge_external_https_redirect_probe.status == 308
+  retries: 36
+  delay: 5
+  loop:
+    - www.nicolaspieper.com
+    - www.papersempire.com
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_state == 'activate'

@@ -10,7 +10,9 @@ COMPOSE := $(MISE_EXEC) docker-compose
 
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
-	check-prometheus check-caddy check-json bootstrap converge converge-check \
+	check-public-static-edge check-prometheus check-caddy check-json bootstrap \
+	converge converge-check prepare-public-static-edge \
+	activate-public-static-edge stop-public-static-edge \
 	doctor-local
 
 help: ## Show the available commands.
@@ -41,6 +43,9 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/site.yml
+	cd ansible && ../.venv/bin/ansible-playbook \
+		--inventory inventories/production/hosts.example.yml \
+		--syntax-check playbooks/public-static-edge.yml
 
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
@@ -60,7 +65,7 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 		schemas/static-route-inventory-v1.schema.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool renovate.json >/dev/null
 
-check-platform: check-platform-config check-prometheus check-caddy ## Validate the shared platform and its Caddy image.
+check-platform: check-platform-config check-public-static-edge check-prometheus check-caddy ## Validate the shared platform and its Caddy image.
 
 check-platform-config: ## Render Compose and apply the production policy.
 	@rendered="$$(mktemp)"; \
@@ -71,6 +76,15 @@ check-platform-config: ## Render Compose and apply the production policy.
 		--structural-only \
 		--repository-root "$(CURDIR)" \
 		vps-platform "$$rendered"
+
+check-public-static-edge: ## Validate the isolated Caddy-only public edge.
+	@rendered="$$(mktemp)"; \
+	trap 'rm -f -- "$$rendered"' EXIT; \
+	$(COMPOSE) --file platform/public-static-edge/compose.yaml \
+		config --format json >"$$rendered"; \
+	./scripts/validate-compose \
+		--expected-images platform/public-static-edge/expected-images.json \
+		vps-public-static-edge "$$rendered"
 
 check-prometheus: ## Validate active and inactive Prometheus rules in the pinned image.
 	@image="$$(sed -n 's/^PROMETHEUS_IMAGE=//p' "$(PLATFORM_ENV)")"; \
@@ -118,6 +132,21 @@ converge-check: ## Predict host changes from an isolated snapshot of origin/main
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --check --diff
+
+prepare-public-static-edge: ## Start the static edge in HTTP-only preflight mode.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --prepare-public-static-edge
+
+activate-public-static-edge: ## Activate HTTPS only after the exact DNS cutover.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --activate-public-static-edge
+
+stop-public-static-edge: ## Stop only the static Caddy edge and preserve its data.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --stop-public-static-edge
 
 doctor-local: ## Audit the local checkout without contact with the VPS.
 	./scripts/doctor --local
