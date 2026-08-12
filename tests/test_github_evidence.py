@@ -203,13 +203,39 @@ def fake_workflow_fetch(repository: str, workflow_url: str, _timeout: float) -> 
 
 
 class GitHubEvidenceTests(unittest.TestCase):
-    def test_disabled_manifest_performs_no_network_call(self) -> None:
-        manifest = RELEASE_POLICY.validate_manifest(sample_manifest())
+    def test_legacy_disabled_manifest_performs_no_network_call(self) -> None:
+        manifest = sample_manifest()
+        for field in ("images", "integration", "postgres", "readiness_evidence"):
+            manifest["platform"].pop(field, None)
+        manifest = RELEASE_POLICY.validate_manifest(manifest)
 
         def unexpected_fetch(_repository: str, _run_id: str, _timeout: float) -> dict:
-            self.fail("network fetch must not run for a disabled manifest")
+            self.fail("network fetch must not run for a legacy disabled manifest")
 
         self.assertEqual(VERIFY.verify_manifest(manifest, fetch_run=unexpected_fetch), 0)
+
+    def test_disabled_platform_candidate_evidence_is_verified(self) -> None:
+        manifest = sample_manifest()
+        enable_platform(manifest)
+        manifest["platform"]["enabled"] = False
+        manifest["platform"]["published_ports"] = []
+        manifest["platform"]["blocked_by"] = sorted(RELEASE_POLICY.PLATFORM_READINESS_GATES)
+        calls: list[tuple[str, str, float]] = []
+
+        def fake_fetch(repository: str, run_id: str, timeout: float) -> dict:
+            calls.append((repository, run_id, timeout))
+            return api_run(repository, "main", SHA_A, run_id)
+
+        self.assertEqual(
+            VERIFY.verify_manifest(
+                manifest,
+                fetch_run=fake_fetch,
+                fetch_workflow=fake_workflow_fetch,
+                timeout=4.0,
+            ),
+            1,
+        )
+        self.assertEqual(calls, [("nclsppr/vps-infra", "101", 4.0)])
 
     def test_platform_evidence_is_deduplicated_and_verified(self) -> None:
         manifest = sample_manifest()

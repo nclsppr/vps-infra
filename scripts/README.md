@@ -42,25 +42,40 @@ Chaque paire `state.json`/`manifest.json` est revalidée par hash, par contenu G
 octet pour octet et par rattachement à `origin/main` avant toute nouvelle
 réconciliation. Les clés JSON dupliquées sont refusées.
 
-## Verrous actuels
+Persisted manifests are also revalidated with the installed Draft 2020-12 JSON
+Schema and the Python release policy. A controller update cannot silently use
+only one of these two trust roots.
 
-Le manifeste impose `activation_policy: locked`. Toute unité `enabled: true` est
-refusée, même avec des preuves syntaxiquement complètes. Déverrouiller cette
-valeur nécessitera une révision auditée du schéma, de la policy et de
-l'applicateur.
+## Current locks
+
+The manifest requires `activation_policy: locked`. The controller rejects each
+unit with `enabled: true`, even when its evidence is structurally valid. A
+separate audited revision of the schema, policy, and applicator is necessary to
+change this rule.
+
+A disabled platform can contain a candidate declaration. The declaration
+consists of the `images`, `integration`, `postgres`, and `readiness_evidence`
+fields. The manifest must contain all four fields or none of them. Candidate
+images and artifacts must use immutable digests. The platform integration
+source revision must be an ancestor of the requested release commit. The
+controller validates candidate evidence and applies artifact quarantine before
+it records desired state. Candidate metadata does not publish a port, create a
+runtime reference in the reconciliation plan, or authorize a service start.
 
 Les projets Compose applicatifs sont également refusés par la CLI tant qu'un
 bundle d'intégration vérifié ne fournit pas le set exact des services et leurs
 références d'images. Il faudra alors ajouter une allowlist exacte des variables
 d'environnement et lier les secrets `_FILE` aux secrets déclarés.
 
-Pour une future activation, `verify-github-evidence` confirme en ligne le dépôt,
-la branche, le SHA, la tentative et le workflow agrégateur exact
-`.github/workflows/vps-release.yml`. Cette vérification ne constitue pas encore
-une attestation cryptographique liant le run au digest OCI ; ce lien de
-provenance reste donc un blocker explicite.
+`verify-github-evidence` confirms the repository, branch, commit, run attempt,
+and exact `.github/workflows/vps-release.yml` workflow through the public GitHub
+API. This check does not yet provide a cryptographic link from the workflow run
+to each OCI digest. A complete candidate declaration is therefore not
+provenance-complete. The provenance link stays an explicit blocker.
 
-Sans `/etc/vps/production-enabled`, `deploy` reste en dry-run et termine avec le
-code 78 après avoir écrit uniquement l'état désiré et le plan. Avec le marqueur,
-il exige en plus le vérificateur GitHub et un futur `apply-release` root-owned ;
-l'état actif n'est promu qu'après succès complet.
+Without `/etc/vps/production-enabled`, `deploy` stays in dry-run mode. It exits
+with code 78 after evidence verification, reconciliation, and desired-state
+recording. While the installed policy is locked, the controller rejects the
+production marker explicitly. It cannot invoke an applicator or create active
+state. The locked controller contains no applicator execution path. A future
+live path requires a separately audited policy revision.

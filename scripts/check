@@ -8,8 +8,23 @@ readonly SCRIPT_DIR
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd -P)
 readonly REPOSITORY_ROOT
 
-"$SCRIPT_DIR/validate-release" --require-json-schema \
-  "$REPOSITORY_ROOT/releases/production.yaml"
+platform_integration_revision=$("$SCRIPT_DIR/validate-release" \
+  --require-json-schema \
+  --print-platform-integration-revision \
+  "$REPOSITORY_ROOT/releases/production.yaml")
+if [[ -n $platform_integration_revision ]]; then
+  git -C "$REPOSITORY_ROOT" cat-file -e \
+    "${platform_integration_revision}^{commit}" 2>/dev/null || {
+      echo "platform integration source revision is unavailable; fetch full Git history" >&2
+      exit 1
+    }
+  git -C "$REPOSITORY_ROOT" merge-base --is-ancestor \
+    "$platform_integration_revision" HEAD || {
+      echo "platform integration source revision is not an ancestor of HEAD" >&2
+      exit 1
+    }
+fi
+echo "release manifest valid: $REPOSITORY_ROOT/releases/production.yaml"
 "$SCRIPT_DIR/verify-github-evidence" \
   "$REPOSITORY_ROOT/releases/production.yaml"
 "$SCRIPT_DIR/check-public-safe" --root "$REPOSITORY_ROOT"

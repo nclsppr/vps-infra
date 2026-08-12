@@ -50,6 +50,11 @@ DNS zone, application release, platform service, or production data was
 changed. The manifest keeps every unit at `enabled: false`. Its root policy
 rejects activation, and the controller still has no live applicator.
 
+The release contract can validate a complete immutable candidate declaration
+while the platform stays disabled. Candidate evidence is checked before the
+controller records desired state. The evidence does not yet prove each digest.
+A candidate does not publish a port, start a container, or create active state.
+
 ## Démarrage local
 
 Prérequis : `mise`, Git, Docker Engine avec le plugin Compose et GNU Make.

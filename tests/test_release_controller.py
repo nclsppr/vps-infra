@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
+
 sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
@@ -90,6 +92,23 @@ def enable_platform(manifest: dict) -> None:
             for gate in RELEASE_POLICY.PLATFORM_READINESS_GATES
         },
     }
+
+
+def add_platform_candidate(manifest: dict) -> None:
+    """Declare a complete platform candidate without enabling runtime state."""
+
+    enable_platform(manifest)
+    manifest["platform"]["enabled"] = False
+    manifest["platform"]["published_ports"] = []
+    manifest["platform"]["blocked_by"] = sorted(
+        RELEASE_POLICY.PLATFORM_READINESS_GATES
+    )
+
+
+def set_platform_candidate_revision(manifest: dict, revision: str) -> None:
+    manifest["platform"]["integration"]["source_revision"] = revision
+    for value in manifest["platform"]["readiness_evidence"].values():
+        value["source_revision"] = revision
 
 
 def enable_parkventory(manifest: dict) -> None:
@@ -183,6 +202,112 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual(list(RELEASE_POLICY.iter_digests(manifest)), [])
         self.assertFalse(manifest["platform"]["enabled"])
         self.assertTrue(all(not app["enabled"] for app in manifest["applications"].values()))
+
+    def test_complete_disabled_platform_candidate_is_valid_and_lists_all_digests(self) -> None:
+        manifest = sample_manifest()
+        add_platform_candidate(manifest)
+        RELEASE_POLICY.validate_manifest(manifest)
+        digests = list(RELEASE_POLICY.iter_digests(manifest))
+        self.assertEqual(len(digests), 7)
+        self.assertEqual(digests.count(f"sha256:{DIGEST_C}"), 6)
+        self.assertEqual(digests.count(f"sha256:{DIGEST_E}"), 1)
+
+    def test_partial_disabled_platform_candidate_is_rejected(self) -> None:
+        manifest = sample_manifest()
+        add_platform_candidate(manifest)
+        del manifest["platform"]["postgres"]
+        with self.assertRaisesRegex(
+            RELEASE_POLICY.PolicyError,
+            "platform candidate fields must be declared together",
+        ):
+            RELEASE_POLICY.validate_manifest(manifest)
+
+    def test_json_schema_accepts_only_complete_or_absent_platform_candidate(self) -> None:
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        legacy = sample_manifest()
+        candidate = sample_manifest()
+        add_platform_candidate(candidate)
+        partial = copy.deepcopy(candidate)
+        del partial["platform"]["integration"]
+
+        self.assertEqual(list(validator.iter_errors(legacy)), [])
+        self.assertEqual(list(validator.iter_errors(candidate)), [])
+        self.assertTrue(list(validator.iter_errors(partial)))
+
+    def test_release_validator_prints_only_declared_platform_integration_revision(self) -> None:
+        candidate = sample_manifest()
+        add_platform_candidate(candidate)
+        legacy = sample_manifest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate_path = root / "candidate.json"
+            legacy_path = root / "legacy.json"
+            candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            legacy_path.write_text(json.dumps(legacy), encoding="utf-8")
+            for path, expected in ((candidate_path, SHA_A), (legacy_path, "")):
+                with self.subTest(path=path.name):
+                    result = subprocess.run(
+                        [
+                            str(SCRIPTS / "validate-release"),
+                            "--require-json-schema",
+                            "--print-platform-integration-revision",
+                            str(path),
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), expected)
+
+    def test_disabled_platform_candidate_evidence_must_match_integration_revision(self) -> None:
+        manifest = sample_manifest()
+        add_platform_candidate(manifest)
+        manifest["platform"]["readiness_evidence"][
+            "alert-routing-and-delivery"
+        ]["source_revision"] = SHA_B
+        with self.assertRaisesRegex(
+            RELEASE_POLICY.PolicyError,
+            "must match a declared component or integration revision",
+        ):
+            RELEASE_POLICY.validate_manifest(manifest)
+
+    def test_disabled_platform_candidate_reconciles_as_runtime_no_op(self) -> None:
+        manifest = sample_manifest()
+        add_platform_candidate(manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = RECONCILE_POLICY.create_plan(
+                manifest,
+                None,
+                SHA_A,
+                None,
+                Path(temporary) / "quarantine",
+            )
+        self.assertFalse(plan["changes_required"])
+        self.assertTrue(
+            all(action["action"] == "unchanged-disabled" for action in plan["actions"])
+        )
+        self.assertTrue(
+            all("desired_references" not in action for action in plan["actions"])
+        )
+
+    def test_quarantined_disabled_platform_candidate_digest_is_rejected(self) -> None:
+        manifest = sample_manifest()
+        add_platform_candidate(manifest)
+        with tempfile.TemporaryDirectory() as temporary:
+            quarantine = Path(temporary) / "quarantine"
+            artifacts = quarantine / "artifacts"
+            artifacts.mkdir(parents=True)
+            (artifacts / f"{DIGEST_C}.json").write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RECONCILE_POLICY.ReconcileError, "quarantined"):
+                RECONCILE_POLICY.create_plan(
+                    manifest,
+                    None,
+                    SHA_A,
+                    None,
+                    quarantine,
+                )
 
     def test_wrong_canonical_branch_is_rejected(self) -> None:
         manifest = sample_manifest()
@@ -1067,6 +1192,9 @@ class ControllerTests(unittest.TestCase):
         return source, repository, sha
 
     def controller_env(self, root: Path, repository: Path) -> dict[str, str]:
+        evidence_verifier = root / "evidence-verifier"
+        evidence_verifier.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        evidence_verifier.chmod(0o700)
         environment = os.environ.copy()
         environment.update(
             {
@@ -1077,9 +1205,8 @@ class ControllerTests(unittest.TestCase):
                 "VPS_PRODUCTION_ENABLE_FILE": str(root / "production-enabled"),
                 "VPS_VALIDATE_RELEASE": str(SCRIPTS / "validate-release"),
                 "VPS_RECONCILE": str(SCRIPTS / "reconcile"),
-                "VPS_PLAN_DIGEST_READER": str(SCRIPTS / "plan-digests"),
                 "VPS_STATE_VERIFIER": str(SCRIPTS / "verify-state"),
-                "VPS_EVIDENCE_VERIFIER": str(SCRIPTS / "verify-github-evidence"),
+                "VPS_EVIDENCE_VERIFIER": str(evidence_verifier),
                 "VPS_EXPECTED_ORIGIN": subprocess.check_output(
                     ["git", "-C", str(repository), "remote", "get-url", "origin"], text=True
                 ).strip(),
@@ -1108,9 +1235,206 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(response["mode"], "dry-run")
             self.assertEqual(response["result"], "validated")
             self.assertTrue((root / "state" / "desired" / "state.json").is_file())
-            self.assertFalse((root / "state" / "active" / "state.json").exists())
+            self.assertFalse((root / "state" / "active").exists())
             plan = json.loads((root / "state" / "plans" / f"{sha}.json").read_text())
             self.assertFalse(plan["automatic_migrations"])
+
+    def test_candidate_evidence_is_verified_before_desired_state_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, repository, base_sha = self.create_repository(root)
+            manifest = sample_manifest()
+            add_platform_candidate(manifest)
+            set_platform_candidate_revision(manifest, base_sha)
+            (source / "releases" / "production.yaml").write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "-C", str(source), "add", "releases/production.yaml"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "-c",
+                    "user.name=VPS tests",
+                    "-c",
+                    "user.email=vps-tests@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "platform candidate",
+                ],
+                check=True,
+            )
+            sha = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            subprocess.run(
+                ["git", "-C", str(source), "push", "-q", "origin", "main"],
+                check=True,
+            )
+            environment = self.controller_env(root, repository)
+            evidence_verifier = root / "candidate-evidence-verifier"
+            evidence_verifier.write_text(
+                "#!/bin/sh\n"
+                "if [ -e \"${VPS_STATE_DIR}/desired\" ]; then exit 91; fi\n"
+                "touch \"${VPS_STATE_DIR}/candidate-evidence-verified\"\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            evidence_verifier.chmod(0o700)
+            environment["VPS_EVIDENCE_VERIFIER"] = str(evidence_verifier)
+            result = subprocess.run(
+                [str(SCRIPTS / "deploy"), sha],
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 78, result.stderr)
+            self.assertTrue((root / "state" / "candidate-evidence-verified").is_file())
+            self.assertTrue((root / "state" / "desired" / "state.json").is_file())
+            self.assertFalse((root / "state" / "active").exists())
+            plan = json.loads(
+                (root / "state" / "plans" / f"{sha}.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(plan["changes_required"])
+            self.assertTrue(
+                all(action["action"] == "unchanged-disabled" for action in plan["actions"])
+            )
+            self.assertTrue(
+                all("desired_references" not in action for action in plan["actions"])
+            )
+
+    def test_candidate_integration_revision_must_be_ancestor_of_requested_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, repository, _ = self.create_repository(root)
+            subprocess.run(
+                ["git", "-C", str(source), "switch", "-q", "-c", "integration"],
+                check=True,
+            )
+            (source / "integration-source.txt").write_text("candidate source\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(source), "add", "integration-source.txt"], check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "-c",
+                    "user.name=VPS tests",
+                    "-c",
+                    "user.email=vps-tests@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "unrelated integration source",
+                ],
+                check=True,
+            )
+            unrelated_sha = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            subprocess.run(
+                ["git", "-C", str(source), "push", "-q", "origin", "integration"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "fetch",
+                    "-q",
+                    "origin",
+                    "integration:refs/remotes/origin/integration",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(source), "switch", "-q", "main"], check=True
+            )
+            manifest = sample_manifest()
+            add_platform_candidate(manifest)
+            set_platform_candidate_revision(manifest, unrelated_sha)
+            (source / "releases" / "production.yaml").write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
+            subprocess.run(
+                ["git", "-C", str(source), "add", "releases/production.yaml"], check=True
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "-c",
+                    "user.name=VPS tests",
+                    "-c",
+                    "user.email=vps-tests@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "candidate with unrelated source",
+                ],
+                check=True,
+            )
+            requested_sha = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+            subprocess.run(
+                ["git", "-C", str(source), "push", "-q", "origin", "main"], check=True
+            )
+            environment = self.controller_env(root, repository)
+            verifier = root / "unexpected-evidence-verifier"
+            verifier.write_text(
+                f"#!/bin/sh\ntouch {root / 'evidence-called'}\nexit 0\n",
+                encoding="utf-8",
+            )
+            verifier.chmod(0o700)
+            environment["VPS_EVIDENCE_VERIFIER"] = str(verifier)
+            result = subprocess.run(
+                [str(SCRIPTS / "deploy"), requested_sha],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not an ancestor", result.stderr)
+            self.assertFalse((root / "evidence-called").exists())
+            self.assertFalse((root / "state" / "desired").exists())
+            self.assertFalse((root / "state" / "plans" / f"{requested_sha}.json").exists())
+
+    def test_evidence_failure_leaves_no_desired_or_active_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, repository, sha = self.create_repository(root)
+            environment = self.controller_env(root, repository)
+            evidence_verifier = root / "reject-evidence"
+            evidence_verifier.write_text(
+                "#!/bin/sh\n"
+                "if [ -e \"${VPS_STATE_DIR}/desired\" ]; then exit 91; fi\n"
+                "exit 23\n",
+                encoding="utf-8",
+            )
+            evidence_verifier.chmod(0o700)
+            environment["VPS_EVIDENCE_VERIFIER"] = str(evidence_verifier)
+            result = subprocess.run(
+                [str(SCRIPTS / "deploy"), sha],
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("evidence verification failed", result.stderr)
+            self.assertFalse((root / "state" / "desired").exists())
+            self.assertFalse((root / "state" / "active").exists())
+            self.assertFalse((root / "state" / "plans" / f"{sha}.json").exists())
 
     def test_existing_lock_and_quarantine_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1168,6 +1492,34 @@ class ControllerTests(unittest.TestCase):
             root = Path(temporary)
             _, repository, sha = self.create_repository(root)
             environment = self.controller_env(root, repository)
+            first = subprocess.run(
+                [str(SCRIPTS / "deploy"), sha],
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(first.returncode, 78, first.stderr)
+            restrictive_schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+            restrictive_schema["properties"]["environment"]["const"] = "staging"
+            restrictive_schema_path = root / "restrictive-schema.json"
+            restrictive_schema_path.write_text(
+                json.dumps(restrictive_schema), encoding="utf-8"
+            )
+            environment["VPS_SCHEMA_FILE"] = str(restrictive_schema_path)
+            second = subprocess.run(
+                [str(SCRIPTS / "deploy"), sha],
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("state integrity", second.stderr)
+            self.assertIn("persisted manifest failed release validation", second.stderr)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, repository, sha = self.create_repository(root)
+            environment = self.controller_env(root, repository)
             active = root / "state" / "active"
             active.mkdir(parents=True)
             (active / "state.json").write_text("{}\n", encoding="utf-8")
@@ -1180,7 +1532,7 @@ class ControllerTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("state pair is incomplete", result.stderr)
 
-    def test_marker_without_applicator_never_changes_active(self) -> None:
+    def test_locked_policy_refuses_marker_without_creating_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, repository, sha = self.create_repository(root)
@@ -1189,25 +1541,32 @@ class ControllerTests(unittest.TestCase):
             result = subprocess.run(
                 [str(SCRIPTS / "deploy"), sha], env=environment, text=True, capture_output=True
             )
-            self.assertEqual(result.returncode, 69, result.stderr)
-            self.assertFalse((root / "state" / "active" / "state.json").exists())
+            self.assertEqual(result.returncode, 78, result.stderr)
+            self.assertIn("activation_policy=locked", result.stderr)
+            self.assertFalse((root / "state" / "desired").exists())
+            self.assertFalse((root / "state" / "active").exists())
 
-    def test_active_is_written_only_after_successful_test_applicator(self) -> None:
+    def test_locked_policy_never_calls_an_installed_applicator(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             _, repository, sha = self.create_repository(root)
             environment = self.controller_env(root, repository)
             Path(environment["VPS_PRODUCTION_ENABLE_FILE"]).touch()
             applicator = root / "apply-release"
-            applicator.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            applicator.write_text(
+                f"#!/bin/sh\ntouch {root / 'applicator-called'}\nexit 0\n",
+                encoding="utf-8",
+            )
             applicator.chmod(0o700)
             environment["VPS_APPLY_EXECUTABLE"] = str(applicator)
             result = subprocess.run(
                 [str(SCRIPTS / "deploy"), sha], env=environment, text=True, capture_output=True
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            active = json.loads((root / "state" / "active" / "state.json").read_text())
-            self.assertEqual(active["commit"], sha)
+            self.assertEqual(result.returncode, 78, result.stderr)
+            self.assertIn("activation_policy=locked", result.stderr)
+            self.assertFalse((root / "applicator-called").exists())
+            self.assertFalse((root / "state" / "desired").exists())
+            self.assertFalse((root / "state" / "active").exists())
 
     def test_bounded_fetch_makes_a_new_main_commit_deployable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1315,24 +1674,6 @@ class ControllerTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("activation_policy", result.stderr)
             self.assertFalse((root / "state" / "desired" / "state.json").exists())
-
-    def test_failed_applicator_quarantines_commit_without_changing_active(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            _, repository, sha = self.create_repository(root)
-            environment = self.controller_env(root, repository)
-            Path(environment["VPS_PRODUCTION_ENABLE_FILE"]).touch()
-            applicator = root / "apply-release"
-            applicator.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
-            applicator.chmod(0o700)
-            environment["VPS_APPLY_EXECUTABLE"] = str(applicator)
-            result = subprocess.run(
-                [str(SCRIPTS / "deploy"), sha], env=environment, text=True, capture_output=True
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertTrue((root / "state" / "quarantine" / "commits" / f"{sha}.json").is_file())
-            self.assertFalse((root / "state" / "active" / "state.json").exists())
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -108,6 +108,22 @@ class SupplyChainContractTests(unittest.TestCase):
 
 
 class SecurityBoundaryContractTests(unittest.TestCase):
+    def test_repository_check_anchors_platform_candidate_to_full_git_history(self) -> None:
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/validate.yml").read_text(encoding="utf-8")
+        )
+        checkout = next(
+            step
+            for step in workflow["jobs"]["check"]["steps"]
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        )
+        self.assertEqual(checkout["with"]["fetch-depth"], 0)
+
+        repository_check = (SCRIPTS / "check").read_text(encoding="utf-8")
+        self.assertIn("--print-platform-integration-revision", repository_check)
+        self.assertIn("merge-base --is-ancestor", repository_check)
+        self.assertIn('"$platform_integration_revision" HEAD', repository_check)
+
     def test_assert_conditions_are_yaml_strings(self) -> None:
         def inspect_assertions(node: object, path: Path) -> None:
             if isinstance(node, dict):
