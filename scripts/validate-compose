@@ -507,11 +507,15 @@ def service_networks(project: str, service_name: str, service: dict[str, Any]) -
         normalized_options = {} if options is None else options
         if not isinstance(normalized_options, dict):
             fail(f"services.{service_name}.networks.{network_name}: options must be an object")
-        expected_options = (
-            {"aliases": ["postgresql"]}
-            if project == "vps-platform" and service_name == "postgresql"
-            else {}
-        )
+        if project == "vps-platform" and service_name == "postgresql":
+            expected_options = {"aliases": ["postgresql"]}
+        elif (
+            project not in INFRASTRUCTURE_PROJECTS
+            and network_name == f"app_{project}"
+        ):
+            expected_options = {"aliases": [f"{project}-{service_name}"]}
+        else:
+            expected_options = {}
         if normalized_options != expected_options:
             fail(
                 f"services.{service_name}.networks.{network_name}: "
@@ -955,15 +959,15 @@ def validate_top_level_resources(project: str, document: dict[str, Any]) -> None
         if project in INFRASTRUCTURE_PROJECTS
         else f"/etc/vps/secrets/{project}/"
     )
-    secret_name_prefix = (
-        "vps-platform_"
-        if project in INFRASTRUCTURE_PROJECTS
-        else f"{project}_"
-    )
     for secret_name, definition in secrets.items():
         if not isinstance(definition, dict):
             fail(f"secrets.{secret_name}: must be an object")
-        if definition.get("name") != f"{secret_name_prefix}{secret_name}":
+        expected_resource_name = (
+            f"vps-platform_{secret_name}"
+            if project in INFRASTRUCTURE_PROJECTS
+            else secret_name
+        )
+        if definition.get("name") != expected_resource_name:
             fail(f"secrets.{secret_name}.name: must be stable and project-scoped")
         file_path = definition.get("file")
         if not isinstance(file_path, str):

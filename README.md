@@ -143,6 +143,7 @@ Cette décision est détaillée dans
 - [Architecture cible](docs/architecture.md)
 - [Automatisation de l’hôte](ansible/README.md)
 - [Pile plateforme](platform/README.md)
+- [Adaptateur Surplasse verrouillé](applications/surplasse/README.md)
 - [Livraison et mises à jour](docs/deployment.md)
 - [Contrat du contrôleur de release](scripts/README.md)
 - [Reconstruction depuis zéro](docs/rebuild.md)

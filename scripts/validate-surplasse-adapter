@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Validate the locked Surplasse Atlas adapter and its migration inventory."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+class AdapterError(ValueError):
+    """Raised when the adapter is not the exact reviewed locked candidate."""
+
+
+def fail(message: str) -> None:
+    raise AdapterError(message)
+
+
+def strict_object(subject: str):
+    def load(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                fail(f"{subject}: duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    return load
+
+
+def load_json(path: Path, subject: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=strict_object(subject),
+            parse_constant=lambda value: fail(
+                f"{subject}: invalid JSON constant {value!r}"
+            ),
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"{subject}: cannot read strict UTF-8 JSON: {exc}")
+    if not isinstance(value, dict):
+        fail(f"{subject}: must be a JSON object")
+    return value
+
+
+def require_keys(value: dict[str, Any], expected: set[str], subject: str) -> None:
+    if set(value) != expected:
+        fail(f"{subject}: expected exactly {', '.join(sorted(expected))}")
+
+
+def service_environment(service: dict[str, Any], name: str) -> dict[str, str]:
+    environment = service.get("environment", {})
+    if not isinstance(environment, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in environment.items()
+    ):
+        fail(f"services.{name}.environment: must be a string map")
+    return environment
+
+
+def secret_sources(service: dict[str, Any], name: str) -> set[str]:
+    secrets = service.get("secrets", [])
+    if not isinstance(secrets, list):
+        fail(f"services.{name}.secrets: must be an array")
+    result: set[str] = set()
+    for secret in secrets:
+        if not isinstance(secret, dict) or set(secret) != {"source", "target"}:
+            fail(f"services.{name}.secrets: contains an invalid reference")
+        source = secret.get("source")
+        if not isinstance(source, str) or secret.get("target") != f"/run/secrets/{source}":
+            fail(f"services.{name}.secrets: contains an invalid target")
+        result.add(source)
+    if len(result) != len(secrets):
+        fail(f"services.{name}.secrets: contains a duplicate source")
+    return result
+
+
+def validate_compose(document: dict[str, Any], expected_images: dict[str, Any]) -> None:
+    expected_runtime = {"backend", "commande", "dashboard", "docs", "onboarding"}
+    expected_services = expected_runtime | {"migrator"}
+    services = document.get("services")
+    if document.get("name") != "surplasse" or not isinstance(services, dict):
+        fail("compose: expected the fixed surplasse project")
+    if set(services) != expected_services:
+        fail("compose: service set differs from the five runtimes plus migrator")
+    if set(expected_images) != expected_services:
+        fail("expected-images: service set is incomplete")
+    for name in expected_services:
+        service = services[name]
+        if not isinstance(service, dict) or service.get("image") != expected_images[name]:
+            fail(f"services.{name}.image: differs from the exact image contract")
+
+    backend = services["backend"]
+    migrator = services["migrator"]
+    if backend["image"] != migrator["image"]:
+        fail("services.migrator.image: must equal the Backend image")
+    if migrator.get("profiles") != ["migration"]:
+        fail("services.migrator.profiles: must equal ['migration']")
+    if migrator.get("restart") != "no":
+        fail("services.migrator.restart: must be 'no'")
+    if migrator.get("entrypoint") != [
+        "/opt/surplasse/scripts/backend-migrate.sh"
+    ]:
+        fail("services.migrator.entrypoint: must use the reviewed one-shot command")
+    if "healthcheck" in migrator:
+        fail("services.migrator.healthcheck: a transient job must not have one")
+
+    backend_environment = service_environment(backend, "backend")
+    migrator_environment = service_environment(migrator, "migrator")
+    exact_backend_environment = {
+        "DEPLOYMENT_PROFILE": "production",
+        "QUARKUS_DATASOURCE_DEVSERVICES_ENABLED": "false",
+        "QUARKUS_DATASOURCE_JDBC_URL": "jdbc:postgresql://postgresql:5432/surplasse",
+        "QUARKUS_DATASOURCE_USERNAME": "surplasse_runtime",
+        "QUARKUS_DATASOURCE_PASSWORD_FILE":
+            "/run/secrets/surplasse_postgres_runtime_password",
+        "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+        "QUARKUS_HTTP_HOST": "0.0.0.0",
+        "STRIPE_LIVE_MODE": "true",
+        "TRUSTED_PROXIES": "172.30.10.254",
+    }
+    for key, expected in exact_backend_environment.items():
+        if backend_environment.get(key) != expected:
+            fail(f"services.backend.environment.{key}: differs from the adapter contract")
+    exact_migrator_environment = {
+        "DEPLOYMENT_PROFILE": "production",
+        "QUARKUS_DATASOURCE_JDBC_URL": "jdbc:postgresql://postgresql:5432/surplasse",
+        "QUARKUS_DATASOURCE_PASSWORD_FILE":
+            "/run/secrets/surplasse_postgres_migrator_password",
+        "QUARKUS_DATASOURCE_USERNAME": "surplasse_migrator",
+    }
+    for key, expected in exact_migrator_environment.items():
+        if migrator_environment.get(key) != expected:
+            fail(f"services.migrator.environment.{key}: differs from the adapter contract")
+    if "QUARKUS_FLYWAY_MIGRATE_AT_START" in migrator_environment:
+        fail("services.migrator: Flyway is controlled only by the one-shot command")
+
+    expected_backend_secrets = {
+        "surplasse_jwt_jwks",
+        "surplasse_jwt_private_key",
+        "surplasse_postgres_runtime_password",
+        "surplasse_smtp_password",
+        "surplasse_smtp_username",
+        "surplasse_stripe_account_webhook_secret",
+        "surplasse_stripe_payment_webhook_secret",
+        "surplasse_stripe_secret_key",
+    }
+    if secret_sources(backend, "backend") != expected_backend_secrets:
+        fail("services.backend.secrets: differs from the exact allowlist")
+    if secret_sources(migrator, "migrator") != {
+        "surplasse_postgres_migrator_password"
+    }:
+        fail("services.migrator.secrets: must contain only its database password")
+
+    expected_healthchecks = {
+        "backend": ["CMD", "/opt/surplasse/scripts/backend-healthcheck.sh"],
+        "onboarding": [
+            "CMD", "wget", "--quiet", "--spider",
+            "http://127.0.0.1:8080/__health",
+        ],
+        "commande": [
+            "CMD", "wget", "--quiet", "--spider",
+            "http://127.0.0.1:8080/healthz",
+        ],
+        "dashboard": [
+            "CMD", "wget", "--quiet", "--spider",
+            "http://127.0.0.1:8080/healthz",
+        ],
+        "docs": [
+            "CMD", "wget", "--quiet", "--spider",
+            "http://127.0.0.1:8080/healthz",
+        ],
+    }
+    for name, expected_test in expected_healthchecks.items():
+        if services[name].get("healthcheck", {}).get("test") != expected_test:
+            fail(f"services.{name}.healthcheck: differs from the image contract")
+
+    for name in expected_runtime - {"backend"}:
+        if service_environment(services[name], name):
+            fail(f"services.{name}.environment: static runtimes receive no environment")
+        if secret_sources(services[name], name):
+            fail(f"services.{name}.secrets: static runtimes receive no secret")
+
+    expected_networks = {
+        "backend": {"app_surplasse", "db_surplasse"},
+        "migrator": {"db_surplasse"},
+        "onboarding": {"app_surplasse"},
+        "commande": {"app_surplasse"},
+        "dashboard": {"app_surplasse"},
+        "docs": {"app_surplasse"},
+    }
+    for name, networks in expected_networks.items():
+        configured = services[name].get("networks")
+        if not isinstance(configured, dict) or set(configured) != networks:
+            fail(f"services.{name}.networks: differs from the isolation contract")
+        app_options = configured.get("app_surplasse")
+        if app_options is not None and app_options != {
+            "aliases": [f"surplasse-{name}"]
+        }:
+            fail(f"services.{name}.networks.app_surplasse: alias differs from the contract")
+
+
+def validate_metadata(
+    root: Path,
+    adapter: dict[str, Any],
+    migrations: dict[str, Any],
+) -> None:
+    release = load_json(root / "releases/production.yaml", "production release")
+    applications = release.get("applications")
+    surplasse_release = (
+        applications.get("surplasse") if isinstance(applications, dict) else None
+    )
+    if (
+        release.get("activation_policy") != "locked"
+        or not isinstance(surplasse_release, dict)
+        or surplasse_release.get("enabled") is not False
+    ):
+        fail("production release: Surplasse must remain disabled under the locked policy")
+
+    require_keys(
+        adapter,
+        {
+            "activation_policy", "blocked_by", "integration", "migration",
+            "runtime_services", "schema", "source_repository", "source_revision",
+            "transient_services",
+        },
+        "adapter",
+    )
+    if adapter["schema"] != 1 or adapter["activation_policy"] != "locked":
+        fail("adapter: this candidate must remain schema 1 and locked")
+    if adapter["runtime_services"] != [
+        "backend", "commande", "dashboard", "docs", "onboarding"
+    ] or adapter["transient_services"] != ["migrator"]:
+        fail("adapter: runtime or transient service set differs from the contract")
+    if adapter["source_repository"] != "nclsppr/surplasse" or re.fullmatch(
+        r"[0-9a-f]{40}", adapter["source_revision"]
+    ) is None:
+        fail("adapter: source identity is invalid")
+
+    migration = adapter.get("migration")
+    if migration != {
+        "entrypoint": "/opt/surplasse/scripts/backend-migrate.sh",
+        "published_in_backend_image": False,
+        "role": "surplasse_migrator",
+        "runtime_auto_migrate": False,
+    }:
+        fail("adapter.migration: differs from the locked candidate")
+    blockers = adapter.get("blocked_by")
+    if not isinstance(blockers, list) or blockers != sorted(set(blockers)):
+        fail("adapter.blocked_by: must be a sorted unique array")
+    required_blockers = {
+        "application-release-controller",
+        "backend-migration-entrypoint-image",
+        "caddy-app-network-and-fixed-address",
+        "ovh-zone-scoped-dns-credentials",
+        "postgres-application-provisioner",
+        "postgres-app-network",
+        "production-image-provenance",
+        "production-secrets",
+        "prometheus-job-and-app-network",
+        "protected-main",
+        "stripe-connect-production-adapter",
+        "vps-integration-bundle",
+    }
+    if not required_blockers.issubset(blockers):
+        fail("adapter.blocked_by: omits an observed activation blocker")
+
+    integration = adapter.get("integration")
+    expected_integration = {
+        "caddy_route": "platform/caddy/routes/surplasse.caddy.disabled",
+        "prometheus_rules":
+            "platform/observability/prometheus/rules/surplasse.yml.disabled",
+        "prometheus_targets":
+            "platform/observability/prometheus/targets/surplasse.yml.disabled",
+    }
+    if integration != expected_integration:
+        fail("adapter.integration: differs from the disabled platform candidates")
+    for relative_path in integration.values():
+        path = root / relative_path
+        if not path.is_file() or path.is_symlink():
+            fail(f"adapter.integration: missing regular candidate {relative_path}")
+    route = (root / integration["caddy_route"]).read_text(encoding="utf-8")
+    for alias in (
+        "surplasse-backend", "surplasse-commande", "surplasse-dashboard",
+        "surplasse-docs", "surplasse-onboarding",
+    ):
+        if alias not in route:
+            fail(f"adapter.integration: Caddy route omits alias {alias}")
+    target = (root / integration["prometheus_targets"]).read_text(encoding="utf-8")
+    if "surplasse-backend:8080" not in target:
+        fail("adapter.integration: Prometheus target omits the Backend alias")
+
+    require_keys(
+        migrations,
+        {"database", "migrations", "schema", "source_repository", "source_revision"},
+        "migrations",
+    )
+    if (
+        migrations["schema"] != 1
+        or migrations["database"] != "surplasse"
+        or migrations["source_repository"] != adapter["source_repository"]
+        or migrations["source_revision"] != adapter["source_revision"]
+    ):
+        fail("migrations: source identity differs from the adapter")
+    records = migrations.get("migrations")
+    if not isinstance(records, list) or len(records) != 14:
+        fail("migrations: expected the 14 versioned production migrations")
+    for expected_version, record in enumerate(records, start=1):
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "version"}:
+            fail(f"migrations[{expected_version - 1}]: invalid record")
+        if record["version"] != expected_version:
+            fail("migrations: versions must be ordered from 1 through 14")
+        if re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None:
+            fail(f"migrations[{expected_version - 1}].sha256: invalid digest")
+        if re.search(rf"/V{expected_version}__[a-z0-9_]+\.sql$", record["path"]) is None:
+            fail(f"migrations[{expected_version - 1}].path: does not match its version")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parent.parent))
+    parser.add_argument("rendered_compose")
+    args = parser.parse_args()
+    try:
+        root = Path(args.root).resolve()
+        application = root / "applications/surplasse"
+        compose = load_json(Path(args.rendered_compose), "compose")
+        expected_images = load_json(application / "expected-images.json", "expected-images")
+        adapter = load_json(application / "adapter.json", "adapter")
+        migrations = load_json(application / "migrations.json", "migrations")
+        validate_compose(compose, expected_images)
+        validate_metadata(root, adapter, migrations)
+    except (AdapterError, OSError, UnicodeDecodeError) as exc:
+        print(f"Surplasse adapter validation failed: {exc}", file=sys.stderr)
+        return 1
+    print("Surplasse adapter valid: locked candidate")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

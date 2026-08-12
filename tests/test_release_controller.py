@@ -44,6 +44,9 @@ def load_script_module(name: str, path: Path):
 
 RELEASE_POLICY = load_script_module("release_policy", SCRIPTS / "lib" / "release_policy.py")
 COMPOSE_POLICY = load_script_module("compose_policy", SCRIPTS / "validate-compose")
+SURPLASSE_ADAPTER = load_script_module(
+    "surplasse_adapter", SCRIPTS / "validate-surplasse-adapter"
+)
 RECONCILE_POLICY = load_script_module("reconcile_policy", SCRIPTS / "reconcile")
 
 
@@ -574,6 +577,9 @@ def app_document(project: str = "surplasse") -> dict:
             image(f"ghcr.io/nclsppr/{project}/{component}"),
             networks,
         )
+        services[component]["networks"][f"app_{project}"] = {
+            "aliases": [f"{project}-{component}"]
+        }
     migrator = hardened_service(
         services["backend"]["image"],
         {f"db_{project}"},
@@ -588,6 +594,69 @@ def app_document(project: str = "surplasse") -> dict:
         "networks": external_networks(project),
         "secrets": {},
     }
+
+
+def surplasse_adapter_document() -> dict:
+    document = app_document()
+    services = document["services"]
+    backend = services["backend"]
+    backend["environment"] = {
+        "DEPLOYMENT_PROFILE": "production",
+        "QUARKUS_DATASOURCE_DEVSERVICES_ENABLED": "false",
+        "QUARKUS_DATASOURCE_JDBC_URL": "jdbc:postgresql://postgresql:5432/surplasse",
+        "QUARKUS_DATASOURCE_USERNAME": "surplasse_runtime",
+        "QUARKUS_DATASOURCE_PASSWORD_FILE":
+            "/run/secrets/surplasse_postgres_runtime_password",
+        "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+        "QUARKUS_HTTP_HOST": "0.0.0.0",
+        "STRIPE_LIVE_MODE": "true",
+        "TRUSTED_PROXIES": "172.30.10.254",
+    }
+    backend_secrets = {
+        "surplasse_jwt_jwks",
+        "surplasse_jwt_private_key",
+        "surplasse_postgres_runtime_password",
+        "surplasse_smtp_password",
+        "surplasse_smtp_username",
+        "surplasse_stripe_account_webhook_secret",
+        "surplasse_stripe_payment_webhook_secret",
+        "surplasse_stripe_secret_key",
+    }
+    backend["secrets"] = [
+        {"source": name, "target": f"/run/secrets/{name}"}
+        for name in sorted(backend_secrets)
+    ]
+    backend["healthcheck"]["test"] = [
+        "CMD", "/opt/surplasse/scripts/backend-healthcheck.sh"
+    ]
+
+    health_paths = {
+        "onboarding": "/__health",
+        "commande": "/healthz",
+        "dashboard": "/healthz",
+        "docs": "/healthz",
+    }
+    for name, path in health_paths.items():
+        services[name]["healthcheck"]["test"] = [
+            "CMD", "wget", "--quiet", "--spider", f"http://127.0.0.1:8080{path}"
+        ]
+
+    migrator = services["migrator"]
+    migrator["entrypoint"] = ["/opt/surplasse/scripts/backend-migrate.sh"]
+    migrator["environment"] = {
+        "DEPLOYMENT_PROFILE": "production",
+        "QUARKUS_DATASOURCE_JDBC_URL": "jdbc:postgresql://postgresql:5432/surplasse",
+        "QUARKUS_DATASOURCE_USERNAME": "surplasse_migrator",
+        "QUARKUS_DATASOURCE_PASSWORD_FILE":
+            "/run/secrets/surplasse_postgres_migrator_password",
+    }
+    migrator["secrets"] = [
+        {
+            "source": "surplasse_postgres_migrator_password",
+            "target": "/run/secrets/surplasse_postgres_migrator_password",
+        }
+    ]
+    return document
 
 
 def validate_app_document(document: dict) -> None:
@@ -880,6 +949,91 @@ class ComposePolicyTests(unittest.TestCase):
     def test_application_without_host_ports_is_valid(self) -> None:
         document = app_document()
         validate_app_document(document)
+
+    def test_surplasse_adapter_enforces_the_one_shot_migration_boundary(self) -> None:
+        document = surplasse_adapter_document()
+        expected = {
+            name: service["image"] for name, service in document["services"].items()
+        }
+        SURPLASSE_ADAPTER.validate_compose(document, expected)
+
+        cases = (
+            (
+                "runtime-auto-migration",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    QUARKUS_FLYWAY_MIGRATE_AT_START="true"
+                ),
+                "MIGRATE_AT_START",
+            ),
+            (
+                "shared-database-role",
+                lambda value: value["services"]["migrator"]["environment"].update(
+                    QUARKUS_DATASOURCE_USERNAME="surplasse_runtime"
+                ),
+                "USERNAME",
+            ),
+            (
+                "shared-database-secret",
+                lambda value: value["services"]["migrator"]["secrets"][0].update(
+                    source="surplasse_postgres_runtime_password",
+                    target="/run/secrets/surplasse_postgres_runtime_password",
+                ),
+                "migrator.secrets",
+            ),
+            (
+                "missing-entrypoint",
+                lambda value: value["services"]["migrator"].pop("entrypoint"),
+                "one-shot command",
+            ),
+            (
+                "generic-backend-alias",
+                lambda value: value["services"]["backend"]["networks"][
+                    "app_surplasse"
+                ].update(aliases=["backend"]),
+                "alias differs",
+            ),
+            (
+                "static-secret",
+                lambda value: value["services"]["docs"].update(
+                    secrets=[
+                        {
+                            "source": "surplasse_jwt_jwks",
+                            "target": "/run/secrets/surplasse_jwt_jwks",
+                        }
+                    ]
+                ),
+                "static runtimes receive no secret",
+            ),
+        )
+        for label, mutate, expected_message in cases:
+            with self.subTest(label=label):
+                changed = copy.deepcopy(document)
+                mutate(changed)
+                with self.assertRaisesRegex(
+                    SURPLASSE_ADAPTER.AdapterError,
+                    expected_message,
+                ):
+                    SURPLASSE_ADAPTER.validate_compose(changed, expected)
+
+        changed = copy.deepcopy(document)
+        changed["services"]["migrator"]["image"] = image(
+            "ghcr.io/nclsppr/surplasse/backend", DIGEST_D
+        )
+        changed_expected = dict(expected)
+        changed_expected["migrator"] = changed["services"]["migrator"]["image"]
+        with self.assertRaisesRegex(
+            SURPLASSE_ADAPTER.AdapterError,
+            "must equal the Backend image",
+        ):
+            SURPLASSE_ADAPTER.validate_compose(changed, changed_expected)
+
+    def test_surplasse_adapter_metadata_matches_disabled_candidates(self) -> None:
+        application = ROOT / "applications/surplasse"
+        adapter = json.loads((application / "adapter.json").read_text(encoding="utf-8"))
+        migrations = json.loads(
+            (application / "migrations.json").read_text(encoding="utf-8")
+        )
+        SURPLASSE_ADAPTER.validate_metadata(ROOT, adapter, migrations)
 
     def test_public_static_edge_is_a_caddy_only_verified_unit(self) -> None:
         document = public_static_edge_document()

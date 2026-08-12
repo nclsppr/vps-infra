@@ -1,0 +1,78 @@
+{
+  "database": "surplasse",
+  "migrations": [
+    {
+      "path": "backend/catalog/src/main/resources/db/migration/V1__catalog_schema.sql",
+      "sha256": "2f845daafb9ce7a27f3771fb9ab26f4f3732670d45a2217996076246060e1760",
+      "version": 1
+    },
+    {
+      "path": "backend/catalog/src/main/resources/db/migration/V2__table_qr.sql",
+      "sha256": "5fed6dd34044298502f8d8456b5c66eb7c3608c77dc139143dd6deaa6ebbdc6a",
+      "version": 2
+    },
+    {
+      "path": "backend/order/src/main/resources/db/migration/V3__order_schema.sql",
+      "sha256": "a9dac5227300bfcd9491eaa585c84d19b0b926a9b77f5331dbcb2a16b64dfedd",
+      "version": 3
+    },
+    {
+      "path": "backend/payment/src/main/resources/db/migration/V4__payment_schema.sql",
+      "sha256": "9e041ef7ce14712250f5073ec6a4989b086efdce6a8f05fb0154038c9c5a84f0",
+      "version": 4
+    },
+    {
+      "path": "backend/identity/src/main/resources/db/migration/V5__identity_schema.sql",
+      "sha256": "ac98fa8e4040cf7032edb11237fa429bd7b050f03449a49b1f58e200675eebb8",
+      "version": 5
+    },
+    {
+      "path": "backend/order/src/main/resources/db/migration/V6__operational_order_index.sql",
+      "sha256": "1485d259169b28e1f8fbcfb456a67e9d43a6bb8415ce480419970e4478d22b16",
+      "version": 6
+    },
+    {
+      "path": "backend/payment/src/main/resources/db/migration/V7__payment_idempotency.sql",
+      "sha256": "0f3655348d7d6388bba92a845e43d0439dc2f14bfafb0384a89fe432661c7074",
+      "version": 7
+    },
+    {
+      "path": "backend/order/src/main/resources/db/migration/V8__order_table_session_scope.sql",
+      "sha256": "d8910dd924cdfd7aa0aaa9f33f504bd1c44675379f79f8deaccc20ecd6d8e85b",
+      "version": 8
+    },
+    {
+      "path": "backend/payment/src/main/resources/db/migration/V9__reconcile_payment_order.sql",
+      "sha256": "b45a8c7ecebe3698d266af80d1d82937d0db6f771f0cdd15a7591a8dfcd76e19",
+      "version": 9
+    },
+    {
+      "path": "backend/catalog/src/main/resources/db/migration/V10__establishment_stripe_connect.sql",
+      "sha256": "440b3efa06a70518e4b674c0eaecbea23933137f9a75fd5b97f0c9fe0b84d139",
+      "version": 10
+    },
+    {
+      "path": "backend/payment/src/main/resources/db/migration/V11__payment_stripe_connect.sql",
+      "sha256": "18f75a08d753a06c694b168ff0d9ba87bb3a9686b7841b4673db90a45c37dd7a",
+      "version": 11
+    },
+    {
+      "path": "backend/catalog/src/main/resources/db/migration/V12__establishment_order_intake.sql",
+      "sha256": "83394173617f0505c2f772d9ca8c3c8071443edb8e92e197530818fc009c1ca3",
+      "version": 12
+    },
+    {
+      "path": "backend/catalog/src/main/resources/db/migration/V13__accounts_v2_capabilities.sql",
+      "sha256": "e2198475b1ce0bf0b0b3321c406f231533b41fea503d999f029378138be95251",
+      "version": 13
+    },
+    {
+      "path": "backend/payment/src/main/resources/db/migration/V14__full_payment_refund.sql",
+      "sha256": "4ceaa5e6faf9001ac12b3da76ac0b81e01c2eddffc1ae42d6e6e64d0d4df135d",
+      "version": 14
+    }
+  ],
+  "schema": 1,
+  "source_repository": "nclsppr/surplasse",
+  "source_revision": "fab494ad2940f9ee46bf9a186ec7fb2735185367"
+}
