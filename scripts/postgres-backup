@@ -35,6 +35,7 @@ HEX_NAME_RE = re.compile(r"^(?:[0-9a-f]{2})+$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_CAPTURE_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_GLOBALS_BYTES = 16 * 1024 * 1024
 MAX_DATABASES = 128
 MAX_ROLES = 256
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
@@ -196,6 +197,18 @@ class Runtime:
             raise BackupError(f"{label} output exceeds its size limit")
         return result.stdout
 
+    def run_with_input(self, arguments: list[str], label: str, content: bytes) -> None:
+        result = subprocess.run(
+            arguments,
+            input=content,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.command_environment(),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise BackupError(f"{label} failed with status {result.returncode}")
+
     def docker_arguments(self, *arguments: str) -> list[str]:
         return [str(self.docker), *arguments]
 
@@ -328,6 +341,20 @@ def source_metadata(runtime: Runtime, container: str) -> tuple[dict[str, object]
             "'system_identifier', (SELECT system_identifier::text FROM pg_control_system()), "
             "'custom_tablespaces', (SELECT count(*) FROM pg_tablespace "
             "WHERE spcname NOT IN ('pg_default', 'pg_global')), "
+            "'platform_admin_oid', (SELECT oid::bigint FROM pg_roles "
+            "WHERE rolname = 'platform_admin'), "
+            "'platform_admin_superuser', (SELECT rolsuper FROM pg_roles "
+            "WHERE rolname = 'platform_admin'), "
+            "'exporter_membership_count', (SELECT count(*) FROM pg_auth_members membership "
+            "JOIN pg_roles granted_role ON granted_role.oid = membership.roleid "
+            "JOIN pg_roles member_role ON member_role.oid = membership.member "
+            "JOIN pg_roles grantor_role ON grantor_role.oid = membership.grantor "
+            "WHERE granted_role.rolname = 'pg_monitor' "
+            "AND member_role.rolname = 'postgres_exporter' "
+            "AND grantor_role.rolname = 'platform_admin' "
+            "AND membership.admin_option IS FALSE "
+            "AND membership.inherit_option IS TRUE "
+            "AND membership.set_option IS TRUE), "
             "'database_bytes', (SELECT coalesce(sum(pg_database_size(datname)), 0)::bigint "
             "FROM pg_database WHERE NOT datistemplate))::text;",
             "PostgreSQL source metadata query",
@@ -339,12 +366,24 @@ def source_metadata(runtime: Runtime, container: str) -> tuple[dict[str, object]
     metadata = metadata_rows[0]
     exact_keys(
         metadata,
-        {"server_version_num", "system_identifier", "custom_tablespaces", "database_bytes"},
+        {
+            "server_version_num",
+            "system_identifier",
+            "custom_tablespaces",
+            "platform_admin_oid",
+            "platform_admin_superuser",
+            "exporter_membership_count",
+            "database_bytes",
+        },
         "PostgreSQL source metadata",
     )
     server_version = require_integer(metadata["server_version_num"], "server version")
     system_identifier = require_string(metadata["system_identifier"], "system identifier")
     custom_tablespaces = require_integer(metadata["custom_tablespaces"], "tablespace count")
+    platform_admin_oid = require_integer(metadata["platform_admin_oid"], "platform_admin OID")
+    exporter_membership_count = require_integer(
+        metadata["exporter_membership_count"], "postgres_exporter membership count"
+    )
     database_bytes = require_integer(metadata["database_bytes"], "database byte count")
     if not 170000 <= server_version < 180000:
         raise BackupError("the source server is not PostgreSQL major version 17")
@@ -352,6 +391,10 @@ def source_metadata(runtime: Runtime, container: str) -> tuple[dict[str, object]
         raise BackupError("the PostgreSQL system identifier has an invalid format")
     if custom_tablespaces != 0:
         raise BackupError("custom PostgreSQL tablespaces require a separate reviewed backup policy")
+    if platform_admin_oid != 10 or metadata["platform_admin_superuser"] is not True:
+        raise BackupError("platform_admin is not the PostgreSQL bootstrap superuser")
+    if exporter_membership_count != 1:
+        raise BackupError("the postgres_exporter pg_monitor grant differs from the platform contract")
     if database_bytes < 0:
         raise BackupError("the PostgreSQL database size is invalid")
 
@@ -407,6 +450,8 @@ def source_metadata(runtime: Runtime, container: str) -> tuple[dict[str, object]
         role_names.add(name)
     if "platform_admin" not in role_names:
         raise BackupError("the platform administrator role is absent")
+    if "postgres_exporter" not in role_names:
+        raise BackupError("the PostgreSQL exporter role is absent")
     return metadata, database_rows, role_rows
 
 
@@ -524,6 +569,8 @@ def create_backup(runtime: Runtime, retention_count: int) -> str:
                 staging_fd,
                 "globals.sql",
             )
+            if require_integer(globals_file["size"], "globals dump size") > MAX_GLOBALS_BYTES:
+                raise BackupError("PostgreSQL globals dump exceeds its size limit")
             globals_file["kind"] = "globals"
 
             files: list[dict[str, object]] = [globals_file]
@@ -689,6 +736,8 @@ def validate_manifest(candidate: object, backup_id: str) -> dict[str, object]:
         role_names.add(name)
     if "platform_admin" not in role_names:
         raise BackupError("backup role inventory omits platform_admin")
+    if "postgres_exporter" not in role_names:
+        raise BackupError("backup role inventory omits postgres_exporter")
 
     files = require_list(manifest["files"], "backup files")
     if len(files) < 2 or len(files) > MAX_DATABASES + 1:
@@ -706,6 +755,8 @@ def validate_manifest(candidate: object, backup_id: str) -> dict[str, object]:
             globals_count += 1
             if entry["path"] != "globals.sql":
                 raise BackupError("globals file path is invalid")
+            if require_integer(entry["size"], "globals file size") > MAX_GLOBALS_BYTES:
+                raise BackupError("globals file size exceeds the restore contract")
         elif kind == "database":
             exact_keys(
                 entry,
@@ -876,6 +927,54 @@ def restore_input(
         os.close(descriptor)
 
 
+def restore_globals(
+    runtime: Runtime,
+    container: str,
+    directory_fd: int,
+) -> None:
+    descriptor = checked_file(directory_fd, "globals.sql", owner=runtime.owner)
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_size <= 0 or metadata.st_size > MAX_GLOBALS_BYTES:
+            raise BackupError("PostgreSQL globals dump size is outside the restore contract")
+        content = bytearray()
+        while len(content) <= MAX_GLOBALS_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, MAX_GLOBALS_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) != metadata.st_size:
+            raise BackupError("PostgreSQL globals dump changed while it was read")
+    finally:
+        os.close(descriptor)
+
+    bootstrap_statement = b"CREATE ROLE platform_admin;\n"
+    lines = bytes(content).splitlines(keepends=True)
+    if sum(line == bootstrap_statement for line in lines) != 1:
+        raise BackupError(
+            "PostgreSQL globals dump must contain one exact platform_admin creation statement"
+        )
+    filtered = b"".join(line for line in lines if line != bootstrap_statement)
+    runtime.run_with_input(
+        runtime.docker_arguments(
+            "exec",
+            "--interactive",
+            container,
+            "psql",
+            "-X",
+            "--host=/var/run/postgresql",
+            "--username=platform_admin",
+            "--dbname=postgres",
+            "--set=ON_ERROR_STOP=on",
+        ),
+        "PostgreSQL global object restore",
+        filtered,
+    )
+
+
 def scratch_psql_capture(
     runtime: Runtime,
     container: str,
@@ -930,11 +1029,8 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
         decode_name(require_dictionary(role, "backup role")["name_hex"], "backup role name")
         for role in require_list(manifest["roles"], "backup roles")
     }
-    while True:
-        suffix = uuid.uuid4().hex[:12]
-        restore_user = f"vps_restore_{suffix}"
-        if restore_user not in expected_roles:
-            break
+    suffix = uuid.uuid4().hex[:12]
+    restore_user = "platform_admin"
     container_name = f"vps-postgres-restore-{suffix}"
     volume_name = f"vps-postgres-restore-{suffix}"
     volume_created = False
@@ -993,7 +1089,7 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
                 "--env",
                 "POSTGRES_DB=postgres",
                 "--env",
-                f"POSTGRES_USER={restore_user}",
+                "POSTGRES_USER=platform_admin",
                 "--env",
                 "POSTGRES_HOST_AUTH_METHOD=trust",
                 "--env",
@@ -1042,21 +1138,7 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
 
         directory_fd, checked_manifest = backup_directory(runtime, backup_id)
         try:
-            restore_input(
-                runtime,
-                container_name,
-                directory_fd,
-                "globals.sql",
-                [
-                    "psql",
-                    "-X",
-                    "--host=/var/run/postgresql",
-                    f"--username={restore_user}",
-                    "--dbname=postgres",
-                    "--set=ON_ERROR_STOP=on",
-                ],
-                "PostgreSQL global object restore",
-            )
+            restore_globals(runtime, container_name, directory_fd)
             database_entries = [
                 require_dictionary(entry, "database backup file")
                 for entry in require_list(checked_manifest["files"], "backup files")
@@ -1114,8 +1196,7 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
                 restore_user,
                 "SELECT json_build_object("
                 "'name_hex', encode(convert_to(rolname, 'UTF8'), 'hex'))::text "
-                "FROM pg_roles WHERE rolname !~ '^pg_' "
-                "AND rolname <> current_user ORDER BY rolname;",
+                "FROM pg_roles WHERE rolname !~ '^pg_' ORDER BY rolname;",
                 "restored role inventory query",
             ),
             "restored role inventory",
@@ -1125,6 +1206,36 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
         }
         if restored_roles != expected_roles:
             raise BackupError("restored role inventory differs from the backup manifest")
+
+        restored_membership_rows = read_json_lines(
+            scratch_psql_capture(
+                runtime,
+                container_name,
+                restore_user,
+                "SELECT json_build_object('count', count(*))::text "
+                "FROM pg_auth_members membership "
+                "JOIN pg_roles granted_role ON granted_role.oid = membership.roleid "
+                "JOIN pg_roles member_role ON member_role.oid = membership.member "
+                "JOIN pg_roles grantor_role ON grantor_role.oid = membership.grantor "
+                "WHERE granted_role.rolname = 'pg_monitor' "
+                "AND member_role.rolname = 'postgres_exporter' "
+                "AND grantor_role.rolname = 'platform_admin' "
+                "AND membership.admin_option IS FALSE "
+                "AND membership.inherit_option IS TRUE "
+                "AND membership.set_option IS TRUE;",
+                "restored postgres_exporter membership query",
+            ),
+            "restored postgres_exporter membership",
+        )
+        if (
+            len(restored_membership_rows) != 1
+            or set(restored_membership_rows[0]) != {"count"}
+            or require_integer(
+                restored_membership_rows[0]["count"], "restored membership count"
+            )
+            != 1
+        ):
+            raise BackupError("restored postgres_exporter membership differs from the source")
 
         for database_name in sorted(expected_database_names):
             runtime.run(

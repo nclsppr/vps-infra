@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
+import uuid
 from pathlib import Path
 
 
@@ -119,6 +123,7 @@ database_rows = [
 ]
 role_rows = [
     {{"name_hex": "706c6174666f726d5f61646d696e"}},
+    {{"name_hex": "706f7374677265735f6578706f72746572"}},
     {{"name_hex": "737572706c617373655f72756e74696d65"}},
 ]
 
@@ -147,6 +152,8 @@ elif arguments[:2] == ["image", "inspect"]:
 elif arguments[:2] == ["volume", "create"]:
     print(arguments[-1])
 elif arguments[0] == "run":
+    if "POSTGRES_USER=platform_admin" not in arguments:
+        raise SystemExit(14)
     print("b" * 64)
 elif arguments[0] == "rm":
     if cleanup_failure_marker.exists():
@@ -168,7 +175,15 @@ elif arguments[0] == "exec":
     if executable == "pg_isready":
         pass
     elif executable == "pg_dumpall":
-        sys.stdout.buffer.write(b"-- PostgreSQL globals\\nCREATE ROLE platform_admin;\\n")
+        sys.stdout.buffer.write(
+            b"-- PostgreSQL globals\\n"
+            b"CREATE ROLE platform_admin;\\n"
+            b"ALTER ROLE platform_admin WITH SUPERUSER LOGIN PASSWORD 'synthetic';\\n"
+            b"CREATE ROLE postgres_exporter;\\n"
+            b"ALTER ROLE postgres_exporter SET search_path TO 'pg_catalog';\\n"
+            b"GRANT pg_monitor TO postgres_exporter WITH INHERIT TRUE "
+            b"GRANTED BY platform_admin;\\n"
+        )
     elif executable == "pg_dump":
         database = next(
             value.split("=", 1)[1]
@@ -190,6 +205,9 @@ elif arguments[0] == "exec":
                 "server_version_num": 170010,
                 "system_identifier": "7612345678901234567",
                 "custom_tablespaces": 0,
+                "platform_admin_oid": 10,
+                "platform_admin_superuser": True,
+                "exporter_membership_count": 1,
                 "database_bytes": 1024,
             }}])
         elif "FROM pg_database" in command_text:
@@ -198,9 +216,23 @@ elif arguments[0] == "exec":
             else:
                 json_lines([{{"name_hex": row["name_hex"]}} for row in database_rows])
         elif "FROM pg_roles" in command_text:
+            if container != production_id and "current_user" in command_text:
+                raise SystemExit(17)
             json_lines(role_rows)
+        elif "FROM pg_auth_members" in command_text:
+            json_lines([{{"count": 1}}])
         elif not any(value.startswith("--command=") for value in command):
-            sys.stdin.buffer.read()
+            globals_input = sys.stdin.buffer.read()
+            if b"CREATE ROLE platform_admin;\\n" in globals_input:
+                raise SystemExit(15)
+            for required in (
+                b"ALTER ROLE platform_admin WITH SUPERUSER LOGIN PASSWORD 'synthetic';\\n",
+                b"ALTER ROLE postgres_exporter SET search_path TO 'pg_catalog';\\n",
+                b"GRANT pg_monitor TO postgres_exporter WITH INHERIT TRUE "
+                b"GRANTED BY platform_admin;\\n",
+            ):
+                if required not in globals_input:
+                    raise SystemExit(16)
     else:
         raise SystemExit(3)
 else:
@@ -371,6 +403,261 @@ else:
             self.assertIn("disposable restore cleanup also failed", cleanup_failed.stderr)
             self.assertIn("scratch container cleanup", cleanup_failed.stderr)
             self.assertIn("scratch volume cleanup", cleanup_failed.stderr)
+
+    def test_restore_rejects_ambiguous_bootstrap_role_filter_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backup_root = root / "backups"
+            backup_root.mkdir(mode=0o700)
+            fake, log, _, _ = self.make_fake_docker(root)
+            created = self.run_backup(backup_root, fake, "create", "--retention-count", "2")
+            self.assertEqual(created.returncode, 0, created.stderr)
+            backup = next(path for path in backup_root.iterdir() if path.is_dir())
+            manifest_path = backup / "manifest.json"
+            checksum_path = backup / "manifest.sha256"
+
+            for globals_content in (
+                b"-- zero exact bootstrap declarations\nCREATE ROLE postgres_exporter;\n",
+                b"CREATE ROLE platform_admin;\nCREATE ROLE platform_admin;\n",
+                b'CREATE ROLE "platform_admin";\nCREATE ROLE postgres_exporter;\n',
+            ):
+                globals_path = backup / "globals.sql"
+                globals_path.write_bytes(globals_content)
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                globals_entry = next(
+                    entry for entry in manifest["files"] if entry["kind"] == "globals"
+                )
+                globals_entry["size"] = len(globals_content)
+                globals_entry["sha256"] = hashlib.sha256(globals_content).hexdigest()
+                manifest_bytes = (
+                    json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+                manifest_path.write_bytes(manifest_bytes)
+                checksum_path.write_bytes(
+                    hashlib.sha256(manifest_bytes).hexdigest().encode("ascii") + b"\n"
+                )
+
+                log.unlink(missing_ok=True)
+                rejected = self.run_backup(backup_root, fake, "rehearse", "--latest")
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn(
+                    "must contain one exact platform_admin creation statement",
+                    rejected.stderr,
+                )
+                commands = [
+                    json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertFalse(
+                    any(
+                        command[:2] == ["exec", "--interactive"] and "psql" in command
+                        for command in commands
+                    )
+                )
+                self.assertTrue(any(command[:2] == ["rm", "--force"] for command in commands))
+                self.assertTrue(any(command[:2] == ["volume", "rm"] for command in commands))
+
+    @unittest.skipUnless(
+        os.environ.get("VPS_POSTGRES_BACKUP_INTEGRATION") == "1",
+        "exact PostgreSQL image integration is opt-in",
+    )
+    def test_exact_postgres17_globals_grantor_restore(self) -> None:
+        docker_name = shutil.which("docker")
+        self.assertIsNotNone(docker_name, "docker is required for the integration test")
+        assert docker_name is not None
+        docker = str(Path(docker_name).absolute())
+        suffix = uuid.uuid4().hex[:12]
+        source_name = f"vps-postgres-source-test-{suffix}"
+        source_volume = source_name
+
+        def docker_capture(*arguments: str) -> str:
+            result = subprocess.run(
+                [docker, *arguments],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        def rehearsal_resources() -> tuple[set[str], set[str]]:
+            containers = set(
+                filter(
+                    None,
+                    docker_capture(
+                        "ps",
+                        "--all",
+                        "--quiet",
+                        "--filter",
+                        "label=com.nclsppr.vps-infra.restore-rehearsal=true",
+                    ).splitlines(),
+                )
+            )
+            volumes = set(
+                filter(
+                    None,
+                    docker_capture(
+                        "volume",
+                        "ls",
+                        "--quiet",
+                        "--filter",
+                        "label=com.nclsppr.vps-infra.restore-rehearsal=true",
+                    ).splitlines(),
+                )
+            )
+            return containers, volumes
+
+        baseline_containers, baseline_volumes = rehearsal_resources()
+        source_created = False
+        volume_created = False
+        try:
+            docker_capture("image", "inspect", POSTGRES_IMAGE)
+            volume_output = docker_capture("volume", "create", source_volume)
+            volume_created = True
+            self.assertEqual(volume_output, source_volume)
+            container_id = docker_capture(
+                "run",
+                "--detach",
+                "--pull=never",
+                "--name",
+                source_name,
+                "--label",
+                "com.docker.compose.project=vps-platform",
+                "--label",
+                "com.docker.compose.service=postgresql",
+                "--network",
+                "none",
+                "--user",
+                "70:70",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--tmpfs",
+                "/tmp:size=64m,mode=1777",
+                "--tmpfs",
+                "/var/run/postgresql:size=16m,mode=2775,uid=70,gid=70",
+                "--mount",
+                f"type=volume,source={source_volume},target=/var/lib/postgresql/data",
+                "--health-cmd",
+                "pg_isready --host=/var/run/postgresql --username=platform_admin --dbname=postgres",
+                "--health-interval",
+                "1s",
+                "--health-timeout",
+                "2s",
+                "--health-retries",
+                "60",
+                "--env",
+                "POSTGRES_DB=postgres",
+                "--env",
+                "POSTGRES_USER=platform_admin",
+                "--env",
+                "POSTGRES_HOST_AUTH_METHOD=trust",
+                "--env",
+                "POSTGRES_INITDB_ARGS=--auth-local=trust --auth-host=trust --data-checksums",
+                "--env",
+                "PGDATA=/var/lib/postgresql/data/pgdata",
+                POSTGRES_IMAGE,
+                "postgres",
+                "-c",
+                "listen_addresses=",
+                "-c",
+                "unix_socket_directories=/var/run/postgresql",
+            )
+            source_created = True
+            self.assertRegex(container_id, r"^[0-9a-f]{64}$")
+            for _ in range(90):
+                inspected_health = docker_capture(
+                    "inspect", "--format", "{{.State.Health.Status}}", source_name
+                )
+                if inspected_health == "healthy":
+                    break
+                if inspected_health == "unhealthy":
+                    self.fail("synthetic PostgreSQL source became unhealthy")
+                time.sleep(1)
+            else:
+                self.fail("synthetic PostgreSQL source did not become healthy")
+
+            docker_capture(
+                "exec",
+                source_name,
+                "psql",
+                "-X",
+                "--host=/var/run/postgresql",
+                "--username=platform_admin",
+                "--dbname=postgres",
+                "--set=ON_ERROR_STOP=on",
+                "--command=CREATE ROLE postgres_exporter LOGIN PASSWORD 'synthetic-only'; "
+                "GRANT pg_monitor TO postgres_exporter; "
+                "ALTER ROLE postgres_exporter SET search_path = pg_catalog; "
+                "CREATE ROLE surplasse_runtime LOGIN PASSWORD 'synthetic-only';",
+            )
+            docker_capture(
+                "exec",
+                source_name,
+                "createdb",
+                "--host=/var/run/postgresql",
+                "--username=platform_admin",
+                "--owner=platform_admin",
+                "surplasse",
+            )
+
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                backup_root = root / "backups"
+                backup_root.mkdir(mode=0o700)
+                wrapper = root / "docker-wrapper"
+                wrapper.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$1\" = ps ]; then\n"
+                    f"  printf '%s\\n' {container_id!r}\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    f"exec {docker!r} \"$@\"\n",
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o700)
+                created = self.run_backup(
+                    backup_root, wrapper, "create", "--retention-count", "2"
+                )
+                self.assertEqual(created.returncode, 0, created.stderr)
+                rehearsed = self.run_backup(backup_root, wrapper, "rehearse", "--latest")
+                self.assertEqual(rehearsed.returncode, 0, rehearsed.stderr)
+
+            final_containers, final_volumes = rehearsal_resources()
+            self.assertEqual(final_containers, baseline_containers)
+            self.assertEqual(final_volumes, baseline_volumes)
+        finally:
+            current_containers, current_volumes = rehearsal_resources()
+            for identifier in sorted(current_containers - baseline_containers):
+                subprocess.run(
+                    [docker, "rm", "--force", identifier],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            for name in sorted(current_volumes - baseline_volumes):
+                subprocess.run(
+                    [docker, "volume", "rm", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            if source_created:
+                subprocess.run(
+                    [docker, "rm", "--force", source_name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            if volume_created:
+                subprocess.run(
+                    [docker, "volume", "rm", source_volume],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
 
     def test_retention_deletes_only_verified_complete_backup_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

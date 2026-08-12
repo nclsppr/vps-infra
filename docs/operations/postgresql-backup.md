@@ -46,10 +46,14 @@ Docker volume. The rehearsal:
 1. verifies every manifest and file checksum;
 2. uses the exact digest-bound image recorded in the backup;
 3. disables the scratch container network and publishes no port;
-4. restores globals and every database with error-stop behavior;
-5. compares the restored role and database inventories with the manifest;
-6. proves a connection to every restored database;
-7. removes the scratch container and volume on success or failure.
+4. initializes `platform_admin` as the scratch bootstrap role, removes exactly
+   its one redundant `CREATE ROLE` statement, and replays every other globals
+   dump byte with error-stop behavior;
+5. restores every database with error-stop behavior;
+6. compares the restored role and database inventories with the manifest;
+7. verifies the `postgres_exporter` membership grant, grantor, and options;
+8. proves a connection to every restored database;
+9. removes the scratch container and volume on success or failure.
 
 The rehearsal does not mount or stop the production volume. It does not prove
 application-specific business invariants. Surplasse and Parkventory must add
