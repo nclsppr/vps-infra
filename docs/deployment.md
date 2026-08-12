@@ -703,6 +703,13 @@ make stop-internal-platform \
   ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
 ```
 
+After the internal platform is healthy, install the daily local PostgreSQL
+backup and monthly isolated restore rehearsal. Run one immediate backup and
+one rehearsal before an application migration. The local stage is explicitly
+not encrypted and not off-site. Follow
+[`operations/postgresql-backup.md`](operations/postgresql-backup.md) for the
+commands, guarantees, and remaining disaster-recovery decision.
+
 ## Déployer une application Compose
 
 Pour une application donnée :

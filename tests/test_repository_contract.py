@@ -2076,6 +2076,31 @@ fi
                     r"playbooks/internal-platform\.yml$",
                 )
 
+            for mode, state in (
+                ("--install-postgres-backup", "installed"),
+                ("--stop-postgres-backup-schedule", "stopped"),
+                ("--backup-postgres-now", "backup-now"),
+                ("--rehearse-postgres-restore", "rehearse-latest"),
+            ):
+                log.unlink()
+                backup_result = subprocess.run(
+                    [converge, mode],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(backup_result.returncode, 0, backup_result.stderr)
+                backup_execution = log.read_text(encoding="utf-8")
+                self.assertRegex(
+                    backup_execution,
+                    rf"(?m)^arguments=.*vps_infra_revision={remote_sha} "
+                    rf"--extra-vars vps_postgres_backup_state={state} "
+                    r"playbooks/postgres-backup\.yml$",
+                )
+
             log.unlink()
             for unsupported_arguments in (
                 ["--check"],

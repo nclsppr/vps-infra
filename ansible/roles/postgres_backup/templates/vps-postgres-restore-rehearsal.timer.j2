@@ -1,0 +1,12 @@
+[Unit]
+Description=Rehearse one isolated PostgreSQL restore each month
+
+[Timer]
+OnCalendar=Sun *-*-01..07 04:17:00 UTC
+RandomizedDelaySec=30m
+AccuracySec=1m
+Persistent=true
+Unit={{ vps_postgres_restore_service }}
+
+[Install]
+WantedBy=timers.target

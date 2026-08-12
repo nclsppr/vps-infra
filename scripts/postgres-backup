@@ -1,0 +1,1240 @@
+#!/usr/bin/env python3
+"""Create, verify, and rehearse a bounded local PostgreSQL logical backup."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import BinaryIO
+
+
+EX_USAGE = 64
+EX_CONFIG = 78
+PRODUCTION_ROOT = Path("/srv/vps/backups/postgresql")
+PRODUCTION_LOCK = Path("/run/lock/vps-postgres-backup.lock")
+PRODUCTION_DOCKER = Path("/usr/bin/docker")
+BACKUP_CONTRACT = "vps-postgres-logical-backup-v1"
+BACKUP_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}$")
+IMAGE_RE = re.compile(
+    r"^ghcr[.]io/nclsppr/vps-infra/postgres:sha-[0-9a-f]{40}"
+    r"@sha256:[0-9a-f]{64}$"
+)
+HEX_NAME_RE = re.compile(r"^(?:[0-9a-f]{2})+$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_CAPTURE_BYTES = 1024 * 1024
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_DATABASES = 128
+MAX_ROLES = 256
+MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
+CLEAN_ENVIRONMENT = {
+    "HOME": "/nonexistent",
+    "PATH": "/usr/bin:/bin",
+    "LC_ALL": "C.UTF-8",
+}
+
+
+class BackupError(RuntimeError):
+    """Raised when a backup operation differs from the strict contract."""
+
+
+def fail(message: str, status: int = EX_CONFIG) -> int:
+    print(f"PostgreSQL backup refused: {message}", file=sys.stderr)
+    return status
+
+
+def strict_json(raw: bytes, label: str) -> object:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise BackupError(f"{label} contains duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BackupError(f"{label} is not strict UTF-8 JSON") from exc
+
+
+def exact_keys(candidate: dict[str, object], expected: set[str], label: str) -> None:
+    if set(candidate) != expected:
+        raise BackupError(f"{label} has unexpected fields")
+
+
+def require_dictionary(candidate: object, label: str) -> dict[str, object]:
+    if not isinstance(candidate, dict):
+        raise BackupError(f"{label} is not an object")
+    return candidate
+
+
+def require_list(candidate: object, label: str) -> list[object]:
+    if not isinstance(candidate, list):
+        raise BackupError(f"{label} is not a list")
+    return candidate
+
+
+def require_string(candidate: object, label: str) -> str:
+    if not isinstance(candidate, str):
+        raise BackupError(f"{label} is not a string")
+    return candidate
+
+
+def require_integer(candidate: object, label: str) -> int:
+    if isinstance(candidate, bool) or not isinstance(candidate, int):
+        raise BackupError(f"{label} is not an integer")
+    return candidate
+
+
+def decode_name(value: object, label: str) -> str:
+    encoded = require_string(value, label)
+    if HEX_NAME_RE.fullmatch(encoded) is None:
+        raise BackupError(f"{label} is not a non-empty lowercase hex string")
+    try:
+        name = bytes.fromhex(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise BackupError(f"{label} is not a UTF-8 name") from exc
+    if not name or "\x00" in name or "\n" in name or "\r" in name:
+        raise BackupError(f"{label} is empty or contains a prohibited character")
+    return name
+
+
+def sha256_file(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def checked_file(
+    directory_fd: int,
+    name: str,
+    *,
+    owner: int,
+    expected_mode: int = 0o600,
+) -> int:
+    if not name or name in {".", ".."} or "/" in name:
+        raise BackupError("backup manifest contains an unsafe file name")
+    try:
+        descriptor = os.open(name, FILE_FLAGS, dir_fd=directory_fd)
+    except OSError as exc:
+        raise BackupError(f"cannot open backup file {name}: {exc.strerror}") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != owner
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != expected_mode
+    ):
+        os.close(descriptor)
+        raise BackupError(f"backup file {name} has unsafe metadata")
+    return descriptor
+
+
+class Runtime:
+    def __init__(self, root: Path, lock_path: Path, docker: Path, owner: int) -> None:
+        self.root = root
+        self.lock_path = lock_path
+        self.docker = docker
+        self.owner = owner
+
+    def command_environment(self) -> dict[str, str]:
+        environment = CLEAN_ENVIRONMENT.copy()
+        if self.docker == PRODUCTION_DOCKER:
+            environment["DOCKER_HOST"] = "unix:///run/docker.sock"
+        return environment
+
+    def run(
+        self,
+        arguments: list[str],
+        label: str,
+        *,
+        stdin: BinaryIO | int | None = None,
+        stdout: BinaryIO | int | None = subprocess.DEVNULL,
+    ) -> None:
+        result = subprocess.run(
+            arguments,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=subprocess.DEVNULL,
+            env=self.command_environment(),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise BackupError(f"{label} failed with status {result.returncode}")
+
+    def capture(self, arguments: list[str], label: str) -> bytes:
+        result = subprocess.run(
+            arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=self.command_environment(),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise BackupError(f"{label} failed with status {result.returncode}")
+        if len(result.stdout) > MAX_CAPTURE_BYTES:
+            raise BackupError(f"{label} output exceeds its size limit")
+        return result.stdout
+
+    def docker_arguments(self, *arguments: str) -> list[str]:
+        return [str(self.docker), *arguments]
+
+
+def validate_root(root: Path, owner: int) -> int:
+    try:
+        descriptor = os.open(root, DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise BackupError(f"cannot open protected backup root: {exc.strerror}") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != owner
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise BackupError("backup root must be owner-owned with mode 0700")
+    return descriptor
+
+
+def acquire_lock(path: Path, owner: int) -> int:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as exc:
+        raise BackupError(f"cannot open the backup lock: {exc.strerror}") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != owner
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        os.close(descriptor)
+        raise BackupError("backup lock has unsafe metadata")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(descriptor)
+        raise BackupError("another backup or restore rehearsal is active") from exc
+    return descriptor
+
+
+def read_json_lines(raw: bytes, label: str) -> list[dict[str, object]]:
+    if not raw or not raw.endswith(b"\n"):
+        raise BackupError(f"{label} output is incomplete")
+    result: list[dict[str, object]] = []
+    for index, line in enumerate(raw.splitlines(), start=1):
+        if not line:
+            continue
+        result.append(require_dictionary(strict_json(line, f"{label} line {index}"), label))
+        if len(result) > max(MAX_DATABASES, MAX_ROLES):
+            raise BackupError(f"{label} contains too many rows")
+    return result
+
+
+def production_container(runtime: Runtime) -> tuple[str, str]:
+    raw_ids = runtime.capture(
+        runtime.docker_arguments(
+            "ps",
+            "--filter",
+            "label=com.docker.compose.project=vps-platform",
+            "--filter",
+            "label=com.docker.compose.service=postgresql",
+            "--format",
+            "{{.ID}}",
+        ),
+        "PostgreSQL container discovery",
+    )
+    identifiers = [line.decode("ascii") for line in raw_ids.splitlines() if line]
+    if len(identifiers) != 1 or re.fullmatch(r"[0-9a-f]{12,64}", identifiers[0]) is None:
+        raise BackupError("exactly one running PostgreSQL service container is required")
+    identifier = identifiers[0]
+    inspected = strict_json(
+        runtime.capture(runtime.docker_arguments("inspect", identifier), "container inspection"),
+        "container inspection",
+    )
+    entries = require_list(inspected, "container inspection")
+    if len(entries) != 1:
+        raise BackupError("container inspection did not return one object")
+    entry = require_dictionary(entries[0], "container inspection entry")
+    config = require_dictionary(entry.get("Config"), "container configuration")
+    state = require_dictionary(entry.get("State"), "container state")
+    labels = require_dictionary(config.get("Labels"), "container labels")
+    health = require_dictionary(state.get("Health"), "container health")
+    image = require_string(config.get("Image"), "container image")
+    if (
+        state.get("Running") is not True
+        or health.get("Status") != "healthy"
+        or labels.get("com.docker.compose.project") != "vps-platform"
+        or labels.get("com.docker.compose.service") != "postgresql"
+        or config.get("User") != "70:70"
+        or IMAGE_RE.fullmatch(image) is None
+    ):
+        raise BackupError("the running PostgreSQL container differs from the backup contract")
+    return identifier, image
+
+
+def psql_capture(runtime: Runtime, container: str, sql: str, label: str) -> bytes:
+    return runtime.capture(
+        runtime.docker_arguments(
+            "exec",
+            container,
+            "psql",
+            "-X",
+            "--host=/var/run/postgresql",
+            "--username=platform_admin",
+            "--dbname=postgres",
+            "--no-align",
+            "--tuples-only",
+            "--set=ON_ERROR_STOP=on",
+            f"--command={sql}",
+        ),
+        label,
+    )
+
+
+def source_metadata(runtime: Runtime, container: str) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
+    metadata_rows = read_json_lines(
+        psql_capture(
+            runtime,
+            container,
+            "SELECT json_build_object("
+            "'server_version_num', current_setting('server_version_num')::integer, "
+            "'system_identifier', (SELECT system_identifier::text FROM pg_control_system()), "
+            "'custom_tablespaces', (SELECT count(*) FROM pg_tablespace "
+            "WHERE spcname NOT IN ('pg_default', 'pg_global')), "
+            "'database_bytes', (SELECT coalesce(sum(pg_database_size(datname)), 0)::bigint "
+            "FROM pg_database WHERE NOT datistemplate))::text;",
+            "PostgreSQL source metadata query",
+        ),
+        "PostgreSQL source metadata",
+    )
+    if len(metadata_rows) != 1:
+        raise BackupError("PostgreSQL source metadata did not return one row")
+    metadata = metadata_rows[0]
+    exact_keys(
+        metadata,
+        {"server_version_num", "system_identifier", "custom_tablespaces", "database_bytes"},
+        "PostgreSQL source metadata",
+    )
+    server_version = require_integer(metadata["server_version_num"], "server version")
+    system_identifier = require_string(metadata["system_identifier"], "system identifier")
+    custom_tablespaces = require_integer(metadata["custom_tablespaces"], "tablespace count")
+    database_bytes = require_integer(metadata["database_bytes"], "database byte count")
+    if not 170000 <= server_version < 180000:
+        raise BackupError("the source server is not PostgreSQL major version 17")
+    if re.fullmatch(r"[0-9]{10,32}", system_identifier) is None:
+        raise BackupError("the PostgreSQL system identifier has an invalid format")
+    if custom_tablespaces != 0:
+        raise BackupError("custom PostgreSQL tablespaces require a separate reviewed backup policy")
+    if database_bytes < 0:
+        raise BackupError("the PostgreSQL database size is invalid")
+
+    database_rows = read_json_lines(
+        psql_capture(
+            runtime,
+            container,
+            "SELECT json_build_object("
+            "'oid', oid::bigint, "
+            "'name_hex', encode(convert_to(datname, 'UTF8'), 'hex'), "
+            "'allow_connections', datallowconn)::text "
+            "FROM pg_database WHERE NOT datistemplate ORDER BY oid;",
+            "PostgreSQL database inventory query",
+        ),
+        "PostgreSQL database inventory",
+    )
+    if not database_rows or len(database_rows) > MAX_DATABASES:
+        raise BackupError("PostgreSQL database count is outside the backup contract")
+    seen_oids: set[int] = set()
+    seen_names: set[str] = set()
+    for row in database_rows:
+        exact_keys(row, {"oid", "name_hex", "allow_connections"}, "database inventory row")
+        oid = require_integer(row["oid"], "database OID")
+        name = decode_name(row["name_hex"], "database name")
+        if oid <= 0 or oid in seen_oids or name in seen_names:
+            raise BackupError("database inventory contains a duplicate or invalid identity")
+        if row["allow_connections"] is not True:
+            raise BackupError("a non-template database rejects connections and cannot be dumped")
+        seen_oids.add(oid)
+        seen_names.add(name)
+    if "postgres" not in seen_names:
+        raise BackupError("the PostgreSQL maintenance database is absent")
+
+    role_rows = read_json_lines(
+        psql_capture(
+            runtime,
+            container,
+            "SELECT json_build_object("
+            "'name_hex', encode(convert_to(rolname, 'UTF8'), 'hex'))::text "
+            "FROM pg_roles WHERE rolname !~ '^pg_' ORDER BY rolname;",
+            "PostgreSQL role inventory query",
+        ),
+        "PostgreSQL role inventory",
+    )
+    if not role_rows or len(role_rows) > MAX_ROLES:
+        raise BackupError("PostgreSQL role count is outside the backup contract")
+    role_names: set[str] = set()
+    for row in role_rows:
+        exact_keys(row, {"name_hex"}, "role inventory row")
+        name = decode_name(row["name_hex"], "role name")
+        if name in role_names:
+            raise BackupError("role inventory contains a duplicate name")
+        role_names.add(name)
+    if "platform_admin" not in role_names:
+        raise BackupError("the platform administrator role is absent")
+    return metadata, database_rows, role_rows
+
+
+def open_new_file(directory_fd: int, name: str) -> int:
+    try:
+        return os.open(
+            name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise BackupError(f"cannot create backup file {name}: {exc.strerror}") from exc
+
+
+def dump_to_file(
+    runtime: Runtime,
+    arguments: list[str],
+    label: str,
+    directory_fd: int,
+    name: str,
+) -> dict[str, object]:
+    descriptor = open_new_file(directory_fd, name)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as destination:
+            runtime.run(arguments, label, stdout=destination)
+            destination.flush()
+            os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if metadata.st_size <= 0:
+            raise BackupError(f"{label} produced an empty file")
+        digest = sha256_file(descriptor)
+        return {"path": name, "size": metadata.st_size, "sha256": digest}
+    finally:
+        os.close(descriptor)
+
+
+def write_new_file(directory_fd: int, name: str, content: bytes) -> None:
+    descriptor = open_new_file(directory_fd, name)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise BackupError(f"cannot write backup file {name}")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def verify_archive_with_source(
+    runtime: Runtime,
+    container: str,
+    directory_fd: int,
+    name: str,
+) -> None:
+    descriptor = checked_file(directory_fd, name, owner=runtime.owner)
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            magic = source.read(5)
+            if magic != b"PGDMP":
+                raise BackupError(f"database archive {name} has an invalid format")
+            source.seek(0)
+            runtime.run(
+                runtime.docker_arguments(
+                    "exec",
+                    "--interactive",
+                    container,
+                    "pg_restore",
+                    "--list",
+                    "-",
+                ),
+                f"PostgreSQL archive verification for {name}",
+                stdin=source,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def create_backup(runtime: Runtime, retention_count: int) -> str:
+    if retention_count < 2 or retention_count > 31:
+        raise BackupError("retention count must be between 2 and 31")
+    root_fd = validate_root(runtime.root, runtime.owner)
+    backup_id = (
+        dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ-")
+        + uuid.uuid4().hex[:12]
+    )
+    staging_name = f".partial-{backup_id}"
+    final_path = runtime.root / backup_id
+    try:
+        if final_path.exists() or final_path.is_symlink():
+            raise BackupError("generated backup identifier already exists")
+        os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
+        staging_fd = os.open(staging_name, DIRECTORY_FLAGS, dir_fd=root_fd)
+        try:
+            container, image = production_container(runtime)
+            metadata, databases, roles = source_metadata(runtime, container)
+            database_bytes = require_integer(metadata["database_bytes"], "database byte count")
+            required_free = max(MIN_FREE_BYTES, database_bytes * 2 + MIN_FREE_BYTES)
+            if shutil.disk_usage(runtime.root).free < required_free:
+                raise BackupError("free space is below the conservative local backup threshold")
+
+            globals_file = dump_to_file(
+                runtime,
+                runtime.docker_arguments(
+                    "exec",
+                    container,
+                    "pg_dumpall",
+                    "--host=/var/run/postgresql",
+                    "--username=platform_admin",
+                    "--database=postgres",
+                    "--globals-only",
+                    "--no-tablespaces",
+                ),
+                "PostgreSQL global object dump",
+                staging_fd,
+                "globals.sql",
+            )
+            globals_file["kind"] = "globals"
+
+            files: list[dict[str, object]] = [globals_file]
+            for database in databases:
+                oid = require_integer(database["oid"], "database OID")
+                name_hex = require_string(database["name_hex"], "database name")
+                name = decode_name(name_hex, "database name")
+                file_name = f"database-{oid}.dump"
+                dumped = dump_to_file(
+                    runtime,
+                    runtime.docker_arguments(
+                        "exec",
+                        "--env",
+                        f"PGDATABASE={name}",
+                        container,
+                        "pg_dump",
+                        "--host=/var/run/postgresql",
+                        "--username=platform_admin",
+                        "--format=custom",
+                        "--compress=6",
+                    ),
+                    f"PostgreSQL database dump for OID {oid}",
+                    staging_fd,
+                    file_name,
+                )
+                verify_archive_with_source(runtime, container, staging_fd, file_name)
+                dumped.update(
+                    {
+                        "kind": "database",
+                        "database_oid": oid,
+                        "database_name_hex": name_hex,
+                    }
+                )
+                files.append(dumped)
+
+            created_at = (
+                dt.datetime.now(dt.timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            manifest = {
+                "contract": BACKUP_CONTRACT,
+                "backup_id": backup_id,
+                "created_at": created_at,
+                "source": {
+                    "compose_project": "vps-platform",
+                    "compose_service": "postgresql",
+                    "image": image,
+                    "postgres_major": 17,
+                    "server_version_num": metadata["server_version_num"],
+                    "system_identifier": metadata["system_identifier"],
+                },
+                "scope": {
+                    "method": "pg_dumpall-globals-plus-pg_dump-custom",
+                    "cross_database_snapshot_atomic": False,
+                    "encrypted": False,
+                    "offsite": False,
+                    "contains_role_password_hashes": True,
+                },
+                "roles": roles,
+                "files": files,
+            }
+            manifest_bytes = (
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+                raise BackupError("backup manifest exceeds its size limit")
+            write_new_file(staging_fd, "manifest.json", manifest_bytes)
+            write_new_file(
+                staging_fd,
+                "manifest.sha256",
+                hashlib.sha256(manifest_bytes).hexdigest().encode("ascii") + b"\n",
+            )
+            os.fsync(staging_fd)
+        finally:
+            os.close(staging_fd)
+        os.rename(staging_name, backup_id, src_dir_fd=root_fd, dst_dir_fd=root_fd)
+        os.fsync(root_fd)
+    except Exception:
+        partial = runtime.root / staging_name
+        if partial.exists() and partial.is_dir() and not partial.is_symlink():
+            shutil.rmtree(partial)
+            os.fsync(root_fd)
+        raise
+    finally:
+        os.close(root_fd)
+
+    verify_backup(runtime, backup_id)
+    prune_backups(runtime, retention_count)
+    return backup_id
+
+
+def validate_manifest(candidate: object, backup_id: str) -> dict[str, object]:
+    manifest = require_dictionary(candidate, "backup manifest")
+    exact_keys(
+        manifest,
+        {"contract", "backup_id", "created_at", "source", "scope", "roles", "files"},
+        "backup manifest",
+    )
+    if manifest["contract"] != BACKUP_CONTRACT or manifest["backup_id"] != backup_id:
+        raise BackupError("backup manifest identity differs from its directory")
+    created_at = require_string(manifest["created_at"], "backup creation time")
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", created_at) is None:
+        raise BackupError("backup creation time is invalid")
+
+    source = require_dictionary(manifest["source"], "backup source")
+    exact_keys(
+        source,
+        {
+            "compose_project",
+            "compose_service",
+            "image",
+            "postgres_major",
+            "server_version_num",
+            "system_identifier",
+        },
+        "backup source",
+    )
+    image = require_string(source["image"], "backup image")
+    server_version = require_integer(source["server_version_num"], "server version")
+    if (
+        source["compose_project"] != "vps-platform"
+        or source["compose_service"] != "postgresql"
+        or source["postgres_major"] != 17
+        or not 170000 <= server_version < 180000
+        or IMAGE_RE.fullmatch(image) is None
+        or re.fullmatch(r"[0-9]{10,32}", require_string(source["system_identifier"], "system identifier")) is None
+    ):
+        raise BackupError("backup source differs from the PostgreSQL 17 platform contract")
+
+    scope = require_dictionary(manifest["scope"], "backup scope")
+    exact_keys(
+        scope,
+        {
+            "method",
+            "cross_database_snapshot_atomic",
+            "encrypted",
+            "offsite",
+            "contains_role_password_hashes",
+        },
+        "backup scope",
+    )
+    if scope != {
+        "method": "pg_dumpall-globals-plus-pg_dump-custom",
+        "cross_database_snapshot_atomic": False,
+        "encrypted": False,
+        "offsite": False,
+        "contains_role_password_hashes": True,
+    }:
+        raise BackupError("backup scope overstates the local logical backup guarantees")
+
+    roles = require_list(manifest["roles"], "backup roles")
+    if not roles or len(roles) > MAX_ROLES:
+        raise BackupError("backup role count is outside the contract")
+    role_names: set[str] = set()
+    for raw_role in roles:
+        role = require_dictionary(raw_role, "backup role")
+        exact_keys(role, {"name_hex"}, "backup role")
+        name = decode_name(role["name_hex"], "backup role name")
+        if name in role_names:
+            raise BackupError("backup role inventory contains a duplicate")
+        role_names.add(name)
+    if "platform_admin" not in role_names:
+        raise BackupError("backup role inventory omits platform_admin")
+
+    files = require_list(manifest["files"], "backup files")
+    if len(files) < 2 or len(files) > MAX_DATABASES + 1:
+        raise BackupError("backup file count is outside the contract")
+    paths: set[str] = set()
+    database_names: set[str] = set()
+    database_oids: set[int] = set()
+    globals_count = 0
+    for raw_file in files:
+        entry = require_dictionary(raw_file, "backup file entry")
+        kind = require_string(entry.get("kind"), "backup file kind")
+        common_keys = {"kind", "path", "size", "sha256"}
+        if kind == "globals":
+            exact_keys(entry, common_keys, "globals file entry")
+            globals_count += 1
+            if entry["path"] != "globals.sql":
+                raise BackupError("globals file path is invalid")
+        elif kind == "database":
+            exact_keys(
+                entry,
+                common_keys | {"database_oid", "database_name_hex"},
+                "database file entry",
+            )
+            oid = require_integer(entry["database_oid"], "database OID")
+            name = decode_name(entry["database_name_hex"], "database name")
+            if oid <= 0 or oid in database_oids or name in database_names:
+                raise BackupError("database file inventory contains a duplicate")
+            if entry["path"] != f"database-{oid}.dump":
+                raise BackupError("database archive path differs from its OID")
+            database_oids.add(oid)
+            database_names.add(name)
+        else:
+            raise BackupError("backup file has an unsupported kind")
+        path = require_string(entry["path"], "backup file path")
+        size = require_integer(entry["size"], "backup file size")
+        digest = require_string(entry["sha256"], "backup file digest")
+        if path in paths or size <= 0 or SHA256_RE.fullmatch(digest) is None:
+            raise BackupError("backup file metadata is invalid or duplicated")
+        paths.add(path)
+    if globals_count != 1 or "postgres" not in database_names:
+        raise BackupError("backup does not contain globals and the postgres database")
+    return manifest
+
+
+def backup_directory(runtime: Runtime, backup_id: str) -> tuple[int, dict[str, object]]:
+    if BACKUP_ID_RE.fullmatch(backup_id) is None:
+        raise BackupError("backup identifier has an invalid format")
+    root_fd = validate_root(runtime.root, runtime.owner)
+    try:
+        directory_fd = os.open(backup_id, DIRECTORY_FLAGS, dir_fd=root_fd)
+    except OSError as exc:
+        os.close(root_fd)
+        raise BackupError(f"cannot open backup directory {backup_id}: {exc.strerror}") from exc
+    os.close(root_fd)
+    metadata = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != runtime.owner
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        os.close(directory_fd)
+        raise BackupError("backup directory has unsafe metadata")
+
+    manifest_fd = checked_file(directory_fd, "manifest.json", owner=runtime.owner)
+    checksum_fd = checked_file(directory_fd, "manifest.sha256", owner=runtime.owner)
+    try:
+        manifest_metadata = os.fstat(manifest_fd)
+        if manifest_metadata.st_size <= 0 or manifest_metadata.st_size > MAX_MANIFEST_BYTES:
+            raise BackupError("backup manifest size is outside the contract")
+        manifest_raw = os.read(manifest_fd, MAX_MANIFEST_BYTES + 1)
+        checksum_raw = os.read(checksum_fd, 66)
+        expected_checksum = hashlib.sha256(manifest_raw).hexdigest().encode("ascii") + b"\n"
+        if checksum_raw != expected_checksum:
+            raise BackupError("backup manifest checksum does not match")
+        manifest = validate_manifest(strict_json(manifest_raw, "backup manifest"), backup_id)
+    except Exception:
+        os.close(directory_fd)
+        raise
+    finally:
+        os.close(manifest_fd)
+        os.close(checksum_fd)
+    return directory_fd, manifest
+
+
+def verify_backup(runtime: Runtime, backup_id: str) -> dict[str, object]:
+    directory_fd, manifest = backup_directory(runtime, backup_id)
+    try:
+        expected_paths = {"manifest.json", "manifest.sha256"}
+        for raw_entry in require_list(manifest["files"], "backup files"):
+            entry = require_dictionary(raw_entry, "backup file")
+            path = require_string(entry["path"], "backup file path")
+            expected_paths.add(path)
+            descriptor = checked_file(directory_fd, path, owner=runtime.owner)
+            try:
+                metadata = os.fstat(descriptor)
+                if metadata.st_size != require_integer(entry["size"], "backup file size"):
+                    raise BackupError(f"backup file {path} size does not match")
+                if sha256_file(descriptor) != require_string(entry["sha256"], "backup digest"):
+                    raise BackupError(f"backup file {path} checksum does not match")
+                if entry["kind"] == "database":
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    if os.read(descriptor, 5) != b"PGDMP":
+                        raise BackupError(f"database archive {path} has an invalid format")
+            finally:
+                os.close(descriptor)
+        observed_paths = set(os.listdir(directory_fd))
+        if observed_paths != expected_paths:
+            raise BackupError("backup directory contains an unexpected or missing entry")
+    finally:
+        os.close(directory_fd)
+    return manifest
+
+
+def complete_backup_ids(runtime: Runtime) -> list[str]:
+    root_fd = validate_root(runtime.root, runtime.owner)
+    try:
+        result: list[str] = []
+        for name in os.listdir(root_fd):
+            if BACKUP_ID_RE.fullmatch(name) is None:
+                continue
+            metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if (
+                stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == runtime.owner
+                and metadata.st_gid == os.getegid()
+                and stat.S_IMODE(metadata.st_mode) == 0o700
+            ):
+                result.append(name)
+        return sorted(result)
+    finally:
+        os.close(root_fd)
+
+
+def latest_backup_id(runtime: Runtime) -> str:
+    candidates = complete_backup_ids(runtime)
+    if not candidates:
+        raise BackupError("no complete local PostgreSQL backup is available")
+    return candidates[-1]
+
+
+def prune_backups(runtime: Runtime, retention_count: int) -> None:
+    candidates = complete_backup_ids(runtime)
+    if len(candidates) <= retention_count:
+        return
+    removable: list[str] = []
+    for backup_id in candidates[:-retention_count]:
+        try:
+            verify_backup(runtime, backup_id)
+        except BackupError:
+            continue
+        removable.append(backup_id)
+    if len(removable) != len(candidates) - retention_count:
+        raise BackupError("retention found an invalid old backup; no backup was deleted")
+    root_fd = validate_root(runtime.root, runtime.owner)
+    try:
+        for backup_id in removable:
+            candidate = runtime.root / backup_id
+            metadata = candidate.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or candidate.is_symlink():
+                raise BackupError("retention candidate changed before deletion")
+            shutil.rmtree(candidate)
+            os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def restore_input(
+    runtime: Runtime,
+    container: str,
+    directory_fd: int,
+    file_name: str,
+    arguments: list[str],
+    label: str,
+) -> None:
+    descriptor = checked_file(directory_fd, file_name, owner=runtime.owner)
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            runtime.run(
+                runtime.docker_arguments("exec", "--interactive", container, *arguments),
+                label,
+                stdin=source,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def scratch_psql_capture(
+    runtime: Runtime,
+    container: str,
+    restore_user: str,
+    sql: str,
+    label: str,
+) -> bytes:
+    return runtime.capture(
+        runtime.docker_arguments(
+            "exec",
+            container,
+            "psql",
+            "-X",
+            "--host=/var/run/postgresql",
+            f"--username={restore_user}",
+            "--dbname=postgres",
+            "--no-align",
+            "--tuples-only",
+            "--set=ON_ERROR_STOP=on",
+            f"--command={sql}",
+        ),
+        label,
+    )
+
+
+def cleanup_rehearsal(runtime: Runtime, container_name: str, volume_name: str) -> None:
+    failures: list[str] = []
+    for arguments, label in (
+        (("rm", "--force", container_name), "scratch container cleanup"),
+        (("volume", "rm", volume_name), "scratch volume cleanup"),
+    ):
+        result = subprocess.run(
+            runtime.docker_arguments(*arguments),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=runtime.command_environment(),
+            check=False,
+        )
+        if result.returncode != 0:
+            failures.append(label)
+    if failures:
+        raise BackupError(" and ".join(failures) + " failed")
+
+
+def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
+    manifest = verify_backup(runtime, backup_id)
+    source = require_dictionary(manifest["source"], "backup source")
+    image = require_string(source["image"], "backup image")
+    runtime.run(runtime.docker_arguments("image", "inspect", image), "backup image inspection")
+
+    expected_roles = {
+        decode_name(require_dictionary(role, "backup role")["name_hex"], "backup role name")
+        for role in require_list(manifest["roles"], "backup roles")
+    }
+    while True:
+        suffix = uuid.uuid4().hex[:12]
+        restore_user = f"vps_restore_{suffix}"
+        if restore_user not in expected_roles:
+            break
+    container_name = f"vps-postgres-restore-{suffix}"
+    volume_name = f"vps-postgres-restore-{suffix}"
+    volume_created = False
+    container_created = False
+    operation_error: Exception | None = None
+    try:
+        volume_output_raw = runtime.capture(
+            runtime.docker_arguments(
+                "volume",
+                "create",
+                "--label",
+                "com.nclsppr.vps-infra.restore-rehearsal=true",
+                volume_name,
+            ),
+            "scratch volume creation",
+        )
+        volume_created = True
+        try:
+            volume_output = volume_output_raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise BackupError("Docker returned a non-ASCII scratch volume identity") from exc
+        if volume_output != volume_name:
+            raise BackupError("Docker returned an unexpected scratch volume identity")
+        container_output_raw = runtime.capture(
+            runtime.docker_arguments(
+                "run",
+                "--detach",
+                "--pull=never",
+                "--name",
+                container_name,
+                "--label",
+                "com.nclsppr.vps-infra.restore-rehearsal=true",
+                "--network",
+                "none",
+                "--user",
+                "70:70",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--pids-limit",
+                "256",
+                "--cpus",
+                "1.0",
+                "--memory",
+                "1536m",
+                "--shm-size",
+                "256m",
+                "--tmpfs",
+                "/tmp:size=64m,mode=1777",
+                "--tmpfs",
+                "/var/run/postgresql:size=16m,mode=2775,uid=70,gid=70",
+                "--mount",
+                f"type=volume,source={volume_name},target=/var/lib/postgresql/data",
+                "--env",
+                "POSTGRES_DB=postgres",
+                "--env",
+                f"POSTGRES_USER={restore_user}",
+                "--env",
+                "POSTGRES_HOST_AUTH_METHOD=trust",
+                "--env",
+                "POSTGRES_INITDB_ARGS=--auth-local=trust --auth-host=trust --data-checksums",
+                "--env",
+                "PGDATA=/var/lib/postgresql/data/pgdata",
+                image,
+                "postgres",
+                "-c",
+                "listen_addresses=",
+                "-c",
+                "unix_socket_directories=/var/run/postgresql",
+            ),
+            "scratch PostgreSQL container creation",
+        )
+        container_created = True
+        try:
+            container_output = container_output_raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise BackupError("Docker returned a non-ASCII scratch container identity") from exc
+        if re.fullmatch(r"[0-9a-f]{12,64}", container_output) is None:
+            raise BackupError("Docker returned an unexpected scratch container identity")
+
+        ready = False
+        for _ in range(60):
+            result = subprocess.run(
+                runtime.docker_arguments(
+                    "exec",
+                    container_name,
+                    "pg_isready",
+                    "--host=/var/run/postgresql",
+                    f"--username={restore_user}",
+                    "--dbname=postgres",
+                ),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=runtime.command_environment(),
+                check=False,
+            )
+            if result.returncode == 0:
+                ready = True
+                break
+            time.sleep(1)
+        if not ready:
+            raise BackupError("scratch PostgreSQL did not become ready")
+
+        directory_fd, checked_manifest = backup_directory(runtime, backup_id)
+        try:
+            restore_input(
+                runtime,
+                container_name,
+                directory_fd,
+                "globals.sql",
+                [
+                    "psql",
+                    "-X",
+                    "--host=/var/run/postgresql",
+                    f"--username={restore_user}",
+                    "--dbname=postgres",
+                    "--set=ON_ERROR_STOP=on",
+                ],
+                "PostgreSQL global object restore",
+            )
+            database_entries = [
+                require_dictionary(entry, "database backup file")
+                for entry in require_list(checked_manifest["files"], "backup files")
+                if require_dictionary(entry, "backup file")["kind"] == "database"
+            ]
+            database_entries.sort(key=lambda entry: require_integer(entry["database_oid"], "database OID"))
+            for entry in database_entries:
+                restore_input(
+                    runtime,
+                    container_name,
+                    directory_fd,
+                    require_string(entry["path"], "database archive path"),
+                    [
+                        "pg_restore",
+                        "--host=/var/run/postgresql",
+                        f"--username={restore_user}",
+                        "--dbname=template1",
+                        "--clean",
+                        "--if-exists",
+                        "--create",
+                        "--exit-on-error",
+                    ],
+                    f"PostgreSQL database restore for OID {entry['database_oid']}",
+                )
+        finally:
+            os.close(directory_fd)
+
+        restored_database_rows = read_json_lines(
+            scratch_psql_capture(
+                runtime,
+                container_name,
+                restore_user,
+                "SELECT json_build_object("
+                "'name_hex', encode(convert_to(datname, 'UTF8'), 'hex'))::text "
+                "FROM pg_database WHERE NOT datistemplate ORDER BY datname;",
+                "restored database inventory query",
+            ),
+            "restored database inventory",
+        )
+        restored_database_names = {
+            decode_name(row["name_hex"], "restored database name")
+            for row in restored_database_rows
+        }
+        expected_database_names = {
+            decode_name(entry["database_name_hex"], "backup database name")
+            for entry in database_entries
+        }
+        if restored_database_names != expected_database_names:
+            raise BackupError("restored database inventory differs from the backup manifest")
+
+        restored_role_rows = read_json_lines(
+            scratch_psql_capture(
+                runtime,
+                container_name,
+                restore_user,
+                "SELECT json_build_object("
+                "'name_hex', encode(convert_to(rolname, 'UTF8'), 'hex'))::text "
+                "FROM pg_roles WHERE rolname !~ '^pg_' "
+                "AND rolname <> current_user ORDER BY rolname;",
+                "restored role inventory query",
+            ),
+            "restored role inventory",
+        )
+        restored_roles = {
+            decode_name(row["name_hex"], "restored role name") for row in restored_role_rows
+        }
+        if restored_roles != expected_roles:
+            raise BackupError("restored role inventory differs from the backup manifest")
+
+        for database_name in sorted(expected_database_names):
+            runtime.run(
+                runtime.docker_arguments(
+                    "exec",
+                    "--env",
+                    f"PGDATABASE={database_name}",
+                    container_name,
+                    "psql",
+                    "-X",
+                    "--host=/var/run/postgresql",
+                    f"--username={restore_user}",
+                    "--no-align",
+                    "--tuples-only",
+                    "--set=ON_ERROR_STOP=on",
+                    "--command=SELECT 1;",
+                ),
+                "restored database connection proof",
+            )
+    except Exception as exc:
+        operation_error = exc
+    cleanup_error: Exception | None = None
+    if container_created or volume_created:
+        try:
+            cleanup_rehearsal(runtime, container_name, volume_name)
+        except Exception as exc:
+            cleanup_error = exc
+    if operation_error is not None and cleanup_error is not None:
+        raise BackupError(
+            f"{operation_error}; disposable restore cleanup also failed: {cleanup_error}"
+        ) from operation_error
+    if operation_error is not None:
+        raise operation_error
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--test-root", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--docker", type=Path, help=argparse.SUPPRESS)
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+
+    create_parser = subparsers.add_parser("create", help="create one local logical backup")
+    create_parser.add_argument("--retention-count", type=int, default=7)
+    for name in ("verify", "rehearse"):
+        operation_parser = subparsers.add_parser(name, help=f"{name} one local backup")
+        selector = operation_parser.add_mutually_exclusive_group(required=True)
+        selector.add_argument("--latest", action="store_true")
+        selector.add_argument("--backup-id")
+    return parser.parse_args()
+
+
+def configured_runtime(args: argparse.Namespace) -> Runtime:
+    if args.test_root is None:
+        if os.geteuid() != 0:
+            raise BackupError("production mode requires root")
+        if args.docker is not None:
+            raise BackupError("production mode does not accept a Docker path override")
+        return Runtime(PRODUCTION_ROOT, PRODUCTION_LOCK, PRODUCTION_DOCKER, 0)
+    if os.geteuid() == 0:
+        raise BackupError("root cannot use test mode")
+    if os.environ.get("VPS_POSTGRES_BACKUP_TESTING") != "1":
+        raise BackupError("test mode requires an explicit environment guard")
+    if not args.test_root.is_absolute() or args.docker is None or not args.docker.is_absolute():
+        raise BackupError("test mode requires absolute backup and Docker paths")
+    return Runtime(
+        args.test_root,
+        args.test_root.parent / ".vps-postgres-backup-test.lock",
+        args.docker,
+        os.geteuid(),
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    lock_fd: int | None = None
+    try:
+        runtime = configured_runtime(args)
+        lock_fd = acquire_lock(runtime.lock_path, runtime.owner)
+        if args.operation == "create":
+            backup_id = create_backup(runtime, args.retention_count)
+            manifest = verify_backup(runtime, backup_id)
+            database_count = sum(
+                1
+                for entry in require_list(manifest["files"], "backup files")
+                if require_dictionary(entry, "backup file")["kind"] == "database"
+            )
+            print(
+                f"local PostgreSQL backup created and verified: {backup_id}; "
+                f"databases={database_count}; offsite=false; encrypted=false"
+            )
+        else:
+            backup_id = latest_backup_id(runtime) if args.latest else args.backup_id
+            assert backup_id is not None
+            if args.operation == "verify":
+                verify_backup(runtime, backup_id)
+                print(f"local PostgreSQL backup verified: {backup_id}")
+            else:
+                rehearse_restore(runtime, backup_id)
+                print(f"isolated PostgreSQL restore rehearsal passed: {backup_id}")
+    except (BackupError, OSError, subprocess.SubprocessError) as exc:
+        return fail(str(exc))
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
