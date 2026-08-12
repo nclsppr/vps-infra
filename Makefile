@@ -11,7 +11,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
-	check-public-static-edge check-prometheus check-caddy check-postgres-image \
+	check-public-static-edge check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	activate-public-static-edge stop-public-static-edge \
@@ -33,7 +33,7 @@ check: check-fast check-platform ## Run the complete CI contract without deploym
 check-fast: check-yaml check-actions check-ansible check-controller check-json ## Run checks that do not require a Docker image.
 
 check-yaml: ## Validate versioned YAML files.
-	$(MISE_EXEC) uv run yamllint --no-warnings .github ansible platform releases
+	$(MISE_EXEC) uv run yamllint --no-warnings .github ansible applications platform releases
 
 check-actions: ## Validate GitHub Actions workflows.
 	$(MISE_EXEC) actionlint
@@ -74,9 +74,15 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 		schemas/platform-vex-v1.schema.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
 		policies/platform-vex-v1.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		applications/surplasse/adapter.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		applications/surplasse/expected-images.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		applications/surplasse/migrations.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool renovate.json >/dev/null
 
-check-platform: check-platform-config check-public-static-edge check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, and custom images.
+check-platform: check-platform-config check-public-static-edge check-surplasse-adapter check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, application candidates, and custom images.
 
 check-platform-config: ## Render Compose and apply the production policy.
 	@rendered="$$(mktemp)"; \
@@ -96,6 +102,18 @@ check-public-static-edge: ## Validate the isolated Caddy-only public edge.
 	./scripts/validate-compose \
 		--expected-images platform/public-static-edge/expected-images.json \
 		vps-public-static-edge "$$rendered"
+
+check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
+	@set -Eeuo pipefail; \
+	rendered="$$(mktemp)"; \
+	trap 'rm -f -- "$$rendered"' EXIT; \
+	$(COMPOSE) --env-file applications/surplasse/.env.example \
+		--file applications/surplasse/compose.yaml --profile migration \
+		config --format json >"$$rendered"; \
+	./scripts/validate-compose \
+		--expected-images applications/surplasse/expected-images.json \
+		surplasse "$$rendered"; \
+	./scripts/validate-surplasse-adapter "$$rendered"
 
 check-prometheus: ## Validate active and inactive Prometheus rules in the pinned image.
 	@image="$$(sed -n 's/^PROMETHEUS_IMAGE=//p' "$(PLATFORM_ENV)")"; \

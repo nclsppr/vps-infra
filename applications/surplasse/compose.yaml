@@ -1,0 +1,243 @@
+---
+name: surplasse
+
+x-logging: &bounded-logging
+  driver: local
+  options:
+    max-file: "3"
+    max-size: 10m
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging: *bounded-logging
+
+services:
+  backend:
+    <<: *hardened
+    image: ${SURPLASSE_BACKEND_IMAGE:?SURPLASSE_BACKEND_IMAGE is required}
+    environment:
+      AUTH_JWT_AUDIENCE: surplasse-dashboard
+      AUTH_JWT_JWKS_PATH: /run/secrets/surplasse_jwt_jwks
+      AUTH_JWT_KEY_ID: ${SURPLASSE_AUTH_JWT_KEY_ID:?SURPLASSE_AUTH_JWT_KEY_ID is required}
+      AUTH_JWT_PRIVATE_KEY_PATH: /run/secrets/surplasse_jwt_private_key
+      DEPLOYMENT_PROFILE: production
+      JAVA_TOOL_OPTIONS: >-
+        -XX:MaxRAMPercentage=75.0
+        -Djava.util.logging.manager=org.jboss.logmanager.LogManager
+      QUARKUS_DATASOURCE_DEVSERVICES_ENABLED: "false"
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgresql:5432/surplasse
+      QUARKUS_DATASOURCE_PASSWORD_FILE: /run/secrets/surplasse_postgres_runtime_password
+      QUARKUS_DATASOURCE_USERNAME: surplasse_runtime
+      QUARKUS_FLYWAY_MIGRATE_AT_START: "false"
+      QUARKUS_HTTP_HOST: 0.0.0.0
+      SMTP_FROM: no-reply@surplasse.com
+      SMTP_HOST: ${SURPLASSE_SMTP_HOST:?SURPLASSE_SMTP_HOST is required}
+      SMTP_PASSWORD_FILE: /run/secrets/surplasse_smtp_password
+      SMTP_PORT: ${SURPLASSE_SMTP_PORT:?SURPLASSE_SMTP_PORT is required}
+      SMTP_START_TLS: REQUIRED
+      SMTP_TLS: "false"
+      SMTP_USERNAME_FILE: /run/secrets/surplasse_smtp_username
+      STRIPE_ACCOUNT_WEBHOOK_SECRET_FILE: >-
+        /run/secrets/surplasse_stripe_account_webhook_secret
+      STRIPE_LIVE_MODE: "true"
+      STRIPE_PAYMENT_WEBHOOK_SECRET_FILE: >-
+        /run/secrets/surplasse_stripe_payment_webhook_secret
+      STRIPE_SECRET_KEY_FILE: /run/secrets/surplasse_stripe_secret_key
+      TRUSTED_PROXIES: 172.30.10.254
+    secrets:
+      - surplasse_jwt_jwks
+      - surplasse_jwt_private_key
+      - surplasse_postgres_runtime_password
+      - surplasse_smtp_password
+      - surplasse_smtp_username
+      - surplasse_stripe_account_webhook_secret
+      - surplasse_stripe_payment_webhook_secret
+      - surplasse_stripe_secret_key
+    user: "10001:10001"
+    restart: unless-stopped
+    cpus: 1.0
+    mem_limit: 768m
+    pids_limit: 256
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - /opt/surplasse/scripts/backend-healthcheck.sh
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      app_surplasse:
+        aliases:
+          - surplasse-backend
+      db_surplasse: {}
+
+  onboarding:
+    <<: *hardened
+    image: ${SURPLASSE_ONBOARDING_IMAGE:?SURPLASSE_ONBOARDING_IMAGE is required}
+    user: "101:101"
+    restart: unless-stopped
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 64
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:8080/__health
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    networks:
+      app_surplasse:
+        aliases:
+          - surplasse-onboarding
+
+  commande:
+    <<: *hardened
+    image: ${SURPLASSE_COMMANDE_IMAGE:?SURPLASSE_COMMANDE_IMAGE is required}
+    user: "101:101"
+    restart: unless-stopped
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 64
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:8080/healthz
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    networks:
+      app_surplasse:
+        aliases:
+          - surplasse-commande
+
+  dashboard:
+    <<: *hardened
+    image: ${SURPLASSE_DASHBOARD_IMAGE:?SURPLASSE_DASHBOARD_IMAGE is required}
+    user: "101:101"
+    restart: unless-stopped
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 64
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:8080/healthz
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    networks:
+      app_surplasse:
+        aliases:
+          - surplasse-dashboard
+
+  docs:
+    <<: *hardened
+    image: ${SURPLASSE_DOCS_IMAGE:?SURPLASSE_DOCS_IMAGE is required}
+    user: "101:101"
+    restart: unless-stopped
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 64
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - --spider
+        - http://127.0.0.1:8080/healthz
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    networks:
+      app_surplasse:
+        aliases:
+          - surplasse-docs
+
+  migrator:
+    <<: *hardened
+    image: ${SURPLASSE_BACKEND_IMAGE:?SURPLASSE_BACKEND_IMAGE is required}
+    profiles:
+      - migration
+    entrypoint:
+      - /opt/surplasse/scripts/backend-migrate.sh
+    environment:
+      DEPLOYMENT_PROFILE: production
+      JAVA_TOOL_OPTIONS: >-
+        -XX:MaxRAMPercentage=75.0
+        -Djava.util.logging.manager=org.jboss.logmanager.LogManager
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgresql:5432/surplasse
+      QUARKUS_DATASOURCE_PASSWORD_FILE: /run/secrets/surplasse_postgres_migrator_password
+      QUARKUS_DATASOURCE_USERNAME: surplasse_migrator
+    secrets:
+      - surplasse_postgres_migrator_password
+    user: "10001:10001"
+    restart: "no"
+    cpus: 0.5
+    mem_limit: 512m
+    pids_limit: 128
+    stop_grace_period: 120s
+    networks:
+      db_surplasse: {}
+
+networks:
+  app_surplasse:
+    external: true
+    name: app_surplasse
+  db_surplasse:
+    external: true
+    name: db_surplasse
+
+secrets:
+  surplasse_jwt_jwks:
+    name: surplasse_jwt_jwks
+    file: /etc/vps/secrets/surplasse/surplasse-jwt-jwks
+  surplasse_jwt_private_key:
+    name: surplasse_jwt_private_key
+    file: /etc/vps/secrets/surplasse/surplasse-jwt-private-key
+  surplasse_postgres_migrator_password:
+    name: surplasse_postgres_migrator_password
+    file: /etc/vps/secrets/surplasse/surplasse-postgres-migrator-password
+  surplasse_postgres_runtime_password:
+    name: surplasse_postgres_runtime_password
+    file: /etc/vps/secrets/surplasse/surplasse-postgres-runtime-password
+  surplasse_smtp_password:
+    name: surplasse_smtp_password
+    file: /etc/vps/secrets/surplasse/surplasse-smtp-password
+  surplasse_smtp_username:
+    name: surplasse_smtp_username
+    file: /etc/vps/secrets/surplasse/surplasse-smtp-username
+  surplasse_stripe_account_webhook_secret:
+    name: surplasse_stripe_account_webhook_secret
+    file: /etc/vps/secrets/surplasse/surplasse-stripe-account-webhook-secret
+  surplasse_stripe_payment_webhook_secret:
+    name: surplasse_stripe_payment_webhook_secret
+    file: /etc/vps/secrets/surplasse/surplasse-stripe-payment-webhook-secret
+  surplasse_stripe_secret_key:
+    name: surplasse_stripe_secret_key
+    file: /etc/vps/secrets/surplasse/surplasse-stripe-secret-key

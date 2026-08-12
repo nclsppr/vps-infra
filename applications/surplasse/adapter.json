@@ -1,0 +1,44 @@
+{
+  "activation_policy": "locked",
+  "blocked_by": [
+    "application-release-controller",
+    "backend-migration-entrypoint-image",
+    "caddy-app-network-and-fixed-address",
+    "dns-cutover",
+    "ovh-zone-scoped-dns-credentials",
+    "postgres-app-network",
+    "postgres-application-provisioner",
+    "production-image-provenance",
+    "production-secrets",
+    "prometheus-job-and-app-network",
+    "protected-main",
+    "public-smoke",
+    "restore-proof",
+    "stripe-connect-production-adapter",
+    "vps-integration-bundle"
+  ],
+  "integration": {
+    "caddy_route": "platform/caddy/routes/surplasse.caddy.disabled",
+    "prometheus_rules": "platform/observability/prometheus/rules/surplasse.yml.disabled",
+    "prometheus_targets": "platform/observability/prometheus/targets/surplasse.yml.disabled"
+  },
+  "migration": {
+    "entrypoint": "/opt/surplasse/scripts/backend-migrate.sh",
+    "published_in_backend_image": false,
+    "role": "surplasse_migrator",
+    "runtime_auto_migrate": false
+  },
+  "runtime_services": [
+    "backend",
+    "commande",
+    "dashboard",
+    "docs",
+    "onboarding"
+  ],
+  "schema": 1,
+  "source_repository": "nclsppr/surplasse",
+  "source_revision": "fab494ad2940f9ee46bf9a186ec7fb2735185367",
+  "transient_services": [
+    "migrator"
+  ]
+}
