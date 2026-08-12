@@ -202,7 +202,8 @@ platform/
 - [ ] prouver qu’aucun fichier interne ou d’outillage n’est publié ;
 - [ ] publier l’archive comme artefact OCI GHCR ;
 - [ ] générer et sonder l’inventaire complet EN/FR, Work, CV, Blog et articles,
-      Dashboard, Claude, archive, erreurs, assets et redirections ;
+      Dashboard, Claude, archive, erreurs et assets ;
+- [ ] sonder séparément les redirections de domaines ;
 - [ ] conserver Pages jusqu’à la bascule DNS validée.
 
 ### Papers Empire
@@ -282,14 +283,21 @@ Critères :
 - [ ] empreinte d’hôte préenregistrée ;
 - [ ] commit d’infrastructure complet et présent sur `main` ;
 - [ ] pull avant activation ;
+- [x] install ORAS 1.3.0 from checksum-locked `amd64` and `arm64` archives;
+- [x] validate the Personal and Papers Empire OCI envelopes, profile limits,
+      unsafe tar cases, and the full archive-to-route-inventory bijection;
+- [x] extract each static release without privilege, make it root-owned, and
+      probe every route through the exact Caddy image before activation;
 - [ ] `compose up --wait` ciblé ;
-- [ ] bascule statique atomique ;
+- [x] bascule statique atomique dans le matérialiseur autonome ;
 - [ ] état précédent conservé ;
 - [ ] rollback automatique des statiques et des échecs applicatifs
       pré-migration ; arrêt explicite après migration sans compatibilité prouvée ;
 - [ ] digests en échec placés en quarantaine jusqu’au revert ou à une action
       explicite ;
 - [ ] journal de déploiement durable ;
+- [ ] connect the materializer to a separately reviewed live applicator, then
+      add public TLS rollback, persistent quarantine, and release retention;
 - [x] environnement GitHub et concurrence globale configurés ; l’interrupteur
       de production reste volontairement à `false` jusqu’aux preuves de la
       phase 6.

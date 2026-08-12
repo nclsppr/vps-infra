@@ -49,6 +49,8 @@
     shell: /usr/sbin/nologin
     create_home: false
     home: /nonexistent
+    groups: ""
+    append: false
     password_lock: true
     state: present
 
@@ -79,12 +81,21 @@
     group: root
     mode: "0755"
 
-- name: Create per-site release roots
+- name: Create per-site static roots
+  ansible.builtin.file:
+    path: "/srv/www/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ vps_static_sites }}"
+
+- name: Create protected per-site release roots
   ansible.builtin.file:
     path: "/srv/www/{{ item }}/releases"
     state: directory
-    owner: "{{ vps_static_user }}"
-    group: "{{ vps_static_user }}"
+    owner: root
+    group: root
     mode: "0755"
   loop: "{{ vps_static_sites }}"
 

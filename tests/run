@@ -68,6 +68,7 @@ python3 "$TESTS_DIR/test_github_evidence.py"
 python3 "$TESTS_DIR/test_platform_integration.py"
 python3 "$TESTS_DIR/test_platform_proof.py"
 python3 "$TESTS_DIR/test_repository_contract.py"
+python3 "$TESTS_DIR/test_static_materializer.py"
 
 parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "deploy $VALID_SHA")
 [[ $parsed == "$VALID_SHA" ]]

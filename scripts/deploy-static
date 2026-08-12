@@ -1,0 +1,1464 @@
+#!/usr/bin/env python3
+"""Materialize and atomically activate one allowlisted static OCI release."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import datetime
+import fcntl
+import gzip
+import hashlib
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import unicodedata
+import urllib.parse
+import zlib
+from pathlib import Path
+from typing import Any, BinaryIO, Iterator
+
+
+MIB = 1024 * 1024
+OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+OCI_EMPTY_CONFIG = {
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "size": 2,
+    "data": "e30=",
+}
+SITE_ARTIFACT_TYPE = "application/vnd.vps-infra.static-site.v1"
+SITE_LAYER_MEDIA_TYPE = "application/vnd.vps-infra.static-site.v1+tar+gzip"
+ROUTES_ARTIFACT_TYPE = "application/vnd.vps-infra.route-inventory.v1"
+ROUTES_LAYER_MEDIA_TYPE = "application/vnd.vps-infra.route-inventory.v1+json"
+SOURCE_ANNOTATION = "org.opencontainers.image.source"
+REVISION_ANNOTATION = "org.opencontainers.image.revision"
+CREATED_ANNOTATION = "org.opencontainers.image.created"
+TITLE_ANNOTATION = "org.opencontainers.image.title"
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RFC3339_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
+CADDY_IMAGE_RE = re.compile(
+    r"^ghcr\.io/nclsppr/vps-infra/caddy"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"
+)
+GZIP_HEADER = bytes.fromhex("1f8b08000000000002ff")
+ORAS_VERSION = "1.3.0"
+ORAS_BINARY_SHA256 = {
+    "x86_64": "040e140304b7dbdd9b40dacd798e2303cea44ad84eeb210750afdf15f1dcf8b4",
+    "aarch64": "e2b67c4efb35f20a546aacc680e0f81f907d3cf4cf9f1b2040c34bb471c428f1",
+}
+PRODUCTION_ROOT = Path("/srv/www")
+ORAS_PATH = Path("/usr/local/bin/oras")
+DOCKER_PATH = Path("/usr/bin/docker")
+CURL_PATH = Path("/usr/bin/curl")
+SETPRIV_PATH = Path("/usr/bin/setpriv")
+PYTHON_PATH = Path("/usr/bin/python3")
+PLATFORM_ENV_PATH = Path("/srv/vps/repository/platform/.env.example")
+STATIC_USER = "vps-static"
+READ_CHUNK = 1024 * 1024
+
+
+class StaticDeploymentError(ValueError):
+    """The candidate static release violates the materialization contract."""
+
+
+@dataclasses.dataclass(frozen=True)
+class StaticProfile:
+    application: str
+    source_repository: str
+    source_url: str
+    site_repository: str
+    routes_repository: str
+    max_archive_bytes: int
+    max_uncompressed_bytes: int
+    max_files: int
+    max_members: int
+    max_tar_stream_bytes: int
+    file_mode: int
+    directory_mode: int
+    require_pax_revision: bool
+    probe_timeout_seconds: int
+
+
+@dataclasses.dataclass(frozen=True)
+class LayerContract:
+    manifest_digest: str
+    layer_digest: str
+    layer_size: int
+    created: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RouteFile:
+    file: str
+    route: str
+    size: int
+    sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class InventoryContract:
+    archive_bytes: int
+    archive_sha256: str
+    file_count: int
+    uncompressed_bytes: int
+    files: tuple[RouteFile, ...]
+
+
+PROFILES = {
+    "personal": StaticProfile(
+        application="personal",
+        source_repository="nclsppr/personal",
+        source_url="https://github.com/nclsppr/personal",
+        site_repository="ghcr.io/nclsppr/personal/site",
+        routes_repository="ghcr.io/nclsppr/personal/routes",
+        max_archive_bytes=50 * MIB,
+        max_uncompressed_bytes=100 * MIB,
+        max_files=2_000,
+        max_members=4_001,
+        max_tar_stream_bytes=128 * MIB,
+        file_mode=0o664,
+        directory_mode=0o775,
+        require_pax_revision=True,
+        probe_timeout_seconds=300,
+    ),
+    "papersempire": StaticProfile(
+        application="papersempire",
+        source_repository="nclsppr/papersempire",
+        source_url="https://github.com/nclsppr/papersempire",
+        site_repository="ghcr.io/nclsppr/papersempire/site",
+        routes_repository="ghcr.io/nclsppr/papersempire/routes",
+        max_archive_bytes=75 * MIB,
+        max_uncompressed_bytes=150 * MIB,
+        max_files=5_000,
+        max_members=10_001,
+        max_tar_stream_bytes=256 * MIB,
+        file_mode=0o644,
+        directory_mode=0o755,
+        require_pax_revision=False,
+        probe_timeout_seconds=600,
+    ),
+}
+
+
+def fail(message: str) -> None:
+    raise StaticDeploymentError(message)
+
+
+def require_exact_keys(
+    value: dict[str, Any],
+    expected: set[str],
+    label: str,
+) -> None:
+    actual = set(value)
+    if actual == expected:
+        return
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    details: list[str] = []
+    if missing:
+        details.append(f"missing {', '.join(missing)}")
+    if extra:
+        details.append(f"unknown {', '.join(extra)}")
+    fail(f"{label} has invalid keys: {'; '.join(details)}")
+
+
+def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"JSON contains duplicate key {key!r}")
+        value[key] = item
+    return value
+
+
+def reject_json_constant(value: str) -> None:
+    fail(f"JSON contains invalid constant {value}")
+
+
+def strict_json_bytes(data: bytes, label: str, *, canonical: bool) -> Any:
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError as exc:
+        fail(f"{label} must be ASCII JSON: {exc}")
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_json_constant,
+        )
+    except (json.JSONDecodeError, StaticDeploymentError) as exc:
+        fail(f"{label} is invalid: {exc}")
+    if canonical:
+        encoded = (
+            json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+            + "\n"
+        ).encode("ascii")
+        if data != encoded:
+            fail(f"{label} is not canonical compact JSON with one final newline")
+    return value
+
+
+def is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def sha256_file(path: Path, *, max_bytes: int | None = None) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(READ_CHUNK):
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    fail(f"{path.name} exceeds the {max_bytes}-byte limit")
+                digest.update(chunk)
+    except OSError as exc:
+        fail(f"cannot read {path}: {exc}")
+    return digest.hexdigest(), total
+
+
+def parse_digest_reference(reference: str, repository: str, label: str) -> str:
+    prefix = f"{repository}@sha256:"
+    if not reference.startswith(prefix):
+        fail(f"{label} must use repository {repository!r} without a tag")
+    digest = reference.removeprefix(f"{repository}@")
+    if not SHA256_RE.fullmatch(digest):
+        fail(f"{label} must end in one lowercase sha256 digest")
+    return digest
+
+
+def parse_created(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not RFC3339_RE.fullmatch(value):
+        fail(f"{label} must be an RFC 3339 timestamp with a timezone")
+    normalized = value.removesuffix("Z") + ("+00:00" if value.endswith("Z") else "")
+    try:
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        fail(f"{label} is invalid: {exc}")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        fail(f"{label} must contain a timezone offset")
+    return value
+
+
+def validate_manifest(
+    path: Path,
+    reference: str,
+    profile: StaticProfile,
+    source_revision: str,
+    *,
+    kind: str,
+) -> LayerContract:
+    if kind == "site":
+        repository = profile.site_repository
+        artifact_type = SITE_ARTIFACT_TYPE
+        layer_media_type = SITE_LAYER_MEDIA_TYPE
+        title = "site.tar.gz"
+        max_layer_size = profile.max_archive_bytes
+    elif kind == "routes":
+        repository = profile.routes_repository
+        artifact_type = ROUTES_ARTIFACT_TYPE
+        layer_media_type = ROUTES_LAYER_MEDIA_TYPE
+        title = "routes.json"
+        max_layer_size = 2 * MIB
+    else:
+        fail(f"unsupported manifest kind {kind!r}")
+
+    expected_digest = parse_digest_reference(reference, repository, f"{kind} reference")
+    raw = path.read_bytes()
+    if len(raw) > 64 * 1024:
+        fail(f"{kind} manifest exceeds 65536 bytes")
+    actual_digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    if actual_digest != expected_digest:
+        fail(f"{kind} manifest digest does not match its immutable reference")
+    value = strict_json_bytes(raw, f"{kind} manifest", canonical=False)
+    if not isinstance(value, dict):
+        fail(f"{kind} manifest must be a JSON object")
+    require_exact_keys(
+        value,
+        {"schemaVersion", "mediaType", "artifactType", "config", "layers", "annotations"},
+        f"{kind} manifest",
+    )
+    if value["schemaVersion"] != 2 or isinstance(value["schemaVersion"], bool):
+        fail(f"{kind} manifest schemaVersion must be 2")
+    if value["mediaType"] != OCI_MANIFEST_MEDIA_TYPE:
+        fail(f"{kind} manifest mediaType is not the OCI image manifest type")
+    if value["artifactType"] != artifact_type:
+        fail(f"{kind} manifest artifactType is not {artifact_type}")
+    if value["config"] != OCI_EMPTY_CONFIG:
+        fail(f"{kind} manifest must use the exact embedded empty OCI config")
+    layers = value["layers"]
+    if not isinstance(layers, list) or len(layers) != 1 or not isinstance(layers[0], dict):
+        fail(f"{kind} manifest must contain exactly one layer")
+    layer = layers[0]
+    require_exact_keys(
+        layer,
+        {"mediaType", "digest", "size", "annotations"},
+        f"{kind} layer",
+    )
+    if layer["mediaType"] != layer_media_type:
+        fail(f"{kind} layer mediaType is not {layer_media_type}")
+    if not isinstance(layer["digest"], str) or not SHA256_RE.fullmatch(layer["digest"]):
+        fail(f"{kind} layer digest must be one lowercase sha256 digest")
+    if not is_int(layer["size"]) or layer["size"] < 1 or layer["size"] > max_layer_size:
+        fail(f"{kind} layer size is outside the profile limit")
+    annotations = layer["annotations"]
+    if not isinstance(annotations, dict):
+        fail(f"{kind} layer annotations must be an object")
+    require_exact_keys(annotations, {TITLE_ANNOTATION}, f"{kind} layer annotations")
+    if annotations[TITLE_ANNOTATION] != title:
+        fail(f"{kind} layer title must be {title!r}")
+
+    annotations = value["annotations"]
+    if not isinstance(annotations, dict):
+        fail(f"{kind} manifest annotations must be an object")
+    require_exact_keys(
+        annotations,
+        {CREATED_ANNOTATION, SOURCE_ANNOTATION, REVISION_ANNOTATION},
+        f"{kind} manifest annotations",
+    )
+    if annotations[SOURCE_ANNOTATION] != profile.source_url:
+        fail(f"{kind} source annotation does not match {profile.source_url}")
+    if annotations[REVISION_ANNOTATION] != source_revision:
+        fail(f"{kind} revision annotation does not match the requested source revision")
+    created = parse_created(annotations[CREATED_ANNOTATION], f"{kind} created annotation")
+    return LayerContract(
+        manifest_digest=expected_digest,
+        layer_digest=layer["digest"],
+        layer_size=layer["size"],
+        created=created,
+    )
+
+
+def validate_relative_path(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        fail(f"{label} must be a non-empty string")
+    if value.startswith("/") or "\\" in value or "\x00" in value:
+        fail(f"{label} must be a relative POSIX path")
+    if unicodedata.normalize("NFC", value) != value:
+        fail(f"{label} must use NFC Unicode normalization")
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        fail(f"{label} must not contain control characters")
+    encoded = value.encode("utf-8")
+    if len(encoded) > 1024:
+        fail(f"{label} exceeds 1024 UTF-8 bytes")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        fail(f"{label} contains an empty, dot, or traversal component")
+    if any(len(part.encode("utf-8")) > 255 for part in parts):
+        fail(f"{label} contains a component longer than 255 UTF-8 bytes")
+    return value
+
+
+def route_for_file(file_name: str) -> str:
+    if file_name == "index.html":
+        route = "/"
+    elif file_name.endswith("/index.html"):
+        route = f"/{file_name[:-len('index.html')]}"
+    else:
+        route = f"/{file_name}"
+    return urllib.parse.quote(route, safe="/-._~")
+
+
+def validate_inventory(
+    path: Path,
+    profile: StaticProfile,
+    source_revision: str,
+    site_layer: LayerContract,
+) -> InventoryContract:
+    raw = path.read_bytes()
+    if len(raw) > 2 * MIB:
+        fail("route inventory exceeds the 2 MiB consumer limit")
+    value = strict_json_bytes(raw, "route inventory", canonical=True)
+    if not isinstance(value, dict):
+        fail("route inventory must be a JSON object")
+    require_exact_keys(value, {"contract", "schema", "site", "source", "routes"}, "route inventory")
+    if value["contract"] != "vps-infra.route-inventory.v1":
+        fail("route inventory has an unsupported contract")
+    if value["schema"] != 1 or isinstance(value["schema"], bool):
+        fail("route inventory schema must be 1")
+
+    source = value["source"]
+    if not isinstance(source, dict):
+        fail("route inventory source must be an object")
+    require_exact_keys(source, {"repository", "revision"}, "route inventory source")
+    if source["repository"] != profile.source_repository:
+        fail("route inventory source repository does not match the application")
+    if source["revision"] != source_revision:
+        fail("route inventory source revision does not match the requested revision")
+
+    site = value["site"]
+    if not isinstance(site, dict):
+        fail("route inventory site metadata must be an object")
+    require_exact_keys(
+        site,
+        {"archive_bytes", "archive_sha256", "file_count", "uncompressed_bytes"},
+        "route inventory site metadata",
+    )
+    for key in ("archive_bytes", "file_count", "uncompressed_bytes"):
+        if not is_int(site[key]) or site[key] < 0:
+            fail(f"route inventory site.{key} must be a non-negative integer")
+    if not isinstance(site["archive_sha256"], str) or not HEX_SHA256_RE.fullmatch(site["archive_sha256"]):
+        fail("route inventory site.archive_sha256 must be 64 lowercase hex characters")
+    if site["archive_bytes"] != site_layer.layer_size:
+        fail("route inventory archive size does not match the site layer descriptor")
+    if f"sha256:{site['archive_sha256']}" != site_layer.layer_digest:
+        fail("route inventory archive checksum does not match the site layer descriptor")
+    if site["archive_bytes"] > profile.max_archive_bytes:
+        fail("route inventory archive size exceeds the application profile")
+    if site["file_count"] < 1 or site["file_count"] > profile.max_files:
+        fail("route inventory file count exceeds the application profile")
+    if site["uncompressed_bytes"] < 1 or site["uncompressed_bytes"] > profile.max_uncompressed_bytes:
+        fail("route inventory uncompressed size exceeds the application profile")
+
+    routes = value["routes"]
+    if not isinstance(routes, list):
+        fail("route inventory routes must be an array")
+    if len(routes) != site["file_count"] or len(routes) > profile.max_files:
+        fail("route inventory route count does not match site.file_count")
+    files: list[RouteFile] = []
+    file_names: set[str] = set()
+    route_names: set[str] = set()
+    total_bytes = 0
+    for index, item in enumerate(routes):
+        label = f"route inventory routes[{index}]"
+        if not isinstance(item, dict):
+            fail(f"{label} must be an object")
+        require_exact_keys(item, {"bytes", "file", "path", "sha256", "status"}, label)
+        file_name = validate_relative_path(item["file"], f"{label}.file")
+        if file_name in file_names:
+            fail(f"{label}.file duplicates {file_name!r}")
+        file_names.add(file_name)
+        if not is_int(item["bytes"]) or item["bytes"] < 0:
+            fail(f"{label}.bytes must be a non-negative integer")
+        if not isinstance(item["sha256"], str) or not HEX_SHA256_RE.fullmatch(item["sha256"]):
+            fail(f"{label}.sha256 must be 64 lowercase hex characters")
+        expected_route = route_for_file(file_name)
+        if item["path"] != expected_route:
+            fail(f"{label}.path does not match the canonical route {expected_route!r}")
+        if len(expected_route.encode("ascii")) > 4096:
+            fail(f"{label}.path exceeds 4096 bytes")
+        if expected_route in route_names:
+            fail(f"{label}.path duplicates {expected_route!r}")
+        route_names.add(expected_route)
+        if item["status"] != 200 or isinstance(item["status"], bool):
+            fail(f"{label}.status must be 200")
+        total_bytes += item["bytes"]
+        if total_bytes > profile.max_uncompressed_bytes:
+            fail("route inventory byte sum exceeds the application profile")
+        files.append(
+            RouteFile(
+                file=file_name,
+                route=expected_route,
+                size=item["bytes"],
+                sha256=item["sha256"],
+            )
+        )
+    if total_bytes != site["uncompressed_bytes"]:
+        fail("route inventory byte sum does not match site.uncompressed_bytes")
+    if "index.html" not in file_names:
+        fail("route inventory must contain the root index.html file")
+    return InventoryContract(
+        archive_bytes=site["archive_bytes"],
+        archive_sha256=site["archive_sha256"],
+        file_count=site["file_count"],
+        uncompressed_bytes=site["uncompressed_bytes"],
+        files=tuple(files),
+    )
+
+
+def validate_single_gzip(path: Path, profile: StaticProfile) -> None:
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(len(GZIP_HEADER))
+            if header != GZIP_HEADER:
+                fail("site archive must use the deterministic gzip header")
+            stream.seek(0)
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            total = 0
+            while chunk := stream.read(READ_CHUNK):
+                remaining = profile.max_tar_stream_bytes - total + 1
+                output = decompressor.decompress(chunk, max(1, remaining))
+                total += len(output)
+                if total > profile.max_tar_stream_bytes or decompressor.unconsumed_tail:
+                    fail("site tar stream exceeds the application profile")
+                if decompressor.eof:
+                    if decompressor.unused_data or stream.read(1):
+                        fail("site archive contains trailing data or concatenated gzip members")
+                    break
+            if not decompressor.eof:
+                fail("site archive is a truncated gzip stream")
+    except (OSError, zlib.error) as exc:
+        fail(f"site archive is not a valid gzip stream: {exc}")
+
+
+def parse_tar_size(field: bytes) -> int:
+    stripped = field.rstrip(b"\x00 ").lstrip(b" ")
+    if not stripped:
+        return 0
+    if not re.fullmatch(rb"[0-7]+", stripped):
+        fail("tar header uses an unsupported size encoding")
+    return int(stripped, 8)
+
+
+def consume_exact(
+    stream: BinaryIO,
+    size: int,
+    label: str,
+    *,
+    require_zero: bool = False,
+) -> bytes | None:
+    remaining = size
+    captured = bytearray() if size <= 1024 else None
+    while remaining:
+        chunk = stream.read(min(READ_CHUNK, remaining))
+        if not chunk:
+            fail(f"site archive ended while reading {label}")
+        if require_zero and any(chunk):
+            fail(f"site archive {label} is not zero-filled")
+        if captured is not None:
+            captured.extend(chunk)
+        remaining -= len(chunk)
+    return bytes(captured) if captured is not None else None
+
+
+def scan_raw_tar(path: Path, profile: StaticProfile, source_revision: str) -> None:
+    raw_members = 0
+    pax_headers = 0
+    zero_blocks = 0
+    try:
+        with gzip.open(path, "rb") as stream:
+            while True:
+                header = stream.read(512)
+                if not header:
+                    break
+                if len(header) != 512:
+                    fail("site tar stream is not aligned to 512-byte records")
+                if header == bytes(512):
+                    zero_blocks += 1
+                    continue
+                if zero_blocks:
+                    fail("site tar stream contains data after its end marker")
+                type_flag = header[156:157]
+                size = parse_tar_size(header[124:136])
+                name = header[:100].split(b"\x00", maxsplit=1)[0]
+                if type_flag == b"g":
+                    if not profile.require_pax_revision or raw_members != 0 or pax_headers != 0:
+                        fail("site archive contains an unexpected global PAX header")
+                    if name != b"pax_global_header" or size > 1024:
+                        fail("site archive contains an invalid global PAX header")
+                    payload = consume_exact(stream, size, "global PAX data")
+                    expected = f"52 comment={source_revision}\n".encode("ascii")
+                    if payload != expected:
+                        fail("site archive global PAX comment does not match the source revision")
+                    pax_headers += 1
+                elif type_flag in {b"\x00", b"0", b"5"}:
+                    consume_exact(stream, size, "member data")
+                    raw_members += 1
+                    if raw_members > profile.max_members:
+                        fail("site archive member count exceeds the application profile")
+                else:
+                    label = type_flag.decode("ascii", errors="backslashreplace")
+                    fail(f"site archive contains unsupported tar type {label!r}")
+                padding = (-size) % 512
+                if padding:
+                    consume_exact(
+                        stream,
+                        padding,
+                        "member padding",
+                        require_zero=True,
+                    )
+            if zero_blocks < 2:
+                fail("site tar stream has no complete end marker")
+            if profile.require_pax_revision and pax_headers != 1:
+                fail("personal site archive must contain one source-revision PAX header")
+            if not profile.require_pax_revision and pax_headers:
+                fail("Papers Empire archive must not contain a PAX header")
+    except (OSError, EOFError) as exc:
+        fail(f"cannot scan site tar stream: {exc}")
+
+
+def tar_member_path(member: tarfile.TarInfo, label: str) -> str:
+    name = validate_relative_path(member.name, label)
+    if name == "site":
+        return ""
+    if not name.startswith("site/"):
+        fail(f"{label} is outside the single site/ root")
+    return validate_relative_path(name.removeprefix("site/"), label)
+
+
+def required_directories(files: Iterator[str]) -> set[str]:
+    directories = {""}
+    for file_name in files:
+        parts = file_name.split("/")[:-1]
+        for index in range(1, len(parts) + 1):
+            directories.add("/".join(parts[:index]))
+    return directories
+
+
+def validate_archive(
+    path: Path,
+    profile: StaticProfile,
+    source_revision: str,
+    inventory: InventoryContract,
+) -> None:
+    archive_digest, archive_size = sha256_file(path, max_bytes=profile.max_archive_bytes)
+    if archive_size != inventory.archive_bytes or archive_digest != inventory.archive_sha256:
+        fail("site archive bytes or checksum do not match the route inventory")
+    validate_single_gzip(path, profile)
+    scan_raw_tar(path, profile, source_revision)
+
+    expected_files = {item.file: item for item in inventory.files}
+    seen_members: set[str] = set()
+    seen_files: set[str] = set()
+    seen_directories: set[str] = set()
+    common_mtime: int | float | None = None
+    total_bytes = 0
+    try:
+        with tarfile.open(path, mode="r:gz", errorlevel=2) as archive:
+            expected_pax = {"comment": source_revision} if profile.require_pax_revision else {}
+            if archive.pax_headers != expected_pax:
+                fail("site archive PAX headers do not match the application profile")
+            for index, member in enumerate(archive):
+                if index >= profile.max_members:
+                    fail("site archive member count exceeds the application profile")
+                relative = tar_member_path(member, f"tar member {index}")
+                if relative in seen_members:
+                    fail(f"site archive contains duplicate member {relative!r}")
+                seen_members.add(relative)
+                if member.uid != 0 or member.gid != 0:
+                    fail(f"tar member {member.name!r} must use uid 0 and gid 0")
+                if member.pax_headers != expected_pax:
+                    fail(f"tar member {member.name!r} has unexpected PAX metadata")
+                if getattr(member, "sparse", None):
+                    fail(f"tar member {member.name!r} must not be sparse")
+                if common_mtime is None:
+                    common_mtime = member.mtime
+                elif profile.require_pax_revision and member.mtime != common_mtime:
+                    fail("personal site archive members must use one commit timestamp")
+                if profile.require_pax_revision:
+                    if not is_int(member.mtime) or member.mtime < 0:
+                        fail(f"tar member {member.name!r} has an invalid timestamp")
+                elif member.mtime != 0:
+                    fail(f"tar member {member.name!r} must use timestamp 0")
+
+                if member.isdir():
+                    if member.mode != profile.directory_mode:
+                        fail(f"tar directory {member.name!r} has an unexpected mode")
+                    seen_directories.add(relative)
+                    continue
+                if not member.isreg():
+                    fail(f"tar member {member.name!r} is not a regular file or directory")
+                if not relative:
+                    fail("site archive root must be a directory")
+                if member.mode != profile.file_mode:
+                    fail(f"tar file {member.name!r} has an unexpected mode")
+                expected = expected_files.get(relative)
+                if expected is None:
+                    fail(f"site archive file {relative!r} is absent from the route inventory")
+                if member.size != expected.size:
+                    fail(f"site archive file {relative!r} has an unexpected size")
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    fail(f"cannot read tar file {member.name!r}")
+                digest = hashlib.sha256()
+                read_bytes = 0
+                while chunk := extracted.read(READ_CHUNK):
+                    read_bytes += len(chunk)
+                    total_bytes += len(chunk)
+                    if total_bytes > profile.max_uncompressed_bytes:
+                        fail("site archive payload exceeds the application profile")
+                    digest.update(chunk)
+                if read_bytes != expected.size or digest.hexdigest() != expected.sha256:
+                    fail(f"site archive file {relative!r} does not match its inventory entry")
+                seen_files.add(relative)
+    except (OSError, tarfile.TarError) as exc:
+        fail(f"site archive is invalid: {exc}")
+
+    if seen_files != set(expected_files):
+        missing = sorted(set(expected_files) - seen_files)
+        fail(f"site archive is missing inventory files: {', '.join(missing[:5])}")
+    expected_directories = required_directories(iter(expected_files))
+    if seen_directories != expected_directories:
+        fail("site archive directories do not match the file hierarchy exactly")
+    if len(seen_files) != inventory.file_count or total_bytes != inventory.uncompressed_bytes:
+        fail("site archive totals do not match the route inventory")
+
+
+def validate_bundle(
+    archive_path: Path,
+    inventory_path: Path,
+    profile: StaticProfile,
+    source_revision: str,
+    site_layer: LayerContract,
+) -> InventoryContract:
+    inventory = validate_inventory(inventory_path, profile, source_revision, site_layer)
+    validate_archive(archive_path, profile, source_revision, inventory)
+    return inventory
+
+
+@contextlib.contextmanager
+def opened_directory(root_fd: int, parts: list[str]) -> Iterator[int]:
+    current_fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        yield current_fd
+    finally:
+        os.close(current_fd)
+
+
+def extract_archive(
+    archive_path: Path,
+    destination: Path,
+    inventory: InventoryContract,
+) -> None:
+    destination_stat = destination.lstat()
+    if not stat.S_ISDIR(destination_stat.st_mode) or destination_stat.st_uid != os.geteuid():
+        fail("extraction destination must be an owned regular directory")
+    if stat.S_IMODE(destination_stat.st_mode) != 0o700 or any(destination.iterdir()):
+        fail("extraction destination must be empty with mode 0700")
+    root_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        directories = sorted(required_directories(iter(item.file for item in inventory.files)))
+        for directory in directories:
+            if not directory:
+                continue
+            with opened_directory(root_fd, directory.split("/")) as directory_fd:
+                os.fchmod(directory_fd, 0o755)
+        with tarfile.open(archive_path, mode="r:gz", errorlevel=2) as archive:
+            for item in inventory.files:
+                member = archive.getmember(f"site/{item.file}")
+                source = archive.extractfile(member)
+                if source is None:
+                    fail(f"cannot extract {item.file!r}")
+                parts = item.file.split("/")
+                with opened_directory(root_fd, parts[:-1]) as parent_fd:
+                    output_fd = os.open(
+                        parts[-1],
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    digest = hashlib.sha256()
+                    written = 0
+                    try:
+                        while chunk := source.read(READ_CHUNK):
+                            written += len(chunk)
+                            digest.update(chunk)
+                            view = memoryview(chunk)
+                            while view:
+                                count = os.write(output_fd, view)
+                                view = view[count:]
+                        if written != item.size or digest.hexdigest() != item.sha256:
+                            fail(f"extracted file {item.file!r} changed during extraction")
+                        os.fchmod(output_fd, 0o644)
+                        os.fsync(output_fd)
+                    finally:
+                        os.close(output_fd)
+        os.fchmod(root_fd, 0o755)
+        os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def filesystem_inventory(
+    release: Path,
+    inventory: InventoryContract,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    release_metadata = release.lstat()
+    if not stat.S_ISDIR(release_metadata.st_mode):
+        fail("materialized release root is not a directory")
+    if release_metadata.st_uid != expected_uid or release_metadata.st_gid != expected_gid:
+        fail("materialized release root has an unexpected owner")
+    if stat.S_IMODE(release_metadata.st_mode) != 0o755:
+        fail("materialized release root must use mode 0755")
+    actual_files: dict[str, tuple[int, str]] = {}
+    actual_directories: set[str] = {""}
+    for current, directories, files in os.walk(release, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for name in list(directories):
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if not stat.S_ISDIR(metadata.st_mode):
+                fail(f"release contains a non-directory entry at {candidate}")
+            if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid:
+                fail(f"release directory {candidate} has an unexpected owner")
+            if stat.S_IMODE(metadata.st_mode) != 0o755:
+                fail(f"release directory {candidate} must use mode 0755")
+            relative = candidate.relative_to(release).as_posix()
+            validate_relative_path(relative, "release directory")
+            actual_directories.add(relative)
+        for name in files:
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                fail(f"release contains a non-regular entry at {candidate}")
+            if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid:
+                fail(f"release file {candidate} has an unexpected owner")
+            if stat.S_IMODE(metadata.st_mode) != 0o644:
+                fail(f"release file {candidate} must use mode 0644")
+            relative = candidate.relative_to(release).as_posix()
+            validate_relative_path(relative, "release file")
+            digest, size = sha256_file(candidate)
+            actual_files[relative] = (size, digest)
+    expected_files = {item.file: (item.size, item.sha256) for item in inventory.files}
+    if actual_files != expected_files:
+        fail("materialized release files do not match the route inventory")
+    if actual_directories != required_directories(iter(expected_files)):
+        fail("materialized release directories do not match the route inventory")
+
+
+def lock_down_release(path: Path) -> None:
+    for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for name in files:
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                fail(f"extracted release contains an unsafe file at {candidate}")
+            os.chown(candidate, 0, 0, follow_symlinks=False)
+            os.chmod(candidate, 0o644, follow_symlinks=False)
+        for name in directories:
+            candidate = current_path / name
+            metadata = candidate.lstat()
+            if not stat.S_ISDIR(metadata.st_mode):
+                fail(f"extracted release contains an unsafe directory at {candidate}")
+            os.chown(candidate, 0, 0, follow_symlinks=False)
+            os.chmod(candidate, 0o755, follow_symlinks=False)
+    os.chown(path, 0, 0, follow_symlinks=False)
+    os.chmod(path, 0o755, follow_symlinks=False)
+
+
+def safe_environment(home: Path) -> dict[str, str]:
+    return {
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "XDG_CONFIG_HOME": str(home / ".config"),
+    }
+
+
+def run_checked(
+    command: list[str],
+    *,
+    environment: dict[str, str],
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"command {command[0]} failed: {exc}")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        fail(f"command {command[0]} failed: {detail[:1000]}")
+    return result
+
+
+def fetch_manifest(reference: str, destination: Path, registry_config: Path, environment: dict[str, str]) -> None:
+    run_checked(
+        [
+            str(ORAS_PATH),
+            "manifest",
+            "fetch",
+            "--media-type",
+            OCI_MANIFEST_MEDIA_TYPE,
+            "--registry-config",
+            str(registry_config),
+            "--output",
+            str(destination),
+            reference,
+        ],
+        environment=environment,
+    )
+
+
+def fetch_blob(
+    repository: str,
+    descriptor: LayerContract,
+    destination: Path,
+    registry_config: Path,
+    environment: dict[str, str],
+) -> None:
+    run_checked(
+        [
+            str(ORAS_PATH),
+            "blob",
+            "fetch",
+            "--no-tty",
+            "--registry-config",
+            str(registry_config),
+            "--output",
+            str(destination),
+            f"{repository}@{descriptor.layer_digest}",
+        ],
+        environment=environment,
+    )
+    digest, size = sha256_file(destination, max_bytes=descriptor.layer_size)
+    if f"sha256:{digest}" != descriptor.layer_digest or size != descriptor.layer_size:
+        fail(f"downloaded layer from {repository} does not match its descriptor")
+    destination.chmod(0o444)
+
+
+def assert_protected_executable(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        fail(f"required executable {path} is unavailable: {exc}")
+    if stat.S_ISLNK(metadata.st_mode):
+        target = path.resolve(strict=True)
+        metadata = target.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+        fail(f"required executable {path} is not a protected root-owned file")
+    if metadata.st_mode & 0o022 or not metadata.st_mode & 0o111:
+        fail(f"required executable {path} is writable by group/others or not executable")
+
+
+def read_promoted_caddy_image(path: Path, *, require_root_owner: bool) -> str:
+    try:
+        metadata = path.lstat()
+        raw = path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read platform image promotion file {path}: {exc}")
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        fail("platform image promotion file must be a regular file")
+    if require_root_owner and (metadata.st_uid != 0 or metadata.st_gid != 0):
+        fail("platform image promotion file must be root-owned")
+    if metadata.st_mode & 0o022:
+        fail("platform image promotion file must not be writable by group or others")
+    if len(raw) > 16 * 1024:
+        fail("platform image promotion file exceeds 16 KiB")
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        fail(f"platform image promotion file must be ASCII: {exc}")
+    assignments: dict[str, str] = {}
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.count("=") != 1:
+            fail(f"platform image promotion line {line_number} is not one assignment")
+        key, value = line.split("=", maxsplit=1)
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or not value:
+            fail(f"platform image promotion line {line_number} is invalid")
+        if key in assignments:
+            fail(f"platform image promotion file duplicates {key}")
+        assignments[key] = value
+    caddy_image = assignments.get("CADDY_PLATFORM_IMAGE")
+    if caddy_image is None or not CADDY_IMAGE_RE.fullmatch(caddy_image):
+        fail("CADDY_PLATFORM_IMAGE is not an immutable vps-infra/caddy reference")
+    return caddy_image
+
+
+def validate_runtime() -> None:
+    if os.geteuid() != 0:
+        fail("production materialization requires root")
+    script_path = Path(__file__)
+    if script_path.is_symlink():
+        fail("deploy-static trust root must not be a symlink")
+    assert_protected_executable(script_path)
+    for executable in (ORAS_PATH, DOCKER_PATH, CURL_PATH, SETPRIV_PATH, PYTHON_PATH):
+        assert_protected_executable(executable)
+    architecture = os.uname().machine
+    expected_oras_digest = ORAS_BINARY_SHA256.get(architecture)
+    if expected_oras_digest is None:
+        fail(f"ORAS is not approved for architecture {architecture!r}")
+    actual_oras_digest, _ = sha256_file(ORAS_PATH)
+    if actual_oras_digest != expected_oras_digest:
+        fail("installed ORAS binary checksum is not approved")
+    result = run_checked(
+        [str(ORAS_PATH), "version"],
+        environment=safe_environment(Path("/nonexistent")),
+        timeout=10,
+    )
+    if not re.search(rf"(?m)^Version:\s+{re.escape(ORAS_VERSION)}$", result.stdout):
+        fail(f"installed ORAS version is not {ORAS_VERSION}")
+
+
+def run_extract_worker(
+    profile: StaticProfile,
+    source_revision: str,
+    archive: Path,
+    inventory_path: Path,
+    site_layer_path: Path,
+    destination: Path,
+) -> None:
+    expected_parent = PRODUCTION_ROOT / profile.application / "releases"
+    if destination.parent.resolve(strict=True) != expected_parent.resolve(strict=True):
+        fail("extract worker destination is outside the application release root")
+    layer_value = strict_json_bytes(site_layer_path.read_bytes(), "worker layer contract", canonical=True)
+    if not isinstance(layer_value, dict):
+        fail("worker layer contract must be an object")
+    require_exact_keys(
+        layer_value,
+        {"created", "layer_digest", "layer_size", "manifest_digest"},
+        "worker layer contract",
+    )
+    site_layer = LayerContract(
+        manifest_digest=layer_value["manifest_digest"],
+        layer_digest=layer_value["layer_digest"],
+        layer_size=layer_value["layer_size"],
+        created=layer_value["created"],
+    )
+    inventory = validate_bundle(archive, inventory_path, profile, source_revision, site_layer)
+    extract_archive(archive, destination, inventory)
+
+
+def write_layer_contract(path: Path, contract: LayerContract) -> None:
+    value = dataclasses.asdict(contract)
+    path.write_text(
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="ascii",
+    )
+    path.chmod(0o444)
+
+
+def create_release_as_static_user(
+    profile: StaticProfile,
+    source_revision: str,
+    archive: Path,
+    inventory_path: Path,
+    site_layer: LayerContract,
+    staging: Path,
+    uid: int,
+    gid: int,
+    home: Path,
+) -> None:
+    os.mkdir(staging, mode=0o700)
+    os.chown(staging, uid, gid)
+    layer_contract_path = home / "site-layer.json"
+    write_layer_contract(layer_contract_path, site_layer)
+    command = [
+        str(SETPRIV_PATH),
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "--no-new-privs",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        str(PYTHON_PATH),
+        str(Path(__file__)),
+        "--extract-worker",
+        profile.application,
+        source_revision,
+        str(archive),
+        str(inventory_path),
+        str(layer_contract_path),
+        str(staging),
+    ]
+    run_checked(command, environment=safe_environment(home), timeout=300)
+
+
+def probe_release(
+    release: Path,
+    inventory: InventoryContract,
+    caddy_image: str,
+    work_directory: Path,
+    max_probe_seconds: int,
+) -> None:
+    if not CADDY_IMAGE_RE.fullmatch(caddy_image):
+        fail("Caddy image must be an immutable vps-infra/caddy GHCR reference")
+    environment = safe_environment(work_directory)
+    run_checked([str(DOCKER_PATH), "pull", caddy_image], environment=environment, timeout=300)
+    name = f"vps-static-probe-{secrets.token_hex(8)}"
+    command = [
+        str(DOCKER_PATH),
+        "run",
+        "--detach",
+        "--name",
+        name,
+        "--pull",
+        "never",
+        "--read-only",
+        "--user",
+        "65534:65534",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "NET_BIND_SERVICE",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--pids-limit",
+        "64",
+        "--memory",
+        "128m",
+        "--cpus",
+        "1",
+        "--tmpfs",
+        "/data:rw,noexec,nosuid,nodev,mode=0777,size=1m",
+        "--tmpfs",
+        "/config:rw,noexec,nosuid,nodev,mode=0777,size=1m",
+        "--env",
+        "XDG_CONFIG_HOME=/config",
+        "--env",
+        "XDG_DATA_HOME=/data",
+        "--publish",
+        "127.0.0.1::8080",
+        "--volume",
+        f"{release}:/srv/site:ro",
+        "--entrypoint",
+        "/usr/bin/caddy",
+        caddy_image,
+        "file-server",
+        "--root",
+        "/srv/site",
+        "--listen",
+        ":8080",
+    ]
+    started = False
+    try:
+        run_checked(command, environment=environment, timeout=60)
+        started = True
+        port_result = run_checked(
+            [str(DOCKER_PATH), "port", name, "8080/tcp"],
+            environment=environment,
+            timeout=10,
+        )
+        match = re.fullmatch(r"127\.0\.0\.1:([1-9][0-9]{0,4})\n?", port_result.stdout)
+        if match is None or int(match.group(1)) > 65535:
+            fail("temporary Caddy returned an invalid loopback port")
+        base_url = f"http://127.0.0.1:{match.group(1)}"
+        deadline = time.monotonic() + 15
+        while True:
+            ready = subprocess.run(
+                [
+                    str(CURL_PATH),
+                    "--fail",
+                    "--silent",
+                    "--output",
+                    "/dev/null",
+                    "--max-time",
+                    "2",
+                    f"{base_url}/",
+                ],
+                check=False,
+                env=environment,
+            )
+            if ready.returncode == 0:
+                break
+            if time.monotonic() >= deadline:
+                fail("temporary Caddy did not become ready")
+            time.sleep(0.2)
+
+        response_path = work_directory / "probe-response"
+        probe_deadline = time.monotonic() + max_probe_seconds
+        for item in inventory.files:
+            remaining_seconds = probe_deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                fail("temporary Caddy route probe exceeded its total time limit")
+            route_timeout = max(1, min(10, int(remaining_seconds)))
+            result = run_checked(
+                [
+                    str(CURL_PATH),
+                    "--silent",
+                    "--show-error",
+                    "--path-as-is",
+                    "--max-time",
+                    str(route_timeout),
+                    "--max-filesize",
+                    str(max(1, item.size)),
+                    "--output",
+                    str(response_path),
+                    "--write-out",
+                    "%{http_code}",
+                    f"{base_url}{item.route}",
+                ],
+                environment=environment,
+                timeout=route_timeout + 5,
+            )
+            if result.stdout != "200":
+                fail(f"temporary Caddy returned HTTP {result.stdout!r} for {item.route}")
+            digest, size = sha256_file(response_path, max_bytes=item.size)
+            if size != item.size or digest != item.sha256:
+                fail(f"temporary Caddy response for {item.route} does not match the inventory")
+    finally:
+        if started:
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run(
+                    [str(DOCKER_PATH), "rm", "--force", name],
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                    timeout=30,
+                )
+
+
+def validate_current_link(current: Path, releases: Path) -> None:
+    try:
+        metadata = current.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISLNK(metadata.st_mode):
+        fail("current activation path exists and is not a symlink")
+    target = os.readlink(current)
+    if not re.fullmatch(r"releases/sha256-[0-9a-f]{64}", target):
+        fail("current symlink has an unsafe or unexpected target")
+    resolved = (current.parent / target).resolve(strict=True)
+    if resolved.parent != releases.resolve(strict=True) or not resolved.is_dir():
+        fail("current symlink target is outside the application release root")
+
+
+def activate_release(current: Path, release_name: str, releases: Path) -> None:
+    validate_current_link(current, releases)
+    temporary = current.parent / f".current-{secrets.token_hex(8)}"
+    try:
+        os.symlink(f"releases/{release_name}", temporary, target_is_directory=True)
+        os.replace(temporary, current)
+        directory_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+@contextlib.contextmanager
+def deployment_lock(application: str) -> Iterator[None]:
+    lock_path = Path("/run/lock") / f"vps-static-{application}.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+            fail("static deployment lock is not a protected root-owned file")
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    fail("another static deployment holds the application lock")
+                time.sleep(0.2)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def deploy(
+    application: str,
+    source_revision: str,
+    site_reference: str,
+    routes_reference: str,
+    caddy_image: str,
+) -> None:
+    profile = PROFILES.get(application)
+    if profile is None:
+        fail(f"application {application!r} is outside the static-site allowlist")
+    if not SHA40_RE.fullmatch(source_revision):
+        fail("source revision must be one full lowercase Git SHA")
+    parse_digest_reference(site_reference, profile.site_repository, "site reference")
+    parse_digest_reference(routes_reference, profile.routes_repository, "routes reference")
+    if not CADDY_IMAGE_RE.fullmatch(caddy_image):
+        fail("Caddy image must be an immutable vps-infra/caddy GHCR reference")
+    validate_runtime()
+    promoted_caddy_image = read_promoted_caddy_image(
+        PLATFORM_ENV_PATH,
+        require_root_owner=True,
+    )
+    if caddy_image != promoted_caddy_image:
+        fail("Caddy image does not match the protected platform promotion point")
+
+    static_account = pwd.getpwnam(STATIC_USER)
+    if static_account.pw_uid == 0 or static_account.pw_gid == 0:
+        fail("static extraction account must be unprivileged")
+    app_root = PRODUCTION_ROOT / profile.application
+    releases = app_root / "releases"
+    for path in (PRODUCTION_ROOT, app_root, releases):
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+            fail(f"static release root {path} must be a root-owned directory")
+        if metadata.st_mode & 0o022:
+            fail(f"static release root {path} must not be writable by group or others")
+
+    with deployment_lock(application), tempfile.TemporaryDirectory(
+        prefix=f"vps-static-{application}-",
+        dir="/var/tmp",
+    ) as temporary_name:
+        temporary = Path(temporary_name)
+        temporary.chmod(0o755)
+        registry_config = temporary / "registry.json"
+        registry_config.write_text("{}\n", encoding="ascii")
+        registry_config.chmod(0o600)
+        environment = safe_environment(temporary)
+        site_manifest_path = temporary / "site-manifest.json"
+        routes_manifest_path = temporary / "routes-manifest.json"
+        fetch_manifest(site_reference, site_manifest_path, registry_config, environment)
+        fetch_manifest(routes_reference, routes_manifest_path, registry_config, environment)
+        site_layer = validate_manifest(
+            site_manifest_path,
+            site_reference,
+            profile,
+            source_revision,
+            kind="site",
+        )
+        routes_layer = validate_manifest(
+            routes_manifest_path,
+            routes_reference,
+            profile,
+            source_revision,
+            kind="routes",
+        )
+        if routes_layer.created != site_layer.created:
+            fail("site and route manifests must use the same creation timestamp")
+
+        archive_path = temporary / "site.tar.gz"
+        inventory_path = temporary / "routes.json"
+        fetch_blob(profile.site_repository, site_layer, archive_path, registry_config, environment)
+        fetch_blob(profile.routes_repository, routes_layer, inventory_path, registry_config, environment)
+        inventory = validate_bundle(
+            archive_path,
+            inventory_path,
+            profile,
+            source_revision,
+            site_layer,
+        )
+        release_name = f"sha256-{site_layer.manifest_digest.removeprefix('sha256:')}"
+        release = releases / release_name
+        staging: Path | None = None
+        try:
+            try:
+                metadata = release.lstat()
+            except FileNotFoundError:
+                metadata = None
+            if metadata is not None:
+                if not stat.S_ISDIR(metadata.st_mode):
+                    fail("digest-named release path exists and is not a directory")
+                filesystem_inventory(release, inventory, expected_uid=0, expected_gid=0)
+            else:
+                staging = releases / f".{release_name}-{secrets.token_hex(8)}"
+                create_release_as_static_user(
+                    profile,
+                    source_revision,
+                    archive_path,
+                    inventory_path,
+                    site_layer,
+                    staging,
+                    static_account.pw_uid,
+                    static_account.pw_gid,
+                    temporary,
+                )
+                filesystem_inventory(
+                    staging,
+                    inventory,
+                    expected_uid=static_account.pw_uid,
+                    expected_gid=static_account.pw_gid,
+                )
+                lock_down_release(staging)
+                filesystem_inventory(staging, inventory, expected_uid=0, expected_gid=0)
+                probe_release(
+                    staging,
+                    inventory,
+                    caddy_image,
+                    temporary,
+                    profile.probe_timeout_seconds,
+                )
+                os.rename(staging, release)
+                staging = None
+                directory_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            if metadata is not None:
+                probe_release(
+                    release,
+                    inventory,
+                    caddy_image,
+                    temporary,
+                    profile.probe_timeout_seconds,
+                )
+            activate_release(app_root / "current", release_name, releases)
+        finally:
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+    print(
+        f"static release active: {application} {site_layer.manifest_digest} "
+        f"source {source_revision}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("application", choices=sorted(PROFILES))
+    parser.add_argument("source_revision")
+    parser.add_argument("site_reference")
+    parser.add_argument("routes_reference")
+    parser.add_argument("caddy_image")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if arguments and arguments[0] == "--extract-worker":
+            if len(arguments) != 7:
+                fail("extract worker received an invalid argument count")
+            _, application, revision, archive, inventory, layer, destination = arguments
+            profile = PROFILES.get(application)
+            if profile is None or not SHA40_RE.fullmatch(revision):
+                fail("extract worker received an invalid application or revision")
+            run_extract_worker(
+                profile,
+                revision,
+                Path(archive),
+                Path(inventory),
+                Path(layer),
+                Path(destination),
+            )
+            return 0
+        args = build_parser().parse_args(arguments)
+        deploy(
+            args.application,
+            args.source_revision,
+            args.site_reference,
+            args.routes_reference,
+            args.caddy_image,
+        )
+    except (OSError, KeyError, StaticDeploymentError) as exc:
+        print(f"static deployment refused: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

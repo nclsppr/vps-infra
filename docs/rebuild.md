@@ -129,12 +129,16 @@ Le playbook `site.yml` :
     avec commande forcée ;
 13. lance les validations hôte.
 
-La tranche actuelle livre les points 1 à 7 et 11 à 13, avec le dépôt public en
-HTTPS et une clé de déclenchement seulement si elle est fournie. Elle crée la
-racine privée des secrets mais ne matérialise encore aucune valeur. ORAS, le
-login GHCR, les secrets déchiffrés, l’applicateur live et leurs validations
-restent donc des portes explicites ; `site.yml` n’active aucun service de
-plateforme.
+The current tranche delivers points 1 to 8 and 11 to 13. It uses the public
+HTTPS repository and installs a trigger key only when the operator supplies
+one. ORAS 1.3.0 is pinned by release archive and executable checksums. Personal
+and Papers Empire are public GHCR packages, so their materializer uses
+anonymous access and an empty registry configuration.
+
+The role creates the private secret root but does not materialize a secret. A
+GHCR credential for private application images, decrypted secrets, the live
+applicator, and their validations remain explicit gates. `site.yml` does not
+activate a platform service or an application.
 
 Le compte de livraison n’entre pas dans le groupe `docker`. Une règle restreinte
 autorise seulement le wrapper root-owned, par chemin absolu et sans `SETENV`.
@@ -205,8 +209,9 @@ fichier hosts :
 
 - validation TLS stricte si les certificats ont été obtenus par DNS-01 avant la
   bascule ;
-- inventaire complet généré pour `personal` : EN/FR, Work, CV, Blog et
-  articles, Dashboard, Claude, archive, erreurs, assets et redirections ;
+- inventaire complet des fichiers `personal` : EN/FR, Work, CV, Blog et
+  articles, Dashboard, Claude, archive, erreurs et assets ;
+- probes séparées des redirections de domaines, dont le domaine historique ;
 - jeu, langues, Dashboard et documentation de Papers Empire ;
 - santé Backend, Onboarding, Commande, Dashboard et documentation Surplasse ;
 - fermeture publique des métriques, Swagger et interfaces internes ;

@@ -193,11 +193,11 @@ Avant tout rechargement :
 ```text
 /srv/www/
   personal/
-    releases/<digest-artefact>/
-    current -> releases/<digest-artefact>
+    releases/sha256-<digest-manifeste-site>/
+    current -> releases/sha256-<digest-manifeste-site>
   papersempire/
-    releases/<digest-artefact>/
-    current -> releases/<digest-artefact>
+    releases/sha256-<digest-manifeste-site>/
+    current -> releases/sha256-<digest-manifeste-site>
 ```
 
 Chaque CI fabrique une archive statique, calcule son checksum et la publie comme
@@ -209,30 +209,46 @@ Le SHA source reste une annotation obligatoire, mais le nom de release utilise
 le digest de l’artefact : un même commit reconstruit dans un environnement
 différent peut produire des octets différents.
 
-Le contrat OCI fixe un type d’artefact, une archive déterministe, son SHA-256,
-l’annotation de révision et des bornes de taille et de nombre de fichiers. Le
-script générique `deploy-static` :
+The implemented OCI envelope uses these exact versioned media types:
+
+- site artifact: `application/vnd.vps-infra.static-site.v1`;
+- site layer: `application/vnd.vps-infra.static-site.v1+tar+gzip`;
+- inventory artifact: `application/vnd.vps-infra.route-inventory.v1`;
+- inventory layer: `application/vnd.vps-infra.route-inventory.v1+json`.
+
+Both manifests contain one layer, the embedded empty OCI config, and exact
+`source`, `revision`, and `created` annotations. The standalone
+`deploy-static` primitive:
 
 1. vérifie l’application contre une allowlist ;
 2. télécharge le digest attendu dans un répertoire temporaire ;
-3. vérifie type, checksum, taille, nombre de fichiers et archive déterministe ;
+3. verifies each manifest and layer digest, the profile limits, canonical
+   inventory, and the archive-to-inventory bijection;
 4. refuse chemins absolus, traversées `..`, symlinks, hardlinks, devices,
    sockets et bombes de décompression ;
-5. extrait sans privilège dans `releases/<digest-artefact>` sans écraser une
-   autre release ;
+5. extracts as `vps-static` into a new staging directory with safe `openat`
+   operations, then makes the complete release root-owned;
 6. sonde la nouvelle racine avec un Caddy temporaire utilisant l’image
    plateforme exacte, jamais avec le vhost encore pointé sur `current` ;
-7. remplace atomiquement le symlink `current` ;
-8. sonde publiquement et revient au symlink précédent en cas d’échec ;
-9. conserve au moins les trois dernières releases.
+7. renames the release to the site OCI manifest digest and atomically replaces
+   the `current` symlink.
+
+The temporary Caddy requests every inventory route and compares its response
+checksum before activation. Its digest must match the protected
+`CADDY_PLATFORM_IMAGE` promotion point, but the platform does not have to be
+active. A failed validation or probe leaves `current` unchanged. The future
+live applicator must still add public TLS probes,
+post-activation rollback, persistent quarantine, and a policy that retains at
+least three old releases. The locked controller cannot invoke this primitive.
 
 Pour `personal`, la CI doit construire un répertoire public par allowlist. Le
 checkout actuel contient des fichiers comme `AGENTS.md`, `infos/` et `.claude/`
 qui ne doivent jamais rejoindre la racine web. La même allowlist génère un
 inventaire de routes : toutes les pages EN/FR, Work, CV, Blog et articles,
-Dashboard, Claude, archive `v2022`, erreurs et redirections de domaines sont
-sondées. Cet inventaire évite qu’une nouvelle route publique soit oubliée par
-un smoke codé à la main.
+Dashboard, Claude, archive `v2022`, erreurs et assets sont liés aux fichiers et
+sondés par le Caddy temporaire. Les redirections de domaines ne sont pas des
+fichiers. Elles restent dans le smoke public futur. Cet inventaire évite qu’une
+nouvelle route de fichier soit oubliée par un smoke codé à la main.
 
 Pour `papersempire`, l’artefact est le répertoire `site/` déjà assemblé par le
 workflow : jeu, Dashboard, documentation Retype et pages de langue. Servir le

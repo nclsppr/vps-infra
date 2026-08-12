@@ -9,9 +9,22 @@ vps_deploy_repository_url: https://github.com/nclsppr/vps-infra.git
 vps_deploy_revision_path: /usr/local/share/vps-infra/controller-revision
 vps_deploy_state_dir: /var/lib/vps-controller
 vps_deploy_production_marker: /etc/vps/production-enabled
+vps_oras_version: "1.3.0"
+vps_oras_install_path: /usr/local/bin/oras
+vps_oras_cache_root: /var/cache/vps-infra/oras
+vps_oras_archives:
+  x86_64:
+    release_architecture: amd64
+    archive_sha256: 6cdc692f929100feb08aa8de584d02f7bcc30ec7d88bc2adc2054d782db57c64
+    binary_sha256: 040e140304b7dbdd9b40dacd798e2303cea44ad84eeb210750afdf15f1dcf8b4
+  aarch64:
+    release_architecture: arm64
+    archive_sha256: 7649738b48fde10542bcc8b0e9b460ba83936c75fb5be01ee6d4443764a14352
+    binary_sha256: e2b67c4efb35f20a546aacc680e0f81f907d3cf4cf9f1b2040c34bb471c428f1
 vps_deploy_executables:
   - check-public-safe
   - deploy
+  - deploy-static
   - doctor
   - forced-command
   - parse-forced-command
