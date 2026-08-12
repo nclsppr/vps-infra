@@ -124,13 +124,21 @@
     - name: Read converged Docker and platform unit state
       ansible.builtin.service_facts:
 
-    - name: Require the running shared internal platform
+    - name: Read the internal platform unit activity
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - "{{ vps_surplasse_internal_platform_unit }}"
+      register: vps_surplasse_internal_platform_unit_activity
+      changed_when: false
+
+    - name: Require the active and enabled shared internal platform
       ansible.builtin.assert:
         that:
           - ansible_facts.services['docker.service'].state == 'running'
           - >-
-            ansible_facts.services[vps_surplasse_internal_platform_unit].state
-            == 'running'
+            vps_surplasse_internal_platform_unit_activity.stdout == 'active'
           - >-
             ansible_facts.services[vps_surplasse_internal_platform_unit].status
             == 'enabled'
