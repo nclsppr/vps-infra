@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Build one deterministic platform integration package from an exact Git commit."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from platform_integration import (  # noqa: E402
+    ARCHIVE_NAME,
+    INVENTORY_NAME,
+    IntegrationError,
+    build_package,
+    sha256,
+)
+
+
+def write_output(path: Path, lines: list[str]) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise IntegrationError("GitHub output must be an existing regular file")
+    with path.open("a", encoding="utf-8") as output:
+        for line in lines:
+            output.write(line + "\n")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repository", default=str(SCRIPT_DIR.parent))
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--output-directory", required=True)
+    parser.add_argument("--github-output")
+    args = parser.parse_args()
+
+    try:
+        repository = Path(args.repository).resolve()
+        output_directory = Path(args.output_directory)
+        if not output_directory.is_absolute():
+            output_directory = Path.cwd() / output_directory
+        if output_directory.is_symlink():
+            raise IntegrationError("output directory must not be a symbolic link")
+        output_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if output_directory.is_symlink() or not output_directory.is_dir():
+            raise IntegrationError("output directory must be a real directory")
+        if any(output_directory.iterdir()):
+            raise IntegrationError("output directory must be empty")
+        package = build_package(repository, args.revision)
+        archive_path = output_directory / ARCHIVE_NAME
+        inventory_path = output_directory / INVENTORY_NAME
+        with archive_path.open("xb") as output:
+            output.write(package.archive)
+        with inventory_path.open("xb") as output:
+            output.write(package.inventory)
+        os.chmod(archive_path, 0o600)
+        os.chmod(inventory_path, 0o600)
+        if args.github_output is not None:
+            write_output(
+                Path(args.github_output),
+                [
+                    f"archive={archive_path}",
+                    f"archive_digest={sha256(package.archive)}",
+                    f"archive_size={len(package.archive)}",
+                    f"created={package.created}",
+                    f"inventory={inventory_path}",
+                    f"inventory_digest={sha256(package.inventory)}",
+                    f"inventory_size={len(package.inventory)}",
+                ],
+            )
+    except (IntegrationError, OSError) as exc:
+        print(f"platform integration build failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        "platform integration package built: "
+        f"{sha256(package.archive)} and {sha256(package.inventory)}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

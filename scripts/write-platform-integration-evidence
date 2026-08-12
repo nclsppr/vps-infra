@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Write a canonical audit record for one verified platform integration artifact."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from platform_integration import IntegrationError, evidence_bytes, sha256  # noqa: E402
+
+
+def positive_integer(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("positive integer required") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("positive integer required")
+    return parsed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifact-reference", required=True)
+    parser.add_argument("--archive", required=True)
+    parser.add_argument("--inventory", required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--created", required=True)
+    parser.add_argument("--run-id", required=True, type=positive_integer)
+    parser.add_argument("--run-attempt", required=True, type=positive_integer)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+    try:
+        evidence = evidence_bytes(
+            artifact_reference=args.artifact_reference,
+            archive_bytes=Path(args.archive).read_bytes(),
+            inventory_bytes=Path(args.inventory).read_bytes(),
+            revision=args.revision,
+            created=args.created,
+            run_id=args.run_id,
+            run_attempt=args.run_attempt,
+        )
+        output = Path(args.output)
+        if output.exists() or output.is_symlink():
+            raise IntegrationError("evidence output must not exist")
+        with output.open("xb") as destination:
+            destination.write(evidence)
+    except (IntegrationError, OSError) as exc:
+        print(f"platform integration evidence failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"platform integration evidence written: {args.output} ({sha256(evidence)})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

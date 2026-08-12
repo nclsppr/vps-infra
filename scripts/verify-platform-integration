@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Verify a platform integration archive and its canonical inventory."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR / "lib"))
+
+from platform_integration import IntegrationError, verify_package  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive", required=True)
+    parser.add_argument("--inventory", required=True)
+    parser.add_argument("--expected-revision")
+    parser.add_argument("--expected-created")
+    args = parser.parse_args()
+    try:
+        archive = Path(args.archive).read_bytes()
+        inventory = Path(args.inventory).read_bytes()
+        archive_digest, inventory_digest = verify_package(
+            archive,
+            inventory,
+            expected_revision=args.expected_revision,
+            expected_created=args.expected_created,
+        )
+    except (IntegrationError, OSError) as exc:
+        print(f"platform integration verification failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        "platform integration package verified: "
+        f"{archive_digest} and {inventory_digest}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

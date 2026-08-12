@@ -192,6 +192,27 @@ artifact retention, subject to the repository retention policy, and the
 verifier rejects deleted or expired evidence. Keep `activation_policy: locked`
 until durable provenance and every semantic gate have separate evidence.
 
+### Platform integration publication
+
+The `Platform integration artifact` workflow publishes the shared platform
+configuration independently from activation. A push to `main` that changes a
+runtime platform path, or a manual run on `main`, builds the package from the
+exact workflow commit. The package contains an exact allowlist of Compose,
+Caddy, PostgreSQL, Prometheus, and Grafana runtime files. It contains no Caddy
+build source, documentation, inventory for a host, or secret.
+
+The workflow publishes two layers in one OCI artifact: a deterministic
+`tar.gz` archive and a canonical JSON inventory. It validates the remote
+manifest digest, artifact type, layer media types, source annotation, revision
+annotation, creation annotation, layer digests, layer sizes, layer titles, and
+the bytes fetched back from GHCR. It creates provenance only after all these
+checks pass. It then verifies the provenance against the exact workflow, full
+source revision, `main` ref, and GitHub-hosted runner policy.
+
+Publication does not update the production manifest. An operator must use the
+resolved digest in a separate reviewed promotion. The locked activation policy
+continues to reject service activation.
+
 The schema stays at version 1 and still accepts the legacy manifest. An older
 controller does not understand the candidate fields. Before a controller
 downgrade, first use the current controller to record a legacy manifest that
