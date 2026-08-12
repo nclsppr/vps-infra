@@ -38,6 +38,19 @@ class PostgresBackupTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("Disable the PostgreSQL backup timers without deleting backup data", tasks)
+        timer_enablement = tasks.split(
+            "- name: Enable the daily backup and monthly restore rehearsal timers\n",
+            maxsplit=1,
+        )[1].split(
+            "- name: Disable the PostgreSQL backup timers without deleting backup data\n",
+            maxsplit=1,
+        )[0]
+        self.assertIn(
+            "when: vps_postgres_backup_state == 'installed'", timer_enablement
+        )
+        self.assertNotIn("!= 'stopped'", timer_enablement)
+        self.assertIn("Read PostgreSQL backup timer activity", tasks)
+        self.assertIn("item.stdout in ['inactive', 'failed']", tasks)
         self.assertNotIn("state: absent", tasks)
         self.assertNotIn("docker compose down", tasks)
         self.assertNotIn("--volumes", tasks)
@@ -80,10 +93,11 @@ class PostgresBackupTests(unittest.TestCase):
             self.assertIn(mode, converge)
             self.assertIn(f"vps_postgres_backup_state={state}", converge)
 
-    def make_fake_docker(self, root: Path) -> tuple[Path, Path, Path]:
+    def make_fake_docker(self, root: Path) -> tuple[Path, Path, Path, Path]:
         fake = root / "docker"
         log = root / "docker-commands.jsonl"
         failure_marker = root / "fail-restore"
+        cleanup_failure_marker = root / "fail-cleanup"
         fake.write_text(
             f"""#!/usr/bin/env python3
 import json
@@ -92,6 +106,7 @@ import sys
 
 log = pathlib.Path({str(log)!r})
 failure_marker = pathlib.Path({str(failure_marker)!r})
+cleanup_failure_marker = pathlib.Path({str(cleanup_failure_marker)!r})
 arguments = sys.argv[1:]
 with log.open("a", encoding="utf-8") as output:
     output.write(json.dumps(arguments, separators=(",", ":")) + "\\n")
@@ -134,9 +149,11 @@ elif arguments[:2] == ["volume", "create"]:
 elif arguments[0] == "run":
     print("b" * 64)
 elif arguments[0] == "rm":
-    pass
+    if cleanup_failure_marker.exists():
+        raise SystemExit(10)
 elif arguments[:2] == ["volume", "rm"]:
-    pass
+    if cleanup_failure_marker.exists():
+        raise SystemExit(11)
 elif arguments[0] == "exec":
     index = 1
     while index < len(arguments) and arguments[index].startswith("--"):
@@ -188,7 +205,7 @@ else:
             encoding="utf-8",
         )
         fake.chmod(0o700)
-        return fake, log, failure_marker
+        return fake, log, failure_marker, cleanup_failure_marker
 
     def run_backup(
         self,
@@ -219,7 +236,7 @@ else:
             root = Path(temporary)
             backup_root = root / "backups"
             backup_root.mkdir(mode=0o700)
-            fake, log, _ = self.make_fake_docker(root)
+            fake, log, _, _ = self.make_fake_docker(root)
 
             created = self.run_backup(
                 backup_root,
@@ -262,7 +279,7 @@ else:
             root = Path(temporary)
             backup_root = root / "backups"
             backup_root.mkdir(mode=0o700)
-            fake, _, _ = self.make_fake_docker(root)
+            fake, _, _, _ = self.make_fake_docker(root)
             created = self.run_backup(backup_root, fake, "create", "--retention-count", "2")
             self.assertEqual(created.returncode, 0, created.stderr)
             backup = next(path for path in backup_root.iterdir() if path.is_dir())
@@ -285,7 +302,7 @@ else:
             root = Path(temporary)
             backup_root = root / "backups"
             backup_root.mkdir(mode=0o700)
-            fake, log, failure_marker = self.make_fake_docker(root)
+            fake, log, failure_marker, cleanup_failure_marker = self.make_fake_docker(root)
             created = self.run_backup(backup_root, fake, "create", "--retention-count", "2")
             self.assertEqual(created.returncode, 0, created.stderr)
 
@@ -331,6 +348,14 @@ else:
                 any(command[:2] == ["volume", "rm"] for command in failure_commands)
             )
 
+            log.unlink()
+            cleanup_failure_marker.touch()
+            cleanup_failed = self.run_backup(backup_root, fake, "rehearse", "--latest")
+            self.assertNotEqual(cleanup_failed.returncode, 0)
+            self.assertIn("disposable restore cleanup also failed", cleanup_failed.stderr)
+            self.assertIn("scratch container cleanup", cleanup_failed.stderr)
+            self.assertIn("scratch volume cleanup", cleanup_failed.stderr)
+
     def test_retention_deletes_only_verified_complete_backup_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -338,7 +363,7 @@ else:
             backup_root.mkdir(mode=0o700)
             unknown = backup_root / "operator-note"
             unknown.write_text("preserve\n", encoding="utf-8")
-            fake, _, _ = self.make_fake_docker(root)
+            fake, _, _, _ = self.make_fake_docker(root)
             for _ in range(3):
                 result = self.run_backup(
                     backup_root,

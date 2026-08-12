@@ -95,7 +95,7 @@
   loop:
     - "{{ vps_postgres_backup_timer }}"
     - "{{ vps_postgres_restore_timer }}"
-  when: vps_postgres_backup_state != 'stopped'
+  when: vps_postgres_backup_state == 'installed'
 
 - name: Disable the PostgreSQL backup timers without deleting backup data
   ansible.builtin.systemd_service:
@@ -154,15 +154,46 @@
   loop:
     - "{{ vps_postgres_backup_timer }}"
     - "{{ vps_postgres_restore_timer }}"
+  when: vps_postgres_backup_state in ['installed', 'stopped']
+
+- name: Read PostgreSQL backup timer activity
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - "{{ item }}"
+  register: vps_postgres_backup_timer_activity
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ vps_postgres_backup_timer }}"
+    - "{{ vps_postgres_restore_timer }}"
+  when: vps_postgres_backup_state in ['installed', 'stopped']
 
 - name: Prove the exact PostgreSQL backup timer state
   ansible.builtin.assert:
     that:
       - >-
-        (vps_postgres_backup_state == 'stopped' and item.rc != 0) or
+        (vps_postgres_backup_state == 'stopped' and item.rc != 0 and
+         item.stdout in ['disabled', 'masked', 'not-found']) or
         (vps_postgres_backup_state != 'stopped' and
          item.rc == 0 and item.stdout == 'enabled')
     fail_msg: A PostgreSQL backup timer differs from the requested state.
   loop: "{{ vps_postgres_backup_timer_enablement.results }}"
   loop_control:
     label: "{{ item.item }}"
+  when: vps_postgres_backup_state in ['installed', 'stopped']
+
+- name: Prove the exact PostgreSQL backup timer activity
+  ansible.builtin.assert:
+    that:
+      - >-
+        (vps_postgres_backup_state == 'stopped' and item.rc != 0 and
+         item.stdout in ['inactive', 'failed']) or
+        (vps_postgres_backup_state != 'stopped' and
+         item.rc == 0 and item.stdout == 'active')
+    fail_msg: A PostgreSQL backup timer differs from the requested activity.
+  loop: "{{ vps_postgres_backup_timer_activity.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: vps_postgres_backup_state in ['installed', 'stopped']

@@ -943,7 +943,7 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
     container_created = False
     operation_error: Exception | None = None
     try:
-        volume_output = runtime.capture(
+        volume_output_raw = runtime.capture(
             runtime.docker_arguments(
                 "volume",
                 "create",
@@ -952,11 +952,15 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
                 volume_name,
             ),
             "scratch volume creation",
-        ).decode("ascii").strip()
+        )
+        volume_created = True
+        try:
+            volume_output = volume_output_raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise BackupError("Docker returned a non-ASCII scratch volume identity") from exc
         if volume_output != volume_name:
             raise BackupError("Docker returned an unexpected scratch volume identity")
-        volume_created = True
-        container_output = runtime.capture(
+        container_output_raw = runtime.capture(
             runtime.docker_arguments(
                 "run",
                 "--detach",
@@ -1006,10 +1010,14 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
                 "unix_socket_directories=/var/run/postgresql",
             ),
             "scratch PostgreSQL container creation",
-        ).decode("ascii").strip()
+        )
+        container_created = True
+        try:
+            container_output = container_output_raw.decode("ascii").strip()
+        except UnicodeDecodeError as exc:
+            raise BackupError("Docker returned a non-ASCII scratch container identity") from exc
         if re.fullmatch(r"[0-9a-f]{12,64}", container_output) is None:
             raise BackupError("Docker returned an unexpected scratch container identity")
-        container_created = True
 
         ready = False
         for _ in range(60):
@@ -1146,6 +1154,10 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
             cleanup_rehearsal(runtime, container_name, volume_name)
         except Exception as exc:
             cleanup_error = exc
+    if operation_error is not None and cleanup_error is not None:
+        raise BackupError(
+            f"{operation_error}; disposable restore cleanup also failed: {cleanup_error}"
+        ) from operation_error
     if operation_error is not None:
         raise operation_error
     if cleanup_error is not None:
