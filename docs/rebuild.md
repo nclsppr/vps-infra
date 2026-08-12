@@ -135,11 +135,15 @@ one. GitHub CLI 2.97.0 is pinned by release archive and executable checksums.
 Personal, Papers Empire, and platform integration are public GHCR packages.
 Their materializer uses anonymous bounded registry downloads in short-lived
 systemd `DynamicUser` executions. One execution fetches each attestation bundle
-set. The root orchestrator copies that set and removes the fetch state. A new
-sequential offline execution of the same fixed transient unit gives the local
-bundle and digest-bound OCI manifest to GitHub CLI. The fixed unit name
-prevents concurrent worker creation. No execution receives an operator token.
-ORAS remains in the locked local and
+set. A separate network execution uses the pinned GitHub CLI and its embedded
+TUF bootstrap roots to obtain one current trusted root per deployment. The root
+orchestrator also requires its versioned SHA-256. A trust-root rotation fails
+closed until a reviewed repository update changes that digest. The orchestrator
+validates and copies these inputs, then removes each fetch state. A
+new sequential offline execution of the same fixed transient unit gives the
+local bundle, copied trusted root, and digest-bound OCI manifest to GitHub CLI.
+The fixed unit name prevents concurrent worker creation. No execution receives
+an operator token. ORAS remains in the locked local and
 CI toolchain; reconstruction does not install it on Atlas.
 
 Before a static activation, supply the exact application source revision, site

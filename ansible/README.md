@@ -152,10 +152,16 @@ source revision, the exact site and route references, the platform integration
 revision and reference, and the exact Caddy image. The materializer runs
 registry fetches, validation, extraction, and GitHub attestation verification
 in short-lived systemd `DynamicUser` units. A dedicated bounded tmpfs stores
-each private runtime directory. Attestation fetch and offline GitHub
-verification use separate sequential executions of one fixed transient unit.
-This unit name serializes worker creation in systemd. Each accepted file is
-copied into a root-owned tree and made durable before activation.
+each private runtime directory. One separate network execution uses the pinned
+GitHub CLI and its embedded TUF bootstrap roots to obtain one current trusted
+root for the deployment. The controller also requires the versioned SHA-256 for
+that root. A trust-root rotation therefore fails closed until a reviewed
+repository update changes the accepted digest. Attestation fetch and offline
+GitHub verification use other sequential executions of one fixed transient
+unit. The offline verifier receives the copied root through
+`--custom-trusted-root`. This unit name
+serializes worker creation in systemd. Each accepted file is copied into a
+root-owned tree and made durable before activation.
 
 The deploy role initializes the root-owned mirror at `/srv/vps/repository` from
 the single allowed public origin:

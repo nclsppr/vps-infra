@@ -78,12 +78,19 @@ Empire source ref is `refs/heads/master`. The integration source ref is
 
 A network-enabled systemd `DynamicUser` execution downloads the bounded
 attestation index, manifest, and bundle objects. The root orchestrator copies
-the exact bundle set into a root-owned file and removes the fetch state. A
-separate sequential offline execution of the same fixed transient unit gives
-that local bundle and the digest-bound local OCI manifest to GitHub CLI through
-`--bundle`. The fixed unit name prevents concurrent worker creation. GitHub CLI
-does not access OCI or receive a token. The verifier succeeds only when the
-unit exits with code zero after its complete cgroup exits.
+the exact bundle set into a root-owned file and removes the fetch state. One
+other network-enabled execution uses the checksum-pinned GitHub CLI and its
+embedded TUF bootstrap roots to obtain one current trusted-root snapshot for
+the complete deployment. The root orchestrator validates and copies the two
+JSONL records only when they match the versioned SHA-256. A trust-root rotation
+therefore fails closed until a reviewed repository update changes the accepted
+digest. The orchestrator then removes that fetch state. A separate sequential
+offline execution of the same fixed transient unit gives the local bundle, copied
+trusted root, and digest-bound local OCI manifest to GitHub CLI through
+`--bundle` and `--custom-trusted-root`. The fixed unit name prevents concurrent
+worker creation. GitHub CLI does not access OCI or receive a token. The verifier
+succeeds only when the unit exits with code zero after its complete cgroup
+exits.
 
 An exact source ref in an attestation does not prove that the branch is
 protected. Repository branch protection or an external ruleset is a separate
@@ -114,10 +121,12 @@ digest tag, and the copied bundle set is size-bounded before the offline
 signature verifier authenticates it. The bearer header stays in a private
 worker file and does not appear in process arguments. The temporary Caddy image
 pull remains a separate root-controlled Docker operation by immutable digest.
-Bounded readers request at most the limit plus one byte so an oversized local
-object cannot be accepted. The complete route probe has a five-minute Personal
-budget and a ten-minute Papers Empire budget. Lock acquisition stops after one
-minute.
+The trusted-root execution has runtime, memory, per-file size, inode, and tmpfs
+limits. GitHub CLI does not expose an in-transfer size limit for its internal
+TUF client. Bounded readers request at most the limit plus one byte so an
+oversized local object cannot be accepted. The complete route probe has a
+five-minute Personal budget and a ten-minute Papers Empire budget. Lock
+acquisition stops after one minute.
 
 The Personal profile accepts the one Git archive PAX comment that contains the
 source SHA. The Papers Empire profile requires its GNU tar normalization. This

@@ -60,6 +60,11 @@ def producer_json(value: object) -> bytes:
     ).encode("ascii")
 
 
+def trusted_root_jsonl() -> bytes:
+    record = producer_json({"mediaType": MATERIALIZER.TRUSTED_ROOT_MEDIA_TYPE})
+    return record + b"\n" + record + b"\n"
+
+
 def write_gzip(source: Path, destination: Path) -> None:
     with source.open("rb") as input_stream, destination.open("wb") as output_stream:
         with gzip.GzipFile(
@@ -1763,6 +1768,9 @@ class StaticBundleContractTests(unittest.TestCase):
             subject_path = root / "manifest.json"
             subject_path.write_bytes(subject)
             subject_path.chmod(0o444)
+            trusted_root = root / "trusted-root.jsonl"
+            trusted_root.write_bytes(trusted_root_jsonl())
+            trusted_root.chmod(0o444)
             state_number = 0
 
             def emulate_worker(phase, command, **kwargs):
@@ -1805,6 +1813,7 @@ class StaticBundleContractTests(unittest.TestCase):
                 MATERIALIZER.verify_github_provenance_isolated(
                     reference,
                     subject_path=subject_path,
+                    trusted_root=trusted_root,
                     repository="nclsppr/example",
                     source_revision=REVISION,
                     source_ref="refs/heads/main",
@@ -1822,12 +1831,298 @@ class StaticBundleContractTests(unittest.TestCase):
             self.assertEqual(verify[1][0], str(MATERIALIZER.GH_PATH))
             self.assertIn(str(subject_path), verify[1])
             self.assertIn("--bundle", verify[1])
+            self.assertIn("--custom-trusted-root", verify[1])
+            self.assertIn(str(trusted_root), verify[1])
             self.assertIn("--digest-alg", verify[1])
             self.assertIn("sha256", verify[1])
+            self.assertIn("--hostname", verify[1])
+            self.assertIn("github.com", verify[1])
             self.assertIn("--deny-self-hosted-runners", verify[1])
             self.assertNotIn("--bundle-from-oci", verify[1])
             self.assertFalse(any("TOKEN" in argument for argument in verify[1]))
+            self.assertIn(trusted_root, verify[2]["inputs"])
             self.assertEqual(list(root.glob("attestation-*.jsonl")), [])
+
+    def test_trusted_root_validation_requires_two_lf_terminated_records(self) -> None:
+        valid = trusted_root_jsonl()
+        MATERIALIZER.validate_trusted_root_jsonl(valid)
+        invalid_values = (
+            valid.rstrip(b"\n"),
+            valid.splitlines(keepends=True)[0],
+            valid + valid.splitlines(keepends=True)[0],
+            b"x" * (MATERIALIZER.MAX_TRUSTED_ROOT_BYTES + 1),
+            b'{"mediaType":"wrong"}\n{"mediaType":"wrong"}\n',
+            (
+                b'{"mediaType":"'
+                + MATERIALIZER.TRUSTED_ROOT_MEDIA_TYPE.encode("ascii")
+                + b'","mediaType":"duplicate"}\n'
+                + valid.splitlines(keepends=True)[1]
+            ),
+            b'{"mediaType":"\xff"}\n' + valid.splitlines(keepends=True)[1],
+        )
+        for raw in invalid_values:
+            with self.subTest(raw=raw[:80]):
+                with self.assertRaises(MATERIALIZER.StaticDeploymentError):
+                    MATERIALIZER.validate_trusted_root_jsonl(raw)
+
+    def test_trusted_root_worker_uses_fixed_gh_command_and_removes_cache(self) -> None:
+        root_bytes = trusted_root_jsonl()
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            worker_home = Path(temporary_directory)
+            output = worker_home / "trusted-root.jsonl"
+
+            def emulate_gh(command, **kwargs):
+                calls.append((command, kwargs))
+                os.write(kwargs["stdout"], root_bytes)
+                cache = Path(kwargs["env"]["XDG_CACHE_HOME"])
+                cache.mkdir(parents=True)
+                (cache / "metadata.json").write_text("cached", encoding="ascii")
+                state = Path(kwargs["env"]["XDG_STATE_HOME"])
+                state.mkdir(parents=True)
+                (state / "device-id").write_text("state", encoding="ascii")
+                return subprocess.CompletedProcess(command, 0)
+
+            with mock.patch.dict(os.environ, {"HOME": str(worker_home)}), mock.patch.object(
+                MATERIALIZER.subprocess,
+                "run",
+                side_effect=emulate_gh,
+            ), mock.patch.object(MATERIALIZER.os, "geteuid", return_value=1000), mock.patch.object(
+                MATERIALIZER.os,
+                "getegid",
+                return_value=1000,
+            ):
+                MATERIALIZER.run_trusted_root_fetch_worker(output)
+
+            self.assertEqual(output.read_bytes(), root_bytes)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o444)
+            self.assertEqual(set(worker_home.iterdir()), {output})
+            self.assertEqual(
+                calls[0][0],
+                [
+                    str(MATERIALIZER.GH_PATH),
+                    "attestation",
+                    "trusted-root",
+                    "--hostname",
+                    "github.com",
+                ],
+            )
+            self.assertEqual(calls[0][1]["stdin"], subprocess.DEVNULL)
+            self.assertEqual(calls[0][1]["stderr"], subprocess.DEVNULL)
+            self.assertNotIn("GH_TOKEN", calls[0][1]["env"])
+            self.assertNotIn("GITHUB_TOKEN", calls[0][1]["env"])
+
+    def test_trusted_root_worker_rejects_failed_or_malformed_fetches(self) -> None:
+        cases = (
+            (1, trusted_root_jsonl()),
+            (0, b'{"mediaType":"wrong"}\n'),
+        )
+        for returncode, payload in cases:
+            with self.subTest(returncode=returncode, payload=payload[:40]):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    worker_home = Path(temporary_directory)
+                    output = worker_home / "trusted-root.jsonl"
+
+                    def emulate_gh(command, **kwargs):
+                        os.write(kwargs["stdout"], payload)
+                        return subprocess.CompletedProcess(command, returncode)
+
+                    with mock.patch.dict(
+                        os.environ,
+                        {"HOME": str(worker_home)},
+                    ), mock.patch.object(
+                        MATERIALIZER.subprocess,
+                        "run",
+                        side_effect=emulate_gh,
+                    ), mock.patch.object(
+                        MATERIALIZER.os,
+                        "geteuid",
+                        return_value=1000,
+                    ), mock.patch.object(
+                        MATERIALIZER.os,
+                        "getegid",
+                        return_value=1000,
+                    ):
+                        with self.assertRaises(MATERIALIZER.StaticDeploymentError):
+                            MATERIALIZER.run_trusted_root_fetch_worker(output)
+                    self.assertFalse(output.exists())
+                    self.assertFalse((worker_home / "scratch").exists())
+
+    def test_trusted_root_worker_rejects_root_and_an_external_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            worker_home = Path(temporary_directory)
+            output = worker_home / "trusted-root.jsonl"
+            with mock.patch.object(MATERIALIZER.os, "geteuid", return_value=0):
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "must be unprivileged",
+                ):
+                    MATERIALIZER.run_trusted_root_fetch_worker(output)
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(worker_home)},
+            ), mock.patch.object(
+                MATERIALIZER.os,
+                "geteuid",
+                return_value=1000,
+            ), mock.patch.object(
+                MATERIALIZER.os,
+                "getegid",
+                return_value=1000,
+            ):
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "protected worker home",
+                ):
+                    MATERIALIZER.run_trusted_root_fetch_worker(
+                        worker_home.parent / "trusted-root.jsonl"
+                    )
+
+    def test_trusted_root_fetch_crosses_root_boundary_after_worker_exit(self) -> None:
+        calls: list[tuple[str, list[str], dict[str, object]]] = []
+        events: list[str] = []
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            root.chmod(0o700)
+            state_root = root / "worker-state"
+
+            def emulate_worker(phase, command, **kwargs):
+                calls.append((phase, command, kwargs))
+                state_root.mkdir(mode=0o700)
+                output = state_root / "trusted-root.jsonl"
+                output.write_bytes(trusted_root_jsonl())
+                output.chmod(0o444)
+                return MATERIALIZER.IsolatedWorkerState(
+                    unit=MATERIALIZER.SYSTEMD_WORKER_UNIT,
+                    state_name="5" * 32,
+                    logical_root=state_root,
+                    physical_root=state_root,
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                )
+
+            def cleanup_worker(state):
+                events.append("worker-cleaned")
+                shutil.rmtree(state.physical_root)
+
+            with mock.patch.object(
+                MATERIALIZER,
+                "run_isolated_worker",
+                side_effect=emulate_worker,
+            ), mock.patch.object(
+                MATERIALIZER,
+                "TRUSTED_ROOT_SHA256",
+                f"sha256:{hashlib.sha256(trusted_root_jsonl()).hexdigest()}",
+            ), mock.patch.object(
+                MATERIALIZER,
+                "cleanup_isolated_worker_state",
+                side_effect=cleanup_worker,
+            ):
+                trusted_root = MATERIALIZER.fetch_github_trusted_root_isolated(
+                    root,
+                    trusted_uid=os.geteuid(),
+                    trusted_gid=os.getegid(),
+                )
+
+            self.assertEqual(events, ["worker-cleaned"])
+            self.assertEqual(trusted_root.read_bytes(), trusted_root_jsonl())
+            self.assertEqual(trusted_root.stat().st_mode & 0o777, 0o444)
+            phase, command, kwargs = calls[0]
+            self.assertEqual(phase, "rootfetch")
+            self.assertTrue(kwargs["network"])
+            self.assertIn(MATERIALIZER.GH_PATH, kwargs["inputs"])
+            self.assertIn("--trusted-root-fetch-worker", command)
+            MATERIALIZER.unlink_trusted_file(
+                trusted_root,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_trusted_root_fetch_removes_copied_authority_on_cleanup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            root.chmod(0o700)
+            state_root = root / "worker-state"
+
+            def emulate_worker(phase, command, **kwargs):
+                state_root.mkdir(mode=0o700)
+                output = state_root / "trusted-root.jsonl"
+                output.write_bytes(trusted_root_jsonl())
+                output.chmod(0o444)
+                return MATERIALIZER.IsolatedWorkerState(
+                    unit=MATERIALIZER.SYSTEMD_WORKER_UNIT,
+                    state_name="6" * 32,
+                    logical_root=state_root,
+                    physical_root=state_root,
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                )
+
+            with mock.patch.object(
+                MATERIALIZER,
+                "run_isolated_worker",
+                side_effect=emulate_worker,
+            ), mock.patch.object(
+                MATERIALIZER,
+                "TRUSTED_ROOT_SHA256",
+                f"sha256:{hashlib.sha256(trusted_root_jsonl()).hexdigest()}",
+            ), mock.patch.object(
+                MATERIALIZER,
+                "cleanup_isolated_worker_state",
+                side_effect=MATERIALIZER.StaticDeploymentError("cleanup failed"),
+            ):
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "cleanup failed",
+                ):
+                    MATERIALIZER.fetch_github_trusted_root_isolated(
+                        root,
+                        trusted_uid=os.geteuid(),
+                        trusted_gid=os.getegid(),
+                    )
+            self.assertEqual(list(root.glob("trusted-root-*.jsonl")), [])
+
+    def test_trusted_root_fetch_rejects_an_unpinned_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            root.chmod(0o700)
+            state_root = root / "worker-state"
+
+            def emulate_worker(phase, command, **kwargs):
+                state_root.mkdir(mode=0o700)
+                output = state_root / "trusted-root.jsonl"
+                output.write_bytes(trusted_root_jsonl())
+                output.chmod(0o444)
+                return MATERIALIZER.IsolatedWorkerState(
+                    unit=MATERIALIZER.SYSTEMD_WORKER_UNIT,
+                    state_name="7" * 32,
+                    logical_root=state_root,
+                    physical_root=state_root,
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                )
+
+            with mock.patch.object(
+                MATERIALIZER,
+                "run_isolated_worker",
+                side_effect=emulate_worker,
+            ), mock.patch.object(
+                MATERIALIZER,
+                "cleanup_isolated_worker_state",
+                side_effect=lambda state: shutil.rmtree(state.physical_root),
+            ):
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "digest does not match",
+                ):
+                    MATERIALIZER.fetch_github_trusted_root_isolated(
+                        root,
+                        trusted_uid=os.geteuid(),
+                        trusted_gid=os.getegid(),
+                    )
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_attestation_bundle_accepts_utf8_json_at_external_boundary(self) -> None:
         profile = MATERIALIZER.PROFILES["personal"]
@@ -1977,6 +2272,9 @@ class StaticBundleContractTests(unittest.TestCase):
             subject_path = root / "manifest.json"
             subject_path.write_bytes(subject)
             subject_path.chmod(0o444)
+            trusted_root = root / "trusted-root.jsonl"
+            trusted_root.write_bytes(trusted_root_jsonl())
+            trusted_root.chmod(0o444)
             fetch_root = root / "fetch-state"
             fetch_root.mkdir(mode=0o700)
             fake = fetch_root / "attestation-bundles.jsonl"
@@ -2018,6 +2316,7 @@ class StaticBundleContractTests(unittest.TestCase):
                     MATERIALIZER.verify_github_provenance_isolated(
                         reference,
                         subject_path=subject_path,
+                        trusted_root=trusted_root,
                         repository="nclsppr/example",
                         source_revision=REVISION,
                         source_ref="refs/heads/main",
@@ -2225,6 +2524,7 @@ class StaticBundleContractTests(unittest.TestCase):
 
         def provenance(*args, **kwargs):
             events.append("provenance")
+            self.assertEqual(kwargs["trusted_root"], trusted_root)
 
         def blob(*args, **kwargs):
             events.append("payload-fetch")
@@ -2238,6 +2538,9 @@ class StaticBundleContractTests(unittest.TestCase):
             app_root.mkdir()
             temporary = root / "temporary"
             temporary.mkdir()
+            trusted_root = temporary / "trusted-root.jsonl"
+            trusted_root.write_bytes(trusted_root_jsonl())
+            trusted_root.chmod(0o444)
             with mock.patch.object(MATERIALIZER, "fetch_manifest", side_effect=manifest), \
                 mock.patch.object(
                     MATERIALIZER,
@@ -2247,7 +2550,18 @@ class StaticBundleContractTests(unittest.TestCase):
                     MATERIALIZER,
                     "verify_github_provenance_isolated",
                     side_effect=provenance,
-                ), mock.patch.object(MATERIALIZER, "fetch_blob", side_effect=blob):
+                ), mock.patch.object(
+                    MATERIALIZER,
+                    "fetch_github_trusted_root_isolated",
+                    return_value=trusted_root,
+                ) as root_fetch, mock.patch.object(
+                    MATERIALIZER,
+                    "unlink_trusted_file",
+                ) as root_cleanup, mock.patch.object(
+                    MATERIALIZER,
+                    "fetch_blob",
+                    side_effect=blob,
+                ):
                 with self.assertRaisesRegex(
                     MATERIALIZER.StaticDeploymentError,
                     "ordering proof",
@@ -2264,6 +2578,8 @@ class StaticBundleContractTests(unittest.TestCase):
                         releases,
                         app_root,
                     )
+                root_fetch.assert_called_once_with(temporary / "downloads")
+                root_cleanup.assert_called_once_with(trusted_root)
 
         reconstruction_index = events.index("root-reconstruction")
         payload_index = events.index("payload-fetch")

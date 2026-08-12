@@ -491,12 +491,18 @@ exact integration package.
 Before payload download, the materializer verifies separate GitHub artifact
 attestations for the site manifest, route manifest, and integration manifest.
 Each check binds the subject to its exact repository, full revision, source ref,
-and workflow. Each check rejects a self-hosted signer. A network-enabled
-systemd `DynamicUser` execution downloads the attestation index, manifests,
-and bundles with explicit transfer limits. The root orchestrator copies one
-exact bundle set and removes the fetch state. A separate sequential offline
-execution of the same fixed transient unit gives the bundle and digest-bound
-local OCI manifest to GitHub CLI with `--bundle`. The fixed unit name prevents
+and workflow. Each check rejects a self-hosted signer. One separate
+network-enabled systemd `DynamicUser` execution uses the checksum-pinned GitHub
+CLI and its embedded TUF bootstrap roots to obtain one current trusted-root
+snapshot for the deployment. The root orchestrator validates its structure and
+versioned SHA-256 before it copies the snapshot and removes the fetch state. A
+root rotation fails closed until a reviewed repository update changes the
+accepted digest. Other network-enabled executions
+download the attestation indexes, manifests, and bundles with explicit transfer
+limits. The root orchestrator copies each exact bundle set and removes its fetch
+state. A separate sequential offline execution of the same fixed transient unit
+gives the bundle, trusted root, and digest-bound local OCI manifest to GitHub CLI
+with `--bundle` and `--custom-trusted-root`. The fixed unit name prevents
 concurrent worker creation. GitHub CLI receives no operator credential.
 
 This provenance check does not prove branch protection. Protect the canonical
@@ -511,8 +517,10 @@ fail at their bounds. The bearer header stays in a private worker file.
 Manifest and payload copies are checked against caller-known digests. Payload
 copies also use exact sizes from reconstructed manifests. The copied
 attestation bundle set is size-bounded before the offline signature verifier
-authenticates it. Manifest, gzip, tar, inventory, integration package, and
-attestation parsing also runs in bounded `DynamicUser` executions. Their
+authenticates it. The trusted-root execution has runtime, memory, per-file size,
+inode, and tmpfs limits. GitHub CLI does not expose an in-transfer size limit for
+its internal TUF client. Manifest, gzip, tar, inventory, integration package,
+and attestation parsing also runs in bounded `DynamicUser` executions. Their
 private runtime directories use a dedicated tmpfs. The orchestrator waits for
 the complete cgroup to exit before it consumes a result. The temporary Caddy
 image pull remains a separate root-controlled Docker operation by immutable
