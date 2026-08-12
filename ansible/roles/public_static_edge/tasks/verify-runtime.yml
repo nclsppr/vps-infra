@@ -80,6 +80,17 @@
   delegate_to: localhost
   when: vps_public_static_edge_state == 'prepare'
 
+- name: Refuse an unconfigured HTTP host from the operator network
+  ansible.builtin.uri:
+    url: "http://{{ ansible_default_ipv4.address }}/"
+    headers:
+      Host: unconfigured.invalid
+    follow_redirects: none
+    status_code: 404
+    return_content: false
+  become: false
+  delegate_to: localhost
+
 - name: Probe HTTPS apex sites from the operator network after DNS activation
   ansible.builtin.uri:
     url: "https://{{ item }}/"

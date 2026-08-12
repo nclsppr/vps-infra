@@ -38,3 +38,10 @@ http://:2019 {
 }
 
 import /etc/caddy/routes/*.caddy
+
+# Refuse every unconfigured HTTP host instead of letting Caddy's empty
+# fallback answer 200. Host-specific site blocks remain more specific.
+http:// {
+	import security_headers
+	respond "Not found.\n" 404
+}
