@@ -865,6 +865,8 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertNotIn("http://papersempire.com", activate_routes)
         caddyfile = (edge_root / "Caddyfile").read_text(encoding="utf-8")
         self.assertIn("metrics /metrics", caddyfile)
+        self.assertIn('respond "Not found.\\n" 404', caddyfile)
+        self.assertIn("http:// {", caddyfile)
 
         playbook = yaml.safe_load(
             (ROOT / "ansible/playbooks/public-static-edge.yml").read_text(
@@ -934,6 +936,9 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("delegate_to: localhost", runtime_verification)
         self.assertIn("validate_certs: true", runtime_verification)
         self.assertIn("http://{{ ansible_default_ipv4.address }}/", runtime_verification)
+        self.assertIn("Refuse an unconfigured HTTP host", runtime_verification)
+        self.assertIn("Host: unconfigured.invalid", runtime_verification)
+        self.assertIn("status_code: 404", runtime_verification)
 
         authoritative_dns = (
             ROOT
