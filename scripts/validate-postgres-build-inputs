@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  printf 'usage: %s [--github-output PATH] BUILD_ENV\n' "${0##*/}" >&2
+  exit 2
+}
+
+fail() {
+  printf 'PostgreSQL build input validation failed: %s\n' "$*" >&2
+  exit 2
+}
+
+github_output=
+if [[ "${1:-}" == "--github-output" ]]; then
+  [[ $# -eq 3 ]] || usage
+  github_output=$2
+  shift 2
+fi
+[[ $# -eq 1 ]] || usage
+
+source_path=$1
+[[ -f "$source_path" ]] || fail "not a file: $source_path"
+
+base_image=
+seen=false
+while IFS= read -r line || [[ -n "$line" ]]; do
+  case "$line" in
+    "" | \#*) continue ;;
+  esac
+  [[ "$line" == *=* ]] || fail "invalid line: $line"
+  key=${line%%=*}
+  value=${line#*=}
+  [[ -n "$value" ]] || fail "empty value: $key"
+  case "$key" in
+    POSTGRES_BASE_IMAGE)
+      [[ "$seen" == false ]] || fail "duplicate key: $key"
+      base_image=$value
+      seen=true
+      ;;
+    *) fail "unexpected key: $key" ;;
+  esac
+done <"$source_path"
+
+[[ "$seen" == true ]] || fail "missing key: POSTGRES_BASE_IMAGE"
+pattern='^docker\.io/library/postgres:17\.[0-9]+-alpine3\.[0-9]+@sha256:[0-9a-f]{64}$'
+[[ "$base_image" =~ $pattern ]] || fail "invalid POSTGRES_BASE_IMAGE"
+
+if [[ -n "$github_output" ]]; then
+  [[ -f "$github_output" ]] || fail "GitHub output is not a file: $github_output"
+  printf 'base=%s\n' "$base_image" >>"$github_output"
+  image_tag=${base_image#*:}
+  printf 'version=%s\n' "${image_tag%%-*}" >>"$github_output"
+else
+  printf 'PostgreSQL build inputs valid: %s\n' "$source_path"
+fi

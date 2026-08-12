@@ -22,12 +22,12 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Update upstream runtime images without promoting Caddy",
+      "description": "Update upstream runtime images without promoting custom images",
       "managerFilePatterns": [
         "/^platform\\/\\.env\\.example$/"
       ],
       "matchStrings": [
-        "(?<envName>(?:POSTGRES|PROMETHEUS|GRAFANA|NODE_EXPORTER|POSTGRES_EXPORTER)_IMAGE)=(?<depName>[a-zA-Z0-9._/-]+):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+        "(?<envName>(?:PROMETHEUS|GRAFANA|NODE_EXPORTER|POSTGRES_EXPORTER)_IMAGE)=(?<depName>[a-zA-Z0-9._/-]+):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker",
       "versioningTemplate": "docker",
@@ -41,6 +41,19 @@
       ],
       "matchStrings": [
         "(?<envName>CADDY_(?:BUILDER|RUNTIME)_IMAGE)=(?<depName>docker\\.io/library/caddy):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker",
+      "autoReplaceStringTemplate": "{{{envName}}}={{{depName}}}:{{{newValue}}}@{{{newDigest}}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the upstream PostgreSQL build image",
+      "managerFilePatterns": [
+        "/^platform\\/postgres\\/build\\.env$/"
+      ],
+      "matchStrings": [
+        "(?<envName>POSTGRES_BASE_IMAGE)=(?<depName>docker\\.io/library/postgres):(?<currentValue>[^\\s@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker",
       "versioningTemplate": "docker",
@@ -78,6 +91,13 @@
       "description": "Promote the built Caddy image only in a dedicated pull request",
       "matchPackageNames": [
         "ghcr.io/nclsppr/vps-infra/caddy"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Promote the built PostgreSQL image only in a dedicated pull request",
+      "matchPackageNames": [
+        "ghcr.io/nclsppr/vps-infra/postgres"
       ],
       "enabled": false
     }

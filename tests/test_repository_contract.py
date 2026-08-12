@@ -411,10 +411,150 @@ class SupplyChainContractTests(unittest.TestCase):
         )["run"]
         self.assertIn("gh attestation verify", provenance)
 
-    def test_renovate_never_promotes_the_custom_caddy_image(self) -> None:
+    def test_postgres_build_input_validator_enforces_exact_upstream_image(self) -> None:
+        validator = ROOT / "scripts/validate-postgres-build-inputs"
+        build_env = ROOT / "platform/postgres/build.env"
+        self.assertTrue(os.access(validator, os.X_OK))
+        source = build_env.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            candidate = root / "build.env"
+            candidate.write_text(source, encoding="utf-8")
+            github_output = root / "github-output"
+            github_output.touch()
+            valid = subprocess.run(
+                [
+                    str(validator),
+                    "--github-output",
+                    str(github_output),
+                    str(candidate),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            output_lines = github_output.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(output_lines), 2)
+            self.assertTrue(output_lines[0].startswith("base="))
+            self.assertEqual(output_lines[1], "version=17.10")
+
+            invalid_cases = {
+                "wrong-repository.env": source.replace(
+                    "docker.io/library/postgres:",
+                    "registry.example/postgres:",
+                ),
+                "wrong-major.env": source.replace("postgres:17.", "postgres:18."),
+                "duplicate.env": source + source,
+                "mutable.env": source.split("@", maxsplit=1)[0] + "\n",
+            }
+            for name, content in invalid_cases.items():
+                candidate.write_text(content, encoding="utf-8")
+                rejected = subprocess.run(
+                    [str(validator), str(candidate)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(rejected.returncode, 0, name)
+
+    def test_postgres_runtime_image_is_gosu_free_and_non_root(self) -> None:
+        dockerfile = (ROOT / "platform/postgres/Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        verifier = (ROOT / "scripts/verify-postgres-image").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("FROM ${POSTGRES_BASE_IMAGE}", dockerfile)
+        self.assertIn('test "$(id -u postgres)" = 70', dockerfile)
+        self.assertIn('test "$(id -g postgres)" = 70', dockerfile)
+        self.assertIn("rm /usr/local/bin/gosu", dockerfile)
+        self.assertTrue(dockerfile.rstrip().endswith("USER 70:70"))
+        self.assertIn('[[ "$identity" == "70:70" ]]', verifier)
+        self.assertIn('[[ "$expected_version" =~ ^17\\.[0-9]+$ ]]', verifier)
+        self.assertNotIn('PostgreSQL) 17.10"', verifier)
+        self.assertIn("! command -v gosu", verifier)
+        self.assertIn("--network none", verifier)
+        self.assertIn("--read-only", verifier)
+        self.assertIn("--cap-drop ALL", verifier)
+        self.assertIn("--security-opt no-new-privileges:true", verifier)
+        self.assertIn("--data-checksums", verifier)
+        self.assertIn('[[ "$pid_one" == "postgres" ]]', verifier)
+        self.assertIn("data did not survive container replacement", verifier)
+        self.assertIn("secret appeared in logs", verifier)
+
+    def test_postgres_workflow_verifies_scans_then_attests_exact_children(self) -> None:
+        workflow_text = (ROOT / ".github/workflows/postgres-image.yml").read_text(
+            encoding="utf-8"
+        )
+        workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
+        expected_paths = [
+            ".github/workflows/postgres-image.yml",
+            "platform/postgres/.dockerignore",
+            "platform/postgres/Dockerfile",
+            "platform/postgres/build.env",
+            "scripts/validate-postgres-build-inputs",
+            "scripts/verify-postgres-image",
+        ]
+        for event in ("pull_request", "push"):
+            self.assertEqual(workflow["on"][event]["paths"], expected_paths)
+
+        matrix = workflow["jobs"]["verify"]["strategy"]["matrix"]["include"]
+        self.assertEqual(
+            {(entry["platform"], entry["runner"]) for entry in matrix},
+            {
+                ("linux/amd64", "ubuntu-24.04"),
+                ("linux/arm64", "ubuntu-24.04-arm"),
+            },
+        )
+        publish_steps = workflow["jobs"]["publish"]["steps"]
+        publish_names = [step["name"] for step in publish_steps]
+        ordered_names = (
+            "Build and publish the exact image",
+            "Verify the published manifest and OCI labels",
+            "Verify both published images",
+            "Scan the published manifest by digest",
+            "Attest the pushed multi-architecture manifest",
+            "Verify GitHub provenance",
+        )
+        self.assertEqual(
+            [publish_names.index(name) for name in ordered_names],
+            sorted(publish_names.index(name) for name in ordered_names),
+        )
+        manifest_check = next(
+            step
+            for step in publish_steps
+            if step["name"] == "Verify the published manifest and OCI labels"
+        )["run"]
+        self.assertIn('.platform.architecture == "amd64"', manifest_check)
+        self.assertIn('.platform.architecture == "arm64"', manifest_check)
+        self.assertIn("(.manifests | length) == 2", manifest_check)
+        self.assertIn('.config.User == "70:70"', manifest_check)
+        self.assertIn("org.opencontainers.image.revision", manifest_check)
+        self.assertIn("org.opencontainers.image.source", manifest_check)
+        scan = next(
+            step
+            for step in publish_steps
+            if step["name"] == "Scan the published manifest by digest"
+        )["run"]
+        self.assertIn('for digest in "${AMD64_DIGEST}" "${ARM64_DIGEST}"', scan)
+        self.assertIn('"${IMAGE_NAME}@${digest}"', scan)
+        self.assertIn("--severity HIGH,CRITICAL", scan)
+        self.assertIn("--exit-code 1", scan)
+        self.assertNotIn("--ignore-unfixed", scan)
+        self.assertNotIn("--ignorefile", scan)
+        self.assertNotIn("self-hosted", workflow_text)
+        validate = yaml.load(
+            (ROOT / ".github/workflows/validate.yml").read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        validate_command = validate["jobs"]["check"]["steps"][-1]["run"]
+        self.assertIn("check-postgres-image", validate_command)
+
+    def test_renovate_never_promotes_custom_images(self) -> None:
         config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
         managers = config["customManagers"]
-        self.assertEqual(len(managers), 2)
+        self.assertEqual(len(managers), 3)
         self.assertEqual(
             managers[0]["managerFilePatterns"],
             [r"/^platform\/\.env\.example$/"],
@@ -422,6 +562,10 @@ class SupplyChainContractTests(unittest.TestCase):
         self.assertEqual(
             managers[1]["managerFilePatterns"],
             [r"/^platform\/caddy\/build\.env$/"],
+        )
+        self.assertEqual(
+            managers[2]["managerFilePatterns"],
+            [r"/^platform\/postgres\/build\.env$/"],
         )
 
         matchers = [
@@ -435,7 +579,6 @@ class SupplyChainContractTests(unittest.TestCase):
 
         digest = "a" * 64
         for env_name in (
-            "POSTGRES_IMAGE",
             "PROMETHEUS_IMAGE",
             "GRAFANA_IMAGE",
             "NODE_EXPORTER_IMAGE",
@@ -458,6 +601,18 @@ class SupplyChainContractTests(unittest.TestCase):
             is_managed(
                 "CADDY_RUNTIME_IMAGE="
                 f"docker.io/library/example:1.2.3-alpine@sha256:{digest}"
+            )
+        )
+        self.assertTrue(
+            is_managed(
+                "POSTGRES_BASE_IMAGE="
+                f"docker.io/library/postgres:17.10-alpine3.24@sha256:{digest}"
+            )
+        )
+        self.assertFalse(
+            is_managed(
+                "POSTGRES_IMAGE="
+                f"ghcr.io/nclsppr/vps-infra/postgres:sha-test@sha256:{digest}"
             )
         )
         self.assertFalse(
@@ -487,6 +642,13 @@ class SupplyChainContractTests(unittest.TestCase):
             in rule.get("matchPackageNames", [])
         )
         self.assertIs(custom_image["enabled"], False)
+        custom_postgres_image = next(
+            rule
+            for rule in package_rules
+            if "ghcr.io/nclsppr/vps-infra/postgres"
+            in rule.get("matchPackageNames", [])
+        )
+        self.assertIs(custom_postgres_image["enabled"], False)
 
     def test_engine_pin_is_fixed_and_held_packages_can_change(self) -> None:
         variables = yaml.safe_load(

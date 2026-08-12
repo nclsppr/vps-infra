@@ -5,12 +5,14 @@ ANSIBLE_INVENTORY ?= ansible/inventories/production/hosts.yml
 ANSIBLE_EXTRA_VARS ?=
 PLATFORM_ENV ?= platform/.env.example
 CADDY_BUILD_ENV ?= platform/caddy/build.env
+POSTGRES_BUILD_ENV ?= platform/postgres/build.env
 MISE_EXEC := mise exec --
 COMPOSE := $(MISE_EXEC) docker-compose
 
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
-	check-public-static-edge check-prometheus check-caddy check-json bootstrap \
+	check-public-static-edge check-prometheus check-caddy check-postgres-image \
+	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	activate-public-static-edge stop-public-static-edge \
 	doctor-local
@@ -50,7 +52,8 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
 	$(MISE_EXEC) shellcheck scripts/validate-caddy-build-inputs \
-		scripts/verify-caddy-image \
+		scripts/verify-caddy-image scripts/validate-postgres-build-inputs \
+		scripts/verify-postgres-image \
 		platform/caddy/entrypoint.sh platform/postgres/initdb/10-platform-exporter.sh
 
 check-public-safe: ## Reject secrets and production inventories in this public repository.
@@ -65,7 +68,7 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 		schemas/static-route-inventory-v1.schema.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool renovate.json >/dev/null
 
-check-platform: check-platform-config check-public-static-edge check-prometheus check-caddy ## Validate the shared platform and its Caddy image.
+check-platform: check-platform-config check-public-static-edge check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, and custom images.
 
 check-platform-config: ## Render Compose and apply the production policy.
 	@rendered="$$(mktemp)"; \
@@ -112,6 +115,22 @@ check-caddy: ## Build Caddy and validate the inactive and candidate route sets.
 		--build-arg "CADDY_RUNTIME_IMAGE=$$runtime" \
 		--tag "$$image" platform/caddy; \
 	./scripts/verify-caddy-image "$$image"
+
+check-postgres-image: ## Build and verify the non-root PostgreSQL runtime image.
+	@set -Eeuo pipefail; \
+	./scripts/validate-postgres-build-inputs "$(POSTGRES_BUILD_ENV)"; \
+	base="$$(sed -n 's/^POSTGRES_BASE_IMAGE=//p' "$(POSTGRES_BUILD_ENV)")"; \
+	test -n "$$base"; \
+	base_tag="$${base#*:}"; \
+	version="$${base_tag%%-*}"; \
+	image="vps-infra/postgres-check:$$(git rev-parse --short=12 HEAD 2>/dev/null || printf local)"; \
+	docker build \
+		--file platform/postgres/Dockerfile \
+		--build-arg "POSTGRES_BASE_IMAGE=$$base" \
+		--tag "$$image" platform/postgres; \
+	POSTGRES_DOCKER_PLATFORM="linux/$$(docker image inspect \
+		--format '{{.Architecture}}' "$$image")" \
+		./scripts/verify-postgres-image "$$image" "$$version"
 
 bootstrap: ## Create the administrator account on a new OVHcloud Ubuntu host.
 	@test -f "$(ANSIBLE_INVENTORY)" || { \
