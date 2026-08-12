@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nclsppr/vps-infra/schemas/platform-candidate.schema.json",
+  "title": "VPS platform candidate proof input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "compose_project", "images", "integration", "postgres"],
+  "$defs": {
+    "sha40": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "image": {
+      "type": "string",
+      "pattern": "^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"
+    }
+  },
+  "properties": {
+    "contract": { "const": "vps-infra.platform-candidate.v1" },
+    "compose_project": { "const": "vps-platform" },
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caddy", "postgres", "prometheus", "grafana", "node_exporter", "postgres_exporter"],
+      "properties": {
+        "caddy": {
+          "allOf": [
+            { "$ref": "#/$defs/image" },
+            { "pattern": "^ghcr\\.io/nclsppr/vps-infra/caddy:" }
+          ]
+        },
+        "postgres": {
+          "allOf": [
+            { "$ref": "#/$defs/image" },
+            { "pattern": "^docker\\.io/library/postgres:17(?:[.-][A-Za-z0-9_.-]+)?@" }
+          ]
+        },
+        "prometheus": {
+          "allOf": [
+            { "$ref": "#/$defs/image" },
+            { "pattern": "^docker\\.io/prom/prometheus:" }
+          ]
+        },
+        "grafana": {
+          "allOf": [
+            { "$ref": "#/$defs/image" },
+            { "pattern": "^docker\\.io/grafana/grafana:" }
+          ]
+        },
+        "node_exporter": {
+          "allOf": [
+            { "$ref": "#/$defs/image" },
+            { "pattern": "^docker\\.io/prom/node-exporter:" }
+          ]
+        },
+        "postgres_exporter": {
+          "allOf": [
+            { "$ref": "#/$defs/image" },
+            { "pattern": "^docker\\.io/prometheuscommunity/postgres-exporter:" }
+          ]
+        }
+      }
+    },
+    "integration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "artifact"],
+      "properties": {
+        "source_revision": { "$ref": "#/$defs/sha40" },
+        "artifact": {
+          "allOf": [
+            { "$ref": "#/$defs/image" },
+            { "pattern": "^ghcr\\.io/nclsppr/vps-infra/platform-integration(?:[:@])" }
+          ]
+        }
+      }
+    },
+    "postgres": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "pgdata"],
+      "properties": {
+        "major": { "const": 17 },
+        "pgdata": { "const": "/var/lib/postgresql/data/pgdata" }
+      }
+    }
+  }
+}

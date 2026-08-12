@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -19,6 +20,11 @@ IMAGE_REF_RE = re.compile(
 BLOCK_REASON_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 RUN_ID_RE = re.compile(r"^[1-9][0-9]*$")
 EVIDENCE_WORKFLOW_PATH = ".github/workflows/vps-release.yml"
+PLATFORM_CANDIDATE_CONTRACT = "vps-infra.platform-candidate.v1"
+PLATFORM_PROOF_ARTIFACT_PREFIX = "platform-candidate-proof-"
+PLATFORM_PROOF_BASELINE_GATES = frozenset(
+    {"caddy-ovh-image", "immutable-image-digests"}
+)
 
 EXPECTED_APPLICATIONS = {
     "personal": ("static", "nclsppr/personal", "main", None),
@@ -259,20 +265,27 @@ def _validate_evidence(
     path: str,
     repository: str,
     allowed_revisions: set[str] | None,
+    platform_subject: str | None = None,
 ) -> None:
     evidence = _expect_dict(value, path)
-    _expect_exact_keys(
-        evidence,
-        path,
-        {
-            "source_revision",
-            "run_id",
-            "run_attempt",
-            "workflow_path",
-            "conclusion",
-            "url",
-        },
-    )
+    required = {
+        "source_revision",
+        "run_id",
+        "run_attempt",
+        "workflow_path",
+        "conclusion",
+        "url",
+    }
+    proof_keys: set[str] = set()
+    if platform_subject is not None:
+        proof_keys = {
+            "subject_sha256",
+            "artifact_name",
+            "artifact_digest",
+            "artifact_gates",
+            "artifact_id",
+        }
+    _expect_exact_keys(evidence, path, required, proof_keys)
     revision = _validate_sha(evidence["source_revision"], f"{path}.source_revision")
     if allowed_revisions is not None and revision not in allowed_revisions:
         _fail(f"{path}.source_revision", "must match a declared component or integration revision")
@@ -290,6 +303,45 @@ def _validate_evidence(
     _expect_literal(evidence["conclusion"], "success", f"{path}.conclusion")
     expected_url = f"https://github.com/{repository}/actions/runs/{run_id}"
     _expect_literal(evidence["url"], expected_url, f"{path}.url")
+    declared_proof_keys = proof_keys & evidence.keys()
+    if declared_proof_keys and declared_proof_keys != proof_keys:
+        missing = proof_keys - declared_proof_keys
+        _fail(path, f"platform proof fields are incomplete: missing {', '.join(sorted(missing))}")
+    if platform_subject is not None and declared_proof_keys:
+        _expect_literal(
+            evidence["subject_sha256"],
+            platform_subject,
+            f"{path}.subject_sha256",
+        )
+        artifact_gates = evidence["artifact_gates"]
+        if (
+            not isinstance(artifact_gates, list)
+            or not artifact_gates
+            or any(not isinstance(gate, str) for gate in artifact_gates)
+        ):
+            _fail(f"{path}.artifact_gates", "must contain readiness gate names")
+        if artifact_gates != sorted(set(artifact_gates)):
+            _fail(f"{path}.artifact_gates", "must be sorted and unique")
+        if set(artifact_gates) != PLATFORM_PROOF_BASELINE_GATES:
+            _fail(
+                f"{path}.artifact_gates",
+                "must contain exactly the digest-bound baseline gates",
+            )
+        expected_artifact_name = (
+            f"{PLATFORM_PROOF_ARTIFACT_PREFIX}{platform_subject.removeprefix('sha256:')}"
+            f"-{run_id}-{run_attempt}.json"
+        )
+        _expect_literal(
+            evidence["artifact_name"],
+            expected_artifact_name,
+            f"{path}.artifact_name",
+        )
+        artifact_digest = evidence["artifact_digest"]
+        if not isinstance(artifact_digest, str) or not DIGEST_RE.fullmatch(artifact_digest):
+            _fail(f"{path}.artifact_digest", "must be a lowercase sha256 digest")
+        artifact_id = evidence["artifact_id"]
+        if not isinstance(artifact_id, str) or not RUN_ID_RE.fullmatch(artifact_id):
+            _fail(f"{path}.artifact_id", "must be a positive immutable artifact id")
 
 
 def _validate_migrations(
@@ -319,6 +371,77 @@ def _validate_migrations(
     else:
         _expect_literal(migrations["strategy"], "blocked", f"{path}.strategy")
         _expect_literal(migrations["proven"], False, f"{path}.proven")
+
+
+def _validate_platform_candidate_fields(value: Any, path: str) -> str:
+    candidate = _expect_dict(value, path)
+    _expect_exact_keys(
+        candidate,
+        path,
+        {"contract", "compose_project", "images", "integration", "postgres"},
+    )
+    _expect_literal(candidate["contract"], PLATFORM_CANDIDATE_CONTRACT, f"{path}.contract")
+    _expect_literal(candidate["compose_project"], "vps-platform", f"{path}.compose_project")
+    images = _expect_dict(candidate["images"], f"{path}.images")
+    _expect_exact_keys(images, f"{path}.images", set(PLATFORM_IMAGE_REPOSITORIES))
+    for service, repository in PLATFORM_IMAGE_REPOSITORIES.items():
+        _validate_image_reference(images[service], repository, f"{path}.images.{service}")
+
+    integration = _expect_dict(candidate["integration"], f"{path}.integration")
+    _expect_exact_keys(integration, f"{path}.integration", {"source_revision", "artifact"})
+    integration_revision = _validate_sha(
+        integration["source_revision"],
+        f"{path}.integration.source_revision",
+    )
+    _validate_image_reference(
+        integration["artifact"],
+        PLATFORM_INTEGRATION_REPOSITORY,
+        f"{path}.integration.artifact",
+    )
+
+    postgres = _expect_dict(candidate["postgres"], f"{path}.postgres")
+    _expect_exact_keys(postgres, f"{path}.postgres", {"major", "pgdata"})
+    _expect_literal(postgres["major"], 17, f"{path}.postgres.major")
+    postgres_tag = _image_tag(images["postgres"])
+    if postgres_tag is None or not re.fullmatch(r"17(?:[.-][A-Za-z0-9_.-]+)?", postgres_tag):
+        _fail(
+            f"{path}.images.postgres",
+            "tag must be present and its major must match platform.postgres.major (17)",
+        )
+    _expect_literal(
+        postgres["pgdata"],
+        "/var/lib/postgresql/data/pgdata",
+        f"{path}.postgres.pgdata",
+    )
+    return integration_revision
+
+
+def validate_platform_candidate(value: Any) -> dict[str, Any]:
+    """Validate the secret-free input for one platform proof run."""
+
+    candidate = _expect_dict(value, "platform_candidate")
+    _validate_platform_candidate_fields(candidate, "platform_candidate")
+    return candidate
+
+
+def platform_candidate(platform: dict[str, Any]) -> dict[str, Any]:
+    """Return the domain-separated platform fields that online proof binds."""
+
+    return {
+        "contract": PLATFORM_CANDIDATE_CONTRACT,
+        "compose_project": platform["compose_project"],
+        "images": platform["images"],
+        "integration": platform["integration"],
+        "postgres": platform["postgres"],
+    }
+
+
+def platform_candidate_subject(value: dict[str, Any]) -> str:
+    """Return the canonical SHA-256 subject for one platform candidate."""
+
+    candidate = validate_platform_candidate(value)
+    digest = hashlib.sha256(canonical_json(candidate).encode("ascii")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _validate_platform(value: Any) -> None:
@@ -360,41 +483,16 @@ def _validate_platform(value: Any) -> None:
             "enabled platform requires images, an immutable integration bundle, "
             "postgres metadata, and readiness evidence",
         )
-    images = _expect_dict(platform["images"], f"{path}.images")
-    _expect_exact_keys(images, f"{path}.images", set(PLATFORM_IMAGE_REPOSITORIES))
-    for service, repository in PLATFORM_IMAGE_REPOSITORIES.items():
-        _validate_image_reference(images[service], repository, f"{path}.images.{service}")
-
-    integration = _expect_dict(platform["integration"], f"{path}.integration")
-    _expect_exact_keys(integration, f"{path}.integration", {"source_revision", "artifact"})
-    integration_revision = _validate_sha(
-        integration["source_revision"],
-        f"{path}.integration.source_revision",
-    )
-    _validate_image_reference(
-        integration["artifact"],
-        PLATFORM_INTEGRATION_REPOSITORY,
-        f"{path}.integration.artifact",
-    )
-
-    postgres = _expect_dict(platform["postgres"], f"{path}.postgres")
-    _expect_exact_keys(postgres, f"{path}.postgres", {"major", "pgdata"})
-    _expect_literal(postgres["major"], 17, f"{path}.postgres.major")
-    postgres_tag = _image_tag(images["postgres"])
-    if postgres_tag is None or not re.fullmatch(r"17(?:[.-][A-Za-z0-9_.-]+)?", postgres_tag):
-        _fail(
-            f"{path}.images.postgres",
-            "tag must be present and its major must match platform.postgres.major (17)",
-        )
-    _expect_literal(
-        postgres["pgdata"],
-        "/var/lib/postgresql/data/pgdata",
-        f"{path}.postgres.pgdata",
-    )
+    candidate = platform_candidate(platform)
+    integration_revision = _validate_platform_candidate_fields(candidate, path)
+    subject = platform_candidate_subject(candidate)
     readiness = _expect_dict(platform["readiness_evidence"], f"{path}.readiness_evidence")
-    if set(readiness) != PLATFORM_READINESS_GATES:
-        missing = PLATFORM_READINESS_GATES - set(readiness)
-        extra = set(readiness) - PLATFORM_READINESS_GATES
+    expected_readiness = (
+        PLATFORM_READINESS_GATES if enabled else PLATFORM_PROOF_BASELINE_GATES
+    )
+    if set(readiness) != expected_readiness:
+        missing = expected_readiness - set(readiness)
+        extra = set(readiness) - expected_readiness
         details = []
         if missing:
             details.append(f"missing {', '.join(sorted(missing))}")
@@ -407,6 +505,7 @@ def _validate_platform(value: Any) -> None:
             f"{path}.readiness_evidence.{gate}",
             "nclsppr/vps-infra",
             {integration_revision},
+            subject if gate in PLATFORM_PROOF_BASELINE_GATES else None,
         )
 
 

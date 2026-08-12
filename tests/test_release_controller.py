@@ -103,6 +103,10 @@ def add_platform_candidate(manifest: dict) -> None:
     manifest["platform"]["blocked_by"] = sorted(
         RELEASE_POLICY.PLATFORM_READINESS_GATES
     )
+    manifest["platform"]["readiness_evidence"] = {
+        gate: manifest["platform"]["readiness_evidence"][gate]
+        for gate in RELEASE_POLICY.PLATFORM_PROOF_BASELINE_GATES
+    }
 
 
 def set_platform_candidate_revision(manifest: dict, revision: str) -> None:
@@ -265,12 +269,21 @@ class ReleasePolicyTests(unittest.TestCase):
         manifest = sample_manifest()
         add_platform_candidate(manifest)
         manifest["platform"]["readiness_evidence"][
-            "alert-routing-and-delivery"
+            "caddy-ovh-image"
         ]["source_revision"] = SHA_B
         with self.assertRaisesRegex(
             RELEASE_POLICY.PolicyError,
             "must match a declared component or integration revision",
         ):
+            RELEASE_POLICY.validate_manifest(manifest)
+
+    def test_disabled_candidate_rejects_unproven_readiness_gate(self) -> None:
+        manifest = sample_manifest()
+        add_platform_candidate(manifest)
+        manifest["platform"]["readiness_evidence"][
+            "alert-routing-and-delivery"
+        ] = evidence("nclsppr/vps-infra")
+        with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "unknown alert-routing"):
             RELEASE_POLICY.validate_manifest(manifest)
 
     def test_disabled_platform_candidate_reconciles_as_runtime_no_op(self) -> None:

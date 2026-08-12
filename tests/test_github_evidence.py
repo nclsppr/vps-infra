@@ -36,6 +36,10 @@ def load_script_module(name: str, path: Path):
 
 VERIFY = load_script_module("github_evidence_policy", SCRIPTS / "verify-github-evidence")
 RELEASE_POLICY = load_script_module("github_evidence_release_policy", SCRIPTS / "lib" / "release_policy.py")
+PLATFORM_PROOF = load_script_module(
+    "github_evidence_platform_proof",
+    SCRIPTS / "lib" / "platform_proof.py",
+)
 
 
 def sample_manifest() -> dict:
@@ -105,6 +109,30 @@ def enable_platform(manifest: dict, run_id: str = "101") -> None:
     }
 
 
+def add_platform_proof(manifest: dict, *, artifact_id: str = "909") -> dict:
+    platform = manifest["platform"]
+    candidate = RELEASE_POLICY.platform_candidate(platform)
+    subject = RELEASE_POLICY.platform_candidate_subject(candidate)
+    gates = sorted(RELEASE_POLICY.PLATFORM_PROOF_BASELINE_GATES)
+    proof = PLATFORM_PROOF.build_platform_proof(
+        candidate,
+        source_revision=SHA_A,
+        run_id="101",
+        run_attempt=1,
+        verified_gates=gates,
+    )
+    proof_metadata = {
+        "subject_sha256": subject,
+        "artifact_id": artifact_id,
+        "artifact_name": proof["artifact_name"],
+        "artifact_digest": PLATFORM_PROOF.platform_proof_digest(proof),
+        "artifact_gates": gates,
+    }
+    for gate in gates:
+        platform["readiness_evidence"][gate].update(proof_metadata)
+    return proof
+
+
 def enable_parkventory(manifest: dict) -> None:
     enable_platform(manifest)
     app = manifest["applications"]["parkventory"]
@@ -164,7 +192,7 @@ def api_run(
     revision: str,
     run_id: str,
     *,
-    event: str = "push",
+    event: str = "workflow_dispatch",
     run_attempt: int = 1,
     workflow_id: int = 77,
 ) -> dict:
@@ -173,7 +201,7 @@ def api_run(
         "html_url": f"https://github.com/{repository}/actions/runs/{run_id}",
         "head_sha": revision,
         "head_branch": branch,
-        "head_repository": {"full_name": repository},
+        "head_repository": {"full_name": repository, "id": 42},
         "status": "completed",
         "conclusion": "success",
         "event": event,
@@ -183,7 +211,7 @@ def api_run(
             f"https://api.github.com/repos/{repository}/actions/workflows/{workflow_id}"
         ),
         "path": VERIFY.REQUIRED_WORKFLOW_PATH,
-        "repository": {"full_name": repository},
+        "repository": {"full_name": repository, "id": 42},
     }
 
 
@@ -200,6 +228,33 @@ def api_workflow(repository: str, workflow_id: int = 77) -> dict:
 def fake_workflow_fetch(repository: str, workflow_url: str, _timeout: float) -> dict:
     workflow_id = int(workflow_url.rsplit("/", 1)[1])
     return api_workflow(repository, workflow_id)
+
+
+def api_artifact(
+    proof: dict,
+    artifact_id: str = "909",
+) -> dict:
+    artifact_integer = int(artifact_id)
+    url = (
+        "https://api.github.com/repos/nclsppr/vps-infra/actions/artifacts/"
+        f"{artifact_id}"
+    )
+    return {
+        "id": artifact_integer,
+        "name": proof["artifact_name"],
+        "size_in_bytes": len(PLATFORM_PROOF.platform_proof_bytes(proof)),
+        "digest": PLATFORM_PROOF.platform_proof_digest(proof),
+        "expired": False,
+        "url": url,
+        "archive_download_url": f"{url}/zip",
+        "workflow_run": {
+            "id": 101,
+            "repository_id": 42,
+            "head_repository_id": 42,
+            "head_branch": "main",
+            "head_sha": SHA_A,
+        },
+    }
 
 
 class GitHubEvidenceTests(unittest.TestCase):
@@ -220,26 +275,115 @@ class GitHubEvidenceTests(unittest.TestCase):
         manifest["platform"]["enabled"] = False
         manifest["platform"]["published_ports"] = []
         manifest["platform"]["blocked_by"] = sorted(RELEASE_POLICY.PLATFORM_READINESS_GATES)
+        proof = add_platform_proof(manifest)
         calls: list[tuple[str, str, float]] = []
+        artifact_calls: list[tuple[str, str, float]] = []
 
         def fake_fetch(repository: str, run_id: str, timeout: float) -> dict:
             calls.append((repository, run_id, timeout))
             return api_run(repository, "main", SHA_A, run_id)
+
+        def fake_artifact(repository: str, artifact_id: str, timeout: float) -> dict:
+            artifact_calls.append((repository, artifact_id, timeout))
+            return api_artifact(proof, artifact_id)
 
         self.assertEqual(
             VERIFY.verify_manifest(
                 manifest,
                 fetch_run=fake_fetch,
                 fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=fake_artifact,
                 timeout=4.0,
             ),
             1,
         )
         self.assertEqual(calls, [("nclsppr/vps-infra", "101", 4.0)])
+        self.assertEqual(artifact_calls, [("nclsppr/vps-infra", "909", 4.0)])
+
+    def test_platform_proof_replay_after_candidate_mutation_is_rejected(self) -> None:
+        manifest = sample_manifest()
+        enable_platform(manifest)
+        proof = add_platform_proof(manifest)
+        manifest["platform"]["images"]["grafana"] = image(
+            "docker.io/grafana/grafana",
+            DIGEST_B,
+        )
+        with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "subject_sha256"):
+            RELEASE_POLICY.validate_manifest(manifest)
+
+        # The public metadata also binds the canonical proof bytes to this run.
+        manifest["platform"]["images"]["grafana"] = image(
+            "docker.io/grafana/grafana",
+            DIGEST_A,
+        )
+        valid = api_artifact(proof)
+        valid["digest"] = f"sha256:{'f' * 64}"
+        with self.assertRaisesRegex(VERIFY.EvidenceError, "artifact.digest"):
+            VERIFY.verify_manifest(
+                manifest,
+                fetch_run=lambda _repository, _run_id, _timeout: api_run(
+                    "nclsppr/vps-infra", "main", SHA_A, "101"
+                ),
+                fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=lambda _repository, _artifact_id, _timeout: valid,
+            )
+
+    def test_every_platform_artifact_identity_field_is_fail_closed(self) -> None:
+        manifest = sample_manifest()
+        enable_platform(manifest)
+        proof = add_platform_proof(manifest)
+        valid = api_artifact(proof)
+        mutations = {
+            "id": 910,
+            "name": "other.json",
+            "size_in_bytes": valid["size_in_bytes"] + 1,
+            "digest": f"sha256:{'f' * 64}",
+            "expired": True,
+            "url": "https://api.github.com/repos/nclsppr/other/actions/artifacts/909",
+            "archive_download_url": "https://example.com/proof",
+        }
+        for field, invalid_value in mutations.items():
+            with self.subTest(field=field):
+                artifact = json.loads(json.dumps(valid))
+                artifact[field] = invalid_value
+                with self.assertRaises(VERIFY.EvidenceError):
+                    VERIFY.verify_manifest(
+                        manifest,
+                        fetch_run=lambda _repository, _run_id, _timeout: api_run(
+                            "nclsppr/vps-infra", "main", SHA_A, "101"
+                        ),
+                        fetch_workflow=fake_workflow_fetch,
+                        fetch_artifact=(
+                            lambda _repository, _artifact_id, _timeout, artifact=artifact: artifact
+                        ),
+                    )
+
+        for field, invalid_value in {
+            "id": 102,
+            "repository_id": 43,
+            "head_repository_id": 43,
+            "head_branch": "feature/untrusted",
+            "head_sha": SHA_B,
+        }.items():
+            with self.subTest(workflow_run_field=field):
+                artifact = json.loads(json.dumps(valid))
+                artifact["workflow_run"][field] = invalid_value
+                with self.assertRaises(VERIFY.EvidenceError):
+                    VERIFY.verify_manifest(
+                        manifest,
+                        fetch_run=lambda _repository, _run_id, _timeout: api_run(
+                            "nclsppr/vps-infra", "main", SHA_A, "101"
+                        ),
+                        fetch_workflow=fake_workflow_fetch,
+                        fetch_artifact=(
+                            lambda _repository, _artifact_id, _timeout, artifact=artifact: artifact
+                        ),
+                    )
 
     def test_platform_evidence_is_deduplicated_and_verified(self) -> None:
         manifest = sample_manifest()
         enable_platform(manifest)
+        proof = add_platform_proof(manifest)
         calls: list[tuple[str, str, float]] = []
 
         def fake_fetch(repository: str, run_id: str, timeout: float) -> dict:
@@ -251,6 +395,9 @@ class GitHubEvidenceTests(unittest.TestCase):
                 manifest,
                 fetch_run=fake_fetch,
                 fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                    proof, artifact_id
+                ),
                 timeout=3.0,
             ),
             1,
@@ -260,6 +407,7 @@ class GitHubEvidenceTests(unittest.TestCase):
     def test_compose_readiness_and_migration_runs_are_both_verified(self) -> None:
         manifest = sample_manifest()
         enable_parkventory(manifest)
+        proof = add_platform_proof(manifest)
         calls: list[tuple[str, str, float]] = []
 
         def fake_fetch(repository: str, run_id: str, timeout: float) -> dict:
@@ -273,6 +421,9 @@ class GitHubEvidenceTests(unittest.TestCase):
                 manifest,
                 fetch_run=fake_fetch,
                 fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                    proof, artifact_id
+                ),
             ),
             3,
         )
@@ -288,6 +439,7 @@ class GitHubEvidenceTests(unittest.TestCase):
     def test_static_readiness_run_uses_the_application_branch(self) -> None:
         manifest = sample_manifest()
         enable_personal(manifest)
+        proof = add_platform_proof(manifest)
         calls: list[tuple[str, str, float]] = []
 
         def fake_fetch(repository: str, run_id: str, timeout: float) -> dict:
@@ -301,6 +453,9 @@ class GitHubEvidenceTests(unittest.TestCase):
                 manifest,
                 fetch_run=fake_fetch,
                 fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                    proof, artifact_id
+                ),
             ),
             2,
         )
@@ -312,6 +467,7 @@ class GitHubEvidenceTests(unittest.TestCase):
     def test_every_security_relevant_field_must_match(self) -> None:
         manifest = sample_manifest()
         enable_platform(manifest)
+        proof = add_platform_proof(manifest)
         valid = api_run("nclsppr/vps-infra", "main", SHA_A, "101")
         mutations = {
             "repository": {"full_name": "nclsppr/other"},
@@ -337,20 +493,41 @@ class GitHubEvidenceTests(unittest.TestCase):
                         manifest,
                         fetch_run=lambda _repository, _run_id, _timeout, run=run: run,
                         fetch_workflow=fake_workflow_fetch,
+                        fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                            proof, artifact_id
+                        ),
                     )
 
     def test_declared_attempt_and_workflow_path_are_fail_closed(self) -> None:
         manifest = sample_manifest()
         enable_platform(manifest)
+        add_platform_proof(manifest)
         values = manifest["platform"]["readiness_evidence"].values()
         for value in values:
             value["run_attempt"] = 2
+        candidate = RELEASE_POLICY.platform_candidate(manifest["platform"])
+        proof = PLATFORM_PROOF.build_platform_proof(
+            candidate,
+            source_revision=SHA_A,
+            run_id="101",
+            run_attempt=2,
+            verified_gates=sorted(RELEASE_POLICY.PLATFORM_PROOF_BASELINE_GATES),
+        )
+        proof_metadata = {
+            "artifact_name": proof["artifact_name"],
+            "artifact_digest": PLATFORM_PROOF.platform_proof_digest(proof),
+        }
+        for gate in RELEASE_POLICY.PLATFORM_PROOF_BASELINE_GATES:
+            manifest["platform"]["readiness_evidence"][gate].update(proof_metadata)
         run = api_run("nclsppr/vps-infra", "main", SHA_A, "101", run_attempt=2)
         self.assertEqual(
             VERIFY.verify_manifest(
                 manifest,
                 fetch_run=lambda _repository, _run_id, _timeout: run,
                 fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                    proof, artifact_id
+                ),
             ),
             1,
         )
@@ -362,11 +539,15 @@ class GitHubEvidenceTests(unittest.TestCase):
                 manifest,
                 fetch_run=lambda _repository, _run_id, _timeout: run,
                 fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                    proof, artifact_id
+                ),
             )
 
     def test_workflow_metadata_must_match_and_remain_active(self) -> None:
         manifest = sample_manifest()
         enable_platform(manifest)
+        proof = add_platform_proof(manifest)
         run = api_run("nclsppr/vps-infra", "main", SHA_A, "101")
         valid = api_workflow("nclsppr/vps-infra")
         for field, invalid_value in {
@@ -385,6 +566,9 @@ class GitHubEvidenceTests(unittest.TestCase):
                         fetch_workflow=(
                             lambda _repository, _url, _timeout, workflow=workflow: workflow
                         ),
+                        fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                            proof, artifact_id
+                        ),
                     )
 
     def test_workflow_api_url_cannot_escape_the_expected_repository(self) -> None:
@@ -400,6 +584,7 @@ class GitHubEvidenceTests(unittest.TestCase):
     def test_workflow_dispatch_is_an_allowed_canonical_event(self) -> None:
         manifest = sample_manifest()
         enable_platform(manifest)
+        proof = add_platform_proof(manifest)
         run = api_run(
             "nclsppr/vps-infra",
             "main",
@@ -412,13 +597,35 @@ class GitHubEvidenceTests(unittest.TestCase):
                 manifest,
                 fetch_run=lambda _repository, _run_id, _timeout: run,
                 fetch_workflow=fake_workflow_fetch,
+                fetch_artifact=lambda _repository, artifact_id, _timeout: api_artifact(
+                    proof, artifact_id
+                ),
             ),
             1,
         )
 
+    def test_platform_proof_rejects_a_push_run(self) -> None:
+        manifest = sample_manifest()
+        enable_platform(manifest)
+        add_platform_proof(manifest)
+        run = api_run(
+            "nclsppr/vps-infra",
+            "main",
+            SHA_A,
+            "101",
+            event="push",
+        )
+        with self.assertRaisesRegex(VERIFY.EvidenceError, "workflow_dispatch"):
+            VERIFY.verify_manifest(
+                manifest,
+                fetch_run=lambda _repository, _run_id, _timeout: run,
+                fetch_workflow=fake_workflow_fetch,
+            )
+
     def test_non_dict_api_payload_is_rejected(self) -> None:
         manifest = sample_manifest()
         enable_platform(manifest)
+        add_platform_proof(manifest)
         with self.assertRaisesRegex(VERIFY.EvidenceError, "simulée invalide"):
             VERIFY.verify_manifest(
                 manifest,

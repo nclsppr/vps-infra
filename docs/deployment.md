@@ -155,26 +155,42 @@ platform:
   postgres:
     major: 17
     pgdata: /var/lib/postgresql/data/pgdata
-  readiness_evidence: <all-platform-evidence>
+  readiness_evidence:
+    caddy-ovh-image: <digest-bound-proof>
+    immutable-image-digests: <same-digest-bound-proof>
 ```
 
 The validator rejects a partial candidate. It also rejects a mutable reference,
 an unexpected registry repository, a PostgreSQL major mismatch, and evidence
-that is not bound to the integration revision. The controller requires the
-integration revision to be an ancestor of the requested release commit. The
-online evidence check runs before desired state is written. Reconciliation
-returns `unchanged-disabled`, emits no applicable runtime reference, and still
-rejects a quarantined candidate digest.
+that is not bound to the integration revision. A locked candidate may declare
+only the two gates the digest-bound workflow actually proves. Its `blocked_by`
+array still contains all eight platform gates. Alert delivery, networks, DNS
+credentials, runtime probes, secret permissions and PostgreSQL compatibility
+cannot reuse that run as evidence. The controller requires the integration
+revision to be an ancestor of the requested release commit. The online evidence
+check runs before desired state is written. Reconciliation returns
+`unchanged-disabled`, emits no applicable runtime reference, and still rejects
+a quarantined candidate digest.
 
 Candidate metadata is not an activation request. While
 `activation_policy: locked` is the only accepted policy, the controller rejects
 the production marker even if an applicator exists. It cannot create active
 state.
 
-The evidence run does not yet certify each declared OCI digest. The manifest
-therefore retains the provenance blockers. A later workflow must verify the
-digest, OCI labels, and attestation explicitly before those blockers can be
-removed.
+The manual `.github/workflows/vps-release.yml` workflow certifies the exact
+platform candidate subject for two review gates: `caddy-ovh-image` and
+`immutable-image-digests`. It resolves and hashes all seven OCI references,
+verifies supported labels, rejects every HIGH or CRITICAL image finding, checks
+the Caddy OVH module, and verifies workflow-bound GitHub attestations while
+rejecting self-hosted signers. It writes a canonical raw proof artifact.
+`scripts/verify-github-evidence` reconstructs the same bytes and compares their
+digest and run identity with public GitHub artifact metadata. This prevents the
+reuse of a successful run after any candidate digest or run-attempt change.
+
+This review proof removes no production blocker. The workflow requests 90-day
+artifact retention, subject to the repository retention policy, and the
+verifier rejects deleted or expired evidence. Keep `activation_policy: locked`
+until durable provenance and every semantic gate have separate evidence.
 
 The schema stays at version 1 and still accepts the legacy manifest. An older
 controller does not understand the candidate fields. Before a controller

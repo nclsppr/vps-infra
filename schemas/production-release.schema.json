@@ -54,6 +54,10 @@
       "type": "string",
       "pattern": "^[0-9a-f]{40}$"
     },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
     "imageReference": {
       "type": "string",
       "pattern": "^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$"
@@ -67,24 +71,25 @@
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/blockReason" }
     },
+    "platformGate": {
+      "enum": [
+        "alert-routing-and-delivery",
+        "caddy-ovh-image",
+        "external-networks-and-cidrs",
+        "immutable-image-digests",
+        "ovh-dns-credentials",
+        "platform-config-and-probes",
+        "platform-secrets-and-permissions",
+        "postgres-pgdata-and-compatibility"
+      ]
+    },
     "platformBlockedBy": {
       "allOf": [
         { "$ref": "#/$defs/blockedBy" },
         {
           "minItems": 8,
           "maxItems": 8,
-          "items": {
-            "enum": [
-              "alert-routing-and-delivery",
-              "caddy-ovh-image",
-              "external-networks-and-cidrs",
-              "immutable-image-digests",
-              "ovh-dns-credentials",
-              "platform-config-and-probes",
-              "platform-secrets-and-permissions",
-              "postgres-pgdata-and-compatibility"
-            ]
-          }
+          "items": { "$ref": "#/$defs/platformGate" }
         }
       ]
     },
@@ -108,6 +113,49 @@
         "url": {
           "type": "string",
           "pattern": "^https://github\\.com/nclsppr/[a-z0-9-]+/actions/runs/[1-9][0-9]*$"
+        }
+      }
+    },
+    "platformEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "run_id", "run_attempt", "workflow_path", "conclusion", "url"],
+      "dependentRequired": {
+        "subject_sha256": ["artifact_id", "artifact_name", "artifact_digest", "artifact_gates"],
+        "artifact_id": ["subject_sha256", "artifact_name", "artifact_digest", "artifact_gates"],
+        "artifact_name": ["subject_sha256", "artifact_id", "artifact_digest", "artifact_gates"],
+        "artifact_digest": ["subject_sha256", "artifact_id", "artifact_name", "artifact_gates"],
+        "artifact_gates": ["subject_sha256", "artifact_id", "artifact_name", "artifact_digest"]
+      },
+      "properties": {
+        "source_revision": { "$ref": "#/$defs/sha40" },
+        "run_id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "run_attempt": { "type": "integer", "minimum": 1 },
+        "workflow_path": { "const": ".github/workflows/vps-release.yml" },
+        "conclusion": { "const": "success" },
+        "url": {
+          "type": "string",
+          "pattern": "^https://github\\.com/nclsppr/vps-infra/actions/runs/[1-9][0-9]*$"
+        },
+        "subject_sha256": { "$ref": "#/$defs/digest" },
+        "artifact_id": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "artifact_name": {
+          "type": "string",
+          "pattern": "^platform-candidate-proof-[0-9a-f]{64}-[1-9][0-9]*-[1-9][0-9]*\\.json$"
+        },
+        "artifact_digest": { "$ref": "#/$defs/digest" },
+        "artifact_gates": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["caddy-ovh-image", "immutable-image-digests"]
+          },
+          "contains": { "const": "caddy-ovh-image" },
+          "allOf": [
+            { "contains": { "const": "immutable-image-digests" } }
+          ]
         }
       }
     },
@@ -188,21 +236,11 @@
         "readiness_evidence": {
           "type": "object",
           "additionalProperties": false,
-          "required": [
-            "alert-routing-and-delivery",
-            "caddy-ovh-image",
-            "external-networks-and-cidrs",
-            "immutable-image-digests",
-            "ovh-dns-credentials",
-            "platform-config-and-probes",
-            "platform-secrets-and-permissions",
-            "postgres-pgdata-and-compatibility"
-          ],
           "properties": {
             "alert-routing-and-delivery": { "$ref": "#/$defs/evidence" },
-            "caddy-ovh-image": { "$ref": "#/$defs/evidence" },
+            "caddy-ovh-image": { "$ref": "#/$defs/platformEvidence" },
             "external-networks-and-cidrs": { "$ref": "#/$defs/evidence" },
-            "immutable-image-digests": { "$ref": "#/$defs/evidence" },
+            "immutable-image-digests": { "$ref": "#/$defs/platformEvidence" },
             "ovh-dns-credentials": { "$ref": "#/$defs/evidence" },
             "platform-config-and-probes": { "$ref": "#/$defs/evidence" },
             "platform-secrets-and-permissions": { "$ref": "#/$defs/evidence" },
@@ -217,6 +255,20 @@
             "required": ["images", "integration", "postgres", "readiness_evidence"],
             "properties": {
               "blocked_by": { "maxItems": 0 },
+              "readiness_evidence": {
+                "required": [
+                  "alert-routing-and-delivery",
+                  "caddy-ovh-image",
+                  "external-networks-and-cidrs",
+                  "immutable-image-digests",
+                  "ovh-dns-credentials",
+                  "platform-config-and-probes",
+                  "platform-secrets-and-permissions",
+                  "postgres-pgdata-and-compatibility"
+                ],
+                "minProperties": 8,
+                "maxProperties": 8
+              },
               "published_ports": {
                 "allOf": [
                   { "contains": { "const": "80/tcp" } },
@@ -228,7 +280,12 @@
           "else": {
             "properties": {
               "blocked_by": { "$ref": "#/$defs/platformBlockedBy" },
-              "published_ports": { "maxItems": 0 }
+              "published_ports": { "maxItems": 0 },
+              "readiness_evidence": {
+                "required": ["caddy-ovh-image", "immutable-image-digests"],
+                "minProperties": 2,
+                "maxProperties": 2
+              }
             }
           }
         }
