@@ -393,7 +393,9 @@ class PlatformIntegrationWorkflowTests(unittest.TestCase):
                 "platform/caddy/Caddyfile",
                 "platform/caddy/routes/**",
                 "platform/observability/**",
-                "platform/postgres/**",
+                "platform/postgres/initdb/**",
+                "platform/postgres/pg_hba.conf",
+                "platform/postgres/postgresql.conf",
                 "mise.lock",
                 "mise.toml",
                 "scripts/build-platform-integration",
@@ -547,6 +549,8 @@ class PlatformIntegrationRepositoryContractTests(unittest.TestCase):
                 path.relative_to(ROOT).as_posix()
                 for path in (ROOT / "platform/postgres").rglob("*")
                 if path.is_file()
+                and path.name
+                not in {".dockerignore", "Dockerfile", "build.env"}
             ),
         }
         self.assertEqual(selected, expected)
@@ -556,6 +560,9 @@ class PlatformIntegrationRepositoryContractTests(unittest.TestCase):
             "platform/caddy/build.env",
             "platform/caddy/build/go.mod",
             "platform/caddy/entrypoint.sh",
+            "platform/postgres/.dockerignore",
+            "platform/postgres/Dockerfile",
+            "platform/postgres/build.env",
         ):
             self.assertNotIn(forbidden, selected)
 

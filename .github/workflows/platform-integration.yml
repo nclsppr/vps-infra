@@ -12,7 +12,9 @@ on:
       - platform/caddy/Caddyfile
       - platform/caddy/routes/**
       - platform/observability/**
-      - platform/postgres/**
+      - platform/postgres/initdb/**
+      - platform/postgres/pg_hba.conf
+      - platform/postgres/postgresql.conf
       - mise.lock
       - mise.toml
       - scripts/build-platform-integration

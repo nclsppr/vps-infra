@@ -1,0 +1,316 @@
+---
+name: PostgreSQL platform image
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/postgres-image.yml
+      - platform/postgres/.dockerignore
+      - platform/postgres/Dockerfile
+      - platform/postgres/build.env
+      - scripts/validate-postgres-build-inputs
+      - scripts/verify-postgres-image
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/postgres-image.yml
+      - platform/postgres/.dockerignore
+      - platform/postgres/Dockerfile
+      - platform/postgres/build.env
+      - scripts/validate-postgres-build-inputs
+      - scripts/verify-postgres-image
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILDKIT_IMAGE: docker.io/moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+  BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.73.0@sha256:7cced7cae583819fc7806d4cbc0dbbc7cad18b99f7d3e235192e6da8c091045c
+  POSTGRES_BUILD_ENV: platform/postgres/build.env
+
+concurrency:
+  group: postgres-image-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify ${{ matrix.architecture }} build
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read and validate the pinned build input
+        id: inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ./scripts/validate-postgres-build-inputs \
+            --github-output "${GITHUB_OUTPUT}" \
+            "${POSTGRES_BUILD_ENV}"
+
+      - name: Configure Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: |
+            image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: Build without registry credentials
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: platform/postgres
+          file: platform/postgres/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          build-args: |
+            POSTGRES_BASE_IMAGE=${{ steps.inputs.outputs.base }}
+          tags: vps-infra/postgres-verify:${{ matrix.architecture }}-${{ github.sha }}
+          cache-from: type=gha,scope=postgres-platform-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=postgres-platform-pr-${{ matrix.architecture }}
+          provenance: false
+          sbom: false
+
+      - name: Verify the exact PostgreSQL image
+        shell: bash
+        env:
+          POSTGRES_DOCKER_PLATFORM: ${{ matrix.platform }}
+          POSTGRES_VERIFY_IMAGE: vps-infra/postgres-verify:${{ matrix.architecture }}-${{ github.sha }}
+        run: ./scripts/verify-postgres-image "${POSTGRES_VERIFY_IMAGE}"
+
+      - name: Reject high or critical vulnerabilities
+        shell: bash
+        env:
+          POSTGRES_VERIFY_IMAGE: vps-infra/postgres-verify:${{ matrix.architecture }}-${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+          docker run --rm \
+            --volume /var/run/docker.sock:/var/run/docker.sock \
+            "${TRIVY_IMAGE}" image \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --no-progress \
+            "${POSTGRES_VERIFY_IMAGE}"
+
+  publish:
+    name: Publish immutable image
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read and validate the pinned build input
+        id: inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ./scripts/validate-postgres-build-inputs \
+            --github-output "${GITHUB_OUTPUT}" \
+            "${POSTGRES_BUILD_ENV}"
+
+      - name: Enable multi-architecture emulation
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
+          platforms: arm64
+
+      - name: Configure Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver-opts: |
+            image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: Authenticate to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive immutable image metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}/postgres
+          tags: |
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and publish the exact image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: platform/postgres
+          file: platform/postgres/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            POSTGRES_BASE_IMAGE=${{ steps.inputs.outputs.base }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=postgres-platform
+          cache-to: type=gha,mode=max,scope=postgres-platform
+          provenance: false
+          sbom: false
+
+      - name: Verify the published manifest and OCI labels
+        id: published
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_NAME: ghcr.io/${{ github.repository }}/postgres
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_SOURCE: https://github.com/${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          reference="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          manifest=$(docker buildx imagetools inspect \
+            "${reference}" --format '{{json .Manifest}}')
+          jq -e --arg digest "${IMAGE_DIGEST}" '
+            .digest == $digest
+            and (.manifests | length) == 2
+            and ([.manifests[] | select(
+              .platform.os == "linux"
+              and (.platform.architecture == "amd64"
+                or .platform.architecture == "arm64")
+            )] | length) == 2
+            and ([.manifests[] | select(
+              .platform.os == "linux" and .platform.architecture == "amd64"
+            )] | length) == 1
+            and ([.manifests[] | select(
+              .platform.os == "linux" and .platform.architecture == "arm64"
+            )] | length) == 1
+          ' <<<"${manifest}" >/dev/null
+          amd64_digest=$(jq -er '.manifests[] | select(
+            .platform.os == "linux" and .platform.architecture == "amd64"
+          ) | .digest' <<<"${manifest}")
+          arm64_digest=$(jq -er '.manifests[] | select(
+            .platform.os == "linux" and .platform.architecture == "arm64"
+          ) | .digest' <<<"${manifest}")
+
+          images=$(docker buildx imagetools inspect \
+            "${reference}" --format '{{json .Image}}')
+          for platform in linux/amd64 linux/arm64; do
+            jq -e \
+              --arg platform "${platform}" \
+              --arg revision "${EXPECTED_REVISION}" \
+              --arg source "${EXPECTED_SOURCE}" '
+                .[$platform].config.Labels["org.opencontainers.image.revision"]
+                  == $revision
+                and .[$platform].config.Labels["org.opencontainers.image.source"]
+                  == $source
+                and .[$platform].config.User == "70:70"
+              ' <<<"${images}" >/dev/null
+          done
+
+          {
+            printf 'reference=%s\n' "${reference}"
+            printf 'amd64_digest=%s\n' "${amd64_digest}"
+            printf 'arm64_digest=%s\n' "${arm64_digest}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Verify both published images
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.published.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.published.outputs.arm64_digest }}
+          IMAGE_NAME: ghcr.io/${{ github.repository }}/postgres
+        run: |
+          set -Eeuo pipefail
+          POSTGRES_DOCKER_PLATFORM=linux/amd64 \
+            ./scripts/verify-postgres-image "${IMAGE_NAME}@${AMD64_DIGEST}"
+          POSTGRES_DOCKER_PLATFORM=linux/arm64 \
+            ./scripts/verify-postgres-image "${IMAGE_NAME}@${ARM64_DIGEST}"
+
+      - name: Scan the published manifest by digest
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+          AMD64_DIGEST: ${{ steps.published.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.published.outputs.arm64_digest }}
+          IMAGE_NAME: ghcr.io/${{ github.repository }}/postgres
+        run: |
+          set -Eeuo pipefail
+          auth_directory=$(mktemp -d)
+          cache_directory=$(mktemp -d)
+          trap 'rm -rf -- "${auth_directory}" "${cache_directory}"' EXIT
+          runner_identity="$(id -u):$(id -g)"
+          printf '%s' "${GHCR_TOKEN}" | docker run --rm --interactive \
+            --user "${runner_identity}" \
+            --volume "${auth_directory}:/tmp/trivy-auth" \
+            --env DOCKER_CONFIG=/tmp/trivy-auth \
+            "${TRIVY_IMAGE}" registry login \
+            --username "${GHCR_USERNAME}" \
+            --password-stdin ghcr.io
+          for digest in "${AMD64_DIGEST}" "${ARM64_DIGEST}"; do
+            docker run --rm \
+              --user "${runner_identity}" \
+              --volume "${auth_directory}:/tmp/trivy-auth:ro" \
+              --volume "${cache_directory}:/tmp/trivy-cache" \
+              --env DOCKER_CONFIG=/tmp/trivy-auth \
+              "${TRIVY_IMAGE}" image \
+              --cache-dir /tmp/trivy-cache \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --exit-code 1 \
+              --no-progress \
+              "${IMAGE_NAME}@${digest}"
+          done
+
+      - name: Attest the pushed multi-architecture manifest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}/postgres
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify GitHub provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REFERENCE: ${{ steps.published.outputs.reference }}
+        run: |
+          set -Eeuo pipefail
+          gh attestation verify "oci://${IMAGE_REFERENCE}" \
+            --repo "${GITHUB_REPOSITORY}"
+
+      - name: Publish digest in the workflow summary
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo '### Published PostgreSQL platform image'
+            echo
+            echo "\`ghcr.io/${GITHUB_REPOSITORY}/postgres@${IMAGE_DIGEST}\`"
+            echo
+            echo 'The image runs as UID/GID 70 and contains no gosu binary.'
+          } >>"${GITHUB_STEP_SUMMARY}"

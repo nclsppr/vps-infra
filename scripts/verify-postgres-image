@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+fail() {
+  printf 'PostgreSQL image verification failed: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ $# -eq 1 ]] || fail "usage: ${0##*/} IMAGE"
+image=$1
+platform=${POSTGRES_DOCKER_PLATFORM:-linux/amd64}
+case "$platform" in
+  linux/amd64 | linux/arm64) ;;
+  *) fail "unsupported platform: $platform" ;;
+esac
+
+container="vps-postgres-verify-${RANDOM}-$$"
+volume="${container}-data"
+credential_directory=$(mktemp -d)
+credential_path="$credential_directory/password"
+cleanup() {
+  status=$?
+  docker rm --force "$container" >/dev/null 2>&1 || true
+  docker volume rm "$volume" >/dev/null 2>&1 || true
+  rm -rf -- "$credential_directory"
+  exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+
+start_server() {
+  docker run --detach \
+    --name "$container" \
+    --platform "$platform" \
+    --network none \
+    --read-only \
+    --security-opt no-new-privileges:true \
+    --cap-drop ALL \
+    --tmpfs /tmp:size=64m,mode=1777 \
+    --tmpfs /var/run/postgresql:size=16m,mode=2775,uid=70,gid=70 \
+    --env POSTGRES_DB=postgres \
+    --env POSTGRES_USER=platform_admin \
+    --env POSTGRES_PASSWORD_FILE=/run/secrets/password \
+    --env 'POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=trust --data-checksums' \
+    --env PGDATA=/var/lib/postgresql/data/pgdata \
+    --mount "type=bind,source=${credential_directory},target=/run/secrets,readonly" \
+    --mount "type=volume,source=${volume},target=/var/lib/postgresql/data" \
+    "$image" >/dev/null
+}
+
+wait_for_final_server() {
+  local container_state pid_one ready=false
+  for _ in $(seq 1 60); do
+    container_state=$(docker inspect --format '{{.State.Status}}' "$container")
+    if [[ "$container_state" != "running" ]]; then
+      docker logs "$container" >&2
+      fail "server exited during startup: $container_state"
+    fi
+    pid_one=$(docker exec "$container" cat /proc/1/comm 2>/dev/null || true)
+    if [[ "$pid_one" == "postgres" ]] && docker exec "$container" pg_isready \
+      --host=/var/run/postgresql \
+      --username=platform_admin \
+      --dbname=postgres >/dev/null 2>&1; then
+      ready=true
+      break
+    fi
+    sleep 1
+  done
+  [[ "$ready" == true ]] || {
+    docker logs "$container" >&2
+    fail "final PostgreSQL process did not become ready"
+  }
+}
+
+assert_secret_absent_from_logs() {
+  if docker logs "$container" 2>&1 | grep -Fq \
+    'temporary-verification-password'; then
+    fail "verification secret appeared in logs"
+  fi
+}
+
+printf '%s\n' 'temporary-verification-password' >"$credential_path"
+chmod 0755 "$credential_directory"
+chmod 0444 "$credential_path"
+
+identity=$(docker run --rm --platform "$platform" --entrypoint /bin/sh "$image" \
+  -ec 'printf "%s:%s\n" "$(id -u)" "$(id -g)"; ! command -v gosu >/dev/null')
+[[ "$identity" == "70:70" ]] || fail "runtime identity must be 70:70"
+
+version=$(docker run --rm --platform "$platform" "$image" postgres --version)
+[[ "$version" == "postgres (PostgreSQL) 17.10" ]] || {
+  fail "unexpected server version: $version"
+}
+
+docker volume create "$volume" >/dev/null
+start_server
+wait_for_final_server
+
+result=$(docker exec "$container" psql \
+  --host=/var/run/postgresql \
+  --username=platform_admin \
+  --dbname=postgres \
+  --tuples-only \
+  --no-align \
+  --command 'SELECT current_setting('"'"'data_checksums'"'"');')
+[[ "$result" == "on" ]] || fail "data checksums are not active"
+
+docker exec "$container" psql \
+  --host=/var/run/postgresql \
+  --username=platform_admin \
+  --dbname=postgres \
+  --set=ON_ERROR_STOP=1 \
+  --command "CREATE TABLE image_verification (value text NOT NULL); INSERT INTO image_verification VALUES ('persistent');" \
+  >/dev/null
+assert_secret_absent_from_logs
+
+docker stop --time 30 "$container" >/dev/null
+docker rm "$container" >/dev/null
+start_server
+wait_for_final_server
+
+persisted=$(docker exec "$container" psql \
+  --host=/var/run/postgresql \
+  --username=platform_admin \
+  --dbname=postgres \
+  --tuples-only \
+  --no-align \
+  --command 'SELECT value FROM image_verification;')
+[[ "$persisted" == "persistent" ]] || fail "data did not survive container replacement"
+assert_secret_absent_from_logs
+
+printf 'PostgreSQL image verified: %s (%s)\n' "$image" "$platform"

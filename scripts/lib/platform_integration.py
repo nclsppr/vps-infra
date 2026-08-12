@@ -67,7 +67,9 @@ RUNTIME_PATHS_TO_SCAN = (
     "platform/caddy/Caddyfile",
     "platform/caddy/routes",
     "platform/observability",
-    "platform/postgres",
+    "platform/postgres/initdb",
+    "platform/postgres/pg_hba.conf",
+    "platform/postgres/postgresql.conf",
 )
 
 
