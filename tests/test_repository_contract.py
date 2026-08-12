@@ -647,6 +647,14 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertIn("Pull the exact verified Caddy image", role_text)
         self.assertIn("Validate Caddy with the staged production files", role_text)
+        self.assertIn(
+            "item.stat.lnk_target is match('^releases/sha256-[0-9a-f]{64}$')",
+            role_text,
+        )
+        self.assertNotIn(
+            "item.stat.lnk_source is match('^releases/sha256-[0-9a-f]{64}$')",
+            role_text,
+        )
         self.assertIn("Read the effective Docker ingress firewall activity", role_text)
         self.assertIn(
             "vps_public_static_edge_ingress_firewall_activity.stdout == 'active'",
