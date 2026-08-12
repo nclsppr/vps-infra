@@ -42,12 +42,15 @@ files with network access disabled. A missing file, changed payload, missing
 dependency, or checksum mismatch fails the build.
 
 `CADDY_PLATFORM_IMAGE` in `platform/.env.example` is the promotion point for an
-already published and attested output. It references the custom image built by
-the protected `main` workflow at infrastructure revision
-`dbbc1b8749670c107193de5b8ec623ac7a147555`, after both native child images
-passed the strict scan and the multi-architecture digest received verified
-GitHub provenance. A promotion does not rebuild the image. Production uses the
-custom image by digest.
+already published and attested output. It references the custom manifest
+`sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f`,
+built by the `main` image workflow at infrastructure revision
+`755565642f71918134151921f8eae63935951ad6`. Workflow run
+[`31575365861`](https://github.com/nclsppr/vps-infra/actions/runs/31575365861)
+verified both native child images, passed the strict scan for each exact child
+digest, and created and verified GitHub provenance for the exact
+multi-architecture manifest. A promotion does not rebuild the image.
+Production uses the custom image by digest.
 
 ## Caddy publication gate
 
