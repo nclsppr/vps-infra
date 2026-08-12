@@ -49,6 +49,8 @@ pattern='^docker\.io/library/postgres:17\.[0-9]+-alpine3\.[0-9]+@sha256:[0-9a-f]
 if [[ -n "$github_output" ]]; then
   [[ -f "$github_output" ]] || fail "GitHub output is not a file: $github_output"
   printf 'base=%s\n' "$base_image" >>"$github_output"
+  image_tag=${base_image#*:}
+  printf 'version=%s\n' "${image_tag%%-*}" >>"$github_output"
 else
   printf 'PostgreSQL build inputs valid: %s\n' "$source_path"
 fi

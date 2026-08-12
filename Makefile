@@ -121,6 +121,8 @@ check-postgres-image: ## Build and verify the non-root PostgreSQL runtime image.
 	./scripts/validate-postgres-build-inputs "$(POSTGRES_BUILD_ENV)"; \
 	base="$$(sed -n 's/^POSTGRES_BASE_IMAGE=//p' "$(POSTGRES_BUILD_ENV)")"; \
 	test -n "$$base"; \
+	base_tag="$${base#*:}"; \
+	version="$${base_tag%%-*}"; \
 	image="vps-infra/postgres-check:$$(git rev-parse --short=12 HEAD 2>/dev/null || printf local)"; \
 	docker build \
 		--file platform/postgres/Dockerfile \
@@ -128,7 +130,7 @@ check-postgres-image: ## Build and verify the non-root PostgreSQL runtime image.
 		--tag "$$image" platform/postgres; \
 	POSTGRES_DOCKER_PLATFORM="linux/$$(docker image inspect \
 		--format '{{.Architecture}}' "$$image")" \
-		./scripts/verify-postgres-image "$$image"
+		./scripts/verify-postgres-image "$$image" "$$version"
 
 bootstrap: ## Create the administrator account on a new OVHcloud Ubuntu host.
 	@test -f "$(ANSIBLE_INVENTORY)" || { \

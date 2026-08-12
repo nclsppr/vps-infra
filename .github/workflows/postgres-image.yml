@@ -93,7 +93,8 @@ jobs:
         env:
           POSTGRES_DOCKER_PLATFORM: ${{ matrix.platform }}
           POSTGRES_VERIFY_IMAGE: vps-infra/postgres-verify:${{ matrix.architecture }}-${{ github.sha }}
-        run: ./scripts/verify-postgres-image "${POSTGRES_VERIFY_IMAGE}"
+          POSTGRES_EXPECTED_VERSION: ${{ steps.inputs.outputs.version }}
+        run: ./scripts/verify-postgres-image "${POSTGRES_VERIFY_IMAGE}" "${POSTGRES_EXPECTED_VERSION}"
 
       - name: Reject high or critical vulnerabilities
         shell: bash
@@ -242,12 +243,13 @@ jobs:
           AMD64_DIGEST: ${{ steps.published.outputs.amd64_digest }}
           ARM64_DIGEST: ${{ steps.published.outputs.arm64_digest }}
           IMAGE_NAME: ghcr.io/${{ github.repository }}/postgres
+          POSTGRES_EXPECTED_VERSION: ${{ steps.inputs.outputs.version }}
         run: |
           set -Eeuo pipefail
           POSTGRES_DOCKER_PLATFORM=linux/amd64 \
-            ./scripts/verify-postgres-image "${IMAGE_NAME}@${AMD64_DIGEST}"
+            ./scripts/verify-postgres-image "${IMAGE_NAME}@${AMD64_DIGEST}" "${POSTGRES_EXPECTED_VERSION}"
           POSTGRES_DOCKER_PLATFORM=linux/arm64 \
-            ./scripts/verify-postgres-image "${IMAGE_NAME}@${ARM64_DIGEST}"
+            ./scripts/verify-postgres-image "${IMAGE_NAME}@${ARM64_DIGEST}" "${POSTGRES_EXPECTED_VERSION}"
 
       - name: Scan the published manifest by digest
         shell: bash

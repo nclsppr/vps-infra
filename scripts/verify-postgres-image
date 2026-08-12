@@ -6,8 +6,12 @@ fail() {
   exit 1
 }
 
-[[ $# -eq 1 ]] || fail "usage: ${0##*/} IMAGE"
+[[ $# -eq 2 ]] || fail "usage: ${0##*/} IMAGE EXPECTED_VERSION"
 image=$1
+expected_version=$2
+[[ "$expected_version" =~ ^17\.[0-9]+$ ]] || {
+  fail "invalid expected PostgreSQL version: $expected_version"
+}
 platform=${POSTGRES_DOCKER_PLATFORM:-linux/amd64}
 case "$platform" in
   linux/amd64 | linux/arm64) ;;
@@ -87,7 +91,7 @@ identity=$(docker run --rm --platform "$platform" --entrypoint /bin/sh "$image" 
 [[ "$identity" == "70:70" ]] || fail "runtime identity must be 70:70"
 
 version=$(docker run --rm --platform "$platform" "$image" postgres --version)
-[[ "$version" == "postgres (PostgreSQL) 17.10" ]] || {
+[[ "$version" == "postgres (PostgreSQL) $expected_version" ]] || {
   fail "unexpected server version: $version"
 }
 

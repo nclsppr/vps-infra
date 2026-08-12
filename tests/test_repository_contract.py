@@ -435,8 +435,9 @@ class SupplyChainContractTests(unittest.TestCase):
             )
             self.assertEqual(valid.returncode, 0, valid.stderr)
             output_lines = github_output.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(output_lines), 1)
+            self.assertEqual(len(output_lines), 2)
             self.assertTrue(output_lines[0].startswith("base="))
+            self.assertEqual(output_lines[1], "version=17.10")
 
             invalid_cases = {
                 "wrong-repository.env": source.replace(
@@ -470,6 +471,8 @@ class SupplyChainContractTests(unittest.TestCase):
         self.assertIn("rm /usr/local/bin/gosu", dockerfile)
         self.assertTrue(dockerfile.rstrip().endswith("USER 70:70"))
         self.assertIn('[[ "$identity" == "70:70" ]]', verifier)
+        self.assertIn('[[ "$expected_version" =~ ^17\\.[0-9]+$ ]]', verifier)
+        self.assertNotIn('PostgreSQL) 17.10"', verifier)
         self.assertIn("! command -v gosu", verifier)
         self.assertIn("--network none", verifier)
         self.assertIn("--read-only", verifier)
