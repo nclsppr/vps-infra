@@ -466,23 +466,21 @@ def verify_archive_with_source(
 ) -> None:
     descriptor = checked_file(directory_fd, name, owner=runtime.owner)
     try:
-        with os.fdopen(descriptor, "rb", closefd=False) as source:
-            magic = source.read(5)
-            if magic != b"PGDMP":
-                raise BackupError(f"database archive {name} has an invalid format")
-            source.seek(0)
-            runtime.run(
-                runtime.docker_arguments(
-                    "exec",
-                    "--interactive",
-                    container,
-                    "pg_restore",
-                    "--list",
-                    "-",
-                ),
-                f"PostgreSQL archive verification for {name}",
-                stdin=source,
-            )
+        magic = os.read(descriptor, 5)
+        if magic != b"PGDMP":
+            raise BackupError(f"database archive {name} has an invalid format")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        runtime.run(
+            runtime.docker_arguments(
+                "exec",
+                "--interactive",
+                container,
+                "pg_restore",
+                "--list",
+            ),
+            f"PostgreSQL archive verification for {name}",
+            stdin=descriptor,
+        )
     finally:
         os.close(descriptor)
 
