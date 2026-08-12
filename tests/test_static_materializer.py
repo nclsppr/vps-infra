@@ -1829,6 +1829,142 @@ class StaticBundleContractTests(unittest.TestCase):
             self.assertFalse(any("TOKEN" in argument for argument in verify[1]))
             self.assertEqual(list(root.glob("attestation-*.jsonl")), [])
 
+    def test_attestation_bundle_accepts_utf8_json_at_external_boundary(self) -> None:
+        profile = MATERIALIZER.PROFILES["personal"]
+        subject_digest = f"sha256:{'1' * 64}"
+        reference = f"{profile.site_repository}@{subject_digest}"
+        bundle = json.dumps(
+            {"note": "signed provenance \u2713"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        bundle_digest = f"sha256:{hashlib.sha256(bundle).hexdigest()}"
+        manifest = producer_json(
+            {
+                "annotations": {},
+                "artifactType": MATERIALIZER.SIGSTORE_BUNDLE_MEDIA_TYPE,
+                "config": {
+                    "digest": MATERIALIZER.OCI_EMPTY_CONFIG["digest"],
+                    "mediaType": MATERIALIZER.OCI_EMPTY_CONFIG["mediaType"],
+                    "size": MATERIALIZER.OCI_EMPTY_CONFIG["size"],
+                },
+                "layers": [
+                    {
+                        "digest": bundle_digest,
+                        "mediaType": MATERIALIZER.SIGSTORE_BUNDLE_MEDIA_TYPE,
+                        "size": len(bundle),
+                    }
+                ],
+                "mediaType": MATERIALIZER.OCI_MANIFEST_MEDIA_TYPE,
+                "schemaVersion": 2,
+                "subject": {
+                    "digest": subject_digest,
+                    "mediaType": MATERIALIZER.OCI_MANIFEST_MEDIA_TYPE,
+                    "size": 1,
+                },
+            }
+        )
+        manifest_digest = f"sha256:{hashlib.sha256(manifest).hexdigest()}"
+        index = producer_json(
+            {
+                "manifests": [
+                    {
+                        "annotations": {
+                            "dev.sigstore.bundle.predicateType": (
+                                MATERIALIZER.SLSA_PROVENANCE_TYPE
+                            )
+                        },
+                        "artifactType": MATERIALIZER.SIGSTORE_BUNDLE_MEDIA_TYPE,
+                        "digest": manifest_digest,
+                        "mediaType": MATERIALIZER.OCI_MANIFEST_MEDIA_TYPE,
+                        "size": len(manifest),
+                    }
+                ],
+                "mediaType": MATERIALIZER.OCI_INDEX_MEDIA_TYPE,
+                "schemaVersion": 2,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+
+            def write_index(
+                repository,
+                name,
+                destination,
+                maximum_size,
+                environment,
+                *,
+                accept,
+            ):
+                self.assertEqual(repository, profile.site_repository)
+                self.assertEqual(
+                    name,
+                    f"sha256-{subject_digest.removeprefix('sha256:')}",
+                )
+                self.assertLessEqual(len(index), maximum_size)
+                self.assertEqual(accept, MATERIALIZER.OCI_INDEX_MEDIA_TYPE)
+                destination.write_bytes(index)
+
+            def write_object(
+                repository,
+                digest,
+                destination,
+                maximum_size,
+                environment,
+                *,
+                kind,
+                expected_size=None,
+            ):
+                self.assertEqual(repository, profile.site_repository)
+                expected = {
+                    manifest_digest: (manifest, "manifest"),
+                    bundle_digest: (bundle, "blob"),
+                }
+                self.assertIn(digest, expected)
+                content, expected_kind = expected[digest]
+                self.assertEqual(kind, expected_kind)
+                self.assertLessEqual(len(content), maximum_size)
+                if expected_size is not None:
+                    self.assertEqual(len(content), expected_size)
+                destination.write_bytes(content)
+
+            with mock.patch.object(
+                MATERIALIZER,
+                "fetch_registry_named_manifest",
+                side_effect=write_index,
+            ), mock.patch.object(
+                MATERIALIZER,
+                "fetch_registry_object",
+                side_effect=write_object,
+            ):
+                combined = MATERIALIZER.fetch_attestation_bundles_bounded(
+                    reference,
+                    root,
+                    MATERIALIZER.safe_environment(root),
+                )
+
+            self.assertEqual(combined.read_bytes(), bundle + b"\n")
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "must be UTF-8 JSON",
+            ):
+                MATERIALIZER.strict_json_bytes(
+                    b'{"note":"\xff"}',
+                    "malformed attestation fixture",
+                    canonical=False,
+                    allow_utf8=True,
+                )
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "must be ASCII JSON",
+            ):
+                MATERIALIZER.strict_json_bytes(
+                    bundle,
+                    "non-attestation fixture",
+                    canonical=False,
+                )
+
     def test_provenance_does_not_accept_worker_declared_success(self) -> None:
         subject = b'{"schemaVersion":2}\n'
         reference = (

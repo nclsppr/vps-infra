@@ -287,11 +287,19 @@ def reject_json_constant(value: str) -> None:
     fail(f"JSON contains invalid constant {value}")
 
 
-def strict_json_bytes(data: bytes, label: str, *, canonical: bool) -> Any:
+def strict_json_bytes(
+    data: bytes,
+    label: str,
+    *,
+    canonical: bool,
+    allow_utf8: bool = False,
+) -> Any:
+    encoding = "utf-8" if allow_utf8 else "ascii"
     try:
-        text = data.decode("ascii")
+        text = data.decode(encoding)
     except UnicodeDecodeError as exc:
-        fail(f"{label} must be ASCII JSON: {exc}")
+        requirement = "UTF-8" if allow_utf8 else "ASCII"
+        fail(f"{label} must be {requirement} JSON: {exc}")
     try:
         value = json.loads(
             text,
@@ -2719,6 +2727,7 @@ def fetch_attestation_bundles_bounded(
             bundle_raw,
             f"attestation bundle {index_number}",
             canonical=False,
+            allow_utf8=True,
         )
         if not isinstance(bundle, dict):
             fail(f"attestation bundle {index_number} must be a JSON object")
