@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the local PostgreSQL logical backup each day
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 UTC
+RandomizedDelaySec=30m
+AccuracySec=1m
+Persistent=true
+Unit={{ vps_postgres_backup_service }}
+
+[Install]
+WantedBy=timers.target

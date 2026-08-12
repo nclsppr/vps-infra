@@ -1,0 +1,37 @@
+[Unit]
+Description=Rehearse the latest PostgreSQL restore without production mutation
+After=docker.service vps-internal-platform.service vps-postgres-backup.service
+Requires=docker.service
+ConditionPathIsDirectory={{ vps_postgres_backup_root }}
+
+[Service]
+Type=oneshot
+ExecStart={{ vps_postgres_backup_script }} rehearse --latest
+TimeoutStartSec=14400
+UMask=0077
+User=root
+Group=root
+Environment=HOME=/nonexistent
+Environment=LC_ALL=C.UTF-8
+Environment=PATH=/usr/bin:/bin
+Environment=DOCKER_HOST=unix:///run/docker.sock
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths={{ vps_postgres_backup_root }} /run/docker.sock
+ReadWritePaths=/run/lock
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

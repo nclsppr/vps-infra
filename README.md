@@ -148,6 +148,7 @@ Cette décision est détaillée dans
 - [Contrat du contrôleur de release](scripts/README.md)
 - [Reconstruction depuis zéro](docs/rebuild.md)
 - [Accès OVHcloud à préparer](docs/operations/acces-ovhcloud.md)
+- [Sauvegarde PostgreSQL et répétition de restauration](docs/operations/postgresql-backup.md)
 - [Contrat des secrets](secrets/README.md)
 - [Sources et preuves d’audit](docs/references.md)
 - [Plan de mise en œuvre](VPS-SETUP.md)

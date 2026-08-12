@@ -37,7 +37,7 @@ déjà à rendre la configuration du système reproductible après l’accès SS
 | accès Git en lecture à `vps-infra` | HTTPS public ; deploy key seulement si la visibilité devient privée |
 | clé du déclencheur SSH de production | secret de l’environnement GitHub `production`, révocable séparément |
 | secrets DNS, JWT, Stripe, SMTP, Grafana et bases | fichiers SOPS chiffrés et clé age externe |
-| sauvegardes métier | cible hors VPS, à définir dans le chantier sauvegarde |
+| sauvegardes métier | étape locale testée sur Atlas ; cible chiffrée hors VPS encore à sélectionner |
 | inventaire DNS, MX, SPF, DKIM et DMARC | export versionné sans secrets et copie opérateur |
 
 Une clé uniquement stockée sur le VPS n’est pas une stratégie de
@@ -194,8 +194,9 @@ interdit de confondre « service sain » et « données récupérées ».
 
 ## Phase 4 — restaurer les données
 
-Ce chantier sera spécifié séparément, mais l’ordre de reconstruction doit déjà
-réserver sa place :
+Le contrôleur local crée des dumps logiques et répète leur restauration dans
+un conteneur jetable. La copie hors site reste à sélectionner. Une
+reconstruction réelle doit conserver cet ordre :
 
 1. arrêter ou ne pas démarrer les backends qui pourraient migrer ;
 2. restaurer chaque base dans le cluster cible ;

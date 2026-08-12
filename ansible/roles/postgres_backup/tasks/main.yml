@@ -1,0 +1,168 @@
+---
+- name: Validate the PostgreSQL backup controller contract
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_postgres_backup_state in
+        ['installed', 'stopped', 'backup-now', 'rehearse-latest']
+      - vps_postgres_backup_root == '/srv/vps/backups/postgresql'
+      - vps_postgres_backup_script == '/usr/local/libexec/vps/postgres-backup'
+      - vps_postgres_backup_service == 'vps-postgres-backup.service'
+      - vps_postgres_backup_timer == 'vps-postgres-backup.timer'
+      - >-
+        vps_postgres_restore_service ==
+        'vps-postgres-restore-rehearsal.service'
+      - >-
+        vps_postgres_restore_timer ==
+        'vps-postgres-restore-rehearsal.timer'
+      - vps_postgres_backup_retention_count == 7
+    fail_msg: The PostgreSQL backup inputs differ from the reviewed contract.
+
+- name: Inspect the internal platform unit
+  ansible.builtin.stat:
+    path: /etc/systemd/system/vps-internal-platform.service
+    follow: false
+  register: vps_postgres_backup_platform_unit
+
+- name: Require the internal platform controller before backup installation
+  ansible.builtin.assert:
+    that:
+      - vps_postgres_backup_platform_unit.stat.exists
+      - vps_postgres_backup_platform_unit.stat.isreg
+      - not vps_postgres_backup_platform_unit.stat.islnk
+      - vps_postgres_backup_platform_unit.stat.uid == 0
+      - vps_postgres_backup_platform_unit.stat.gid == 0
+      - vps_postgres_backup_platform_unit.stat.mode == '0644'
+    fail_msg: Install the internal platform controller before its backup timer.
+  when: vps_postgres_backup_state != 'stopped'
+
+- name: Create the protected PostgreSQL backup directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: /usr/local/libexec/vps
+      mode: "0755"
+    - path: /srv/vps/backups
+      mode: "0700"
+    - path: "{{ vps_postgres_backup_root }}"
+      mode: "0700"
+  when: vps_postgres_backup_state != 'stopped'
+
+- name: Install the bounded PostgreSQL backup executable
+  ansible.builtin.copy:
+    src: "{{ playbook_dir ~ '/../../scripts/postgres-backup' }}"
+    dest: "{{ vps_postgres_backup_script }}"
+    owner: root
+    group: root
+    mode: "0500"
+  when: vps_postgres_backup_state != 'stopped'
+
+- name: Install the PostgreSQL backup systemd units
+  ansible.builtin.template:
+    src: "{{ item.source }}"
+    dest: "/etc/systemd/system/{{ item.destination }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - source: vps-postgres-backup.service.j2
+      destination: "{{ vps_postgres_backup_service }}"
+    - source: vps-postgres-backup.timer.j2
+      destination: "{{ vps_postgres_backup_timer }}"
+    - source: vps-postgres-restore-rehearsal.service.j2
+      destination: "{{ vps_postgres_restore_service }}"
+    - source: vps-postgres-restore-rehearsal.timer.j2
+      destination: "{{ vps_postgres_restore_timer }}"
+  register: vps_postgres_backup_units
+  when: vps_postgres_backup_state != 'stopped'
+
+- name: Reload systemd after PostgreSQL backup unit changes
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - vps_postgres_backup_state != 'stopped'
+    - vps_postgres_backup_units.changed
+
+- name: Enable the daily backup and monthly restore rehearsal timers
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - "{{ vps_postgres_backup_timer }}"
+    - "{{ vps_postgres_restore_timer }}"
+  when: vps_postgres_backup_state != 'stopped'
+
+- name: Disable the PostgreSQL backup timers without deleting backup data
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+    daemon_reload: true
+  failed_when: false
+  loop:
+    - "{{ vps_postgres_backup_timer }}"
+    - "{{ vps_postgres_restore_timer }}"
+  when: vps_postgres_backup_state == 'stopped'
+
+- name: Read the internal platform service state before an immediate operation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - vps-internal-platform.service
+  register: vps_postgres_backup_platform_state
+  changed_when: false
+  failed_when: false
+  when: >-
+    vps_postgres_backup_state in ['backup-now', 'rehearse-latest']
+
+- name: Require an active internal platform before an immediate operation
+  ansible.builtin.assert:
+    that:
+      - vps_postgres_backup_platform_state.rc == 0
+      - vps_postgres_backup_platform_state.stdout == 'active'
+    fail_msg: Start and verify the internal platform before this operation.
+  when: >-
+    vps_postgres_backup_state in ['backup-now', 'rehearse-latest']
+
+- name: Create and verify one local PostgreSQL backup now
+  ansible.builtin.systemd_service:
+    name: "{{ vps_postgres_backup_service }}"
+    state: started
+  when: vps_postgres_backup_state == 'backup-now'
+
+- name: Rehearse the latest restore in an isolated disposable container
+  ansible.builtin.systemd_service:
+    name: "{{ vps_postgres_restore_service }}"
+    state: started
+  when: vps_postgres_backup_state == 'rehearse-latest'
+
+- name: Read PostgreSQL backup timer enablement
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-enabled
+      - "{{ item }}"
+  register: vps_postgres_backup_timer_enablement
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ vps_postgres_backup_timer }}"
+    - "{{ vps_postgres_restore_timer }}"
+
+- name: Prove the exact PostgreSQL backup timer state
+  ansible.builtin.assert:
+    that:
+      - >-
+        (vps_postgres_backup_state == 'stopped' and item.rc != 0) or
+        (vps_postgres_backup_state != 'stopped' and
+         item.rc == 0 and item.stdout == 'enabled')
+    fail_msg: A PostgreSQL backup timer differs from the requested state.
+  loop: "{{ vps_postgres_backup_timer_enablement.results }}"
+  loop_control:
+    label: "{{ item.item }}"

@@ -40,13 +40,16 @@ refuserait un déploiement depuis ce checkout.
 - haute disponibilité et bascule automatique vers un second VPS ;
 - Kubernetes ou orchestration multi-nœuds ;
 - stockage objet des images et uploads ;
-- politique complète de sauvegarde et restauration des données ;
+- politique complète de sauvegarde hors site et restauration des données ;
 - centralisation des logs avec Loki et traces avec Tempo ;
 - réplication PostgreSQL.
 
 L’infrastructure peut être reconstruite sans ces sujets. Les données métier ne
 peuvent pas l’être : sans sauvegarde restaurée, PostgreSQL repart vide puis
-Flyway crée uniquement les schémas.
+Flyway crée uniquement les schémas. Le contrôleur local décrit dans
+[`operations/postgresql-backup.md`](operations/postgresql-backup.md) crée des
+dumps et répète une restauration isolée. Il ne constitue pas une sauvegarde de
+sinistre tant qu'aucune copie chiffrée hors d'Atlas n'existe.
 
 ## Vue d’ensemble
 
