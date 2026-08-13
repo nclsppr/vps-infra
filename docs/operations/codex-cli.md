@@ -29,9 +29,14 @@ can make Codex fail, but cannot consume the remainder of the host filesystem.
 The package comes from the exact versioned OpenAI release URL. Ansible checks
 the archive digest, the complete extracted file inventory, the package
 metadata, every executable digest, root ownership, and `codex --version`
-before switching `current` atomically. The standalone package includes its own
-pinned `bwrap`, `rg`, and `zsh` executables. Atlas does not depend on the
-distribution `bubblewrap` package for this runtime.
+before switching `current` atomically. The standalone package includes pinned
+`bwrap`, `rg`, and `zsh` executables. Atlas installs the Ubuntu `bubblewrap`
+package and makes `/usr/bin/bwrap` the runtime sandbox executable. This path
+matches the distribution AppArmor profile. The role rejects a setuid binary,
+unexpected ownership or mode, and any file capability before it starts Codex.
+It does not disable Ubuntu user namespace restrictions or grant network
+administration capabilities. The packaged `bwrap` remains part of the verified
+release inventory but is not placed on the runtime `PATH`.
 
 The `codex` account has no direct SSH login, sudo, Docker group, production
 repository access, controller access, or secret access. The supported session
@@ -208,6 +213,9 @@ test ! -r /srv/vps/repository
 test ! -r /var/run/docker.sock
 sudo -n true
 ```
+
+On Ubuntu, `command -v bwrap` inside that session must return
+`/usr/bin/bwrap`. This keeps the distribution AppArmor boundary active.
 
 The final command must fail. Never print `auth.json` or session files while
 diagnosing a login.

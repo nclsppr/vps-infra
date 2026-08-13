@@ -230,7 +230,8 @@
         HOME: "{{ vps_codex_home }}"
         CODEX_HOME: "{{ vps_codex_home }}/.codex"
         PATH: >-
-          {{ vps_codex_candidate_path }}/codex-resources:{{ vps_codex_candidate_path }}/codex-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          {{ vps_codex_candidate_path
+          }}/codex-path:/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin
       changed_when: false
 
   always:

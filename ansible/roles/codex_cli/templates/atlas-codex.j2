@@ -16,7 +16,7 @@ case "${1:-}" in
     session_unit=atlas-codex-activation-verification
     set -- --pipe \
       /bin/bash -c \
-      'grep -Fq /atlas-codex.slice/ /proc/self/cgroup && test "$(systemctl show atlas-codex-activation-verification.service --property=ProtectProc --value)" = invisible && test -r /proc/self/cmdline && test ! -r /proc/1/cmdline && test ! -r /etc/vps && test ! -x /etc/vps && test ! -r /home/vpsadmin && test ! -x /home/vpsadmin && test ! -r /srv/vps && test ! -x /srv/vps && test ! -r /var/lib/docker && test ! -x /var/lib/docker && test ! -r /var/lib/vps-controller && test ! -x /var/lib/vps-controller && test ! -r /run/containerd/containerd.sock && test ! -r /run/docker.sock && test ! -r /var/run/docker.sock && test "$(findmnt --noheadings --output FSTYPE -T /tmp)" = tmpfs && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)nosuid(,|$)" && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)nodev(,|$)" && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)noexec(,|$)" && exec {{ vps_codex_release_path }}/bin/codex sandbox --include-managed-config --permission-profile atlas_workspace --cd {{ vps_codex_workspace_root }} /bin/bash -c "test ! -r {{ vps_codex_home }}/.codex/config.toml && test ! -r /etc/vps && test ! -r /srv/vps && test ! -r /run/docker.sock"'
+      'grep -Fq /atlas-codex.slice/ /proc/self/cgroup && test "$(systemctl show atlas-codex-activation-verification.service --property=ProtectProc --value)" = invisible && test "$(command -v bwrap)" = /usr/bin/bwrap && test -r /proc/self/cmdline && test ! -r /proc/1/cmdline && test ! -r /etc/vps && test ! -x /etc/vps && test ! -r /home/vpsadmin && test ! -x /home/vpsadmin && test ! -r /srv/vps && test ! -x /srv/vps && test ! -r /var/lib/docker && test ! -x /var/lib/docker && test ! -r /var/lib/vps-controller && test ! -x /var/lib/vps-controller && test ! -r /run/containerd/containerd.sock && test ! -r /run/docker.sock && test ! -r /var/run/docker.sock && test "$(findmnt --noheadings --output FSTYPE -T /tmp)" = tmpfs && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)nosuid(,|$)" && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)nodev(,|$)" && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)noexec(,|$)" && exec {{ vps_codex_release_path }}/bin/codex sandbox --include-managed-config --permission-profile atlas_workspace --cd {{ vps_codex_workspace_root }} /bin/bash -c "test ! -r {{ vps_codex_home }}/.codex/config.toml && test ! -r /etc/vps && test ! -r /srv/vps && test ! -r /run/docker.sock"'
     ;;
   *)
     printf '%s\n' 'atlas-codex accepts only the internal --verify argument' >&2
@@ -61,7 +61,7 @@ exec /usr/bin/systemd-run \
   --setenv=USER={{ vps_codex_user }} \
   --setenv=LOGNAME={{ vps_codex_user }} \
   --setenv=LANG=C.UTF-8 \
-  --setenv=PATH={{ vps_codex_release_path }}/codex-resources:{{ vps_codex_release_path }}/codex-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  --setenv=PATH={{ vps_codex_release_path }}/codex-path:/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin \
   --property=CPUQuota={{ vps_codex_cpu_quota }} \
   --property=MemoryHigh={{ vps_codex_memory_high }} \
   --property=MemoryMax={{ vps_codex_memory_max }} \

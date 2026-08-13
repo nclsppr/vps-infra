@@ -107,7 +107,9 @@
 - name: Install the bounded storage dependencies
   ansible.builtin.apt:
     name:
+      - bubblewrap
       - e2fsprogs
+      - libcap2-bin
       - mount
       - util-linux
     state: present
@@ -117,6 +119,34 @@
   environment:
     DEBIAN_FRONTEND: noninteractive
     NEEDRESTART_MODE: a
+
+- name: Inspect the distribution bubblewrap executable
+  ansible.builtin.stat:
+    path: /usr/bin/bwrap
+    follow: false
+  register: vps_codex_distribution_bwrap
+
+- name: Inspect distribution bubblewrap file capabilities
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/getcap
+      - /usr/bin/bwrap
+  register: vps_codex_distribution_bwrap_capabilities
+  changed_when: false
+  check_mode: false
+
+- name: Prove the distribution bubblewrap boundary
+  ansible.builtin.assert:
+    that:
+      - vps_codex_distribution_bwrap.stat.isreg
+      - not vps_codex_distribution_bwrap.stat.islnk
+      - vps_codex_distribution_bwrap.stat.uid == 0
+      - vps_codex_distribution_bwrap.stat.gid == 0
+      - vps_codex_distribution_bwrap.stat.mode == '0755'
+      - vps_codex_distribution_bwrap_capabilities.stdout == ''
+    fail_msg: >-
+      The Ubuntu bubblewrap executable has an unexpected type, owner, mode,
+      or file capability. Codex sandbox validation cannot continue safely.
 
 - name: Create the isolated Codex group
   ansible.builtin.group:
