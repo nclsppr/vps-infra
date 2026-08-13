@@ -19,6 +19,12 @@ IMAGE_REPOSITORIES = {
     "migrator": "ghcr.io/nclsppr/surplasse/backend",
     "onboarding": "ghcr.io/nclsppr/surplasse/onboarding",
 }
+SMTP_HOST_RE = re.compile(
+    r"(?=.{1,253}\Z)"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
+)
+JWT_KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
 class AdapterError(ValueError):
@@ -89,6 +95,71 @@ def secret_sources(service: dict[str, Any], name: str) -> set[str]:
     return result
 
 
+def validate_backend_environment(environment: dict[str, str]) -> None:
+    expected = {
+        "AUTH_JWT_AUDIENCE": "surplasse-dashboard",
+        "AUTH_JWT_JWKS_PATH": "/run/secrets/surplasse_jwt_jwks",
+        "AUTH_JWT_PRIVATE_KEY_PATH": "/run/secrets/surplasse_jwt_private_key",
+        "DEPLOYMENT_PROFILE": "production",
+        "JAVA_TOOL_OPTIONS": (
+            "-XX:MaxRAMPercentage=75.0 "
+            "-Djava.util.logging.manager=org.jboss.logmanager.LogManager"
+        ),
+        "QUARKUS_DATASOURCE_DEVSERVICES_ENABLED": "false",
+        "QUARKUS_DATASOURCE_JDBC_URL": (
+            "jdbc:postgresql://postgresql:5432/surplasse"
+        ),
+        "QUARKUS_DATASOURCE_PASSWORD_FILE": (
+            "/run/secrets/surplasse_postgres_runtime_password"
+        ),
+        "QUARKUS_DATASOURCE_USERNAME": "surplasse_runtime",
+        "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+        "QUARKUS_HTTP_HOST": "0.0.0.0",
+        "QUARKUS_MAILER_AUTH_METHODS": "PLAIN LOGIN",
+        "SMTP_FROM": "no-reply@surplasse.com",
+        "SMTP_PASSWORD_FILE": "/run/secrets/surplasse_smtp_password",
+        "SMTP_PORT": "587",
+        "SMTP_START_TLS": "REQUIRED",
+        "SMTP_TLS": "false",
+        "SMTP_USERNAME_FILE": "/run/secrets/surplasse_smtp_username",
+        "STRIPE_ACCOUNT_WEBHOOK_SECRET_FILE": (
+            "/run/secrets/surplasse_stripe_account_webhook_secret"
+        ),
+        "STRIPE_LIVE_MODE": "true",
+        "STRIPE_PAYMENT_WEBHOOK_SECRET_FILE": (
+            "/run/secrets/surplasse_stripe_payment_webhook_secret"
+        ),
+        "STRIPE_SECRET_KEY_FILE": "/run/secrets/surplasse_stripe_secret_key",
+        "TRUSTED_PROXIES": "172.30.10.254",
+    }
+    dynamic_keys = {"AUTH_JWT_KEY_ID", "SMTP_HOST"}
+    require_keys(
+        environment,
+        set(expected) | dynamic_keys,
+        "services.backend.environment",
+    )
+    for key, expected_value in expected.items():
+        if environment[key] != expected_value:
+            fail(
+                f"services.backend.environment.{key}: diffère du contrat de "
+                "l'adaptateur"
+            )
+    if JWT_KEY_ID_RE.fullmatch(environment["AUTH_JWT_KEY_ID"]) is None:
+        fail(
+            "services.backend.environment.AUTH_JWT_KEY_ID: doit utiliser le "
+            "format borné d'identifiant de clé"
+        )
+    host = environment["SMTP_HOST"]
+    if (
+        SMTP_HOST_RE.fullmatch(host) is None
+        or host.rsplit(".", maxsplit=1)[-1].isdigit()
+    ):
+        fail(
+            "services.backend.environment.SMTP_HOST: doit être un nom DNS en "
+            "minuscules"
+        )
+
+
 def validate_image_contract(
     expected_images: dict[str, Any], source_revision: str
 ) -> None:
@@ -145,24 +216,25 @@ def validate_compose(document: dict[str, Any], expected_images: dict[str, Any]) 
         fail("services.migrator.entrypoint: must use the reviewed one-shot command")
     if "healthcheck" in migrator:
         fail("services.migrator.healthcheck: a transient job must not have one")
+    if migrator.get("command") is not None:
+        fail("services.migrator.command: le job transitoire n'accepte aucun argument")
+
+    for name in expected_runtime:
+        runtime = services[name]
+        overrides = {
+            key
+            for key in ("entrypoint", "command")
+            if runtime.get(key) is not None
+        }
+        if overrides:
+            fail(
+                f"services.{name}: les overrides runtime sont interdits : "
+                f"{', '.join(sorted(overrides))}"
+            )
 
     backend_environment = service_environment(backend, "backend")
     migrator_environment = service_environment(migrator, "migrator")
-    exact_backend_environment = {
-        "DEPLOYMENT_PROFILE": "production",
-        "QUARKUS_DATASOURCE_DEVSERVICES_ENABLED": "false",
-        "QUARKUS_DATASOURCE_JDBC_URL": "jdbc:postgresql://postgresql:5432/surplasse",
-        "QUARKUS_DATASOURCE_USERNAME": "surplasse_runtime",
-        "QUARKUS_DATASOURCE_PASSWORD_FILE":
-            "/run/secrets/surplasse_postgres_runtime_password",
-        "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
-        "QUARKUS_HTTP_HOST": "0.0.0.0",
-        "STRIPE_LIVE_MODE": "true",
-        "TRUSTED_PROXIES": "172.30.10.254",
-    }
-    for key, expected in exact_backend_environment.items():
-        if backend_environment.get(key) != expected:
-            fail(f"services.backend.environment.{key}: differs from the adapter contract")
+    validate_backend_environment(backend_environment)
     exact_migrator_environment = {
         "DEPLOYMENT_PROFILE": "production",
         "QUARKUS_DATASOURCE_JDBC_URL": "jdbc:postgresql://postgresql:5432/surplasse",
@@ -300,7 +372,12 @@ def validate_metadata(
         "production-secrets",
         "prometheus-job-and-app-network",
         "protected-main",
+        "email-delivery-observability",
+        "email-domain-authentication",
+        "smtp-atlas-connectivity",
+        "smtp-effective-runtime-configuration",
         "stripe-connect-production-adapter",
+        "transactional-email-provider",
         "vps-integration-bundle",
     }
     if not required_blockers.issubset(blockers):

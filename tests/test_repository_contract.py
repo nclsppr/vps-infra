@@ -550,7 +550,12 @@ class SupplyChainContractTests(unittest.TestCase):
             Loader=yaml.BaseLoader,
         )
         validate_command = validate["jobs"]["check"]["steps"][-1]["run"]
-        self.assertIn("check-postgres-image", validate_command)
+        self.assertEqual(validate_command, "make check")
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        platform_check = next(
+            line for line in makefile.splitlines() if line.startswith("check-platform:")
+        )
+        self.assertIn("check-postgres-image", platform_check)
 
     def test_renovate_never_promotes_custom_images(self) -> None:
         config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
@@ -1055,6 +1060,85 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("validate_secret(descriptor, spec, owner)", helper_text)
         self.assertIn('SecretSpec("postgres-superuser-password", 70)', helper_text)
         self.assertIn('SecretSpec("grafana-secret-key", 472)', helper_text)
+
+    def test_surplasse_smtp_preflight_is_packaged_for_atlas(self) -> None:
+        base_defaults = yaml.safe_load(
+            (ROOT / "ansible/roles/base/defaults/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertNotIn("python3-cryptography", base_defaults["vps_base_packages"])
+
+        surplasse_defaults = yaml.safe_load(
+            (ROOT / "ansible/roles/surplasse/defaults/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        expected_validators = [
+            "validate-compose",
+            "validate-surplasse-adapter",
+            "validate-surplasse-controller",
+            "verify-surplasse-smtp-preflight",
+        ]
+        self.assertEqual(
+            surplasse_defaults["vps_surplasse_validator_files"],
+            expected_validators,
+        )
+        preflight = ROOT / "scripts/verify-surplasse-smtp-preflight"
+        self.assertTrue(preflight.is_file())
+        self.assertTrue(os.access(preflight, os.X_OK))
+
+        role = yaml.safe_load(
+            (ROOT / "ansible/roles/surplasse/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        controller_guard = role[0]["ansible.builtin.assert"]["that"]
+        self.assertTrue(
+            any(
+                "vps_surplasse_validator_files | sort ==" in assertion
+                and "verify-surplasse-smtp-preflight" in assertion
+                for assertion in controller_guard
+            )
+        )
+
+        stage = next(
+            task
+            for task in role
+            if task["name"] == "Stage a fail-closed Surplasse release"
+        )
+        stage_tasks = {task["name"]: task for task in stage["block"]}
+        runtime_task = stage_tasks["Install the bounded SMTP preflight runtime"]
+        runtime_package = runtime_task["ansible.builtin.apt"]
+        self.assertEqual(runtime_package["name"], "python3-cryptography")
+        self.assertEqual(runtime_package["state"], "present")
+        self.assertFalse(runtime_package["update_cache"])
+        self.assertFalse(runtime_package["install_recommends"])
+        create_release = stage_tasks[
+            "Create a new immutable Surplasse release tree"
+        ]
+        create_tasks = {task["name"]: task for task in create_release["block"]}
+        copy_task = create_tasks["Copy the exact Surplasse controller validators"]
+        audit_task = stage_tasks["Audit every immutable Surplasse validator"]
+
+        for task, release_root in (
+            (copy_task, "{{ vps_surplasse_staging_dir }}"),
+            (audit_task, "{{ vps_surplasse_release_dir }}"),
+        ):
+            self.assertEqual(task["loop"], "{{ vps_surplasse_validator_files }}")
+            copy = task["ansible.builtin.copy"]
+            self.assertEqual(
+                copy["src"],
+                "{{ playbook_dir ~ '/../../scripts/' ~ item }}",
+            )
+            self.assertEqual(
+                copy["dest"],
+                f"{release_root}/scripts/{{{{ item }}}}",
+            )
+            self.assertEqual(copy["owner"], "root")
+            self.assertEqual(copy["group"], "root")
+            self.assertEqual(copy["mode"], "0555")
+        self.assertTrue(audit_task["check_mode"])
 
     def test_surplasse_guard_accepts_the_active_oneshot_platform_unit(self) -> None:
         unit = (

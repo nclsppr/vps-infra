@@ -3,7 +3,9 @@ name = "vps-infra"
 version = "0.1.0"
 description = "Infrastructure reproductible du VPS multi-projets"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = [
+  "cryptography>=50,<51",
+]
 
 [dependency-groups]
 dev = [

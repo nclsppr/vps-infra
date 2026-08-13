@@ -402,6 +402,15 @@ class ReleasePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "protected-main"):
             RELEASE_POLICY.validate_manifest(manifest)
 
+    def test_surplasse_generic_github_evidence_cannot_prove_external_smtp(self) -> None:
+        manifest = sample_manifest()
+        enable_surplasse(manifest)
+        with self.assertRaisesRegex(
+            RELEASE_POLICY.PolicyError,
+            "typed external SMTP evidence",
+        ):
+            RELEASE_POLICY.validate_manifest(manifest)
+
     def test_complete_parkventory_evidence_is_valid(self) -> None:
         manifest = sample_manifest()
         enable_parkventory(manifest)
@@ -601,7 +610,15 @@ def surplasse_adapter_document() -> dict:
     services = document["services"]
     backend = services["backend"]
     backend["environment"] = {
+        "AUTH_JWT_AUDIENCE": "surplasse-dashboard",
+        "AUTH_JWT_JWKS_PATH": "/run/secrets/surplasse_jwt_jwks",
+        "AUTH_JWT_KEY_ID": "replace-with-active-key-id",
+        "AUTH_JWT_PRIVATE_KEY_PATH": "/run/secrets/surplasse_jwt_private_key",
         "DEPLOYMENT_PROFILE": "production",
+        "JAVA_TOOL_OPTIONS": (
+            "-XX:MaxRAMPercentage=75.0 "
+            "-Djava.util.logging.manager=org.jboss.logmanager.LogManager"
+        ),
         "QUARKUS_DATASOURCE_DEVSERVICES_ENABLED": "false",
         "QUARKUS_DATASOURCE_JDBC_URL": "jdbc:postgresql://postgresql:5432/surplasse",
         "QUARKUS_DATASOURCE_USERNAME": "surplasse_runtime",
@@ -609,7 +626,22 @@ def surplasse_adapter_document() -> dict:
             "/run/secrets/surplasse_postgres_runtime_password",
         "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
         "QUARKUS_HTTP_HOST": "0.0.0.0",
+        "QUARKUS_MAILER_AUTH_METHODS": "PLAIN LOGIN",
+        "SMTP_FROM": "no-reply@surplasse.com",
+        "SMTP_HOST": "smtp.example.invalid",
+        "SMTP_PASSWORD_FILE": "/run/secrets/surplasse_smtp_password",
+        "SMTP_PORT": "587",
+        "SMTP_START_TLS": "REQUIRED",
+        "SMTP_TLS": "false",
+        "SMTP_USERNAME_FILE": "/run/secrets/surplasse_smtp_username",
+        "STRIPE_ACCOUNT_WEBHOOK_SECRET_FILE": (
+            "/run/secrets/surplasse_stripe_account_webhook_secret"
+        ),
         "STRIPE_LIVE_MODE": "true",
+        "STRIPE_PAYMENT_WEBHOOK_SECRET_FILE": (
+            "/run/secrets/surplasse_stripe_payment_webhook_secret"
+        ),
+        "STRIPE_SECRET_KEY_FILE": "/run/secrets/surplasse_stripe_secret_key",
         "TRUSTED_PROXIES": "172.30.10.254",
     }
     backend_secrets = {
@@ -1006,6 +1038,111 @@ class ComposePolicyTests(unittest.TestCase):
                     ]
                 ),
                 "static runtimes receive no secret",
+            ),
+            (
+                "smtp-starttls-disabled",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    SMTP_START_TLS="DISABLED"
+                ),
+                "SMTP_START_TLS",
+            ),
+            (
+                "smtp-implicit-tls",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    SMTP_TLS="true"
+                ),
+                "SMTP_TLS",
+            ),
+            (
+                "smtp-cross-wired-secret",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    SMTP_PASSWORD_FILE="/run/secrets/surplasse_stripe_secret_key"
+                ),
+                "SMTP_PASSWORD_FILE",
+            ),
+            (
+                "smtp-wrong-port",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    SMTP_PORT="25"
+                ),
+                "SMTP_PORT",
+            ),
+            (
+                "smtp-wrong-sender",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    SMTP_FROM="support@surplasse.com"
+                ),
+                "SMTP_FROM",
+            ),
+            (
+                "smtp-url-host",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    SMTP_HOST="smtp://relay.example.com"
+                ),
+                "SMTP_HOST",
+            ),
+            (
+                "smtp-ip-literal",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    SMTP_HOST="127.0.0.1"
+                ),
+                "SMTP_HOST",
+            ),
+            (
+                "smtp-extra-option",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    SMTP_LOGIN="DISABLED"
+                ),
+                "expected exactly",
+            ),
+            (
+                "quarkus-mailer-override",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    QUARKUS_MAILER_MOCK="true"
+                ),
+                "expected exactly",
+            ),
+            (
+                "quarkus-mailer-auth-drift",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    QUARKUS_MAILER_AUTH_METHODS="XOAUTH2"
+                ),
+                "QUARKUS_MAILER_AUTH_METHODS",
+            ),
+            (
+                "global-tls-override",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    QUARKUS_TLS_TRUST_ALL="true"
+                ),
+                "expected exactly",
+            ),
+            (
+                "java-mailer-override",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    JAVA_TOOL_OPTIONS="-Dquarkus.mailer.host=127.0.0.1"
+                ),
+                "JAVA_TOOL_OPTIONS",
+            ),
+            (
+                "backend-entrypoint-override",
+                lambda value: value["services"]["backend"].update(
+                    entrypoint=["/bin/sh"]
+                ),
+                "overrides runtime",
+            ),
+            (
+                "backend-command-override",
+                lambda value: value["services"]["backend"].update(
+                    command=["-Dquarkus.mailer.mock=true"]
+                ),
+                "overrides runtime",
+            ),
+            (
+                "migrator-command-override",
+                lambda value: value["services"]["migrator"].update(
+                    command=["--repair"]
+                ),
+                "n'accepte aucun argument",
             ),
         )
         for label, mutate, expected_message in cases:

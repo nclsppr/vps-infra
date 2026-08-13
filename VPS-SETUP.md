@@ -264,6 +264,15 @@ platform/
       inchangées ;
 - [ ] ne publier que les composants affectés ;
 - [ ] garder SBOM, provenance, attestations et Trivy ;
+- [ ] sélectionner un relais email transactionnel managé et accepter son DPA,
+      ses limites et ses frais ;
+- [ ] conserver les MX OVH et publier un seul SPF revu, DKIM et DMARC ;
+- [ ] prouver depuis Atlas l'accès au port `587` avec STARTTLS obligatoire,
+      puis prouver la livraison, le traitement des rebonds et la réception de
+      l'alerte selon le runbook SMTP ;
+- [ ] inspecter l'image Backend par digest et le processus lancé pour prouver la
+      configuration SMTP et TLS effective, pas seulement sa déclaration
+      Compose ;
 - [ ] ajouter la promotion vers `vps-infra`.
 
 ## Phase 5 — livrer le contrôleur de releases

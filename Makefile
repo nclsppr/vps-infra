@@ -6,6 +6,7 @@ ANSIBLE_EXTRA_VARS ?=
 PLATFORM_ENV ?= platform/.env.example
 CADDY_BUILD_ENV ?= platform/caddy/build.env
 POSTGRES_BUILD_ENV ?= platform/postgres/build.env
+SURPLASSE_SMTP_CONTRACT ?=
 MISE_EXEC := mise exec --
 COMPOSE := $(MISE_EXEC) docker-compose
 
@@ -19,6 +20,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	install-postgres-backup stop-postgres-backup-schedule \
 	backup-postgres-now rehearse-postgres-restore \
 	prepare-surplasse activate-surplasse stop-surplasse \
+	verify-surplasse-smtp \
 	doctor-local
 
 help: ## Show the available commands.
@@ -123,6 +125,14 @@ check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 		--expected-images applications/surplasse/expected-images.json \
 		surplasse "$$rendered"; \
 	./scripts/validate-surplasse-adapter "$$rendered"
+
+verify-surplasse-smtp: ## Vérifier le DNS mail et STARTTLS sans identifiants.
+	@test -n "$(SURPLASSE_SMTP_CONTRACT)" || { \
+		echo "SURPLASSE_SMTP_CONTRACT doit désigner le contrat public revu." >&2; \
+		exit 2; \
+	}
+	$(MISE_EXEC) ./scripts/verify-surplasse-smtp-preflight \
+		--contract "$(SURPLASSE_SMTP_CONTRACT)"
 
 check-prometheus: ## Validate active and inactive Prometheus rules in the pinned image.
 	@set -Eeuo pipefail; \

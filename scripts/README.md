@@ -255,6 +255,25 @@ must verify that artifact and the release manifest through independent trust
 roots. Environment variable allowlists and declared `_FILE` secret bindings
 remain required before application activation.
 
+Pour Surplasse, `validate-surplasse-adapter` exige l'environnement Backend
+complet et exact. Il fixe l'expéditeur, les chemins de secrets, le port `587`,
+STARTTLS obligatoire et les mécanismes d'authentification `PLAIN LOGIN`. Il
+refuse toute autre surcharge Quarkus ou Java déclarée par Compose. Il ne prouve
+pas que l'image ou l'entrypoint n'ajoute aucune configuration. La configuration
+effective du runtime reste une porte distincte.
+
+`verify-surplasse-smtp-preflight` accepte un contrat fournisseur public strict.
+Ce contrat n'existe pas dans ce dépôt. Le script peut valider les MX OVH
+conservés, le SPF exact, DKIM, DMARC et un handshake STARTTLS sans
+authentification. Il valide la chaîne normale de l'autorité de certification et
+le nom d'hôte. Son contrôle SPF est une analyse statique d'un graphe limité à
+dix termes DNS. Ce n'est pas une évaluation SPF `check_host` complète. Il ne
+prouve ni l'autorisation d'une adresse IP source ni la livraison d'un message.
+Le script ne lit aucun identifiant et n'envoie aucun message. Le
+[runbook SMTP](../docs/operations/surplasse-smtp.md) définit les preuves de
+livraison et la préparation du rollback que ce diagnostic de transport ne peut
+pas établir.
+
 `verify-github-evidence` confirms the repository, branch, commit, run attempt,
 and exact `.github/workflows/vps-release.yml` workflow through the public GitHub
 API. The `caddy-ovh-image` and `immutable-image-digests` gates must also name a

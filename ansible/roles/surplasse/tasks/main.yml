@@ -14,6 +14,11 @@
         vps_surplasse_runtime_services | sort ==
         ['backend', 'commande', 'dashboard', 'docs', 'onboarding']
       - >-
+        vps_surplasse_validator_files | sort ==
+        ['validate-compose', 'validate-surplasse-adapter',
+         'validate-surplasse-controller',
+         'verify-surplasse-smtp-preflight']
+      - >-
         vps_surplasse_database_secrets | sort ==
         ['surplasse-postgres-migrator-password',
          'surplasse-postgres-runtime-password']
@@ -122,6 +127,16 @@
 - name: Stage a fail-closed Surplasse release
   when: vps_surplasse_state in ['prepare', 'activate']
   block:
+    - name: Install the bounded SMTP preflight runtime
+      ansible.builtin.apt:
+        name: python3-cryptography
+        state: present
+        update_cache: false
+        install_recommends: false
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_MODE: a
+
     - name: Derive the immutable Surplasse release paths
       ansible.builtin.set_fact:
         vps_surplasse_release_dir: >-
@@ -266,10 +281,7 @@
             owner: root
             group: root
             mode: "0555"
-          loop:
-            - validate-compose
-            - validate-surplasse-adapter
-            - validate-surplasse-controller
+          loop: "{{ vps_surplasse_validator_files }}"
 
         - name: Record the exact Surplasse controller revision
           ansible.builtin.copy:
@@ -334,10 +346,7 @@
         mode: "0555"
       check_mode: true
       register: vps_surplasse_validator_audit
-      loop:
-        - validate-compose
-        - validate-surplasse-adapter
-        - validate-surplasse-controller
+      loop: "{{ vps_surplasse_validator_files }}"
 
     - name: Read the immutable Surplasse release revision
       ansible.builtin.slurp:

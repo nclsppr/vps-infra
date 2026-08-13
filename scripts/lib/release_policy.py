@@ -86,7 +86,12 @@ SURPLASSE_READINESS_GATES = frozenset(
         "public-smoke",
         "restore-proof",
         "separated-migrations",
+        "email-delivery-observability",
+        "email-domain-authentication",
+        "smtp-atlas-connectivity",
+        "smtp-effective-runtime-configuration",
         "stripe-connect-production-adapter",
+        "transactional-email-provider",
         "vps-integration-bundle",
     }
 )
@@ -679,6 +684,13 @@ def _validate_compose_application(name: str, app: dict[str, Any], enabled: bool)
         repository=app["source_repository"],
         allowed_revisions=declared_revisions,
     )
+    if name == "surplasse":
+        _fail(
+            app_path,
+            "enabled Surplasse requires typed external SMTP evidence; generic "
+            "GitHub Actions evidence cannot prove DNS, Atlas connectivity, "
+            "effective runtime configuration, delivery, bounce, or alerting",
+        )
 
 
 def _validate_applications(value: Any, *, platform_enabled: bool) -> None:

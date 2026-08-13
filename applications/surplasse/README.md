@@ -44,7 +44,10 @@ The adapter also stays locked for these integration reasons:
   `.disabled` suffix;
 - the Caddy service does not receive scoped OVH DNS credentials;
 - the application secret files, restore proof, DNS cutover, and public smoke
-  proof do not exist in the release contract.
+  proof do not exist in the release contract;
+- aucun fournisseur email transactionnel n'est sélectionné ou provisionné ;
+- SPF, DKIM, DMARC, STARTTLS entre Atlas et le relais, la livraison finale, le
+  traitement des rebonds et les alertes opérateur n'ont aucune preuve ;
 - the source branch, image provenance, Stripe Connect production adapter, and
   Surplasse integration bundle do not have complete release evidence.
 
@@ -97,8 +100,23 @@ Every single-line input must end with one newline. The Stripe key must be a
 live secret key. Both webhook values must have the Stripe signing-secret
 prefix, and the two values must be distinct. The OVH values must match their
 documented token lengths. The application secret and consumer key must be
-distinct. The SMTP host must be a DNS name and the port must be in the TCP
-port range.
+distinct. Le matérialiseur de secrets accepte un nom DNS et un port TCP bornés
+comme entrées opérateur. Cette validation d'entrée n'est pas une preuve de
+readiness SMTP. L'adaptateur rendu exige séparément un nom DNS en minuscules, le
+port `587`, `SMTP_START_TLS=REQUIRED`, `SMTP_TLS=false`,
+`QUARKUS_MAILER_AUTH_METHODS=PLAIN LOGIN`, l'expéditeur fixe et les chemins de
+secrets exacts. La tranche qui sélectionnera le fournisseur devra lier l'hôte à
+un contrat public revu. L'adaptateur refuse toute clé d'environnement Backend
+supplémentaire dans Compose. Ce contrôle empêche une autre option Quarkus, TLS
+globale ou Java déclarée de modifier silencieusement cette partie du contrat. Il
+ne détecte pas une valeur contenue dans l'image ou exportée par l'entrypoint. La
+porte `smtp-effective-runtime-configuration` reste fermée jusqu'à l'inspection
+de l'image par digest et de l'environnement assaini du processus lancé.
+
+Atlas n'exécute ni Postfix, ni Exim, ni autre MTA. Le Backend se connecte
+directement à un relais email transactionnel managé. Suivre le
+[runbook SMTP](../../docs/operations/surplasse-smtp.md) pour sélectionner le
+fournisseur et prouver le DNS public, STARTTLS et la livraison.
 
 The helper parses the JWKS as strict UTF-8 JSON. It rejects duplicate JSON
 keys, private RSA parameters, keys other than RS256 signing keys, an RSA key
@@ -165,6 +183,21 @@ For a focused non-mutating check:
 ```bash
 make check-surplasse-adapter
 ```
+
+Le contrat fournisseur n'existe pas dans ce dépôt. Après son ajout et sa revue
+dans une tranche ultérieure, valider le DNS mail et STARTTLS sans
+authentification depuis un checkout de développement :
+
+```bash
+make verify-surplasse-smtp \
+  SURPLASSE_SMTP_CONTRACT=applications/surplasse/smtp-provider.json
+```
+
+Cette commande n'utilise aucun identifiant SMTP et n'envoie aucun message. Elle
+ne fait pas partie de `make check`. La livraison finale, le traitement des
+rebonds et la réception de l'alerte restent des portes d'activation distinctes.
+Pour un diagnostic Atlas autorisé, utiliser le script de la release immuable,
+pas cette cible `make`.
 
 The focused target renders both the five long-running services and the
 transient migration profile. It applies the shared Compose policy, then checks

@@ -434,6 +434,9 @@ wheels = [
 name = "vps-infra"
 version = "0.1.0"
 source = { virtual = "." }
+dependencies = [
+    { name = "cryptography" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -444,6 +447,7 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "cryptography", specifier = ">=50,<51" }]
 
 [package.metadata.requires-dev]
 dev = [

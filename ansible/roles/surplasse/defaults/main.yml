@@ -52,6 +52,11 @@ vps_surplasse_release_files:
     dest: platform/observability/prometheus/targets/surplasse.yml.disabled
   - src: releases/production.yaml
     dest: releases/production.yaml
+vps_surplasse_validator_files:
+  - validate-compose
+  - validate-surplasse-adapter
+  - validate-surplasse-controller
+  - verify-surplasse-smtp-preflight
 vps_surplasse_runtime_services:
   - backend
   - commande

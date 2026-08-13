@@ -1,0 +1,1359 @@
+#!/usr/bin/env python3
+"""Verify Surplasse public mail DNS and unauthenticated SMTP STARTTLS."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import time
+from typing import Any, Callable
+
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
+
+
+MAX_CONTRACT_BYTES = 64 * 1024
+MAX_DNS_OUTPUT_BYTES = 64 * 1024
+MAX_SMTP_REPLY_BYTES = 64 * 1024
+MAX_SMTP_ADDRESSES = 8
+MAX_SPF_DNS_LOOKUPS = 10
+BACKEND_AUTH_METHODS = frozenset({"PLAIN", "LOGIN"})
+EXPECTED_DOMAIN = "surplasse.com"
+EXPECTED_FROM = "no-reply@surplasse.com"
+EXPECTED_MX = {
+    (1, "mx1.mail.ovh.net."),
+    (5, "mx2.mail.ovh.net."),
+    (100, "mx3.mail.ovh.net."),
+}
+DNS_NAME_RE = re.compile(
+    r"(?=.{1,253}\Z)"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+)
+DNS_OWNER_RE = re.compile(
+    r"(?=.{1,253}\Z)"
+    r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
+    r"(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)*"
+)
+PROVIDER_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,63}")
+DMARC_ATEXT = r"A-Za-z0-9!#$%&'*+/=?^_`{|}~-"
+DMARC_MAILBOX_RE = re.compile(
+    rf"[{DMARC_ATEXT}]+(?:\.[{DMARC_ATEXT}]+)*"
+)
+QUOTED_TXT_LINE_RE = re.compile(r'(?:[ \t]*"(?:[^"\\]|\\.)*"[ \t]*)+')
+IANA_SPECIAL_USE_REGISTRY_DATE = "2026-05-22"
+SPECIAL_USE_DOMAINS = frozenset(
+    {
+        "alt",
+        "arpa",
+        "example",
+        "example.com",
+        "example.net",
+        "example.org",
+        "invalid",
+        "local",
+        "localhost",
+        "onion",
+        "test",
+    }
+)
+
+
+class PreflightError(ValueError):
+    """Raised when the SMTP readiness preflight cannot prove its contract."""
+
+
+def fail(message: str) -> None:
+    raise PreflightError(message)
+
+
+def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"contrat JSON : clé dupliquée {key!r}")
+        value[key] = item
+    return value
+
+
+def exact_keys(value: Any, expected: set[str], subject: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail(f"{subject} doit être un objet JSON")
+    actual = set(value)
+    if actual != expected:
+        missing = expected - actual
+        extra = actual - expected
+        details = []
+        if missing:
+            details.append(
+                "clés manquantes : "
+                + ", ".join(repr(key) for key in sorted(missing))
+            )
+        if extra:
+            details.append(
+                "clés inattendues : "
+                + ", ".join(repr(key) for key in sorted(extra))
+            )
+        fail(f"{subject} : {' ; '.join(details)}")
+    return value
+
+
+def load_contract(path: Path) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            fail("le contrat doit être un fichier régulier, pas un lien symbolique")
+        if metadata.st_size > MAX_CONTRACT_BYTES:
+            fail("le contrat dépasse 64 Kio")
+        raw = path.read_bytes()
+    except OSError as exc:
+        fail(f"lecture du contrat impossible : {exc}")
+    if len(raw) > MAX_CONTRACT_BYTES or b"\0" in raw:
+        fail("le contrat est trop grand ou binaire")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=strict_object,
+            parse_constant=lambda item: fail(
+                f"contrat JSON : constante invalide {item!r}"
+            ),
+        )
+    except PreflightError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        fail(f"le contrat n'est pas un JSON UTF-8 strict : {exc}")
+    if not isinstance(value, dict):
+        fail("le contrat doit être un objet JSON")
+    return value
+
+
+def require_string(value: Any, subject: str, *, max_length: int = 4096) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > max_length
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        fail(f"{subject} doit être une chaîne ASCII imprimable et bornée")
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError:
+        fail(f"{subject} doit être en ASCII")
+    return value
+
+
+def validate_dns_name(
+    value: Any,
+    subject: str,
+    *,
+    absolute: bool,
+) -> str:
+    name = require_string(value, subject, max_length=254)
+    if absolute:
+        if not name.endswith("."):
+            fail(f"{subject} doit être un nom DNS absolu terminé par un point")
+        candidate = name[:-1]
+    else:
+        if name.endswith("."):
+            fail(f"{subject} ne doit pas se terminer par un point")
+        candidate = name
+    if candidate != candidate.lower() or DNS_NAME_RE.fullmatch(candidate) is None:
+        fail(f"{subject} doit être un nom DNS ASCII minuscule valide")
+    return name
+
+
+def validate_dns_owner(
+    value: Any,
+    subject: str,
+    *,
+    absolute: bool,
+    public: bool,
+) -> str:
+    name = require_string(value, subject, max_length=254)
+    if absolute:
+        if not name.endswith("."):
+            fail(f"{subject} doit être un nom DNS absolu terminé par un point")
+        candidate = name[:-1]
+    else:
+        if name.endswith("."):
+            fail(f"{subject} ne doit pas se terminer par un point")
+        candidate = name
+    if candidate != candidate.lower() or DNS_OWNER_RE.fullmatch(candidate) is None:
+        fail(f"{subject} doit être un nom de propriétaire DNS valide")
+    terminal_label = candidate.rsplit(".", maxsplit=1)[-1]
+    if public and (
+        "." not in candidate
+        or terminal_label.isdigit()
+        or is_special_use_domain(candidate)
+    ):
+        fail(f"{subject} doit désigner un nom DNS public non réservé")
+    return name
+
+
+def is_special_use_domain(value: str) -> bool:
+    normalized = value.removesuffix(".").lower()
+    return any(
+        normalized == domain or normalized.endswith(f".{domain}")
+        for domain in SPECIAL_USE_DOMAINS
+    )
+
+
+def validate_contract(value: dict[str, Any]) -> dict[str, Any]:
+    contract = exact_keys(
+        value,
+        {"schema", "provider", "domain", "from", "smtp", "dns"},
+        "contrat",
+    )
+    if type(contract["schema"]) is not int or contract["schema"] != 1:
+        fail("contrat.schema doit valoir l'entier 1")
+    provider = require_string(contract["provider"], "contrat.provider", max_length=64)
+    if PROVIDER_RE.fullmatch(provider) is None:
+        fail("contrat.provider doit être un identifiant minuscule borné")
+    if contract["domain"] != EXPECTED_DOMAIN:
+        fail(f"contrat.domain doit valoir {EXPECTED_DOMAIN}")
+    if contract["from"] != EXPECTED_FROM:
+        fail(f"contrat.from doit valoir {EXPECTED_FROM}")
+
+    smtp = exact_keys(
+        contract["smtp"],
+        {"host", "port", "security"},
+        "contrat.smtp",
+    )
+    host = validate_dns_name(smtp["host"], "contrat.smtp.host", absolute=False)
+    if (
+        "." not in host
+        or host.rsplit(".", maxsplit=1)[-1].isdigit()
+        or is_special_use_domain(host)
+    ):
+        fail("contrat.smtp.host doit être un FQDN public non réservé")
+    if type(smtp["port"]) is not int or smtp["port"] != 587:
+        fail("contrat.smtp.port doit valoir l'entier 587")
+    if smtp["security"] != "starttls-required":
+        fail("contrat.smtp.security doit valoir starttls-required")
+
+    dns = exact_keys(
+        contract["dns"],
+        {
+            "mx",
+            "spf",
+            "provider_spf_mechanism",
+            "domain_verification",
+            "dkim",
+            "dmarc",
+        },
+        "contrat.dns",
+    )
+    mx = dns["mx"]
+    if not isinstance(mx, list):
+        fail("contrat.dns.mx doit être une liste")
+    actual_mx: set[tuple[int, str]] = set()
+    for index, raw_record in enumerate(mx):
+        record = exact_keys(
+            raw_record,
+            {"priority", "target"},
+            f"contrat.dns.mx[{index}]",
+        )
+        priority = record["priority"]
+        if type(priority) is not int or not 0 <= priority <= 65535:
+            fail(f"contrat.dns.mx[{index}].priority est invalide")
+        target = validate_dns_name(
+            record["target"],
+            f"contrat.dns.mx[{index}].target",
+            absolute=True,
+        )
+        actual_mx.add((priority, target))
+    if len(actual_mx) != len(mx) or actual_mx != EXPECTED_MX:
+        fail("contrat.dns.mx doit préserver exactement les trois MX OVH vérifiés")
+
+    provider_spf = dns["provider_spf_mechanism"]
+    if provider_spf is not None:
+        provider_spf = require_string(
+            provider_spf,
+            "contrat.dns.provider_spf_mechanism",
+            max_length=260,
+        )
+        if not provider_spf.startswith("include:"):
+            fail(
+                "contrat.dns.provider_spf_mechanism doit être null ou un "
+                "mécanisme include:"
+            )
+        validate_dns_owner(
+            provider_spf.removeprefix("include:"),
+            "contrat.dns.provider_spf_mechanism",
+            absolute=False,
+            public=True,
+        )
+        if provider_spf in {"include:mx.ovh.com", f"include:{EXPECTED_DOMAIN}"}:
+            fail("le mécanisme SPF du relais doit désigner un FQDN public distinct")
+
+    spf = exact_keys(dns["spf"], {"name", "value"}, "contrat.dns.spf")
+    if spf["name"] != f"{EXPECTED_DOMAIN}.":
+        fail(f"contrat.dns.spf.name doit valoir {EXPECTED_DOMAIN}.")
+    spf_value = require_string(spf["value"], "contrat.dns.spf.value")
+    spf_tokens = spf_value.split()
+    expected_spf_tokens = ["v=spf1", "include:mx.ovh.com"]
+    if provider_spf is not None:
+        expected_spf_tokens.append(provider_spf)
+    expected_spf_tokens.append("-all")
+    if spf_tokens != expected_spf_tokens:
+        fail(
+            "contrat.dns.spf.value doit conserver exactement OVH, ajouter le "
+            "mécanisme du relais seulement s'il est déclaré, puis finir par -all"
+        )
+
+    domain_verification = dns["domain_verification"]
+    if not isinstance(domain_verification, list) or len(domain_verification) > 10:
+        fail("contrat.dns.domain_verification doit contenir au plus dix entrées")
+    verification_identities: set[tuple[str, str, str]] = set()
+    for index, raw_record in enumerate(domain_verification):
+        record = validate_auxiliary_record(
+            raw_record,
+            f"contrat.dns.domain_verification[{index}]",
+        )
+        identity = (record["name"], record["type"], record["value"])
+        if identity in verification_identities:
+            fail("contrat.dns.domain_verification contient une entrée dupliquée")
+        verification_identities.add(identity)
+
+    dkim = dns["dkim"]
+    if not isinstance(dkim, list) or not 1 <= len(dkim) <= 10:
+        fail("contrat.dns.dkim doit contenir entre un et dix enregistrements")
+    dkim_names: set[str] = set()
+    for index, raw_record in enumerate(dkim):
+        record = exact_keys(
+            raw_record,
+            {"name", "type", "value"},
+            f"contrat.dns.dkim[{index}]",
+        )
+        name = require_string(
+            record["name"],
+            f"contrat.dns.dkim[{index}].name",
+            max_length=254,
+        )
+        if name != name.lower():
+            fail(f"contrat.dns.dkim[{index}].name doit être en minuscules")
+        suffix = f"._domainkey.{EXPECTED_DOMAIN}."
+        selector = name[: -len(suffix)] if name.endswith(suffix) else ""
+        if not selector or DNS_NAME_RE.fullmatch(selector) is None:
+            fail(f"contrat.dns.dkim[{index}].name n'est pas un sélecteur du domaine")
+        if name in dkim_names:
+            fail("contrat.dns.dkim contient un sélecteur dupliqué")
+        dkim_names.add(name)
+        record_type = record["type"]
+        if record_type not in {"TXT", "CNAME"}:
+            fail(f"contrat.dns.dkim[{index}].type doit valoir TXT ou CNAME")
+        record_value = require_string(
+            record["value"],
+            f"contrat.dns.dkim[{index}].value",
+        )
+        if record_type == "TXT":
+            validate_dkim_txt(record_value, f"contrat.dns.dkim[{index}].value")
+        else:
+            validate_dns_owner(
+                record_value,
+                f"contrat.dns.dkim[{index}].value",
+                absolute=True,
+                public=True,
+            )
+
+    dmarc = exact_keys(dns["dmarc"], {"name", "value"}, "contrat.dns.dmarc")
+    if dmarc["name"] != f"_dmarc.{EXPECTED_DOMAIN}.":
+        fail(f"contrat.dns.dmarc.name doit valoir _dmarc.{EXPECTED_DOMAIN}.")
+    dmarc_value = require_string(dmarc["value"], "contrat.dns.dmarc.value")
+    raw_tags = parse_tag_list(dmarc_value, "contrat.dns.dmarc.value")
+    parsed_tags: dict[str, str] = {}
+    for raw_tag in raw_tags:
+        if "=" not in raw_tag:
+            fail("contrat.dns.dmarc.value contient un tag invalide")
+        key, tag_value = parse_tag(raw_tag, "contrat.dns.dmarc.value")
+        if key in parsed_tags:
+            fail(f"contrat.dns.dmarc.value contient le tag dupliqué {key}")
+        parsed_tags[key] = tag_value
+    first_tag = parse_tag(raw_tags[0], "contrat.dns.dmarc.value")
+    raw_report_destinations = parsed_tags.get("rua", "").split(",")
+    report_destinations = [
+        destination.strip() for destination in raw_report_destinations
+    ]
+    if (
+        not raw_tags
+        or first_tag != ("v", "DMARC1")
+        or parsed_tags.get("p") not in {"none", "quarantine", "reject"}
+        or not 1 <= len(report_destinations) <= 10
+        or any(not destination for destination in report_destinations)
+        or any(
+            not destination.startswith("mailto:")
+            or not valid_dmarc_destination(destination)
+            for destination in report_destinations
+        )
+    ):
+        fail("contrat.dns.dmarc.value doit définir v=DMARC1, p= et un rua mailto:")
+    if set(parsed_tags) != {"v", "p", "rua"}:
+        fail("contrat.dns.dmarc.value autorise seulement les tags v, p et rua")
+    validate_cname_exclusivity(contract)
+    return contract
+
+
+def validate_dkim_txt(value: str, subject: str) -> None:
+    raw_tags = parse_tag_list(value, subject)
+    parsed_tags: dict[str, str] = {}
+    for raw_tag in raw_tags:
+        if "=" not in raw_tag:
+            fail(f"{subject} contient un tag invalide")
+        key, tag_value = parse_tag(raw_tag, subject)
+        if key in parsed_tags:
+            fail(f"{subject} contient le tag dupliqué {key}")
+        parsed_tags[key] = tag_value
+    first_tag = parse_tag(raw_tags[0], subject)
+    declared_version = parsed_tags.get("v")
+    if declared_version is not None and (
+        first_tag != ("v", "DKIM1") or declared_version != "DKIM1"
+    ):
+        fail(f"{subject} contient une version DKIM non prise en charge")
+    key_type = parsed_tags.get("k", "rsa").lower()
+    key_material = re.sub(r"\s+", "", parsed_tags.get("p", ""))
+    if (
+        not raw_tags
+        or key_type not in {"rsa", "ed25519"}
+        or re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", key_material) is None
+    ):
+        fail(f"{subject} doit définir une clé DKIM p= bornée non vide")
+    services = parsed_tags.get("s")
+    if services is not None and not {
+            service.strip().lower() for service in services.split(":")
+    }.intersection({"*", "email"}):
+        fail(f"{subject} doit autoriser le service email")
+    try:
+        decoded_key = base64.b64decode(key_material, validate=True)
+    except (binascii.Error, ValueError):
+        fail(f"{subject} contient une clé p= qui n'est pas du Base64 strict")
+    if key_type == "ed25519":
+        try:
+            ed25519.Ed25519PublicKey.from_public_bytes(decoded_key)
+        except ValueError:
+            fail(f"{subject} doit contenir une clé Ed25519 brute de 32 octets")
+    else:
+        try:
+            public_key = serialization.load_der_public_key(decoded_key)
+        except (TypeError, ValueError, UnsupportedAlgorithm):
+            fail(f"{subject} doit contenir une clé publique RSA DER valide")
+        canonical_encodings: set[bytes] = set()
+        if isinstance(public_key, rsa.RSAPublicKey):
+            canonical_encodings = {
+                public_key.public_bytes(
+                    serialization.Encoding.DER,
+                    serialization.PublicFormat.PKCS1,
+                ),
+                public_key.public_bytes(
+                    serialization.Encoding.DER,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                ),
+            }
+        if (
+            not isinstance(public_key, rsa.RSAPublicKey)
+            or public_key.key_size < 2048
+            or public_key.public_numbers().e != 65537
+            or decoded_key not in canonical_encodings
+        ):
+            fail(
+                f"{subject} doit contenir une clé publique RSA DER canonique "
+                "PKCS#1 ou SubjectPublicKeyInfo d'au moins 2048 bits avec "
+                "l'exposant 65537"
+            )
+    flags = {
+        flag.strip().lower()
+        for flag in parsed_tags.get("t", "").split(":")
+        if flag
+    }
+    if "y" in flags:
+        fail(f"{subject} ne doit pas publier une clé DKIM en mode test t=y")
+    hashes = {
+        algorithm.strip().lower()
+        for algorithm in parsed_tags.get("h", "sha256").split(":")
+        if algorithm
+    }
+    if hashes != {"sha256"}:
+        fail(f"{subject} doit autoriser uniquement l'algorithme DKIM SHA-256")
+
+
+def parse_tag_list(value: str, subject: str) -> list[str]:
+    parts = value.split(";")
+    if parts and parts[-1].strip() == "":
+        parts.pop()
+    if not parts or any(not part.strip() for part in parts):
+        fail(f"{subject} contient un tag vide")
+    return [part.strip() for part in parts]
+
+
+def parse_tag(value: str, subject: str) -> tuple[str, str]:
+    match = re.fullmatch(r"([A-Za-z][A-Za-z0-9]*)[ \t]*=[ \t]*(.*)", value)
+    if match is None:
+        fail(f"{subject} contient un tag invalide")
+    tag_value = match.group(2).strip()
+    if not tag_value:
+        fail(f"{subject} contient un tag invalide")
+    return match.group(1).lower(), tag_value
+
+
+def valid_dmarc_destination(value: str) -> bool:
+    destination = value.removeprefix("mailto:")
+    if "!" in destination:
+        return False
+    mailbox = destination
+    if mailbox.count("@") != 1:
+        return False
+    local_part, domain = mailbox.rsplit("@", maxsplit=1)
+    if (
+        len(local_part.encode("ascii")) > 64
+        or DMARC_MAILBOX_RE.fullmatch(local_part) is None
+        or len(domain) > 253
+        or validate_mailbox_domain(domain) is None
+        or len(mailbox.encode("ascii")) > 254
+    ):
+        return False
+    return True
+
+
+def validate_mailbox_domain(value: str) -> str | None:
+    if (
+        value != value.lower()
+        or DNS_NAME_RE.fullmatch(value) is None
+        or "." not in value
+        or value.rsplit(".", maxsplit=1)[-1].isdigit()
+        or is_special_use_domain(value)
+    ):
+        return None
+    return value
+
+
+def validate_auxiliary_record(value: Any, subject: str) -> dict[str, Any]:
+    record = exact_keys(value, {"name", "type", "value"}, subject)
+    name = require_string(record["name"], f"{subject}.name", max_length=254)
+    if name == f"{EXPECTED_DOMAIN}.":
+        pass
+    else:
+        owner = name[:-1] if name.endswith(".") else ""
+        if (
+            not owner
+            or owner != owner.lower()
+            or DNS_OWNER_RE.fullmatch(owner) is None
+            or not name.endswith(f".{EXPECTED_DOMAIN}.")
+        ):
+            fail(f"{subject}.name doit appartenir à {EXPECTED_DOMAIN}")
+    record_type = record["type"]
+    if record_type not in {"TXT", "CNAME"}:
+        fail(f"{subject}.type doit valoir TXT ou CNAME")
+    if name == f"{EXPECTED_DOMAIN}." and record_type == "CNAME":
+        fail(f"{subject} ne peut pas publier un CNAME à l'apex")
+    record_value = require_string(record["value"], f"{subject}.value")
+    if record_type == "CNAME":
+        validate_dns_owner(
+            record_value,
+            f"{subject}.value",
+            absolute=True,
+            public=True,
+        )
+    return record
+
+
+def validate_cname_exclusivity(contract: dict[str, Any]) -> None:
+    records_by_owner: dict[str, list[tuple[str, str]]] = {
+        f"{EXPECTED_DOMAIN}.": [("MX", ""), ("TXT", contract["dns"]["spf"]["value"])],
+        contract["dns"]["dmarc"]["name"]: [
+            ("TXT", contract["dns"]["dmarc"]["value"])
+        ],
+    }
+    for collection in ("domain_verification", "dkim"):
+        for record in contract["dns"][collection]:
+            records_by_owner.setdefault(record["name"], []).append(
+                (record["type"], record["value"])
+            )
+    cname_targets: dict[str, str] = {}
+    for owner, records in records_by_owner.items():
+        cname_records = [record for record in records if record[0] == "CNAME"]
+        if not cname_records:
+            continue
+        if len(records) != 1:
+            fail(
+                f"contrat DNS : le CNAME {owner} doit être unique et exclusif "
+                "de tout autre enregistrement"
+            )
+        cname_targets[owner] = cname_records[0][1]
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(owner: str, path: tuple[str, ...]) -> None:
+        if owner in visiting:
+            fail("contrat DNS : cycle CNAME déclaré : " + " -> ".join((*path, owner)))
+        if owner in visited or owner not in cname_targets:
+            return
+        visiting.add(owner)
+        target = cname_targets[owner]
+        visit(target, (*path, owner))
+        visiting.remove(owner)
+        visited.add(owner)
+
+    for owner in sorted(cname_targets):
+        visit(owner, ())
+
+
+def find_dig() -> str:
+    dig = shutil.which(
+        "dig",
+        path="/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+    )
+    if dig is None:
+        fail("dig est requis pour vérifier les enregistrements DNS")
+    return dig
+
+
+def query_dns(name: str, record_type: str) -> list[str]:
+    command = [find_dig(), "+time=5", "+tries=1", "+short", name, record_type]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            timeout=10,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"requête DNS {record_type} {name} impossible : {exc}")
+    if len(result.stdout) > MAX_DNS_OUTPUT_BYTES or len(result.stderr) > 4096:
+        fail(f"réponse DNS {record_type} {name} trop grande")
+    if result.returncode != 0:
+        fail(f"requête DNS {record_type} {name} refusée")
+    try:
+        return result.stdout.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        fail(f"réponse DNS {record_type} {name} non ASCII")
+
+
+def parse_txt_lines(lines: list[str], subject: str) -> list[str]:
+    values = []
+    for line in lines:
+        if QUOTED_TXT_LINE_RE.fullmatch(line) is None:
+            fail(f"{subject} contient une réponse qui n'est pas un TXT cité")
+        try:
+            chunks = shlex.split(line, posix=True)
+        except ValueError as exc:
+            fail(f"{subject} contient un TXT illisible : {exc}")
+        if not chunks:
+            fail(f"{subject} contient un TXT vide")
+        value = "".join(chunks)
+        require_string(value, subject)
+        values.append(value)
+    return values
+
+
+DnsQuery = Callable[[str, str], list[str]]
+
+
+def spf_domain_spec(value: str, subject: str) -> str:
+    if "%" in value:
+        fail(f"{subject} ne doit pas utiliser de macro SPF")
+    candidate = value.removesuffix(".").lower()
+    validate_dns_owner(candidate, subject, absolute=False, public=True)
+    return candidate
+
+
+def spf_network(value: str, version: int, subject: str) -> None:
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        fail(f"{subject} contient un réseau IP invalide")
+    if (
+        network.version != version
+        or not network.is_global
+        or network.is_multicast
+        or network.is_reserved
+        or network.is_loopback
+        or network.is_link_local
+        or network.is_unspecified
+        or (version == 6 and network.is_site_local)
+        or network.prefixlen == 0
+    ):
+        fail(f"{subject} doit autoriser un réseau IPv{version} public et borné")
+
+
+def spf_dual_cidr_mechanism(
+    value: str,
+    owner: str,
+    subject: str,
+) -> str | None:
+    match = re.fullmatch(
+        r"(?:a|mx)(?::([^/]+))?(?:/([0-9]{1,3}))?(?://([0-9]{1,3}))?",
+        value,
+    )
+    if match is None:
+        return None
+    domain, ipv4_prefix, ipv6_prefix = match.groups()
+    if ipv4_prefix is not None and not 1 <= int(ipv4_prefix) <= 32:
+        fail(f"{subject} contient un préfixe IPv4 SPF invalide")
+    if ipv6_prefix is not None and not 1 <= int(ipv6_prefix) <= 128:
+        fail(f"{subject} contient un préfixe IPv6 SPF invalide")
+    if domain is None:
+        return owner
+    return spf_domain_spec(domain, subject)
+
+
+def parse_spf_lookups(owner: str, value: str) -> list[tuple[str, str, bool]]:
+    require_string(value, f"SPF de {owner}")
+    tokens = value.split()
+    if not tokens or tokens[0].lower() != "v=spf1":
+        fail(f"SPF de {owner} doit commencer par v=spf1")
+    lookups: list[tuple[str, str, bool]] = []
+    modifiers: set[str] = set()
+    has_all = False
+    for raw_token in tokens[1:]:
+        directive = raw_token.lower()
+        if "=" in directive:
+            name, modifier_value = directive.split("=", maxsplit=1)
+            if name not in {"redirect", "exp"} or not modifier_value:
+                fail(f"SPF de {owner} contient le modificateur invalide {raw_token!r}")
+            if name in modifiers:
+                fail(f"SPF de {owner} contient le modificateur dupliqué {name}")
+            modifiers.add(name)
+            target = spf_domain_spec(
+                modifier_value,
+                f"modificateur SPF {name} de {owner}",
+            )
+            if name == "redirect":
+                lookups.append(("redirect", target, True))
+            continue
+
+        qualifier = directive[0] if directive and directive[0] in "+-~?" else ""
+        mechanism = directive[1:] if qualifier else directive
+        if has_all:
+            fail(f"SPF de {owner} contient un mécanisme après all")
+        if mechanism == "all":
+            has_all = True
+            if qualifier in {"", "+"}:
+                fail(f"SPF de {owner} contient une autorisation ouverte +all")
+            continue
+        can_pass = qualifier in {"", "+"}
+        if mechanism.startswith("include:"):
+            target = spf_domain_spec(
+                mechanism.removeprefix("include:"),
+                f"mécanisme include SPF de {owner}",
+            )
+            lookups.append(("include", target, can_pass))
+            continue
+        if mechanism.startswith("ip4:"):
+            spf_network(
+                mechanism.removeprefix("ip4:"),
+                4,
+                f"mécanisme ip4 SPF de {owner}",
+            )
+            lookups.append(("ip4", "", can_pass))
+            continue
+        if mechanism.startswith("ip6:"):
+            spf_network(
+                mechanism.removeprefix("ip6:"),
+                6,
+                f"mécanisme ip6 SPF de {owner}",
+            )
+            lookups.append(("ip6", "", can_pass))
+            continue
+        dual_cidr_owner = spf_dual_cidr_mechanism(
+            mechanism,
+            owner,
+            f"mécanisme SPF de {owner}",
+        )
+        if dual_cidr_owner is not None:
+            lookup_type = mechanism.split(":", maxsplit=1)[0].split(
+                "/", maxsplit=1
+            )[0]
+            lookups.append((lookup_type, dual_cidr_owner, can_pass))
+            continue
+        if mechanism == "ptr" or mechanism.startswith("ptr:"):
+            target = (
+                owner
+                if mechanism == "ptr"
+                else spf_domain_spec(
+                    mechanism.removeprefix("ptr:"),
+                    f"mécanisme ptr SPF de {owner}",
+                )
+            )
+            lookups.append(("ptr", target, can_pass))
+            continue
+        if mechanism.startswith("exists:"):
+            target = spf_domain_spec(
+                mechanism.removeprefix("exists:"),
+                f"mécanisme exists SPF de {owner}",
+            )
+            lookups.append(("exists", target, can_pass))
+            continue
+        fail(f"SPF de {owner} contient le mécanisme invalide {raw_token!r}")
+    if has_all and "redirect" in modifiers:
+        fail(f"SPF de {owner} combine redirect avec un mécanisme all qui le masque")
+    return lookups
+
+
+def verify_spf_graph(
+    owner: str,
+    value: str,
+    query: DnsQuery,
+    *,
+    budget: list[int] | None = None,
+    stack: tuple[str, ...] = (),
+) -> bool:
+    normalized_owner = owner.removesuffix(".").lower()
+    if normalized_owner in stack:
+        fail("le graphe SPF contient un cycle : " + " -> ".join((*stack, normalized_owner)))
+    current_stack = (*stack, normalized_owner)
+    lookup_budget = [0] if budget is None else budget
+    can_pass = False
+    for mechanism, target, positive_qualifier in parse_spf_lookups(
+        normalized_owner,
+        value,
+    ):
+        if mechanism in {"include", "redirect", "a", "mx", "ptr", "exists"}:
+            lookup_budget[0] += 1
+            if lookup_budget[0] > MAX_SPF_DNS_LOOKUPS:
+                fail("le graphe SPF dépasse le budget de dix recherches DNS")
+        if mechanism not in {"include", "redirect"}:
+            can_pass = can_pass or positive_qualifier
+            continue
+        target_record = unique_spf_record(target, query)
+        target_can_pass = verify_spf_graph(
+            target,
+            target_record,
+            query,
+            budget=lookup_budget,
+            stack=current_stack,
+        )
+        can_pass = can_pass or (positive_qualifier and target_can_pass)
+    return can_pass
+
+
+def unique_spf_record(owner: str, query: DnsQuery) -> str:
+    records = [
+        item
+        for item in parse_txt_lines(
+            query(owner, "TXT"),
+            f"réponse SPF de {owner}",
+        )
+        if is_spf_record(item)
+    ]
+    if len(records) != 1:
+        fail(f"la cible SPF {owner} doit publier un unique SPF")
+    return records[0]
+
+
+def verify_dns(contract: dict[str, Any], query: DnsQuery = query_dns) -> None:
+    dns = contract["dns"]
+    domain_name = f"{contract['domain']}."
+    observed_mx: list[tuple[int, str]] = []
+    for line in query(domain_name, "MX"):
+        parts = line.split()
+        if (
+            len(parts) != 2
+            or re.fullmatch(r"[0-9]{1,5}", parts[0]) is None
+            or int(parts[0]) > 65535
+        ):
+            fail("la réponse MX contient un enregistrement invalide")
+        target = parts[1].lower()
+        validate_dns_name(target, "réponse MX", absolute=True)
+        observed_mx.append((int(parts[0]), target))
+    if len(set(observed_mx)) != len(observed_mx) or set(observed_mx) != EXPECTED_MX:
+        fail("les MX publics ne correspondent pas exactement aux trois MX OVH")
+
+    root_txt = parse_txt_lines(query(domain_name, "TXT"), "réponse TXT du domaine")
+    observed_spf = [value for value in root_txt if is_spf_record(value)]
+    if observed_spf != [dns["spf"]["value"]]:
+        fail("le domaine doit publier un unique SPF égal au contrat")
+    if not verify_spf_graph(domain_name, dns["spf"]["value"], query):
+        fail("le SPF du domaine ne contient aucun chemin pouvant autoriser un envoi")
+    provider_spf = dns["provider_spf_mechanism"]
+    if provider_spf is not None:
+        provider_owner = provider_spf.removeprefix("include:")
+        provider_record = unique_spf_record(provider_owner, query)
+        if not verify_spf_graph(provider_owner, provider_record, query):
+            fail(
+                "le mécanisme SPF du relais ne contient aucun chemin pouvant "
+                "autoriser un envoi"
+            )
+
+    for record in dns["domain_verification"]:
+        lines = query(record["name"], record["type"])
+        if record["type"] == "TXT":
+            observed = parse_txt_lines(
+                lines,
+                f"réponse de vérification {record['name']}",
+            )
+            matches = observed.count(record["value"])
+        else:
+            observed = [line.strip().lower() for line in lines if line.strip()]
+            matches = 1 if observed == [record["value"]] else 0
+        if matches != 1:
+            fail(
+                f"la vérification de domaine {record['name']} ne correspond pas "
+                "exactement au contrat"
+            )
+
+    for record in dns["dkim"]:
+        lines = query(record["name"], record["type"])
+        if record["type"] == "TXT":
+            observed = parse_txt_lines(lines, f"réponse DKIM {record['name']}")
+        else:
+            observed = [line.strip().lower() for line in lines if line.strip()]
+        if observed != [record["value"]]:
+            fail(f"le DKIM public {record['name']} ne correspond pas au contrat")
+        if record["type"] == "CNAME":
+            terminal_txt = parse_txt_lines(
+                query(record["value"], "TXT"),
+                f"réponse DKIM terminale {record['value']}",
+            )
+            if len(terminal_txt) != 1:
+                fail(
+                    f"la cible DKIM {record['value']} doit publier un unique TXT"
+                )
+            validate_dkim_txt(
+                terminal_txt[0],
+                f"réponse DKIM terminale {record['value']}",
+            )
+
+    dmarc = dns["dmarc"]
+    dmarc_txt = parse_txt_lines(query(dmarc["name"], "TXT"), "réponse DMARC")
+    observed_dmarc = [value for value in dmarc_txt if is_dmarc_record(value)]
+    if observed_dmarc != [dmarc["value"]]:
+        fail("le domaine doit publier un unique DMARC égal au contrat")
+
+    report_domains = {
+        destination.removeprefix("mailto:")
+        .split("!", maxsplit=1)[0]
+        .rsplit("@", maxsplit=1)[1]
+        .lower()
+        for destination in parsed_dmarc_destinations(dmarc["value"])
+    }
+    external_report_domains = {
+        domain
+        for domain in report_domains
+        if domain != EXPECTED_DOMAIN and not domain.endswith(f".{EXPECTED_DOMAIN}")
+    }
+    for report_domain in sorted(external_report_domains):
+        authorization_name = (
+            f"{EXPECTED_DOMAIN}._report._dmarc.{report_domain}."
+        )
+        authorization = parse_txt_lines(
+            query(authorization_name, "TXT"),
+            f"autorisation DMARC externe {authorization_name}",
+        )
+        if not any(
+            dmarc_authorization_valid(value, report_domain)
+            for value in authorization
+        ):
+            fail(
+                f"le destinataire DMARC externe {report_domain} n'autorise pas "
+                f"les rapports de {EXPECTED_DOMAIN}"
+            )
+
+
+def parsed_dmarc_destinations(value: str) -> list[str]:
+    for raw_tag in parse_tag_list(value, "enregistrement DMARC"):
+        key, tag_value = parse_tag(raw_tag, "enregistrement DMARC")
+        if key == "rua":
+            return [item.strip() for item in tag_value.split(",")]
+    return []
+
+
+def dmarc_authorization_valid(value: str, expected_report_domain: str) -> bool:
+    try:
+        tags = parse_tag_list(value, "autorisation DMARC externe")
+    except PreflightError:
+        return False
+    parsed_tags: dict[str, str] = {}
+    for tag in tags:
+        try:
+            key, tag_value = parse_tag(tag, "autorisation DMARC externe")
+        except PreflightError:
+            return False
+        if key in parsed_tags:
+            return False
+        parsed_tags[key] = tag_value
+    try:
+        first_tag = parse_tag(tags[0], "autorisation DMARC externe")
+    except PreflightError:
+        return False
+    if first_tag != ("v", "DMARC1"):
+        return False
+    if "rua" in parsed_tags:
+        destinations = [
+            destination.strip()
+            for destination in parsed_tags["rua"].split(",")
+        ]
+        if not destinations or any(
+            not valid_dmarc_destination(destination)
+            or dmarc_destination_domain(destination) != expected_report_domain
+            for destination in destinations
+        ):
+            return False
+    return True
+
+
+def dmarc_destination_domain(value: str) -> str:
+    return value.removeprefix("mailto:").rsplit("@", maxsplit=1)[1].lower()
+
+
+def is_dmarc_record(value: str) -> bool:
+    try:
+        first_tag = value.split(";", maxsplit=1)[0].strip()
+        return parse_tag(first_tag, "enregistrement DMARC") == ("v", "DMARC1")
+    except PreflightError:
+        return False
+
+
+def is_spf_record(value: str) -> bool:
+    normalized = value.lower()
+    return normalized == "v=spf1" or normalized.startswith("v=spf1 ")
+
+
+def public_addresses(
+    host: str,
+    port: int,
+    query: DnsQuery = query_dns,
+) -> list[tuple[int, int, int, tuple[Any, ...]]]:
+    result: list[tuple[int, int, int, tuple[Any, ...]]] = []
+    seen: set[tuple[int, str]] = set()
+    for record_type, family in (("A", socket.AF_INET), ("AAAA", socket.AF_INET6)):
+        for raw_answer in query(host, record_type):
+            answer = raw_answer.strip().lower()
+            try:
+                parsed = ipaddress.ip_address(answer)
+            except ValueError:
+                validate_dns_owner(
+                    answer,
+                    f"réponse {record_type} du relais",
+                    absolute=True,
+                    public=True,
+                )
+                continue
+            if (
+                (family == socket.AF_INET and parsed.version != 4)
+                or (family == socket.AF_INET6 and parsed.version != 6)
+            ):
+                fail(f"la réponse {record_type} contient une famille IP incohérente")
+            if (
+                not parsed.is_global
+                or parsed.is_multicast
+                or parsed.is_reserved
+                or parsed.is_loopback
+                or parsed.is_link_local
+                or parsed.is_unspecified
+                or (parsed.version == 6 and parsed.is_site_local)
+            ):
+                fail("le relais SMTP résout vers une adresse non publique")
+            identity = (family, str(parsed))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            address: tuple[Any, ...]
+            if family == socket.AF_INET:
+                address = (str(parsed), port)
+            else:
+                address = (str(parsed), port, 0, 0)
+            result.append((family, socket.SOCK_STREAM, socket.IPPROTO_TCP, address))
+            if len(result) > MAX_SMTP_ADDRESSES:
+                fail("le relais SMTP résout vers plus de huit adresses")
+    if not result:
+        fail("le relais SMTP ne résout vers aucune adresse publique")
+    return result
+
+
+def remaining_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        fail("le délai total des tentatives SMTP est dépassé")
+    return remaining
+
+
+def build_tls_context() -> ssl.SSLContext:
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        fail("SSL_CERT_FILE et SSL_CERT_DIR sont interdits pour ce préflight")
+    paths = ssl.get_default_verify_paths()
+    cafile = (
+        paths.openssl_cafile
+        if paths.openssl_cafile and Path(paths.openssl_cafile).is_file()
+        else None
+    )
+    capath = (
+        paths.openssl_capath
+        if paths.openssl_capath and Path(paths.openssl_capath).is_dir()
+        else None
+    )
+    if cafile is None and capath is None:
+        fail("aucun magasin CA système OpenSSL n'est disponible")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    context.load_verify_locations(cafile=cafile, capath=capath)
+    return context
+
+
+class SmtpLineReader:
+    """Read SMTP lines while enforcing an absolute connection deadline."""
+
+    def __init__(self, connection: Any) -> None:
+        self.connection = connection
+        self.buffer = bytearray()
+
+    def readline(self, deadline: float) -> bytes:
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(self.buffer[: newline + 1])
+                del self.buffer[: newline + 1]
+                return line
+            if len(self.buffer) >= 512:
+                fail("le relais SMTP a envoyé une ligne de plus de 512 octets")
+            self.connection.settimeout(remaining_timeout(deadline))
+            try:
+                chunk = self.connection.recv(4096)
+            except OSError as exc:
+                fail(f"lecture SMTP impossible : {exc}")
+            if not chunk:
+                fail("le relais SMTP a fermé la connexion pendant une réponse")
+            self.buffer.extend(chunk)
+            if len(self.buffer) > MAX_SMTP_REPLY_BYTES:
+                fail("le relais SMTP a envoyé une réponse trop grande")
+
+    def require_empty(self) -> None:
+        if self.buffer:
+            fail("le relais SMTP a envoyé des octets inattendus avant STARTTLS")
+
+
+def read_smtp_reply(
+    reader: SmtpLineReader,
+    deadline: float,
+) -> tuple[int, list[str]]:
+    code: int | None = None
+    lines: list[str] = []
+    total = 0
+    for _index in range(100):
+        raw_line = reader.readline(deadline)
+        total += len(raw_line)
+        if (
+            not raw_line
+            or len(raw_line) > 512
+            or total > MAX_SMTP_REPLY_BYTES
+            or not raw_line.endswith(b"\r\n")
+            or b"\r" in raw_line[:-2]
+            or b"\n" in raw_line[:-2]
+        ):
+            fail("le relais SMTP a envoyé une réponse absente ou trop grande")
+        try:
+            line = raw_line.rstrip(b"\r\n").decode("ascii")
+        except UnicodeDecodeError:
+            fail("le relais SMTP a envoyé une réponse non ASCII")
+        match = re.fullmatch(r"([0-9]{3})([ -])(.*)", line)
+        if match is None:
+            fail("le relais SMTP a envoyé une réponse mal formée")
+        current_code = int(match.group(1))
+        if code is None:
+            code = current_code
+        elif current_code != code:
+            fail("le relais SMTP a envoyé une réponse multiligne incohérente")
+        lines.append(match.group(3))
+        if match.group(2) == " ":
+            return current_code, lines
+    fail("le relais SMTP a envoyé trop de lignes")
+
+
+def smtp_command(
+    connection: Any,
+    reader: SmtpLineReader,
+    command: bytes,
+    deadline: float,
+) -> tuple[int, list[str]]:
+    connection.settimeout(remaining_timeout(deadline))
+    try:
+        connection.sendall(command + b"\r\n")
+    except OSError as exc:
+        fail(f"écriture SMTP impossible : {exc}")
+    reply = read_smtp_reply(reader, deadline)
+    reader.require_empty()
+    return reply
+
+
+def ehlo_capabilities(lines: list[str]) -> list[str]:
+    if not lines:
+        fail("EHLO ne contient aucune ligne d'accueil")
+    greeting_parts = lines[0].split(maxsplit=1)
+    if not greeting_parts:
+        fail("la première ligne EHLO est vide")
+    greeting = greeting_parts[0].removesuffix(".").lower()
+    try:
+        ipaddress.ip_address(greeting.strip("[]"))
+    except ValueError:
+        if DNS_NAME_RE.fullmatch(greeting) is None:
+            fail("la première ligne EHLO ne contient pas un domaine ou une adresse")
+    return lines[1:]
+
+
+def advertised_auth_methods(capabilities: list[str]) -> set[str]:
+    methods: set[str] = set()
+    for capability in capabilities:
+        tokens = capability.upper().split()
+        if not tokens:
+            continue
+        keyword = tokens[0]
+        if keyword == "AUTH":
+            advertised = tokens[1:]
+        elif keyword.startswith("AUTH=") and len(keyword) > len("AUTH="):
+            advertised = [keyword.removeprefix("AUTH="), *tokens[1:]]
+        else:
+            continue
+        methods.update(advertised)
+    return methods
+
+
+def probe_starttls(contract: dict[str, Any], timeout: float) -> tuple[str, str, str]:
+    host = contract["smtp"]["host"]
+    port = contract["smtp"]["port"]
+    errors = []
+    addresses = public_addresses(host, port)
+    deadline = time.monotonic() + timeout
+    for family, socket_type, protocol, address in addresses:
+        connection: socket.socket | ssl.SSLSocket | None = None
+        reader: SmtpLineReader | None = None
+        try:
+            connection = socket.socket(family, socket_type, protocol)
+            connection.settimeout(remaining_timeout(deadline))
+            connection.connect(address)
+            reader = SmtpLineReader(connection)
+            greeting_code, _greeting = read_smtp_reply(reader, deadline)
+            if greeting_code != 220:
+                fail(f"le relais SMTP refuse la connexion avec le code {greeting_code}")
+            reader.require_empty()
+            ehlo_code, capabilities = smtp_command(
+                connection,
+                reader,
+                b"EHLO surplasse.com",
+                deadline,
+            )
+            if ehlo_code != 250:
+                fail(f"EHLO est refusé avec le code {ehlo_code}")
+            capabilities = ehlo_capabilities(capabilities)
+            if not any(
+                line.upper() == "STARTTLS" or line.upper().startswith("STARTTLS ")
+                for line in capabilities
+            ):
+                fail("le relais SMTP n'annonce pas STARTTLS")
+            starttls_code, _response = smtp_command(
+                connection,
+                reader,
+                b"STARTTLS",
+                deadline,
+            )
+            if starttls_code != 220:
+                fail(f"STARTTLS est refusé avec le code {starttls_code}")
+            reader = None
+
+            context = build_tls_context()
+            connection.settimeout(remaining_timeout(deadline))
+            tls_connection = context.wrap_socket(connection, server_hostname=host)
+            connection = tls_connection
+            reader = SmtpLineReader(tls_connection)
+            secured_ehlo_code, _secured_capabilities = smtp_command(
+                tls_connection,
+                reader,
+                b"EHLO surplasse.com",
+                deadline,
+            )
+            if secured_ehlo_code != 250:
+                fail(f"EHLO après STARTTLS est refusé avec le code {secured_ehlo_code}")
+            _secured_capabilities = ehlo_capabilities(_secured_capabilities)
+            auth_methods = advertised_auth_methods(_secured_capabilities)
+            if not auth_methods.intersection(BACKEND_AUTH_METHODS):
+                fail(
+                    "le relais SMTP n'annonce après STARTTLS aucun mécanisme "
+                    "AUTH PLAIN ou LOGIN accepté par le Backend"
+                )
+            try:
+                quit_code, _quit_response = smtp_command(
+                    tls_connection,
+                    reader,
+                    b"QUIT",
+                    deadline,
+                )
+                if quit_code != 221:
+                    fail(f"QUIT est refusé avec le code {quit_code}")
+            except PreflightError:
+                pass
+            cipher = tls_connection.cipher()
+            return (
+                str(address[0]),
+                tls_connection.version() or "inconnu",
+                cipher[0] if cipher else "inconnu",
+            )
+        except (OSError, ssl.SSLError, PreflightError) as exc:
+            errors.append(f"{address[0]}: {exc}")
+        finally:
+            if connection is not None:
+                connection.close()
+    fail("aucune adresse du relais n'a passé STARTTLS : " + " ; ".join(errors))
+
+
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Vérifie le contrat public SMTP de Surplasse, son DNS et STARTTLS "
+            "sans authentification ni envoi de message."
+        )
+    )
+    parser.add_argument("--contract", required=True, type=Path)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--validate-only", action="store_true")
+    mode.add_argument("--dns-only", action="store_true")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="délai total des tentatives SMTP, hors requêtes DNS bornées",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    arguments = parse_arguments(argv)
+    try:
+        if not 1 <= arguments.timeout <= 30:
+            fail("--timeout doit être compris entre 1 et 30 secondes")
+        contract = validate_contract(load_contract(arguments.contract))
+        if arguments.validate_only:
+            print("contrat SMTP Surplasse valide")
+            return 0
+        verify_dns(contract)
+        if arguments.dns_only:
+            print("contrat et DNS mail Surplasse conformes")
+            return 0
+        address, tls_version, cipher = probe_starttls(contract, arguments.timeout)
+        print(
+            "contrat, DNS mail et STARTTLS SMTP valides "
+            f"(adresse={address}, version={tls_version}, suite={cipher})"
+        )
+        print("aucune authentification ni aucun message n'a été envoyé")
+        return 0
+    except PreflightError as exc:
+        print(f"préflight SMTP Surplasse refusé : {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
