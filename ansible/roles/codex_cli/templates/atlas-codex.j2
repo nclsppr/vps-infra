@@ -24,6 +24,14 @@ case "${1:-}" in
     ;;
 esac
 
+if ! printf '%s  %s\n' \
+  '{{ vps_codex_bubblewrap_artifact.executable_sha256 }}' \
+  /usr/bin/bwrap \
+  | /usr/bin/sha256sum --check --status; then
+  printf '%s\n' 'The Codex sandbox executable digest is not approved' >&2
+  exit 69
+fi
+
 workspace_source=$(
   /usr/bin/findmnt --noheadings --output SOURCE \
     --mountpoint {{ vps_codex_storage_root }}

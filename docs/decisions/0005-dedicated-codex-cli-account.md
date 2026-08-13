@@ -29,8 +29,11 @@ Ansible installs the official standalone Codex CLI package with these controls:
    as the runtime account before an atomic release switch. The standalone
    artifact includes a pinned `bwrap`, but Atlas selects `/usr/bin/bwrap` from
    the Ubuntu `bubblewrap` package. This executable matches Ubuntu's AppArmor
-   profile for unprivileged user namespace sandbox setup. The role validates
-   its owner, mode, setuid state, and file capabilities before use.
+   profile for unprivileged user namespace sandbox setup. Git fixes the exact
+   package version, architecture-specific package archive digest, and installed
+   executable digest. The package remains held between reviewed updates. The
+   role and launcher validate the executable digest, owner, mode, setuid state,
+   and file capabilities before use.
 3. The `codex` system account has a locked password, no SSH key, no direct SSH
    login, no sudo rule, no supplementary group, and no Docker socket access.
 4. The account owns only `/srv/codex/home` and `/srv/codex/workspaces`. Both are

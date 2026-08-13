@@ -1755,6 +1755,20 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "is-active",
                 "atlas-codex-session.service",
             ],
+            ("codex_cli", "Read pinned Ubuntu bubblewrap package metadata"): [
+                "/usr/bin/apt-cache",
+                "show",
+                "bubblewrap={{ vps_codex_bubblewrap_version }}",
+            ],
+            (
+                "codex_cli",
+                "Read the installed bubblewrap version after reconciliation",
+            ): [
+                "/usr/bin/dpkg-query",
+                "--show",
+                "--showformat=${Version}",
+                "bubblewrap",
+            ],
             ("codex_cli", "Inspect distribution bubblewrap file capabilities"): [
                 "/usr/sbin/getcap",
                 "/usr/bin/bwrap",
