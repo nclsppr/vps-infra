@@ -1,0 +1,171 @@
+---
+- name: Inspect the complete Codex activation snapshot marker
+  ansible.builtin.stat:
+    path: "{{ vps_codex_activation_rollback_root }}/snapshot-complete"
+    follow: false
+  register: vps_codex_rollback_snapshot_marker
+
+- name: Refuse an incomplete Codex activation snapshot
+  ansible.builtin.assert:
+    that:
+      - vps_codex_rollback_snapshot_marker.stat.isreg | default(false)
+      - not (vps_codex_rollback_snapshot_marker.stat.islnk | default(false))
+      - vps_codex_rollback_snapshot_marker.stat.uid == 0
+      - vps_codex_rollback_snapshot_marker.stat.gid == 0
+      - vps_codex_rollback_snapshot_marker.stat.mode == '0600'
+    fail_msg: >-
+      The Codex activation snapshot is incomplete. The session remains masked
+      and no automatic restoration is safe.
+
+- name: Inspect each Codex activation snapshot entry
+  ansible.builtin.stat:
+    path: "{{ vps_codex_activation_rollback_root }}/{{ item.backup }}"
+    follow: false
+    checksum_algorithm: sha256
+  loop: "{{ vps_codex_activation_surfaces }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: vps_codex_rollback_backups
+
+- name: Inspect each absent Codex activation snapshot marker
+  ansible.builtin.stat:
+    path: "{{ vps_codex_activation_rollback_root }}/{{ item.backup }}.absent"
+    follow: false
+  loop: "{{ vps_codex_activation_surfaces }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: vps_codex_rollback_absent_markers
+
+- name: Prove every Codex activation snapshot entry is unambiguous
+  ansible.builtin.assert:
+    that:
+      - >-
+        (item.0.stat.exists | bool) !=
+        (item.1.stat.exists | bool)
+      - >-
+        not item.0.stat.exists or
+        (item.0.item.type == 'file' and item.0.stat.isreg and
+         not item.0.stat.islnk) or
+        (item.0.item.type == 'link' and item.0.stat.islnk)
+      - >-
+        not item.1.stat.exists or
+        (item.1.stat.isreg and not item.1.stat.islnk and
+         item.1.stat.uid == 0 and item.1.stat.gid == 0 and
+         item.1.stat.mode == '0600')
+    fail_msg: >-
+      A Codex activation snapshot entry is missing, duplicated, or unsafe.
+      The session remains persistently masked.
+  loop: >-
+    {{ vps_codex_rollback_backups.results |
+       zip(vps_codex_rollback_absent_markers.results) | list }}
+  loop_control:
+    label: "{{ item.0.item.path }}"
+
+- name: Remove stale Codex rollback publication candidates
+  ansible.builtin.file:
+    path: "{{ item.item.path }}.rollback"
+    state: absent
+  loop: "{{ vps_codex_rollback_backups.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Copy existing Codex activation surfaces to rollback candidates
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/cp
+      - --archive
+      - --no-target-directory
+      - "{{ vps_codex_activation_rollback_root }}/{{ item.item.backup }}"
+      - "{{ item.item.path }}.rollback"
+  loop: "{{ vps_codex_rollback_backups.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: item.stat.exists
+  changed_when: true
+
+- name: Atomically restore existing Codex activation surfaces
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/mv
+      - --force
+      - --no-target-directory
+      - "{{ item.item.path }}.rollback"
+      - "{{ item.item.path }}"
+  loop: "{{ vps_codex_rollback_backups.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: item.stat.exists
+  changed_when: true
+
+- name: Remove Codex activation surfaces absent before activation
+  ansible.builtin.file:
+    path: "{{ item.item.path }}"
+    state: absent
+  loop: "{{ vps_codex_rollback_absent_markers.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: item.stat.exists
+
+- name: Reload systemd after Codex activation rollback
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Reinspect restored Codex activation surfaces
+  ansible.builtin.stat:
+    path: "{{ item.item.path }}"
+    follow: false
+    checksum_algorithm: sha256
+  loop: "{{ vps_codex_rollback_backups.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  register: vps_codex_restored_surfaces
+
+- name: Prove existing Codex activation surfaces were restored exactly
+  ansible.builtin.assert:
+    that:
+      - item.1.stat.exists
+      - item.1.stat.mode == item.0.stat.mode
+      - item.1.stat.uid == item.0.stat.uid
+      - item.1.stat.gid == item.0.stat.gid
+      - >-
+        (item.0.item.type == 'file' and item.1.stat.isreg and
+         not item.1.stat.islnk and
+         item.1.stat.checksum == item.0.stat.checksum) or
+        (item.0.item.type == 'link' and item.1.stat.islnk and
+         item.1.stat.lnk_target == item.0.stat.lnk_target)
+    fail_msg: >-
+      A Codex activation surface was not restored exactly. Recovery state and
+      the persistent session mask are preserved.
+  loop: >-
+    {{ vps_codex_rollback_backups.results |
+       zip(vps_codex_restored_surfaces.results) | list }}
+  loop_control:
+    label: "{{ item.0.item.path }}"
+  when: item.0.stat.exists
+
+- name: Prove originally absent Codex activation surfaces remain absent
+  ansible.builtin.assert:
+    that:
+      - not item.1.stat.exists
+    fail_msg: >-
+      A newly created Codex activation surface survived rollback. Recovery
+      state and the persistent session mask are preserved.
+  loop: >-
+    {{ vps_codex_rollback_absent_markers.results |
+       zip(vps_codex_restored_surfaces.results) | list }}
+  loop_control:
+    label: "{{ item.0.item.path }}"
+  when: item.0.stat.exists
+
+- name: Record verified Codex activation rollback
+  ansible.builtin.file:
+    path: "{{ vps_codex_activation_rollback_root }}/rollback-complete"
+    state: touch
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Remove verified Codex activation recovery state
+  ansible.builtin.file:
+    path: "{{ vps_codex_activation_rollback_root }}"
+    state: absent

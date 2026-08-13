@@ -1,0 +1,95 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+  "")
+    test "$#" -eq 0
+    if [ -e /run/atlas-codex-maintenance ]; then
+      printf '%s\n' 'Codex convergence is in progress; retry after it completes' >&2
+      exit 75
+    fi
+    session_unit=atlas-codex-session
+    set -- --pty /bin/bash --noprofile --norc
+    ;;
+  --verify)
+    test "$#" -eq 1
+    session_unit=atlas-codex-activation-verification
+    set -- --pipe \
+      /bin/bash -c \
+      'grep -Fq /atlas-codex.slice/ /proc/self/cgroup && test "$(systemctl show atlas-codex-activation-verification.service --property=ProtectProc --value)" = invisible && test -r /proc/self/cmdline && test ! -r /proc/1/cmdline && test ! -r /etc/vps && test ! -x /etc/vps && test ! -r /home/vpsadmin && test ! -x /home/vpsadmin && test ! -r /srv/vps && test ! -x /srv/vps && test ! -r /var/lib/docker && test ! -x /var/lib/docker && test ! -r /var/lib/vps-controller && test ! -x /var/lib/vps-controller && test ! -r /run/containerd/containerd.sock && test ! -r /run/docker.sock && test ! -r /var/run/docker.sock && test "$(findmnt --noheadings --output FSTYPE -T /tmp)" = tmpfs && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)nosuid(,|$)" && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)nodev(,|$)" && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)noexec(,|$)" && exec {{ vps_codex_release_path }}/bin/codex sandbox --include-managed-config --permission-profile atlas_workspace --cd {{ vps_codex_workspace_root }} /bin/bash -c "test ! -r {{ vps_codex_home }}/.codex/config.toml && test ! -r /etc/vps && test ! -r /srv/vps && test ! -r /run/docker.sock"'
+    ;;
+  *)
+    printf '%s\n' 'atlas-codex accepts only the internal --verify argument' >&2
+    exit 64
+    ;;
+esac
+
+workspace_source=$(
+  /usr/bin/findmnt --noheadings --output SOURCE \
+    --mountpoint {{ vps_codex_storage_root }}
+) || {
+  printf '%s\n' 'Codex storage is not mounted' >&2
+  exit 69
+}
+
+workspace_backing=$(
+  /usr/sbin/losetup --noheadings --output BACK-FILE "$workspace_source"
+) || {
+  printf '%s\n' 'Codex storage has no loop backing file' >&2
+  exit 69
+}
+
+if [ "$workspace_backing" != "{{ vps_codex_storage_image_path }}" ]; then
+  printf '%s\n' 'Codex storage has an unexpected backing file' >&2
+  exit 69
+fi
+
+exec /usr/bin/systemd-run \
+  --quiet \
+  --collect \
+  --wait \
+  --send-sighup \
+  --service-type=exec \
+  --unit="$session_unit" \
+  --slice=atlas-codex.slice \
+  --uid={{ vps_codex_user }} \
+  --gid={{ vps_codex_group }} \
+  --working-directory={{ vps_codex_workspace_root }} \
+  --setenv=HOME={{ vps_codex_home }} \
+  --setenv=CODEX_HOME={{ vps_codex_home }}/.codex \
+  --setenv=SHELL=/bin/bash \
+  --setenv=USER={{ vps_codex_user }} \
+  --setenv=LOGNAME={{ vps_codex_user }} \
+  --setenv=LANG=C.UTF-8 \
+  --setenv=PATH={{ vps_codex_release_path }}/codex-resources:{{ vps_codex_release_path }}/codex-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  --property=CPUQuota={{ vps_codex_cpu_quota }} \
+  --property=MemoryHigh={{ vps_codex_memory_high }} \
+  --property=MemoryMax={{ vps_codex_memory_max }} \
+  --property=MemorySwapMax={{ vps_codex_memory_swap_max }} \
+  --property=TasksMax={{ vps_codex_tasks_max }} \
+  --property=CPUWeight=50 \
+  --property=IOWeight=50 \
+  --property=Nice=5 \
+  --property=UMask=0077 \
+  --property=NoNewPrivileges=yes \
+  --property='CapabilityBoundingSet=' \
+  --property=PrivateDevices=yes \
+  --property=PrivateTmp=no \
+  --property='TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size={{ vps_codex_tmpfs_size_mb }}M,mode=1777' \
+  --property='TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,noexec,size={{ vps_codex_tmpfs_size_mb }}M,mode=1777' \
+  --property=ProtectClock=yes \
+  --property=ProtectControlGroups=yes \
+  --property=ProtectKernelLogs=yes \
+  --property=ProtectKernelModules=yes \
+  --property=ProtectKernelTunables=yes \
+  --property=ProtectProc=invisible \
+  --property=ProtectSystem=strict \
+  --property='InaccessiblePaths=-/etc/vps -/home/deploy -/home/ubuntu -/home/vpsadmin -/root -/run/containerd/containerd.sock -/run/docker.sock -/srv/vps -/var/lib/docker -/var/lib/vps-controller -/var/run/docker.sock' \
+  --property=ReadWritePaths={{ vps_codex_storage_root }} \
+  --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' \
+  --property='DeviceAllow=char-netlink rw' \
+  --property=RestrictSUIDSGID=yes \
+  --property=RuntimeMaxSec=12h \
+  --property=SystemCallArchitectures=native \
+  --property=TimeoutStopSec=30s \
+  "$@"

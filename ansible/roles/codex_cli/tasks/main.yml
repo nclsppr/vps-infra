@@ -1,0 +1,256 @@
+---
+- name: Read an existing Codex convergence lease
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - "{{ vps_codex_convergence_unit }}"
+      - --property=LoadState
+      - --property=ActiveState
+      - --property=Result
+  register: vps_codex_existing_lease
+  changed_when: false
+  failed_when: vps_codex_existing_lease.rc != 0
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Refuse concurrent Codex convergence
+  ansible.builtin.assert:
+    that:
+      - >-
+        'LoadState=not-found' in vps_codex_existing_lease.stdout_lines or
+        'ActiveState=inactive' in vps_codex_existing_lease.stdout_lines or
+        'ActiveState=failed' in vps_codex_existing_lease.stdout_lines
+    fail_msg: >-
+      Another controller owns the active Atlas Codex convergence lease. Wait
+      for that convergence to complete before retrying.
+  when: not ansible_check_mode
+
+- name: Identify the persistent SSH controller process
+  ansible.builtin.command:
+    argv:
+      - /bin/sh
+      - -c
+      - |-
+        set -eu
+
+        pid=$PPID
+        while [ "$pid" -gt 1 ]; do
+          parent=$(/usr/bin/awk '/^PPid:/ {print $2}' "/proc/$pid/status") || exit 69
+          [ "$parent" -gt 1 ] || break
+          grandparent=$(/usr/bin/awk '/^PPid:/ {print $2}' "/proc/$parent/status") || exit 69
+          parent_comm=$(/usr/bin/cat "/proc/$parent/comm") || exit 69
+          if [ "$grandparent" -eq 1 ] && [ "$parent_comm" = sshd ]; then
+            start_time=$(
+              /usr/bin/awk '{sub(/^[^)]*\) /, ""); print $20}' "/proc/$pid/stat"
+            ) || exit 69
+            case "$start_time" in
+              *[!0-9]*|'') exit 69 ;;
+            esac
+            printf '%s %s\n' "$pid" "$start_time"
+            exit 0
+          fi
+          pid=$parent
+        done
+
+        printf '%s\n' 'No persistent SSH controller process was found' >&2
+        exit 69
+  register: vps_codex_controller_owner
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Prove the Codex convergence owner identity
+  ansible.builtin.assert:
+    that:
+      - vps_codex_controller_owner.stdout is match('^[0-9]+ [0-9]+$')
+    fail_msg: >-
+      Codex convergence requires a persistent SSH controller process so the
+      host lease ends automatically when that controller disconnects.
+  when: not ansible_check_mode
+
+- name: Generate a unique Codex convergence lease nonce
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/cat
+      - /proc/sys/kernel/random/uuid
+  register: vps_codex_convergence_nonce_command
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Prove the unique Codex convergence lease nonce
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_codex_convergence_nonce_command.stdout is
+        match('^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+    fail_msg: >-
+      The kernel did not provide a valid unique Atlas Codex convergence nonce.
+  when: not ansible_check_mode
+
+- name: Select the Codex convergence owner process identity
+  ansible.builtin.set_fact:
+    vps_codex_controller_owner_pid: >-
+      {{ vps_codex_controller_owner.stdout.split()[0] }}
+    vps_codex_controller_owner_start_time: >-
+      {{ vps_codex_controller_owner.stdout.split()[1] }}
+    vps_codex_convergence_release_path: >-
+      /run/atlas-codex-convergence/{{
+      vps_codex_convergence_nonce_command.stdout }}.release
+    vps_codex_convergence_description: >-
+      {{ 'Atlas Codex convergence lease ' ~
+         vps_codex_controller_owner.stdout.split()[0] ~ ':' ~
+         vps_codex_controller_owner.stdout.split()[1] ~ ':' ~
+         vps_codex_convergence_nonce_command.stdout }}
+  when: not ansible_check_mode
+
+- name: Acquire the atomic host Codex convergence lease
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemd-run
+      - --quiet
+      - --collect
+      - --service-type=exec
+      - --unit={{ vps_codex_convergence_unit | regex_replace('\.service$', '') }}
+      - --description={{ vps_codex_convergence_description }}
+      - --property=RuntimeMaxSec=24h
+      - --property=TimeoutStopSec=10s
+      - --property=RuntimeDirectory=atlas-codex-convergence
+      - --property=RuntimeDirectoryMode=0700
+      - /bin/sh
+      - -c
+      - |-
+        set -eu
+
+        owner_pid=$1
+        owner_start_time=$2
+        release_path=$3
+        case "$release_path" in
+          /run/atlas-codex-convergence/????????-????-4???-[89ab]???-????????????.release) ;;
+          *) exit 64 ;;
+        esac
+        [ "$(/usr/bin/stat --format=%u:%g:%a /run/atlas-codex-convergence)" = 0:0:700 ] || exit 70
+        [ ! -e "$release_path" ] && [ ! -L "$release_path" ] || exit 70
+
+        trap '/usr/bin/rm -f -- "$release_path"' 0 1 2 15
+
+        while [ -r "/proc/$owner_pid/stat" ]; do
+          [ ! -e "$release_path" ] || exit 0
+          current_start_time=$(
+            /usr/bin/awk '{sub(/^[^)]*\) /, ""); print $20}' "/proc/$owner_pid/stat"
+          ) || exit 0
+          [ "$current_start_time" = "$owner_start_time" ] || exit 0
+          /usr/bin/sleep 1
+        done
+      - atlas-codex-convergence-lease
+      - "{{ vps_codex_controller_owner_pid }}"
+      - "{{ vps_codex_controller_owner_start_time }}"
+      - "{{ vps_codex_convergence_release_path }}"
+  register: vps_codex_lease_acquisition
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Read the acquired Codex convergence lease identity
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - "{{ vps_codex_convergence_unit }}"
+      - --property=LoadState
+      - --property=ActiveState
+      - --property=Description
+  register: vps_codex_acquired_lease
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Confirm exclusive Codex convergence lease acquisition
+  ansible.builtin.assert:
+    that:
+      - vps_codex_lease_acquisition.rc == 0
+      - "'LoadState=loaded' in vps_codex_acquired_lease.stdout_lines"
+      - "'ActiveState=active' in vps_codex_acquired_lease.stdout_lines"
+      - >-
+        ('Description=' ~ vps_codex_convergence_description) in
+        vps_codex_acquired_lease.stdout_lines
+    fail_msg: >-
+      The atomic Atlas Codex convergence lease was acquired concurrently by
+      another controller. No host mutation was attempted.
+  when: not ansible_check_mode
+
+- name: Own the complete Codex convergence lease lifecycle
+  when: not ansible_check_mode
+  block:
+    - name: Converge Codex behind the acquired host lease
+      ansible.builtin.include_tasks: locked_convergence.yml
+
+  always:
+    - name: Signal owner-aware Codex convergence lease release
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - |-
+            set -eu
+
+            release_path=$1
+            expected_description=$2
+            unit=$3
+            release_directory=/run/atlas-codex-convergence
+            case "$release_path" in
+              "$release_directory"/????????-????-4???-[89ab]???-????????????.release) ;;
+              *) exit 64 ;;
+            esac
+            release_directory_mode=$(
+              /usr/bin/stat --format=%u:%g:%a "$release_directory"
+            ) || exit 70
+            [ "$release_directory_mode" = 0:0:700 ] || exit 70
+            [ ! -e "$release_path" ] && [ ! -L "$release_path" ] || exit 70
+
+            trap '/usr/bin/rm -f -- "$release_path"' 0 1 2 15
+
+            set -C
+            : > "$release_path"
+            set +C
+            attempts=0
+            while [ "$attempts" -lt 30 ]; do
+              load_state=$(
+                /usr/bin/systemctl show "$unit" --property=LoadState --value
+              ) || load_state=unknown
+              description=$(
+                /usr/bin/systemctl show "$unit" --property=Description --value
+              ) || description=
+              if [ "$load_state" != loaded ] ||
+                 [ "$description" != "$expected_description" ]; then
+                exit 0
+              fi
+              attempts=$((attempts + 1))
+              /usr/bin/sleep 1
+            done
+
+            printf '%s\n' 'The owned Codex convergence lease did not exit' >&2
+            exit 70
+          - atlas-codex-convergence-release
+          - "{{ vps_codex_convergence_release_path }}"
+          - "{{ vps_codex_convergence_description }}"
+          - "{{ vps_codex_convergence_unit }}"
+      register: vps_codex_lease_release
+      changed_when: false
+      failed_when: false
+      when:
+        - vps_codex_lease_acquisition is defined
+        - vps_codex_lease_acquisition.rc == 0
+
+    - name: Confirm owner-aware Codex convergence lease release
+      ansible.builtin.assert:
+        that:
+          - vps_codex_lease_release.rc == 0
+        fail_msg: >-
+          The owned Atlas Codex convergence lease did not exit after its unique
+          release signal. No different controller lease was stopped.
+      when:
+        - vps_codex_lease_acquisition is defined
+        - vps_codex_lease_acquisition.rc == 0
+
+- name: Predict Codex drift without mutating interlocks
+  ansible.builtin.include_tasks: converge.yml
+  when: ansible_check_mode

@@ -96,10 +96,14 @@ pas comme un agent permanent privilégié sur le VPS. Il gère au minimum :
 - répertoires `/srv/vps`, `/srv/vps/releases`, `/srv/www` et `/etc/vps` ;
 - réseaux Docker externes et unités systemd nécessaires ;
 - outils de récupération d’artefacts, épinglés et vérifiés ;
+- Codex CLI autonome pour les travaux interactifs bornés, avec un compte sans
+  sudo, Docker, SSH direct ni accès aux états de production ;
 - permissions des secrets matérialisés.
 
 Java, Node, Maven, npm, PostgreSQL, Caddy, Prometheus et Grafana ne sont pas
 installés directement sur l’hôte. Les builds appartiennent aux runners CI.
+Codex ne change pas cette règle : son paquet autonome ne fournit aucune
+toolchain applicative et son espace de travail est séparé de `/srv/vps`.
 
 Un second passage Ansible doit être sans changement. Le mode
 `ansible-playbook --check --diff` fait partie de la validation, tout en gardant

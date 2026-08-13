@@ -25,6 +25,14 @@ installs it. The deployment controller uses it to validate the Draft 2020-12
 release schema. Production validation stops if this independent schema check
 is unavailable.
 
+Host convergence also installs the standalone Codex CLI package without Node
+or npm. The `codex_cli` role pins the release archive and every executable,
+publishes it atomically, and runs it only through the isolated `codex` account.
+The enforced launcher applies aggregate resource limits and keeps all state on
+a dedicated 6 GiB filesystem. It installs no SSH key, persistent service,
+port, application checkout, or credential.
+See [`docs/operations/codex-cli.md`](../docs/operations/codex-cli.md).
+
 Confirm the SSH host-key fingerprint through the OVHcloud console before you
 add it to `known_hosts`. Keep host-key checking enabled. Do not accept a
 fingerprint through the same network path as the SSH connection.

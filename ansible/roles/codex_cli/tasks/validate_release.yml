@@ -1,0 +1,244 @@
+---
+- name: Inspect the Codex release candidate root
+  ansible.builtin.stat:
+    path: "{{ vps_codex_candidate_path }}"
+    follow: false
+  register: vps_codex_candidate_root
+
+- name: Prove the Codex release candidate root boundary
+  ansible.builtin.assert:
+    that:
+      - vps_codex_candidate_root.stat.exists
+      - vps_codex_candidate_root.stat.isdir
+      - not vps_codex_candidate_root.stat.islnk
+      - vps_codex_candidate_root.stat.pw_name == 'root'
+    fail_msg: "The Codex release candidate root is not a root-owned directory."
+
+- name: Protect the Codex release candidate root
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/chown
+      - --no-dereference
+      - "root:{{ vps_codex_group }}"
+      - "{{ vps_codex_candidate_path }}"
+  changed_when: vps_codex_candidate_root.stat.gr_name != vps_codex_group
+
+- name: Restrict the Codex release candidate root
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/chmod
+      - "0750"
+      - "{{ vps_codex_candidate_path }}"
+  changed_when: vps_codex_candidate_root.stat.mode != '0750'
+
+- name: Reinspect the protected Codex release candidate root
+  ansible.builtin.stat:
+    path: "{{ vps_codex_candidate_path }}"
+    follow: false
+  register: vps_codex_protected_candidate_root
+
+- name: Prove the protected Codex release candidate root
+  ansible.builtin.assert:
+    that:
+      - vps_codex_protected_candidate_root.stat.pw_name == 'root'
+      - vps_codex_protected_candidate_root.stat.gr_name == vps_codex_group
+      - vps_codex_protected_candidate_root.stat.mode == '0750'
+    fail_msg: "The Codex release candidate root could not be protected."
+
+- name: Read the complete Codex release candidate tree
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/find
+      - "{{ vps_codex_candidate_path }}"
+      - -mindepth
+      - "1"
+      - -printf
+      - "%P|%y\n"
+  register: vps_codex_candidate_entries
+  changed_when: false
+  check_mode: false
+
+- name: Prove the complete Codex release candidate tree
+  ansible.builtin.assert:
+    that:
+      - (vps_codex_candidate_entries.stdout_lines | sort) == (vps_codex_release_entries | sort)
+    fail_msg: >-
+      The Codex release candidate contains a missing, unexpected, or
+      non-regular entry.
+
+- name: Protect the Codex release candidate directories
+  ansible.builtin.file:
+    path: "{{ vps_codex_candidate_path }}/{{ item }}"
+    state: directory
+    owner: root
+    group: "{{ vps_codex_group }}"
+    mode: "0750"
+  loop:
+    - bin
+    - codex-path
+    - codex-resources
+    - codex-resources/zsh
+    - codex-resources/zsh/bin
+
+- name: Protect the Codex release candidate executables
+  ansible.builtin.file:
+    path: "{{ vps_codex_candidate_path }}/{{ item }}"
+    state: file
+    owner: root
+    group: "{{ vps_codex_group }}"
+    mode: "0750"
+  loop: "{{ vps_codex_artifact.file_sha256.keys() | list }}"
+
+- name: Protect the Codex release candidate metadata
+  ansible.builtin.file:
+    path: "{{ vps_codex_candidate_path }}/codex-package.json"
+    state: file
+    owner: root
+    group: "{{ vps_codex_group }}"
+    mode: "0640"
+
+- name: Read the Codex release candidate metadata
+  ansible.builtin.slurp:
+    src: "{{ vps_codex_candidate_path }}/codex-package.json"
+  register: vps_codex_package_metadata_file
+
+- name: Parse the Codex release candidate metadata
+  ansible.builtin.set_fact:
+    vps_codex_package_metadata: >-
+      {{ vps_codex_package_metadata_file.content | b64decode | from_json }}
+
+- name: Verify the Codex release candidate identity
+  ansible.builtin.assert:
+    that:
+      - vps_codex_package_metadata.layoutVersion | int == 1
+      - vps_codex_package_metadata.version == vps_codex_version
+      - vps_codex_package_metadata.target == vps_codex_artifact.target
+      - vps_codex_package_metadata.variant == 'codex'
+      - vps_codex_package_metadata.entrypoint == 'bin/codex'
+      - vps_codex_package_metadata.resourcesDir == 'codex-resources'
+      - vps_codex_package_metadata.pathDir == 'codex-path'
+    fail_msg: "The Codex release candidate metadata is not the pinned package."
+
+- name: Read each Codex release candidate executable digest
+  ansible.builtin.stat:
+    path: "{{ vps_codex_candidate_path }}/{{ item.key }}"
+    checksum_algorithm: sha256
+    follow: false
+  register: vps_codex_executable_digests
+  loop: "{{ vps_codex_artifact.file_sha256 | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Verify each Codex release candidate executable digest
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - item.stat.pw_name == 'root'
+      - item.stat.gr_name == vps_codex_group
+      - item.stat.checksum == item.item.value
+    fail_msg: "A Codex release candidate executable is not the pinned file."
+  loop: "{{ vps_codex_executable_digests.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Execute the Codex release candidate as the runtime account
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_codex_candidate_path }}/bin/codex"
+      - --version
+  become: true
+  become_user: "{{ vps_codex_user }}"
+  environment:
+    HOME: "{{ vps_codex_home }}"
+    CODEX_HOME: "{{ vps_codex_home }}/.codex"
+  register: vps_codex_candidate_version
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Prove the Codex release candidate version
+  ansible.builtin.assert:
+    that:
+      - vps_codex_candidate_version.stdout == 'codex-cli ' ~ vps_codex_version
+    fail_msg: "The Codex release candidate did not report the pinned version."
+  when: not ansible_check_mode
+
+- name: Prove the Codex release candidate loads the managed sandbox
+  when:
+    - not ansible_check_mode
+    - vps_codex_validate_sandbox | default(true) | bool
+  block:
+    - name: Allocate a Codex sandbox probe directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ vps_codex_workspace_root }}"
+        prefix: .sandbox-probe-
+      register: vps_codex_release_sandbox_probe
+      changed_when: false
+
+    - name: Delegate the Codex sandbox probe directory
+      ansible.builtin.file:
+        path: "{{ vps_codex_release_sandbox_probe.path }}"
+        state: directory
+        owner: "{{ vps_codex_user }}"
+        group: "{{ vps_codex_group }}"
+        mode: "0700"
+      changed_when: false
+
+    - name: Create a deeply nested Codex sandbox probe directory
+      ansible.builtin.file:
+        path: >-
+          {{ vps_codex_release_sandbox_probe.path }}/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p
+        state: directory
+        owner: "{{ vps_codex_user }}"
+        group: "{{ vps_codex_group }}"
+        mode: "0700"
+      changed_when: false
+
+    - name: Create a disposable deeply nested Codex secret fixture
+      ansible.builtin.copy:
+        content: sandbox-probe
+        dest: >-
+          {{ vps_codex_release_sandbox_probe.path }}/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/.env
+        owner: "{{ vps_codex_user }}"
+        group: "{{ vps_codex_group }}"
+        mode: "0600"
+      changed_when: false
+
+    - name: Execute the managed Codex sandbox boundary probe
+      ansible.builtin.command:
+        argv:
+          - "{{ vps_codex_candidate_path }}/bin/codex"
+          - sandbox
+          - --include-managed-config
+          - --permission-profile
+          - atlas_workspace
+          - --cd
+          - "{{ vps_codex_workspace_root }}"
+          - /bin/bash
+          - -c
+          - >-
+            test ! -r {{ vps_codex_home }}/.codex/config.toml &&
+            test ! -r /etc/vps &&
+            test ! -r /srv/vps &&
+            test ! -r /run/docker.sock &&
+            test ! -r {{ vps_codex_release_sandbox_probe.path }}/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/.env
+      become: true
+      become_user: "{{ vps_codex_user }}"
+      environment:
+        HOME: "{{ vps_codex_home }}"
+        CODEX_HOME: "{{ vps_codex_home }}/.codex"
+        PATH: >-
+          {{ vps_codex_candidate_path }}/codex-resources:{{ vps_codex_candidate_path }}/codex-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      changed_when: false
+
+  always:
+    - name: Remove the disposable Codex sandbox probe fixture
+      ansible.builtin.file:
+        path: "{{ vps_codex_release_sandbox_probe.path }}"
+        state: absent
+      when:
+        - vps_codex_release_sandbox_probe is defined
+        - vps_codex_release_sandbox_probe.path is defined
+      changed_when: false

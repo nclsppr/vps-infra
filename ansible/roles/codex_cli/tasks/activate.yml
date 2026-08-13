@@ -1,0 +1,205 @@
+---
+- name: Validate and publish the final Codex policy transaction
+  ansible.builtin.include_tasks: policy_transaction.yml
+  vars:
+    vps_codex_policy_candidate_path: "{{ vps_codex_release_path }}"
+    vps_codex_publish_policy: true
+
+- name: Install the aggregate Codex resource slice
+  ansible.builtin.template:
+    src: atlas-codex.slice.j2
+    dest: /etc/systemd/system/atlas-codex.slice
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd for the Codex session boundary
+
+- name: Load the aggregate Codex resource slice before verification
+  ansible.builtin.meta: flush_handlers
+
+- name: Read effective aggregate Codex resource limits
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - atlas-codex.slice
+      - --property=CPUQuotaPerSecUSec
+      - --property=MemoryHigh
+      - --property=MemoryMax
+      - --property=MemorySwapMax
+      - --property=TasksMax
+      - --property=CPUWeight
+      - --property=IOWeight
+  register: vps_codex_effective_slice
+  changed_when: false
+  check_mode: false
+
+- name: Prove effective aggregate Codex resource limits
+  ansible.builtin.assert:
+    that:
+      - "'CPUQuotaPerSecUSec=2s' in vps_codex_effective_slice.stdout_lines"
+      - "'MemoryHigh=2147483648' in vps_codex_effective_slice.stdout_lines"
+      - "'MemoryMax=3221225472' in vps_codex_effective_slice.stdout_lines"
+      - "'MemorySwapMax=0' in vps_codex_effective_slice.stdout_lines"
+      - "'TasksMax=256' in vps_codex_effective_slice.stdout_lines"
+      - "'CPUWeight=50' in vps_codex_effective_slice.stdout_lines"
+      - "'IOWeight=50' in vps_codex_effective_slice.stdout_lines"
+    fail_msg: "The effective aggregate Codex resource limits diverge."
+
+- name: Install the bounded Codex session launcher
+  ansible.builtin.template:
+    src: atlas-codex.j2
+    dest: /usr/local/sbin/atlas-codex
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Validate the published Codex release
+  ansible.builtin.include_tasks: validate_release.yml
+  vars:
+    vps_codex_candidate_path: "{{ vps_codex_release_path }}"
+
+- name: Prove the bounded Codex session and managed sandbox
+  ansible.builtin.command:
+    argv:
+      - /usr/local/sbin/atlas-codex
+      - --verify
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Read the selected Codex release target
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/readlink
+      - --canonicalize
+      - "{{ vps_codex_install_root }}/current"
+  register: vps_codex_current_release
+  changed_when: false
+  failed_when: vps_codex_current_release.rc not in [0, 1]
+  check_mode: false
+
+- name: Atomically select the verified Codex release
+  when: vps_codex_current_release.stdout != vps_codex_release_path
+  block:
+    - name: Remove a stale Codex release selector candidate
+      ansible.builtin.file:
+        path: "{{ vps_codex_install_root }}/.current.next"
+        state: absent
+
+    - name: Create the Codex release selector candidate
+      ansible.builtin.file:
+        src: "{{ vps_codex_release_path }}"
+        dest: "{{ vps_codex_install_root }}/.current.next"
+        state: link
+        follow: false
+        owner: root
+        group: root
+
+    - name: Publish the Codex release selector
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/mv
+          - --force
+          - --no-target-directory
+          - "{{ vps_codex_install_root }}/.current.next"
+          - "{{ vps_codex_install_root }}/current"
+      changed_when: true
+
+- name: Install the guarded system Codex entry points
+  ansible.builtin.template:
+    src: codex-entrypoint.j2
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - name: codex
+      dest: /usr/local/bin/codex
+    - name: codex-code-mode-host
+      dest: /usr/local/bin/codex-code-mode-host
+  vars:
+    vps_codex_entrypoint: "{{ item.name }}"
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: Prove ordinary direct Codex invocation uses the guarded entry point
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/codex
+      - --version
+  register: vps_codex_direct_entrypoint_probe
+  changed_when: false
+  failed_when: false
+  become: false
+  check_mode: false
+
+- name: Confirm ordinary direct Codex invocation is rejected
+  ansible.builtin.assert:
+    that:
+      - vps_codex_direct_entrypoint_probe.rc == 77
+      - >-
+        'sudo atlas-codex' in
+        (vps_codex_direct_entrypoint_probe.stdout ~
+         vps_codex_direct_entrypoint_probe.stderr)
+    fail_msg: "The ordinary direct Codex entry point bypassed the launcher."
+
+- name: Read the Codex account groups
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/id
+      - -nG
+      - "{{ vps_codex_user }}"
+  register: vps_codex_groups
+  changed_when: false
+  check_mode: false
+
+- name: Prove the Codex account has only its primary group
+  ansible.builtin.assert:
+    that:
+      - vps_codex_groups.stdout.split() == [vps_codex_group]
+    fail_msg: "The Codex account has an unexpected supplementary group."
+
+- name: Probe prohibited Codex account capabilities
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - >-
+        test ! -r /etc/vps/secrets &&
+        test ! -x /etc/vps/secrets &&
+        test ! -r /home/vpsadmin &&
+        test ! -r /srv/vps/repository &&
+        test ! -r /run/containerd/containerd.sock &&
+        test ! -r /var/run/docker.sock &&
+        test -x {{ vps_codex_storage_root }} &&
+        test -w {{ vps_codex_workspace_root }} &&
+        ! /usr/bin/sudo -n /usr/bin/true
+  become: true
+  become_user: "{{ vps_codex_user }}"
+  environment:
+    HOME: "{{ vps_codex_home }}"
+  changed_when: false
+  check_mode: false
+
+- name: Verify the selected Codex version
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_codex_install_root }}/current/bin/codex"
+      - --version
+  become: true
+  become_user: "{{ vps_codex_user }}"
+  environment:
+    HOME: "{{ vps_codex_home }}"
+    CODEX_HOME: "{{ vps_codex_home }}/.codex"
+  args:
+    chdir: "{{ vps_codex_workspace_root }}"
+  register: vps_codex_installed_version
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Prove the selected Codex version is exact
+  ansible.builtin.assert:
+    that:
+      - vps_codex_installed_version.stdout == 'codex-cli ' ~ vps_codex_version
+    fail_msg: "The selected Codex version does not match the pinned release."
+  when: not ansible_check_mode

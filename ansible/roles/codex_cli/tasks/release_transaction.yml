@@ -1,0 +1,74 @@
+---
+- name: Validate and publish the missing Codex release transaction
+  when: not vps_codex_release_state.stat.exists
+  block:
+    - name: Create a private Codex release staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ vps_codex_install_root }}/releases"
+        prefix: ".{{ vps_codex_version }}-{{ vps_codex_artifact.target }}."
+      register: vps_codex_stage_directory
+      changed_when: false
+
+    - name: Make the Codex release staging directory traversable
+      ansible.builtin.file:
+        path: "{{ vps_codex_stage_directory.path }}"
+        state: directory
+        owner: root
+        group: "{{ vps_codex_group }}"
+        mode: "0750"
+      changed_when: false
+
+    - name: Extract the Codex release into staging
+      ansible.builtin.unarchive:
+        src: "{{ vps_codex_cached_archive_path }}"
+        dest: "{{ vps_codex_stage_directory.path }}"
+        remote_src: true
+        owner: root
+        group: "{{ vps_codex_group }}"
+        extra_opts:
+          - --no-same-owner
+      changed_when: false
+
+    - name: Validate the staged Codex release identity
+      ansible.builtin.include_tasks: validate_release.yml
+      vars:
+        vps_codex_candidate_path: "{{ vps_codex_stage_directory.path }}"
+        vps_codex_validate_sandbox: false
+
+    - name: Select the staged Codex path for policy validation
+      ansible.builtin.set_fact:
+        vps_codex_policy_candidate_path: "{{ vps_codex_stage_directory.path }}"
+
+    - name: Validate Codex policy against the staged release
+      ansible.builtin.include_tasks: policy_transaction.yml
+      vars:
+        vps_codex_publish_policy: false
+
+    - name: Atomically publish the verified Codex release
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/mv
+          - --no-target-directory
+          - "{{ vps_codex_stage_directory.path }}"
+          - "{{ vps_codex_release_path }}"
+      args:
+        creates: "{{ vps_codex_release_path }}"
+
+  rescue:
+    - name: Refuse to publish an invalid Codex release
+      ansible.builtin.fail:
+        msg: >-
+          The pinned Codex release or policy failed validation. The active
+          release was left unchanged.
+
+  always:
+    - name: Remove an unpublished Codex release staging directory
+      ansible.builtin.file:
+        path: "{{ vps_codex_stage_directory.path }}"
+        state: absent
+      when:
+        - vps_codex_stage_directory is defined
+        - vps_codex_stage_directory.path is defined
+        - not vps_codex_release_state.stat.exists
+      changed_when: false

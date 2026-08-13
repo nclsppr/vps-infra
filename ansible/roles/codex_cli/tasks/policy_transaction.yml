@@ -1,0 +1,372 @@
+---
+- name: Validate and publish candidate Codex policy
+  when: not ansible_check_mode
+  block:
+    - name: Reset Codex policy publication transaction state
+      ansible.builtin.set_fact:
+        vps_codex_policy_publish_started: false
+        vps_codex_policy_publish_complete: false
+
+    - name: Create a private remote Codex policy staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: vps-codex-policy-
+      register: vps_codex_remote_policy_stage
+      changed_when: false
+
+    - name: Back up existing live Codex policy files
+      ansible.builtin.copy:
+        src: "{{ item.item }}"
+        dest: >-
+          {{ vps_codex_remote_policy_stage.path }}/backup-{{
+          'config.toml' if item.item == vps_codex_home ~ '/.codex/config.toml'
+          else 'requirements.toml' }}
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ vps_codex_live_policy_state.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists
+      changed_when: false
+
+    - name: Copy candidate Codex policy files to remote staging
+      ansible.builtin.template:
+        src: "{{ item.name }}.j2"
+        dest: "{{ vps_codex_remote_policy_stage.path }}/{{ item.name }}"
+        owner: root
+        group: "{{ vps_codex_group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - name: config.toml
+          mode: "0640"
+        - name: requirements.toml
+          mode: "0640"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Create neutral validation bind destinations
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: touch
+        access_time: preserve
+        modification_time: preserve
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - path: "{{ vps_codex_home }}/.codex/config.toml"
+          owner: "{{ vps_codex_user }}"
+          group: "{{ vps_codex_group }}"
+          mode: "0600"
+        - path: /etc/codex/requirements.toml
+          owner: root
+          group: root
+          mode: "0644"
+      when: >-
+        not (vps_codex_live_policy_state.results |
+             selectattr('item', 'equalto', item.path) |
+             map(attribute='stat.exists') | first)
+      changed_when: false
+
+    - name: Allocate a disposable unit-visible Codex policy probe home
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ vps_codex_storage_root }}"
+        prefix: .policy-probe-
+      register: vps_codex_policy_probe_home
+      changed_when: false
+
+    - name: Delegate the disposable Codex policy probe home
+      ansible.builtin.file:
+        path: "{{ vps_codex_policy_probe_home.path }}"
+        state: directory
+        owner: "{{ vps_codex_user }}"
+        group: "{{ vps_codex_group }}"
+        mode: "0700"
+      changed_when: false
+
+    - name: Parse and enforce the candidate Codex policy before publication
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemd-run
+          - --quiet
+          - --collect
+          - --wait
+          - --pipe
+          - --service-type=exec
+          - --unit=atlas-codex-policy-validation
+          - --uid={{ vps_codex_user }}
+          - --gid={{ vps_codex_group }}
+          - --setenv=HOME={{ vps_codex_home }}
+          - --setenv=CODEX_HOME={{ vps_codex_home }}/.codex
+          - >-
+            --setenv=PATH={{ vps_codex_policy_candidate_path }}/codex-resources:{{
+            vps_codex_policy_candidate_path }}/codex-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/requirements.toml:/etc/codex/requirements.toml
+          - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/config.toml:{{ vps_codex_home }}/.codex/config.toml
+          - --property=NoNewPrivileges=yes
+          - --property=PrivateDevices=yes
+          - --property=PrivateTmp=yes
+          - --property=ProtectSystem=strict
+          - --property=ReadWritePaths={{ vps_codex_storage_root }}
+          - "{{ vps_codex_policy_candidate_path }}/bin/codex"
+          - sandbox
+          - --include-managed-config
+          - --permission-profile
+          - atlas_workspace
+          - --cd
+          - "{{ vps_codex_workspace_root }}"
+          - /bin/true
+      changed_when: false
+
+    - name: Prove candidate policy rejects API-key authentication
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemd-run
+          - --quiet
+          - --collect
+          - --wait
+          - --pipe
+          - --service-type=exec
+          - --unit=atlas-codex-auth-policy-validation
+          - --uid={{ vps_codex_user }}
+          - --gid={{ vps_codex_group }}
+          - --setenv=HOME={{ vps_codex_policy_probe_home.path }}
+          - --setenv=CODEX_HOME={{ vps_codex_policy_probe_home.path }}
+          - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/requirements.toml:/etc/codex/requirements.toml
+          - --property=NoNewPrivileges=yes
+          - --property=PrivateDevices=yes
+          - --property=PrivateTmp=yes
+          - --property=ProtectSystem=strict
+          - /bin/bash
+          - -c
+          - >-
+            printf '%s\n' codex-policy-probe |
+            {{ vps_codex_policy_candidate_path }}/bin/codex login --with-api-key
+      register: vps_codex_candidate_policy_api_login
+      changed_when: false
+      failed_when: false
+
+    - name: Confirm candidate policy rejected API-key authentication
+      ansible.builtin.assert:
+        that:
+          - vps_codex_candidate_policy_api_login.rc != 0
+          - >-
+            'API key login is disabled' in
+            (vps_codex_candidate_policy_api_login.stdout ~
+             vps_codex_candidate_policy_api_login.stderr)
+        fail_msg: >-
+          Candidate policy did not explicitly reject API-key authentication.
+
+    - name: Allocate a staged-policy sandbox probe directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: "{{ vps_codex_workspace_root }}"
+        prefix: .policy-sandbox-probe-
+      register: vps_codex_policy_sandbox_probe
+      changed_when: false
+
+    - name: Delegate the staged-policy sandbox probe directory
+      ansible.builtin.file:
+        path: "{{ vps_codex_policy_sandbox_probe.path }}"
+        state: directory
+        owner: "{{ vps_codex_user }}"
+        group: "{{ vps_codex_group }}"
+        mode: "0700"
+      changed_when: false
+
+    - name: Create a deeply nested staged-policy sandbox probe directory
+      ansible.builtin.file:
+        path: >-
+          {{ vps_codex_policy_sandbox_probe.path }}/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p
+        state: directory
+        owner: "{{ vps_codex_user }}"
+        group: "{{ vps_codex_group }}"
+        mode: "0700"
+      changed_when: false
+
+    - name: Create a disposable deeply nested staged-policy secret fixture
+      ansible.builtin.copy:
+        content: sandbox-probe
+        dest: >-
+          {{ vps_codex_policy_sandbox_probe.path }}/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/.env
+        owner: "{{ vps_codex_user }}"
+        group: "{{ vps_codex_group }}"
+        mode: "0600"
+      changed_when: false
+
+    - name: Prove the staged policy denies host and deep workspace secrets
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemd-run
+          - --quiet
+          - --collect
+          - --wait
+          - --pipe
+          - --service-type=exec
+          - --unit=atlas-codex-policy-sandbox-validation
+          - --uid={{ vps_codex_user }}
+          - --gid={{ vps_codex_group }}
+          - --setenv=HOME={{ vps_codex_home }}
+          - --setenv=CODEX_HOME={{ vps_codex_home }}/.codex
+          - >-
+            --setenv=PATH={{ vps_codex_policy_candidate_path }}/codex-resources:{{
+            vps_codex_policy_candidate_path }}/codex-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/requirements.toml:/etc/codex/requirements.toml
+          - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/config.toml:{{ vps_codex_home }}/.codex/config.toml
+          - --property=NoNewPrivileges=yes
+          - --property=PrivateDevices=yes
+          - --property=PrivateTmp=yes
+          - --property=ProtectSystem=strict
+          - --property=ReadWritePaths={{ vps_codex_storage_root }}
+          - "{{ vps_codex_policy_candidate_path }}/bin/codex"
+          - sandbox
+          - --include-managed-config
+          - --permission-profile
+          - atlas_workspace
+          - --cd
+          - "{{ vps_codex_workspace_root }}"
+          - /bin/bash
+          - -c
+          - >-
+            test ! -r {{ vps_codex_home }}/.codex/config.toml &&
+            test ! -r /etc/vps &&
+            test ! -r /srv/vps &&
+            test ! -r /run/docker.sock &&
+            test ! -r {{ vps_codex_policy_sandbox_probe.path }}/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/.env
+      changed_when: false
+
+    - name: Mark the validated Codex policy publication boundary
+      ansible.builtin.set_fact:
+        vps_codex_policy_publish_started: true
+      when: vps_codex_publish_policy | default(true) | bool
+
+    - name: Install the validated user-level secure defaults
+      ansible.builtin.template:
+        src: config.toml.j2
+        dest: "{{ vps_codex_home }}/.codex/config.toml"
+        owner: "{{ vps_codex_user }}"
+        group: "{{ vps_codex_group }}"
+        mode: "0600"
+      when: vps_codex_publish_policy | default(true) | bool
+
+    - name: Install the validated immutable Codex runtime requirements
+      ansible.builtin.template:
+        src: requirements.toml.j2
+        dest: /etc/codex/requirements.toml
+        owner: root
+        group: root
+        mode: "0644"
+      when: vps_codex_publish_policy | default(true) | bool
+
+    - name: Mark the validated Codex policy publication complete
+      ansible.builtin.set_fact:
+        vps_codex_policy_publish_complete: true
+      when: vps_codex_publish_policy | default(true) | bool
+
+  rescue:
+    - name: Restore existing live Codex policy files
+      ansible.builtin.copy:
+        src: >-
+          {{ vps_codex_remote_policy_stage.path }}/backup-{{
+          'config.toml' if item.item == vps_codex_home ~ '/.codex/config.toml'
+          else 'requirements.toml' }}
+        dest: "{{ item.item }}"
+        remote_src: true
+        owner: >-
+          {{ vps_codex_user if item.item == vps_codex_home ~ '/.codex/config.toml'
+          else 'root' }}
+        group: >-
+          {{ vps_codex_group if item.item == vps_codex_home ~ '/.codex/config.toml'
+          else 'root' }}
+        mode: >-
+          {{ '0600' if item.item == vps_codex_home ~ '/.codex/config.toml'
+          else '0644' }}
+      loop: "{{ vps_codex_live_policy_state.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - vps_codex_policy_publish_started | default(false) | bool
+        - item.stat.exists
+
+    - name: Remove newly published Codex policy files after failure
+      ansible.builtin.file:
+        path: "{{ item.item }}"
+        state: absent
+      loop: "{{ vps_codex_live_policy_state.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - vps_codex_policy_publish_started | default(false) | bool
+        - not item.stat.exists
+
+    - name: Refuse a failed Codex policy transaction
+      ansible.builtin.fail:
+        msg: >-
+          Codex policy validation or publication failed. Any prior live policy
+          was restored before convergence stopped.
+
+  always:
+    - name: Remove the disposable Codex policy probe home
+      ansible.builtin.file:
+        path: "{{ vps_codex_policy_probe_home.path }}"
+        state: absent
+      when:
+        - vps_codex_policy_probe_home is defined
+        - vps_codex_policy_probe_home.path is defined
+      changed_when: false
+
+    - name: Remove remote Codex policy staging
+      ansible.builtin.file:
+        path: "{{ vps_codex_remote_policy_stage.path }}"
+        state: absent
+      when:
+        - vps_codex_remote_policy_stage is defined
+        - vps_codex_remote_policy_stage.path is defined
+      changed_when: false
+
+    - name: Remove the disposable staged-policy sandbox fixture
+      ansible.builtin.file:
+        path: "{{ vps_codex_policy_sandbox_probe.path }}"
+        state: absent
+      when:
+        - vps_codex_policy_sandbox_probe is defined
+        - vps_codex_policy_sandbox_probe.path is defined
+      changed_when: false
+
+    - name: Remove neutral Codex bind destinations after validation
+      ansible.builtin.file:
+        path: "{{ item.item }}"
+        state: absent
+      loop: "{{ vps_codex_live_policy_state.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - not item.stat.exists
+        - not (vps_codex_policy_publish_complete | default(false) | bool)
+      changed_when: false
+
+- name: Predict validated user-level secure default drift
+  ansible.builtin.template:
+    src: config.toml.j2
+    dest: "{{ vps_codex_home }}/.codex/config.toml"
+    owner: "{{ vps_codex_user }}"
+    group: "{{ vps_codex_group }}"
+    mode: "0600"
+  when:
+    - ansible_check_mode
+    - vps_codex_publish_policy | default(true) | bool
+
+- name: Predict validated immutable Codex requirement drift
+  ansible.builtin.template:
+    src: requirements.toml.j2
+    dest: /etc/codex/requirements.toml
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - ansible_check_mode
+    - vps_codex_publish_policy | default(true) | bool

@@ -1,0 +1,75 @@
+# Managed by Ansible. The Codex runtime user cannot modify this policy.
+allowed_approval_policies = ["never"]
+allowed_login_methods = ["chatgpt"]
+allow_appshots = false
+allow_login_shell = false
+allow_managed_hooks_only = true
+allow_remote_control = false
+allowed_web_search_modes = []
+check_for_update_on_startup = false
+default_permissions = "atlas_workspace"
+
+[allowed_permission_profiles]
+":read-only" = true
+atlas_workspace = true
+
+[permissions.atlas_workspace]
+description = "Edit only the selected workspace without command network access."
+extends = ":workspace"
+
+[permissions.atlas_workspace.filesystem]
+":root" = "deny"
+":minimal" = "read"
+"/opt/codex" = "read"
+
+[permissions.atlas_workspace.filesystem.":workspace_roots"]
+"**/.env" = "deny"
+"**/.env.*" = "deny"
+"**/.git-credentials" = "deny"
+"**/.netrc" = "deny"
+"**/.npmrc" = "deny"
+"**/.pypirc" = "deny"
+"**/.ssh" = "deny"
+"**/.ssh/**" = "deny"
+"**/*.key" = "deny"
+"**/*.pem" = "deny"
+"**/*credentials*" = "deny"
+"**/*secret*" = "deny"
+
+[permissions.atlas_workspace.network]
+enabled = false
+
+# These paths remain unreadable even if a future workspace is placed below a
+# broader readable root. Unix ownership is still the primary host boundary.
+[permissions.filesystem]
+deny_read = [
+  "/etc/vps",
+  "/home/deploy",
+  "/srv/codex/home/.codex",
+  "/home/ubuntu",
+  "/home/vpsadmin",
+  "/root",
+  "/run/containerd/containerd.sock",
+  "/run/docker.sock",
+  "/srv/vps",
+  "/var/lib/docker",
+  "/var/lib/vps-controller",
+  "/var/run/docker.sock",
+]
+
+# An empty managed allowlist disables every user-configured MCP server.
+[mcp_servers]
+
+[features]
+apps = false
+browser_use = false
+browser_use_external = false
+browser_use_full_cdp_access = false
+computer_use = false
+image_generation = false
+in_app_browser = false
+plugins = false
+recommended_plugins = false
+remote_control = false
+remote_plugin = false
+skill_mcp_dependency_install = false
