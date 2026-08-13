@@ -25,6 +25,10 @@ class CodexCliContractTests(unittest.TestCase):
         )
         self.assertRegex(defaults["vps_codex_version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(set(defaults["vps_codex_artifacts"]), {"x86_64", "aarch64"})
+        self.assertEqual(
+            set(defaults["vps_codex_bubblewrap_artifacts"]),
+            {"x86_64", "aarch64"},
+        )
         expected_files = {
             "bin/codex",
             "bin/codex-code-mode-host",
@@ -58,6 +62,9 @@ class CodexCliContractTests(unittest.TestCase):
                 self.assertRegex(digest, digest_pattern)
             self.assertTrue(artifact["target"].endswith("-unknown-linux-musl"))
             self.assertTrue(artifact["target"].startswith(architecture))
+        for artifact in defaults["vps_codex_bubblewrap_artifacts"].values():
+            self.assertRegex(artifact["package_sha256"], digest_pattern)
+            self.assertRegex(artifact["executable_sha256"], digest_pattern)
 
     def test_managed_policy_excludes_privileged_and_extensible_modes(self) -> None:
         requirements = tomllib.loads(
@@ -164,6 +171,55 @@ class CodexCliContractTests(unittest.TestCase):
         )
         self.assertFalse(download["force"])
 
+        dependencies = by_name[
+            "Install bounded storage and package verification dependencies"
+        ][
+            "ansible.builtin.apt"
+        ]["name"]
+        self.assertIn("libcap2-bin", dependencies)
+        bubblewrap_install = by_name["Install the exact Ubuntu bubblewrap package"][
+            "ansible.builtin.apt"
+        ]
+        self.assertEqual(
+            bubblewrap_install["name"],
+            "bubblewrap={{ vps_codex_bubblewrap_version }}",
+        )
+        self.assertFalse(bubblewrap_install["allow_downgrade"])
+        self.assertTrue(bubblewrap_install["allow_change_held_packages"])
+        self.assertEqual(
+            by_name["Install the exact Ubuntu bubblewrap package"]["register"],
+            "vps_codex_bubblewrap_install",
+        )
+        self.assertEqual(
+            by_name["Hold the reviewed Ubuntu bubblewrap package"][
+                "ansible.builtin.dpkg_selections"
+            ]["selection"],
+            "hold",
+        )
+        bwrap_guard = by_name["Prove the distribution bubblewrap boundary"][
+            "ansible.builtin.assert"
+        ]["that"]
+        self.assertIn("vps_codex_distribution_bwrap.stat.mode == '0755'", bwrap_guard)
+        self.assertIn(
+            "vps_codex_distribution_bwrap.stat.checksum == "
+            "vps_codex_bubblewrap_artifact.executable_sha256",
+            bwrap_guard,
+        )
+        self.assertIn(
+            "vps_codex_distribution_bwrap_capabilities.stdout == ''",
+            bwrap_guard,
+        )
+        for post_install_check in (
+            "Read the installed bubblewrap version after reconciliation",
+            "Inspect the distribution bubblewrap executable",
+            "Inspect distribution bubblewrap file capabilities",
+            "Prove the distribution bubblewrap boundary",
+        ):
+            self.assertIn(
+                "vps_codex_bubblewrap_install.changed",
+                by_name[post_install_check]["when"],
+            )
+
         task_names = list(by_name)
         self.assertLess(
             task_names.index("Validate the published Codex release"),
@@ -251,10 +307,16 @@ class CodexCliContractTests(unittest.TestCase):
         self.assertIn('--unit="$session_unit"', launcher)
         self.assertIn("{{ vps_codex_storage_image_path }}", launcher)
         self.assertIn(
-            "PATH={{ vps_codex_release_path }}/codex-resources:"
-            "{{ vps_codex_release_path }}/codex-path:",
+            "PATH={{ vps_codex_release_path }}/codex-path:/usr/bin:",
             launcher,
         )
+        self.assertNotIn("/codex-resources:", launcher)
+        self.assertIn('test "$(command -v bwrap)" = /usr/bin/bwrap', launcher)
+        self.assertIn(
+            "{{ vps_codex_bubblewrap_artifact.executable_sha256 }}",
+            launcher,
+        )
+        self.assertIn("sha256sum --check --status", launcher)
         self.assertIn("findmnt --noheadings --output FSTYPE -T /tmp", launcher)
         self.assertIn(
             "systemctl show atlas-codex-activation-verification.service "
@@ -366,10 +428,34 @@ class CodexCliContractTests(unittest.TestCase):
         self.assertIn("atlas_workspace", candidate_sandbox)
         self.assertIn(".codex/config.toml", candidate_sandbox[-1])
         self.assertIn("a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/.env", candidate_sandbox[-1])
+        candidate_environment = sandbox_tasks[
+            "Execute the managed Codex sandbox boundary probe"
+        ]["environment"]
+        self.assertTrue(candidate_environment["PATH"].startswith(
+            "{{ vps_codex_candidate_path }}/codex-path:/usr/bin:"
+        ))
+        self.assertNotIn("/codex-resources:", candidate_environment["PATH"])
         self.assertEqual(
             sandbox_block["always"][0]["ansible.builtin.file"]["state"],
             "absent",
         )
+
+        policy_transaction = yaml.safe_load(
+            (ROLE / "tasks/policy_transaction.yml").read_text(encoding="utf-8")
+        )[0]
+        policy_block = {task["name"]: task for task in policy_transaction["block"]}
+        for task_name in (
+            "Parse and enforce the candidate Codex policy before publication",
+            "Prove the staged policy denies host and deep workspace secrets",
+        ):
+            policy_argv = policy_block[task_name]["ansible.builtin.command"]["argv"]
+            runtime_path = next(
+                item
+                for item in policy_argv
+                if isinstance(item, str) and item.startswith("--setenv=PATH=")
+            )
+            self.assertIn("/codex-path:/usr/bin:", runtime_path)
+            self.assertNotIn("/codex-resources:", runtime_path)
 
     def test_predictive_check_requires_a_complete_normal_install(self) -> None:
         tasks = yaml.safe_load(

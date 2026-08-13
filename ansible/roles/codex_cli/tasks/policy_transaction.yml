@@ -103,8 +103,8 @@
           - --setenv=HOME={{ vps_codex_home }}
           - --setenv=CODEX_HOME={{ vps_codex_home }}/.codex
           - >-
-            --setenv=PATH={{ vps_codex_policy_candidate_path }}/codex-resources:{{
-            vps_codex_policy_candidate_path }}/codex-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            --setenv=PATH={{ vps_codex_policy_candidate_path
+            }}/codex-path:/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin
           - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/requirements.toml:/etc/codex/requirements.toml
           - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/config.toml:{{ vps_codex_home }}/.codex/config.toml
           - --property=NoNewPrivileges=yes
@@ -213,8 +213,8 @@
           - --setenv=HOME={{ vps_codex_home }}
           - --setenv=CODEX_HOME={{ vps_codex_home }}/.codex
           - >-
-            --setenv=PATH={{ vps_codex_policy_candidate_path }}/codex-resources:{{
-            vps_codex_policy_candidate_path }}/codex-path:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            --setenv=PATH={{ vps_codex_policy_candidate_path
+            }}/codex-path:/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin
           - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/requirements.toml:/etc/codex/requirements.toml
           - --property=BindReadOnlyPaths={{ vps_codex_remote_policy_stage.path }}/config.toml:{{ vps_codex_home }}/.codex/config.toml
           - --property=NoNewPrivileges=yes

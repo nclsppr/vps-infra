@@ -14,12 +14,24 @@ vps_codex_session_mask_owner: /var/lib/vps-infra/codex-session-mask.owner
 vps_codex_activation_rollback_root: /var/lib/vps-infra/codex-activation-rollback
 vps_codex_version: "0.147.0"
 vps_codex_release_base_url: https://releases.openai.com/codex/releases
+vps_codex_bubblewrap_version: 0.11.1-1ubuntu0.1
 vps_codex_cpu_quota: 200%
 vps_codex_memory_high: 2G
 vps_codex_memory_max: 3G
 vps_codex_memory_swap_max: 0
 vps_codex_tasks_max: 256
 vps_codex_tmpfs_size_mb: 512
+
+# Ubuntu's signed package index binds each architecture-specific package
+# archive to package_sha256. The executable digest independently binds the
+# exact runtime file that the Codex launcher admits.
+vps_codex_bubblewrap_artifacts:
+  x86_64:
+    package_sha256: b353088d1003adb3f760deeccfb84c47928a36c8dc102bf680efc94eb19f4408
+    executable_sha256: 0abea81db798ebf6b4742ac0664802d97521547a353c2a0dbdc21d76cbbfd2c0
+  aarch64:
+    package_sha256: 7798d8926cf4c51cfc56187703499d75f7ab66d199a700d1093b45916d7120c0
+    executable_sha256: 29cb90e51494b3765b7b36587b0635863898d1e85025e082674121bcdf34a08b
 
 vps_codex_activation_surfaces:
   - path: /srv/codex/home/.codex/config.toml

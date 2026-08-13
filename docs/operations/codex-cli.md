@@ -29,9 +29,18 @@ can make Codex fail, but cannot consume the remainder of the host filesystem.
 The package comes from the exact versioned OpenAI release URL. Ansible checks
 the archive digest, the complete extracted file inventory, the package
 metadata, every executable digest, root ownership, and `codex --version`
-before switching `current` atomically. The standalone package includes its own
-pinned `bwrap`, `rg`, and `zsh` executables. Atlas does not depend on the
-distribution `bubblewrap` package for this runtime.
+before switching `current` atomically. The standalone package includes pinned
+`bwrap`, `rg`, and `zsh` executables. Atlas installs the Ubuntu `bubblewrap`
+package and makes `/usr/bin/bwrap` the runtime sandbox executable. This path
+matches the distribution AppArmor profile. Git fixes the package version, its
+architecture-specific archive SHA-256, and the installed executable SHA-256.
+APT verifies the archive against Ubuntu's signed package index. Ansible holds
+the installed version and rejects a different executable digest, setuid bit,
+owner, mode, or file capability before it starts Codex. The launcher repeats
+the executable digest check before every session. It does not disable Ubuntu
+user namespace restrictions or grant network administration capabilities. The
+packaged `bwrap` remains part of the verified release inventory but is not
+placed on the runtime `PATH`.
 
 The `codex` account has no direct SSH login, sudo, Docker group, production
 repository access, controller access, or secret access. The supported session
@@ -209,6 +218,9 @@ test ! -r /var/run/docker.sock
 sudo -n true
 ```
 
+On Ubuntu, `command -v bwrap` inside that session must return
+`/usr/bin/bwrap`. This keeps the distribution AppArmor boundary active.
+
 The final command must fail. Never print `auth.json` or session files while
 diagnosing a login.
 
@@ -218,8 +230,10 @@ Never run `codex update`, `npm install -g`, or an installer piped from the
 network on Atlas. Upgrade through one pull request that changes the exact
 version, archive digests, executable digests, and expected package inventory.
 The role validates the new release, including a sandbox smoke test using the
-packaged `bwrap`, before the active symlink changes and keeps older release
-directories for rollback.
+reviewed Ubuntu `bwrap`, before the active symlink changes and keeps older
+release directories for rollback. A `bubblewrap` security update also requires
+the reviewed package version, archive digest, and executable digest to change
+in Git before APT can change the held package during convergence.
 
 See [ADR-0005](../decisions/0005-dedicated-codex-cli-account.md) for the trust
 boundary and accepted tradeoffs.

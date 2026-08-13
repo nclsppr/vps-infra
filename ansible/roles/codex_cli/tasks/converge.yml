@@ -27,7 +27,11 @@
         '/var/lib/vps-infra/codex-activation-rollback'
       - vps_codex_release_base_url == 'https://releases.openai.com/codex/releases'
       - vps_codex_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - >-
+        vps_codex_bubblewrap_version is
+        match('^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+ubuntu[0-9.]+$')
       - ansible_facts.architecture in vps_codex_artifacts
+      - ansible_facts.architecture in vps_codex_bubblewrap_artifacts
       - vps_codex_user not in ['root', vps_admin_user, vps_deploy_user]
     fail_msg: >-
       The Codex CLI role accepts only the dedicated, unprivileged Atlas
@@ -37,6 +41,8 @@
   ansible.builtin.set_fact:
     vps_codex_artifact: >-
       {{ vps_codex_artifacts[ansible_facts.architecture] }}
+    vps_codex_bubblewrap_artifact: >-
+      {{ vps_codex_bubblewrap_artifacts[ansible_facts.architecture] }}
     vps_codex_archive_name: >-
       codex-package-{{
       vps_codex_artifacts[ansible_facts.architecture].target }}.tar.gz
@@ -104,10 +110,11 @@
       The fixed Atlas Codex session is not strictly inactive after acquiring
       the convergence interlock. Stop it and inspect the unit before retrying.
 
-- name: Install the bounded storage dependencies
+- name: Install bounded storage and package verification dependencies
   ansible.builtin.apt:
     name:
       - e2fsprogs
+      - libcap2-bin
       - mount
       - util-linux
     state: present
@@ -117,6 +124,103 @@
   environment:
     DEBIAN_FRONTEND: noninteractive
     NEEDRESTART_MODE: a
+
+- name: Read pinned Ubuntu bubblewrap package metadata
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/apt-cache
+      - show
+      - bubblewrap={{ vps_codex_bubblewrap_version }}
+  register: vps_codex_bubblewrap_package_metadata
+  changed_when: false
+  check_mode: false
+
+- name: Prove the Ubuntu bubblewrap package archive digest
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_codex_bubblewrap_package_metadata.stdout |
+        regex_findall('(?m)^SHA256: ([0-9a-f]{64})$') |
+        unique | list == [vps_codex_bubblewrap_artifact.package_sha256]
+    fail_msg: >-
+      The signed Ubuntu package index does not bind the pinned bubblewrap
+      version to the reviewed architecture-specific archive digest.
+
+- name: Install the exact Ubuntu bubblewrap package
+  ansible.builtin.apt:
+    name: bubblewrap={{ vps_codex_bubblewrap_version }}
+    state: present
+    allow_downgrade: false
+    allow_change_held_packages: true
+    install_recommends: false
+  register: vps_codex_bubblewrap_install
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    NEEDRESTART_MODE: a
+
+- name: Hold the reviewed Ubuntu bubblewrap package
+  ansible.builtin.dpkg_selections:
+    name: bubblewrap
+    selection: hold
+
+- name: Read the installed bubblewrap version after reconciliation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg-query
+      - --show
+      - --showformat=${Version}
+      - bubblewrap
+  register: vps_codex_installed_bubblewrap
+  changed_when: false
+  check_mode: false
+  when: >-
+    not (ansible_check_mode and
+         vps_codex_bubblewrap_install.changed | default(false))
+
+- name: Inspect the distribution bubblewrap executable
+  ansible.builtin.stat:
+    path: /usr/bin/bwrap
+    follow: false
+    checksum_algorithm: sha256
+  register: vps_codex_distribution_bwrap
+  when: >-
+    not (ansible_check_mode and
+         vps_codex_bubblewrap_install.changed | default(false))
+
+- name: Inspect distribution bubblewrap file capabilities
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/getcap
+      - /usr/bin/bwrap
+  register: vps_codex_distribution_bwrap_capabilities
+  changed_when: false
+  check_mode: false
+  when: >-
+    not (ansible_check_mode and
+         vps_codex_bubblewrap_install.changed | default(false))
+
+- name: Prove the distribution bubblewrap boundary
+  ansible.builtin.assert:
+    that:
+      - vps_codex_distribution_bwrap.stat.isreg
+      - not vps_codex_distribution_bwrap.stat.islnk
+      - vps_codex_distribution_bwrap.stat.uid == 0
+      - vps_codex_distribution_bwrap.stat.gid == 0
+      - vps_codex_distribution_bwrap.stat.mode == '0755'
+      - >-
+        vps_codex_distribution_bwrap.stat.checksum ==
+        vps_codex_bubblewrap_artifact.executable_sha256
+      - vps_codex_distribution_bwrap_capabilities.stdout == ''
+      - >-
+        vps_codex_installed_bubblewrap.stdout ==
+        vps_codex_bubblewrap_version
+    fail_msg: >-
+      The Ubuntu bubblewrap package or executable has an unexpected version,
+      digest, type, owner, mode, or file capability. Codex sandbox validation
+      cannot continue safely.
+  when: >-
+    not (ansible_check_mode and
+         vps_codex_bubblewrap_install.changed | default(false))
 
 - name: Create the isolated Codex group
   ansible.builtin.group:

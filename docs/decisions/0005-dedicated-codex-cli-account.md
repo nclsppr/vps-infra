@@ -27,8 +27,13 @@ Ansible installs the official standalone Codex CLI package with these controls:
 2. The archive is downloaded from the versioned OpenAI release path, extracted
    into a root-owned staging directory, completely inventoried, and executed
    as the runtime account before an atomic release switch. The standalone
-   artifact includes the pinned `bwrap` sandbox executable, so Codex does not
-   depend on the distribution `bubblewrap` package.
+   artifact includes a pinned `bwrap`, but Atlas selects `/usr/bin/bwrap` from
+   the Ubuntu `bubblewrap` package. This executable matches Ubuntu's AppArmor
+   profile for unprivileged user namespace sandbox setup. Git fixes the exact
+   package version, architecture-specific package archive digest, and installed
+   executable digest. The package remains held between reviewed updates. The
+   role and launcher validate the executable digest, owner, mode, setuid state,
+   and file capabilities before use.
 3. The `codex` system account has a locked password, no SSH key, no direct SSH
    login, no sudo rule, no supplementary group, and no Docker socket access.
 4. The account owns only `/srv/codex/home` and `/srv/codex/workspaces`. Both are
@@ -102,8 +107,10 @@ automatically. A 24-hour runtime limit bounds a stale lease.
   command sandbox, including its disabled network boundary.
 - Updates remain reviewable Git changes with exact release evidence and a
   deterministic rollback target.
-- The host gains no Node.js, npm, or distribution `bubblewrap` supply chain and
-  no public network surface.
+- The host gains no Node.js, npm, or public network surface. The Ubuntu
+  `bubblewrap` package integrates Codex sandbox setup with the host AppArmor
+  policy without disabling user namespace restrictions or granting host
+  capabilities.
 - Persistent Codex data cannot grow past its dedicated 6 GiB filesystem, and
   session resources are also capped in aggregate.
 
