@@ -30,6 +30,7 @@
     - role: base
     - role: docker
     - role: layout
+    - role: codex_cli
     - role: deploy
     - role: ssh
     - role: firewall

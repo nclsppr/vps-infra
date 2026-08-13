@@ -1732,10 +1732,127 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "TYPE",
                 "{{ vps_swap_path }}",
             ],
+            ("codex_cli", "Read an existing Codex convergence lease"): [
+                "/usr/bin/systemctl",
+                "show",
+                "{{ vps_codex_convergence_unit }}",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=Result",
+            ],
             ("base", "Read active swap devices"): [
                 "/usr/bin/awk",
                 "NR>1 {print $1}",
                 "/proc/swaps",
+            ],
+            ("codex_cli", "Read the selected Codex release target"): [
+                "/usr/bin/readlink",
+                "--canonicalize",
+                "{{ vps_codex_install_root }}/current",
+            ],
+            ("codex_cli", "Read active Atlas Codex session state before mutation"): [
+                "/usr/bin/systemctl",
+                "is-active",
+                "atlas-codex-session.service",
+            ],
+            ("codex_cli", "Read effective aggregate Codex resource limits"): [
+                "/usr/bin/systemctl",
+                "show",
+                "atlas-codex.slice",
+                "--property=CPUQuotaPerSecUSec",
+                "--property=MemoryHigh",
+                "--property=MemoryMax",
+                "--property=MemorySwapMax",
+                "--property=TasksMax",
+                "--property=CPUWeight",
+                "--property=IOWeight",
+            ],
+            ("codex_cli", "Inspect an active Codex storage mount"): [
+                "/usr/bin/findmnt",
+                "--json",
+                "--mountpoint",
+                "{{ vps_codex_storage_root }}",
+                "--output",
+                "TARGET,SOURCE,FSTYPE,OPTIONS",
+            ],
+            (
+                "codex_cli",
+                "Inspect content that would be shadowed by Codex storage",
+            ): [
+                "/usr/bin/find",
+                "{{ vps_codex_storage_root }}",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-print",
+                "-quit",
+            ],
+            ("codex_cli", "Read the active Codex storage backing file"): [
+                "/usr/sbin/losetup",
+                "--noheadings",
+                "--output",
+                "BACK-FILE",
+                "{{ vps_codex_active_storage_mount.source }}",
+            ],
+            ("codex_cli", "Read the bounded Codex storage filesystem type"): [
+                "/usr/sbin/blkid",
+                "-o",
+                "value",
+                "-s",
+                "TYPE",
+                "{{ vps_codex_storage_image_path }}",
+            ],
+            ("codex_cli", "Read existing fstab entries for the Codex mountpoint"): [
+                "/usr/bin/awk",
+                '$1 !~ /^#/ && $2 == "{{ vps_codex_storage_root }}" {print $0}',
+                "/etc/fstab",
+            ],
+            ("codex_cli", "Read free space before allocating Codex storage"): [
+                "/usr/bin/df",
+                "--block-size=1M",
+                "--output=avail",
+                "{{ vps_codex_storage_image_path | dirname }}",
+            ],
+            ("codex_cli", "Reinspect the activated Codex storage mount"): [
+                "/usr/bin/findmnt",
+                "--json",
+                "--mountpoint",
+                "{{ vps_codex_storage_root }}",
+                "--output",
+                "TARGET,SOURCE,FSTYPE,OPTIONS",
+            ],
+            ("codex_cli", "Read the activated Codex storage backing file"): [
+                "/usr/sbin/losetup",
+                "--noheadings",
+                "--output",
+                "BACK-FILE",
+                "{{ vps_codex_activated_storage_mount.source }}",
+            ],
+            ("codex_cli", "Read the Codex account groups"): [
+                "/usr/bin/id",
+                "-nG",
+                "{{ vps_codex_user }}",
+            ],
+            (
+                "codex_cli",
+                "Prove ordinary direct Codex invocation uses the guarded entry point",
+            ): [
+                "/usr/local/bin/codex",
+                "--version",
+            ],
+            ("codex_cli", "Probe prohibited Codex account capabilities"): [
+                "/bin/bash",
+                "-c",
+                "test ! -r /etc/vps/secrets && "
+                "test ! -x /etc/vps/secrets && "
+                "test ! -r /home/vpsadmin && "
+                "test ! -r /srv/vps/repository && "
+                "test ! -r /run/containerd/containerd.sock && "
+                "test ! -r /var/run/docker.sock && "
+                "test -x {{ vps_codex_storage_root }} && "
+                "test -w {{ vps_codex_workspace_root }} && "
+                "! /usr/bin/sudo -n /usr/bin/true",
             ],
             ("deploy", "Read the infrastructure mirror origin"): [
                 "/usr/bin/git",
@@ -1814,7 +1931,14 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             ],
         }
         observed: dict[tuple[str, str], list[str]] = {}
-        for task_file in sorted((ROOT / "ansible/roles").glob("*/tasks/main.yml")):
+        task_files = sorted((ROOT / "ansible/roles").glob("*/tasks/main.yml"))
+        task_files.extend(
+            [
+                ROOT / "ansible/roles/codex_cli/tasks/converge.yml",
+                ROOT / "ansible/roles/codex_cli/tasks/activate.yml",
+            ]
+        )
+        for task_file in task_files:
             role = task_file.parent.parent.name
             for task in yaml.safe_load(task_file.read_text(encoding="utf-8")):
                 if task.get("check_mode") is not False:

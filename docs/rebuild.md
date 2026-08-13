@@ -150,6 +150,14 @@ The fixed unit name prevents concurrent worker creation. No execution receives
 an operator token. ORAS remains in the locked local and
 CI toolchain; reconstruction does not install it on Atlas.
 
+Host convergence installs one operator tool outside that CI toolchain: the
+standalone Codex CLI package. It uses no Node.js or npm and runs only as the
+isolated `codex` account through the enforced bounded launcher. Its persistent
+state is capped by a dedicated 6 GiB filesystem. Authentication is not part of
+reconstruction. After convergence, an operator may restore access with the
+ChatGPT-only device flow documented in
+[`operations/codex-cli.md`](operations/codex-cli.md).
+
 Before a static activation, supply the exact application source revision, site
 digest, route digest, platform integration revision, integration digest, and
 Caddy image digest. The integration package and the protected infrastructure

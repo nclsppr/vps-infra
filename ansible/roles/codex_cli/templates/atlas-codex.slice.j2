@@ -1,0 +1,12 @@
+# Managed by Ansible. Limits apply to all Codex sessions in aggregate.
+[Unit]
+Description=Aggregate Atlas Codex resource boundary
+
+[Slice]
+CPUQuota={{ vps_codex_cpu_quota }}
+MemoryHigh={{ vps_codex_memory_high }}
+MemoryMax={{ vps_codex_memory_max }}
+MemorySwapMax={{ vps_codex_memory_swap_max }}
+TasksMax={{ vps_codex_tasks_max }}
+CPUWeight=50
+IOWeight=50

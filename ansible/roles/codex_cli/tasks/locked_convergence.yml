@@ -1,0 +1,166 @@
+---
+- name: Converge Codex behind durable session and controller interlocks
+  block:
+    - name: Create the private Codex transaction state parent
+      ansible.builtin.file:
+        path: "{{ vps_codex_activation_rollback_root | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Inspect the persistent Codex session mask
+      ansible.builtin.stat:
+        path: /etc/systemd/system/atlas-codex-session.service
+        follow: false
+      register: vps_codex_existing_session_mask
+
+    - name: Inspect the Codex session mask ownership record
+      ansible.builtin.stat:
+        path: "{{ vps_codex_session_mask_owner }}"
+        follow: false
+      register: vps_codex_existing_mask_owner
+
+    - name: Refuse an unowned or unsafe Codex session mask
+      ansible.builtin.assert:
+        that:
+          - >-
+            not vps_codex_existing_session_mask.stat.exists or
+            vps_codex_existing_mask_owner.stat.exists
+          - >-
+            not vps_codex_existing_session_mask.stat.exists or
+            (vps_codex_existing_session_mask.stat.islnk and
+             vps_codex_existing_session_mask.stat.lnk_source == '/dev/null')
+          - >-
+            not vps_codex_existing_mask_owner.stat.exists or
+            (vps_codex_existing_mask_owner.stat.isreg and
+             not vps_codex_existing_mask_owner.stat.islnk and
+             vps_codex_existing_mask_owner.stat.uid == 0 and
+             vps_codex_existing_mask_owner.stat.gid == 0 and
+             vps_codex_existing_mask_owner.stat.mode == '0600')
+        fail_msg: >-
+          The persistent Atlas Codex session mask is not owned by a recorded
+          Codex convergence. It was preserved for manual inspection.
+
+    - name: Record ownership of the Codex session mask
+      ansible.builtin.file:
+        path: "{{ vps_codex_session_mask_owner }}"
+        state: touch
+        access_time: preserve
+        modification_time: preserve
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+
+    - name: Mark the Codex session interlock as owned
+      ansible.builtin.set_fact:
+        vps_codex_session_interlock_owned: true
+
+    - name: Publish the Codex convergence maintenance marker
+      ansible.builtin.file:
+        path: /run/atlas-codex-maintenance
+        state: touch
+        access_time: preserve
+        modification_time: preserve
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+
+    - name: Persistently prevent a new fixed Codex session
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - mask
+          - atlas-codex-session.service
+      register: vps_codex_persistent_mask
+      changed_when: false
+
+    - name: Read fixed Codex session state behind the interlock
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - atlas-codex-session.service
+      register: vps_codex_interlocked_session_state
+      changed_when: false
+      failed_when: vps_codex_interlocked_session_state.rc not in [0, 3]
+
+    - name: Prove no Codex session survived interlock acquisition
+      ansible.builtin.assert:
+        that:
+          - vps_codex_interlocked_session_state.rc == 3
+          - vps_codex_interlocked_session_state.stdout == 'inactive'
+        fail_msg: >-
+          The fixed Atlas Codex session is not strictly inactive after the
+          persistent interlock was acquired. No host mutation was attempted.
+
+    - name: Recover an interrupted Codex activation
+      ansible.builtin.include_tasks: recover_activation.yml
+
+    - name: Converge the isolated Codex runtime
+      ansible.builtin.include_tasks: converge.yml
+
+  always:
+    - name: Inspect Codex rollback state before releasing interlocks
+      ansible.builtin.stat:
+        path: "{{ vps_codex_activation_rollback_root }}"
+        follow: false
+      register: vps_codex_final_rollback_state
+
+    - name: Release the persistent Codex session mask
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - unmask
+          - atlas-codex-session.service
+      register: vps_codex_persistent_unmask
+      changed_when: false
+      failed_when: false
+      when:
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+
+    - name: Inspect the released Codex session mask
+      ansible.builtin.stat:
+        path: /etc/systemd/system/atlas-codex-session.service
+        follow: false
+      register: vps_codex_released_mask_state
+      when:
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+
+    - name: Remove the Codex convergence maintenance marker
+      ansible.builtin.file:
+        path: /run/atlas-codex-maintenance
+        state: absent
+      changed_when: false
+      when:
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+        - vps_codex_persistent_unmask.rc == 0
+        - not vps_codex_released_mask_state.stat.exists
+
+    - name: Remove the released Codex session mask ownership record
+      ansible.builtin.file:
+        path: "{{ vps_codex_session_mask_owner }}"
+        state: absent
+      changed_when: false
+      when:
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+        - vps_codex_persistent_unmask.rc == 0
+        - not vps_codex_released_mask_state.stat.exists
+
+    - name: Confirm the Codex session interlock was safely released
+      ansible.builtin.assert:
+        that:
+          - not vps_codex_final_rollback_state.stat.exists
+          - vps_codex_persistent_unmask is defined
+          - vps_codex_persistent_unmask.rc == 0
+          - not vps_codex_released_mask_state.stat.exists
+        fail_msg: >-
+          Codex activation or rollback is incomplete. The persistent session
+          mask and recovery state were deliberately preserved.
+      when: vps_codex_session_interlock_owned | default(false) | bool

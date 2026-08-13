@@ -1,0 +1,81 @@
+---
+vps_codex_user: codex
+vps_codex_group: codex
+vps_codex_storage_root: /srv/codex
+vps_codex_storage_image_path: /var/lib/vps-infra/codex-storage.ext4
+vps_codex_storage_size_mb: 6144
+vps_codex_host_reserve_mb: 10240
+vps_codex_home: /srv/codex/home
+vps_codex_workspace_root: /srv/codex/workspaces
+vps_codex_install_root: /opt/codex
+vps_codex_cache_root: /var/cache/vps-infra/codex
+vps_codex_convergence_unit: atlas-codex-convergence.service
+vps_codex_session_mask_owner: /var/lib/vps-infra/codex-session-mask.owner
+vps_codex_activation_rollback_root: /var/lib/vps-infra/codex-activation-rollback
+vps_codex_version: "0.147.0"
+vps_codex_release_base_url: https://releases.openai.com/codex/releases
+vps_codex_cpu_quota: 200%
+vps_codex_memory_high: 2G
+vps_codex_memory_max: 3G
+vps_codex_memory_swap_max: 0
+vps_codex_tasks_max: 256
+vps_codex_tmpfs_size_mb: 512
+
+vps_codex_activation_surfaces:
+  - path: /srv/codex/home/.codex/config.toml
+    backup: config.toml
+    type: file
+  - path: /etc/codex/requirements.toml
+    backup: requirements.toml
+    type: file
+  - path: /etc/systemd/system/atlas-codex.slice
+    backup: atlas-codex.slice
+    type: file
+  - path: /usr/local/sbin/atlas-codex
+    backup: atlas-codex
+    type: file
+  - path: /usr/local/bin/codex
+    backup: codex
+    type: file
+  - path: /usr/local/bin/codex-code-mode-host
+    backup: codex-code-mode-host
+    type: file
+  - path: /opt/codex/current
+    backup: current
+    type: link
+
+vps_codex_release_entries:
+  - bin|d
+  - bin/codex-code-mode-host|f
+  - bin/codex|f
+  - codex-package.json|f
+  - codex-path|d
+  - codex-path/rg|f
+  - codex-resources|d
+  - codex-resources/bwrap|f
+  - codex-resources/zsh/bin/zsh|f
+  - codex-resources/zsh/bin|d
+  - codex-resources/zsh|d
+
+# Each archive is an official OpenAI release artifact. The outer archive and
+# every executable file are pinned so a replaced or damaged artifact fails
+# closed before the active symlink changes.
+vps_codex_artifacts:
+  x86_64:
+    target: x86_64-unknown-linux-musl
+    archive_sha256: bd758d53d56e41dc65e045f4589df79a038ed197a011adcb52a258e6ad64cfda
+    file_sha256:
+      bin/codex: cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40
+      bin/codex-code-mode-host: 00ecf5d040865b97884c488883abd342581c2a432debe7a54e4646bceee3d2d6
+      codex-path/rg: e62198eb19b136b88c330af83647b5a962cb99b6b1f066758568f12de1974849
+      codex-resources/bwrap: 77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c
+      codex-resources/zsh/bin/zsh: 67faaaa89242c4a332e16e508a1977cffc24bf7fca31d4411cdfd101f3831ef3
+  aarch64:
+    target: aarch64-unknown-linux-musl
+    archive_sha256: 89cbf79bd5ae6f9c58da47e8079f311c84219350c9c43c070d42f3e9b2a81401
+    file_sha256:
+      bin/codex: e23d0be344d2496986c985cd3db61e6f649b1ddd900e6afc1b5aaabbffcbb4e2
+      bin/codex-code-mode-host: c8fd26e2ddb0243d79d7c3dfa8bcd47b6a30b14695083790fc51884e82e8ebc2
+      codex-path/rg: e36d0eb52e70696bdf1781392722e05a21bb91d3b7b762ef5ec20e5df2ec687b
+      codex-resources/bwrap: c547cbdc762a70ed216789ffaa4c6c0e7d2beabe32245a498f8e365a9fc8dab4
+      codex-resources/zsh/bin/zsh: 7feeacd883e1dc749847936948c378653c80a69ec4a9542f0f126b411882c179

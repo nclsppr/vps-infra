@@ -145,6 +145,23 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
 - [Renovate — Docker Compose](https://docs.renovatebot.com/modules/manager/docker-compose/) :
   découverte des images dans les fichiers Compose.
 
+### Codex CLI
+
+- [OpenAI - Codex CLI](https://developers.openai.com/codex/cli) : official
+  standalone installation and update channels.
+- [OpenAI - authentication](https://learn.chatgpt.com/docs/auth#login-on-headless-devices) :
+  headless device authentication without placing an API key in automation.
+- [OpenAI - approvals and sandboxing](https://learn.chatgpt.com/docs/agent-approvals-security) :
+  operating-system sandbox and approval boundaries.
+- [OpenAI - managed configuration](https://learn.chatgpt.com/docs/enterprise/managed-configuration) :
+  `/etc/codex/requirements.toml`, permission allowlists, integrations, and
+  precedence.
+- [OpenAI - permission profiles](https://learn.chatgpt.com/docs/permissions) :
+  managed filesystem and network profiles used by the Atlas account.
+- [OpenAI Codex CLI 0.147.0](https://github.com/openai/codex/releases/tag/rust-v0.147.0) :
+  exact release represented by the pinned package and executable SHA-256
+  values.
+
 ### Données et observabilité
 
 - [PostgreSQL 17 — `CREATE ROLE`](https://www.postgresql.org/docs/17/sql-createrole.html) :

@@ -1,0 +1,144 @@
+---
+- name: Activate Codex with durable rollback
+  when: not ansible_check_mode
+  block:
+    - name: Inspect live Codex activation surfaces
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        follow: false
+        checksum_algorithm: sha256
+      loop: "{{ vps_codex_activation_surfaces }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: vps_codex_activation_surface_state
+
+    - name: Refuse unsafe live Codex activation surface types
+      ansible.builtin.assert:
+        that:
+          - >-
+            not item.stat.exists or
+            (item.item.type == 'file' and item.stat.isreg and
+             not item.stat.islnk) or
+            (item.item.type == 'link' and item.stat.islnk)
+        fail_msg: >-
+          A live Codex activation surface has an unexpected type. No snapshot
+          or activation was attempted.
+      loop: "{{ vps_codex_activation_surface_state.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+
+    - name: Inspect prior Codex activation recovery state
+      ansible.builtin.stat:
+        path: "{{ vps_codex_activation_rollback_root }}"
+        follow: false
+      register: vps_codex_activation_rollback_state
+
+    - name: Refuse to overwrite Codex activation recovery state
+      ansible.builtin.assert:
+        that:
+          - not vps_codex_activation_rollback_state.stat.exists
+        fail_msg: >-
+          Prior Codex activation recovery state still exists. The persistent
+          session mask remains in place.
+
+    - name: Create the private Codex activation snapshot
+      ansible.builtin.file:
+        path: "{{ vps_codex_activation_rollback_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      changed_when: false
+
+    - name: Copy existing Codex activation surfaces into the snapshot
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/cp
+          - --archive
+          - --no-target-directory
+          - "{{ item.item.path }}"
+          - "{{ vps_codex_activation_rollback_root }}/{{ item.item.backup }}"
+      loop: "{{ vps_codex_activation_surface_state.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      when: item.stat.exists
+      changed_when: false
+
+    - name: Record originally absent Codex activation surfaces
+      ansible.builtin.file:
+        path: >-
+          {{ vps_codex_activation_rollback_root }}/{{ item.item.backup }}.absent
+        state: touch
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ vps_codex_activation_surface_state.results }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      when: not item.stat.exists
+      changed_when: false
+
+    - name: Record the complete Codex activation snapshot
+      ansible.builtin.file:
+        path: "{{ vps_codex_activation_rollback_root }}/snapshot-complete"
+        state: touch
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+
+    - name: Record the Codex activation publication boundary
+      ansible.builtin.file:
+        path: "{{ vps_codex_activation_rollback_root }}/activation-started"
+        state: touch
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+
+    - name: Publish and verify all active Codex surfaces
+      ansible.builtin.include_tasks: activate.yml
+
+  rescue:
+    - name: Inspect failed Codex activation publication state
+      ansible.builtin.stat:
+        path: "{{ vps_codex_activation_rollback_root }}/activation-started"
+        follow: false
+      register: vps_codex_failed_activation_started
+
+    - name: Remove an incomplete pre-publication Codex snapshot
+      ansible.builtin.file:
+        path: "{{ vps_codex_activation_rollback_root }}"
+        state: absent
+      when: not vps_codex_failed_activation_started.stat.exists
+
+    - name: Restore the prior Codex activation after publication failure
+      ansible.builtin.include_tasks: rollback_activation.yml
+      when: vps_codex_failed_activation_started.stat.exists
+
+    - name: Refuse the failed Codex activation
+      ansible.builtin.fail:
+        msg: >-
+          Codex activation failed. The prior active surfaces were restored and
+          verified before convergence stopped.
+
+- name: Record the verified Codex activation commit
+  ansible.builtin.file:
+    path: "{{ vps_codex_activation_rollback_root }}/commit-complete"
+    state: touch
+    owner: root
+    group: root
+    mode: "0600"
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Remove committed Codex activation recovery state
+  ansible.builtin.file:
+    path: "{{ vps_codex_activation_rollback_root }}"
+    state: absent
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Predict active Codex surface drift
+  ansible.builtin.include_tasks: activate.yml
+  when: ansible_check_mode

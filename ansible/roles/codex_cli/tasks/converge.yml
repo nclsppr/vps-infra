@@ -1,0 +1,664 @@
+---
+- name: Validate the Codex CLI contract
+  ansible.builtin.assert:
+    that:
+      - vps_codex_user == 'codex'
+      - vps_codex_group == 'codex'
+      - vps_codex_storage_root == '/srv/codex'
+      - vps_codex_storage_image_path == '/var/lib/vps-infra/codex-storage.ext4'
+      - vps_codex_storage_size_mb | int == 6144
+      - vps_codex_host_reserve_mb | int == 10240
+      - vps_codex_tmpfs_size_mb | int == 512
+      - vps_codex_cpu_quota == '200%'
+      - vps_codex_memory_high == '2G'
+      - vps_codex_memory_max == '3G'
+      - vps_codex_memory_swap_max | int == 0
+      - vps_codex_tasks_max | int == 256
+      - vps_codex_home == '/srv/codex/home'
+      - vps_codex_workspace_root == '/srv/codex/workspaces'
+      - vps_codex_install_root == '/opt/codex'
+      - vps_codex_cache_root == '/var/cache/vps-infra/codex'
+      - vps_codex_convergence_unit == 'atlas-codex-convergence.service'
+      - >-
+        vps_codex_session_mask_owner ==
+        '/var/lib/vps-infra/codex-session-mask.owner'
+      - >-
+        vps_codex_activation_rollback_root ==
+        '/var/lib/vps-infra/codex-activation-rollback'
+      - vps_codex_release_base_url == 'https://releases.openai.com/codex/releases'
+      - vps_codex_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - ansible_facts.architecture in vps_codex_artifacts
+      - vps_codex_user not in ['root', vps_admin_user, vps_deploy_user]
+    fail_msg: >-
+      The Codex CLI role accepts only the dedicated, unprivileged Atlas
+      identity and a pinned official release artifact.
+
+- name: Select the pinned Codex artifact for this architecture
+  ansible.builtin.set_fact:
+    vps_codex_artifact: >-
+      {{ vps_codex_artifacts[ansible_facts.architecture] }}
+    vps_codex_archive_name: >-
+      codex-package-{{
+      vps_codex_artifacts[ansible_facts.architecture].target }}.tar.gz
+    vps_codex_cached_archive_path: >-
+      {{ vps_codex_cache_root }}/{{ vps_codex_version }}-codex-package-{{
+      vps_codex_artifacts[ansible_facts.architecture].target }}.tar.gz
+    vps_codex_release_path: >-
+      {{ vps_codex_install_root }}/releases/{{ vps_codex_version }}-{{
+      vps_codex_artifacts[ansible_facts.architecture].target }}
+
+- name: Read the Codex account before a predictive check
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ vps_codex_user }}"
+    fail_key: false
+  when: ansible_check_mode
+
+- name: Inspect installed Codex boundaries before a predictive check
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ vps_codex_storage_root }}"
+    - "{{ vps_codex_storage_image_path }}"
+    - "{{ vps_codex_home }}"
+    - "{{ vps_codex_home }}/.codex/config.toml"
+    - /etc/codex/requirements.toml
+    - /etc/systemd/system/atlas-codex.slice
+    - "{{ vps_codex_release_path }}"
+    - /usr/local/sbin/atlas-codex
+  register: vps_codex_predictive_state
+  when: ansible_check_mode
+
+- name: Refuse a predictive check before normal Codex convergence
+  ansible.builtin.assert:
+    that:
+      - vps_codex_user in (ansible_facts.getent_passwd | default({}))
+      - >-
+        vps_codex_predictive_state.results
+        | selectattr('stat.exists', 'equalto', false)
+        | list
+        | length == 0
+    fail_msg: >-
+      Codex predictive checking requires one successful normal convergence.
+      No simulated install or partial runtime validation is attempted.
+  when: ansible_check_mode
+
+- name: Read active Atlas Codex session state before mutation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - atlas-codex-session.service
+  register: vps_codex_session_state
+  changed_when: false
+  failed_when: vps_codex_session_state.rc not in [0, 3, 4]
+  check_mode: false
+
+- name: Refuse convergence during an active Atlas Codex session
+  ansible.builtin.assert:
+    that:
+      - vps_codex_session_state.rc in [3, 4]
+      - vps_codex_session_state.stdout in ['inactive', 'unknown']
+    fail_msg: >-
+      The fixed Atlas Codex session is not strictly inactive after acquiring
+      the convergence interlock. Stop it and inspect the unit before retrying.
+
+- name: Install the bounded storage dependencies
+  ansible.builtin.apt:
+    name:
+      - e2fsprogs
+      - mount
+      - util-linux
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    install_recommends: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    NEEDRESTART_MODE: a
+
+- name: Create the isolated Codex group
+  ansible.builtin.group:
+    name: "{{ vps_codex_group }}"
+    system: true
+    state: present
+
+- name: Create the isolated Codex runtime account
+  ansible.builtin.user:
+    name: "{{ vps_codex_user }}"
+    comment: Unprivileged Codex CLI runtime managed by Ansible
+    home: "{{ vps_codex_home }}"
+    shell: /bin/bash
+    group: "{{ vps_codex_group }}"
+    groups: ""
+    append: false
+    system: true
+    create_home: false
+    password_lock: true
+    state: present
+
+- name: Inspect the bounded Codex storage root
+  ansible.builtin.stat:
+    path: "{{ vps_codex_storage_root }}"
+    follow: false
+  register: vps_codex_storage_root_state
+
+- name: Inspect an active Codex storage mount
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --json
+      - --mountpoint
+      - "{{ vps_codex_storage_root }}"
+      - --output
+      - TARGET,SOURCE,FSTYPE,OPTIONS
+  register: vps_codex_storage_findmnt
+  changed_when: false
+  failed_when: vps_codex_storage_findmnt.rc not in [0, 1]
+  check_mode: false
+
+- name: Inspect content that would be shadowed by Codex storage
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/find
+      - "{{ vps_codex_storage_root }}"
+      - -mindepth
+      - "1"
+      - -maxdepth
+      - "1"
+      - -print
+      - -quit
+  register: vps_codex_storage_root_content
+  changed_when: false
+  check_mode: false
+  when:
+    - vps_codex_storage_findmnt.rc == 1
+    - vps_codex_storage_root_state.stat.exists
+    - vps_codex_storage_root_state.stat.isdir | default(false)
+    - not (vps_codex_storage_root_state.stat.islnk | default(false))
+
+- name: Refuse unsafe or shadowed Codex storage content
+  ansible.builtin.assert:
+    that:
+      - >-
+        not vps_codex_storage_root_state.stat.exists or
+        (vps_codex_storage_root_state.stat.isdir and
+         not vps_codex_storage_root_state.stat.islnk and
+         vps_codex_storage_root_state.stat.uid == 0 and
+         vps_codex_storage_root_state.stat.gid == 0 and
+         vps_codex_storage_root_state.stat.mode == '0711')
+      - >-
+        not vps_codex_storage_root_state.stat.exists or
+        (vps_codex_storage_root_content.stdout | default('')) == ''
+    fail_msg: >-
+      The Codex storage mountpoint has an unsafe type, ownership, mode, or
+      content that the bounded filesystem would hide. Migrate it explicitly.
+  when: vps_codex_storage_findmnt.rc == 1
+
+- name: Parse the active Codex storage mount
+  ansible.builtin.set_fact:
+    vps_codex_active_storage_mount: >-
+      {{ (vps_codex_storage_findmnt.stdout | from_json).filesystems | first }}
+    vps_codex_active_storage_options: >-
+      {{ ((vps_codex_storage_findmnt.stdout | from_json).filesystems |
+          first).options.split(',') }}
+  when: vps_codex_storage_findmnt.rc == 0
+
+- name: Read the active Codex storage backing file
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/losetup
+      - --noheadings
+      - --output
+      - BACK-FILE
+      - "{{ vps_codex_active_storage_mount.source }}"
+  register: vps_codex_active_storage_backing
+  changed_when: false
+  failed_when: vps_codex_active_storage_backing.rc not in [0, 1]
+  check_mode: false
+  when: vps_codex_storage_findmnt.rc == 0
+
+- name: Refuse a divergent active Codex storage mount
+  ansible.builtin.assert:
+    that:
+      - vps_codex_active_storage_mount.target == vps_codex_storage_root
+      - vps_codex_active_storage_mount.fstype == 'ext4'
+      - vps_codex_active_storage_mount.source is match('^/dev/loop[0-9]+$')
+      - vps_codex_storage_root_state.stat.exists
+      - vps_codex_storage_root_state.stat.isdir
+      - not vps_codex_storage_root_state.stat.islnk
+      - vps_codex_storage_root_state.stat.uid == 0
+      - vps_codex_storage_root_state.stat.gid == 0
+      - >-
+        (['rw', 'nosuid', 'nodev', 'noatime'] |
+         difference(vps_codex_active_storage_options) | length) == 0
+      - vps_codex_active_storage_backing.rc == 0
+      - >-
+        (vps_codex_active_storage_backing.stdout | trim) ==
+        vps_codex_storage_image_path
+    fail_msg: >-
+      A divergent active mount occupies the Codex storage root. The role will
+      not unmount or replace it implicitly.
+  when: vps_codex_storage_findmnt.rc == 0
+
+- name: Create the empty Codex storage mountpoint
+  ansible.builtin.file:
+    path: "{{ vps_codex_storage_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0711"
+  when: vps_codex_storage_findmnt.rc == 1
+
+- name: Create the private Codex storage image parent
+  ansible.builtin.file:
+    path: "{{ vps_codex_storage_image_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Inspect the bounded Codex storage image
+  ansible.builtin.stat:
+    path: "{{ vps_codex_storage_image_path }}"
+    follow: false
+  register: vps_codex_storage_image
+
+- name: Refuse to resize or replace existing Codex storage implicitly
+  ansible.builtin.assert:
+    that:
+      - vps_codex_storage_image.stat.isreg
+      - not vps_codex_storage_image.stat.islnk
+      - vps_codex_storage_image.stat.uid == 0
+      - vps_codex_storage_image.stat.gid == 0
+      - >-
+        vps_codex_storage_image.stat.size | int ==
+        (vps_codex_storage_size_mb | int * 1024 * 1024)
+    fail_msg: >-
+      The existing Codex storage image has a different type, ownership, or
+      size. Migrate it through a separate, reviewed operation.
+  when: vps_codex_storage_image.stat.exists
+
+- name: Read free space before allocating Codex storage
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/df
+      - --block-size=1M
+      - --output=avail
+      - "{{ vps_codex_storage_image_path | dirname }}"
+  register: vps_codex_storage_free_space
+  changed_when: false
+  check_mode: false
+  when: not vps_codex_storage_image.stat.exists
+
+- name: Preserve host disk reserve before allocating Codex storage
+  ansible.builtin.assert:
+    that:
+      - >-
+        (vps_codex_storage_free_space.stdout_lines | last | trim | int) >=
+        (vps_codex_storage_size_mb | int + vps_codex_host_reserve_mb | int)
+    fail_msg: >-
+      Atlas lacks enough free disk for the bounded Codex image while preserving
+      the required host reserve. Free space through a reviewed operation.
+  when: not vps_codex_storage_image.stat.exists
+
+- name: Remove an interrupted known Codex storage candidate
+  ansible.builtin.file:
+    path: "{{ vps_codex_storage_image_path }}.next"
+    state: absent
+  when: not vps_codex_storage_image.stat.exists
+
+- name: Allocate a bounded Codex storage candidate
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/fallocate
+      - -l
+      - "{{ vps_codex_storage_size_mb }}M"
+      - "{{ vps_codex_storage_image_path }}.next"
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - not vps_codex_storage_image.stat.exists
+
+- name: Protect the bounded Codex storage candidate
+  ansible.builtin.file:
+    path: "{{ vps_codex_storage_image_path }}.next"
+    state: file
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - not ansible_check_mode
+    - not vps_codex_storage_image.stat.exists
+
+- name: Format the bounded Codex storage candidate
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/mkfs.ext4
+      - -q
+      - -L
+      - atlas-codex-storage
+      - "{{ vps_codex_storage_image_path }}.next"
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - not vps_codex_storage_image.stat.exists
+
+- name: Verify the bounded Codex storage candidate type
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/blkid
+      - -o
+      - value
+      - -s
+      - TYPE
+      - "{{ vps_codex_storage_image_path }}.next"
+  register: vps_codex_storage_candidate_type
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - not vps_codex_storage_image.stat.exists
+
+- name: Prove the bounded Codex storage candidate type
+  ansible.builtin.assert:
+    that:
+      - vps_codex_storage_candidate_type.stdout == 'ext4'
+    fail_msg: "The new Codex storage candidate is not ext4."
+  when:
+    - not ansible_check_mode
+    - not vps_codex_storage_image.stat.exists
+
+- name: Atomically publish the bounded Codex storage image
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/mv
+      - --no-target-directory
+      - "{{ vps_codex_storage_image_path }}.next"
+      - "{{ vps_codex_storage_image_path }}"
+  args:
+    creates: "{{ vps_codex_storage_image_path }}"
+  when:
+    - not ansible_check_mode
+    - not vps_codex_storage_image.stat.exists
+
+- name: Protect the bounded Codex storage image
+  ansible.builtin.file:
+    path: "{{ vps_codex_storage_image_path }}"
+    state: file
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Read the bounded Codex storage filesystem type
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/blkid
+      - -o
+      - value
+      - -s
+      - TYPE
+      - "{{ vps_codex_storage_image_path }}"
+  register: vps_codex_storage_type
+  changed_when: false
+  failed_when: vps_codex_storage_type.rc not in [0, 2]
+  check_mode: false
+
+- name: Refuse an untrusted pre-existing Codex storage image
+  ansible.builtin.assert:
+    that:
+      - >-
+        (vps_codex_storage_type.stdout | default('')) == 'ext4'
+    fail_msg: >-
+      The final Codex storage image lacks the required ext4 signature. The
+      role refuses to format pre-existing data.
+
+- name: Read existing fstab entries for the Codex mountpoint
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/awk
+      - >-
+        $1 !~ /^#/ && $2 == "{{ vps_codex_storage_root }}" {print $0}
+      - /etc/fstab
+  register: vps_codex_fstab_entries
+  changed_when: false
+  check_mode: false
+
+- name: Refuse divergent or duplicate Codex fstab entries
+  ansible.builtin.assert:
+    that:
+      - vps_codex_fstab_entries.stdout_lines | length <= 1
+      - >-
+        vps_codex_fstab_entries.stdout_lines | length == 0 or
+        vps_codex_fstab_entries.stdout_lines == [
+          vps_codex_storage_image_path ~ ' ' ~ vps_codex_storage_root ~
+          ' ext4 loop,nofail,nodev,nosuid,noatime 0 2'
+        ]
+    fail_msg: >-
+      A divergent or duplicate fstab entry targets the Codex storage root.
+      Remove it through an explicit reviewed migration.
+
+- name: Persist the bounded Codex storage mount
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: "^{{ vps_codex_storage_image_path | regex_escape }}\\s+"
+    line: >-
+      {{ vps_codex_storage_image_path }} {{ vps_codex_storage_root }} ext4
+      loop,nofail,nodev,nosuid,noatime 0 2
+    owner: root
+    group: root
+    mode: "0644"
+    state: present
+
+- name: Activate the bounded Codex storage mount
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/mount
+      - --
+      - "{{ vps_codex_storage_root }}"
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - vps_codex_storage_findmnt.rc == 1
+
+- name: Reinspect the activated Codex storage mount
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/findmnt
+      - --json
+      - --mountpoint
+      - "{{ vps_codex_storage_root }}"
+      - --output
+      - TARGET,SOURCE,FSTYPE,OPTIONS
+  register: vps_codex_activated_storage_findmnt
+  changed_when: false
+  check_mode: false
+
+- name: Parse the activated Codex storage mount
+  ansible.builtin.set_fact:
+    vps_codex_activated_storage_mount: >-
+      {{ (vps_codex_activated_storage_findmnt.stdout |
+          from_json).filesystems | first }}
+    vps_codex_activated_storage_options: >-
+      {{ ((vps_codex_activated_storage_findmnt.stdout |
+          from_json).filesystems | first).options.split(',') }}
+
+- name: Read the activated Codex storage backing file
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/losetup
+      - --noheadings
+      - --output
+      - BACK-FILE
+      - "{{ vps_codex_activated_storage_mount.source }}"
+  register: vps_codex_activated_storage_backing
+  changed_when: false
+  check_mode: false
+
+- name: Prove the activated Codex storage contract
+  ansible.builtin.assert:
+    that:
+      - vps_codex_activated_storage_findmnt.rc == 0
+      - vps_codex_activated_storage_mount.target == vps_codex_storage_root
+      - vps_codex_activated_storage_mount.fstype == 'ext4'
+      - vps_codex_activated_storage_mount.source is match('^/dev/loop[0-9]+$')
+      - >-
+        (['rw', 'nosuid', 'nodev', 'noatime'] |
+         difference(vps_codex_activated_storage_options) | length) == 0
+      - >-
+        (vps_codex_activated_storage_backing.stdout | trim) ==
+        vps_codex_storage_image_path
+    fail_msg: >-
+      The activated Codex storage mount does not satisfy the bounded contract.
+
+- name: Protect the mounted Codex storage root
+  ansible.builtin.file:
+    path: "{{ vps_codex_storage_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0711"
+
+- name: Create the private Codex home directory
+  ansible.builtin.file:
+    path: "{{ vps_codex_home }}"
+    state: directory
+    owner: "{{ vps_codex_user }}"
+    group: "{{ vps_codex_group }}"
+    mode: "0700"
+
+- name: Create the private Codex workspace root
+  ansible.builtin.file:
+    path: "{{ vps_codex_workspace_root }}"
+    state: directory
+    owner: "{{ vps_codex_user }}"
+    group: "{{ vps_codex_group }}"
+    mode: "0700"
+
+- name: Inspect the protected Codex state directory
+  ansible.builtin.stat:
+    path: "{{ vps_codex_home }}/.codex"
+    follow: false
+  register: vps_codex_state_directory
+
+- name: Refuse an unsafe existing Codex state directory
+  ansible.builtin.assert:
+    that:
+      - >-
+        not vps_codex_state_directory.stat.exists or
+        (vps_codex_state_directory.stat.isdir and
+         not vps_codex_state_directory.stat.islnk and
+         vps_codex_state_directory.stat.pw_name == vps_codex_user and
+         vps_codex_state_directory.stat.gr_name == vps_codex_group and
+         vps_codex_state_directory.stat.mode == '0700')
+    fail_msg: >-
+      The Codex state directory has an unsafe type, owner, group, or mode. It
+      was preserved for explicit operator inspection.
+
+- name: Create the missing protected Codex state directory
+  ansible.builtin.file:
+    path: "{{ vps_codex_home }}/.codex"
+    state: directory
+    follow: false
+    owner: "{{ vps_codex_user }}"
+    group: "{{ vps_codex_group }}"
+    mode: "0700"
+  when: not vps_codex_state_directory.stat.exists
+
+- name: Reinspect the protected Codex state directory
+  ansible.builtin.stat:
+    path: "{{ vps_codex_home }}/.codex"
+    follow: false
+  register: vps_codex_protected_state_directory
+
+- name: Prove the protected Codex state directory boundary
+  ansible.builtin.assert:
+    that:
+      - vps_codex_protected_state_directory.stat.isdir
+      - not vps_codex_protected_state_directory.stat.islnk
+      - vps_codex_protected_state_directory.stat.pw_name == vps_codex_user
+      - vps_codex_protected_state_directory.stat.gr_name == vps_codex_group
+      - vps_codex_protected_state_directory.stat.mode == '0700'
+    fail_msg: "The protected Codex state directory boundary is not exact."
+
+- name: Create the system Codex policy directory
+  ansible.builtin.file:
+    path: /etc/codex
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Inspect live Codex policy files before candidate validation
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ vps_codex_home }}/.codex/config.toml"
+    - /etc/codex/requirements.toml
+  register: vps_codex_live_policy_state
+
+- name: Refuse unexpected live Codex policy file types
+  ansible.builtin.assert:
+    that:
+      - not item.stat.exists or item.stat.isreg
+      - not item.stat.exists or not item.stat.islnk
+    fail_msg: "A live Codex policy path has an unsafe type."
+  loop: "{{ vps_codex_live_policy_state.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Create the Codex release and cache roots
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: "{{ vps_codex_install_root }}"
+      mode: "0755"
+    - path: "{{ vps_codex_install_root }}/releases"
+      mode: "0755"
+    - path: "{{ vps_codex_cache_root }}"
+      mode: "0755"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Download the exact official Codex release archive
+  ansible.builtin.get_url:
+    url: >-
+      {{ vps_codex_release_base_url }}/{{ vps_codex_version }}/{{ vps_codex_archive_name }}
+    dest: "{{ vps_codex_cached_archive_path }}"
+    checksum: "sha256:{{ vps_codex_artifact.archive_sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+    timeout: 300
+
+- name: Inspect the immutable Codex release path
+  ansible.builtin.stat:
+    path: "{{ vps_codex_release_path }}"
+    follow: false
+  register: vps_codex_release_state
+
+- name: Inspect direct SSH state for the Codex account
+  ansible.builtin.stat:
+    path: "{{ vps_codex_home }}/.ssh"
+    follow: false
+  register: vps_codex_ssh_state
+
+- name: Refuse direct SSH state for the Codex account
+  ansible.builtin.assert:
+    that:
+      - not vps_codex_ssh_state.stat.exists
+    fail_msg: >-
+      The Codex account contains direct SSH state. Remove it through an
+      explicit credential-retirement operation before convergence.
+
+- name: Validate and publish the missing-release Codex transaction
+  ansible.builtin.include_tasks: release_transaction.yml
+
+- name: Activate all Codex surfaces transactionally
+  ansible.builtin.include_tasks: activation_transaction.yml

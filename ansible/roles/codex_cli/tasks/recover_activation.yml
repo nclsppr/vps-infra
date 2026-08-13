@@ -1,0 +1,62 @@
+---
+- name: Inspect durable Codex activation recovery state
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ vps_codex_activation_rollback_root }}"
+    - "{{ vps_codex_activation_rollback_root }}/snapshot-complete"
+    - "{{ vps_codex_activation_rollback_root }}/activation-started"
+    - "{{ vps_codex_activation_rollback_root }}/commit-complete"
+  register: vps_codex_recovery_state
+
+- name: Select durable Codex activation recovery markers
+  ansible.builtin.set_fact:
+    vps_codex_recovery_root_state: "{{ vps_codex_recovery_state.results[0].stat }}"
+    vps_codex_recovery_snapshot_state: "{{ vps_codex_recovery_state.results[1].stat }}"
+    vps_codex_recovery_started_state: "{{ vps_codex_recovery_state.results[2].stat }}"
+    vps_codex_recovery_commit_state: "{{ vps_codex_recovery_state.results[3].stat }}"
+
+- name: Refuse unsafe Codex activation recovery state
+  ansible.builtin.assert:
+    that:
+      - >-
+        not vps_codex_recovery_root_state.exists or
+        (vps_codex_recovery_root_state.isdir and
+         not vps_codex_recovery_root_state.islnk and
+         vps_codex_recovery_root_state.uid == 0 and
+         vps_codex_recovery_root_state.gid == 0 and
+         vps_codex_recovery_root_state.mode == '0700')
+      - >-
+        not vps_codex_recovery_started_state.exists or
+        vps_codex_recovery_snapshot_state.exists
+      - >-
+        not vps_codex_recovery_commit_state.exists or
+        (vps_codex_recovery_snapshot_state.exists and
+         vps_codex_recovery_started_state.exists)
+    fail_msg: >-
+      Codex activation recovery markers are incomplete or unsafe. The session
+      remains persistently masked for manual inspection.
+
+- name: Remove an interrupted pre-activation Codex snapshot
+  ansible.builtin.file:
+    path: "{{ vps_codex_activation_rollback_root }}"
+    state: absent
+  when:
+    - vps_codex_recovery_root_state.exists
+    - not vps_codex_recovery_started_state.exists
+
+- name: Accept a fully verified interrupted Codex activation commit
+  ansible.builtin.file:
+    path: "{{ vps_codex_activation_rollback_root }}"
+    state: absent
+  when:
+    - vps_codex_recovery_root_state.exists
+    - vps_codex_recovery_commit_state.exists
+
+- name: Roll back an interrupted Codex activation
+  ansible.builtin.include_tasks: rollback_activation.yml
+  when:
+    - vps_codex_recovery_root_state.exists
+    - vps_codex_recovery_started_state.exists
+    - not vps_codex_recovery_commit_state.exists
