@@ -120,6 +120,210 @@
           - --signal=TERM
           - --kill-after=5s
           - 10s
+          - /usr/bin/python3
+          - -I
+          - -c
+          - |-
+            import os
+            import selectors
+            import signal
+            import subprocess
+            import sys
+            import time
+
+            CAPTURE_LIMIT = 16384
+            HEADER_END = b"\r\n\r\n"
+            READ_TIMEOUT = 5.0
+            CLEANUP_GRACE = 0.5
+            DRAIN_GRACE = 0.25
+
+
+            def normalized_returncode(returncode):
+                if returncode is None or returncode == 0:
+                    return 70
+                if returncode < 0:
+                    return min(255, 128 - returncode)
+                return min(255, returncode)
+
+
+            def append_bounded(destination, chunk):
+                available = CAPTURE_LIMIT - len(destination)
+                if available > 0:
+                    destination.extend(chunk[:available])
+                return len(chunk) > max(0, available)
+
+
+            def read_ready(selector, timeout):
+                overflow = False
+                for key, _ in selector.select(timeout):
+                    try:
+                        chunk = os.read(key.fd, 4096)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fd)
+                        continue
+                    overflow = append_bounded(key.data, chunk) or overflow
+                return overflow
+
+
+            def signal_group(process, requested_signal):
+                try:
+                    os.killpg(process.pid, requested_signal)
+                    return True
+                except (ProcessLookupError, PermissionError):
+                    return False
+
+
+            def interrupt(signum, _frame):
+                raise InterruptedError(f"received {signal.Signals(signum).name}")
+
+
+            request = sys.stdin.buffer.read(4097)
+            if not request or len(request) > 4096:
+                raise SystemExit("invalid WebSocket smoke request")
+            if len(sys.argv) < 2:
+                raise SystemExit("missing WebSocket proxy command")
+
+            try:
+                process = subprocess.Popen(
+                    sys.argv[1:],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                    bufsize=0,
+                )
+            except OSError as error:
+                print(f"cannot start WebSocket proxy: {error}", file=sys.stderr)
+                raise SystemExit(127) from error
+
+            handled_signals = (signal.SIGTERM, signal.SIGHUP)
+            for handled_signal in handled_signals:
+                signal.signal(handled_signal, interrupt)
+
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+            for stream in (process.stdout, process.stderr):
+                os.set_blocking(stream.fileno(), False)
+
+            output = bytearray()
+            errors = bytearray()
+            failure = None
+            overflow = False
+            terminated_by_harness = False
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout.fileno(), selectors.EVENT_READ, output)
+            selector.register(process.stderr.fileno(), selectors.EVENT_READ, errors)
+
+            try:
+                process.stdin.write(request)
+                process.stdin.flush()
+                deadline = time.monotonic() + READ_TIMEOUT
+                while HEADER_END not in output:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("WebSocket response header timed out")
+                    if read_ready(selector, min(remaining, 0.1)):
+                        overflow = True
+                        raise RuntimeError("WebSocket smoke output exceeded its bound")
+                    if not selector.get_map():
+                        break
+            except BaseException as error:
+                failure = error
+            finally:
+                for handled_signal in handled_signals:
+                    signal.signal(handled_signal, signal.SIG_IGN)
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+                process.stdin = None
+
+                cleanup_deadline = time.monotonic() + CLEANUP_GRACE
+                while True:
+                    remaining = cleanup_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if selector.get_map():
+                        overflow = (
+                            read_ready(selector, min(remaining, 0.05)) or overflow
+                        )
+                    else:
+                        time.sleep(min(remaining, 0.05))
+
+                terminated_by_harness = signal_group(process, signal.SIGTERM)
+                termination_deadline = time.monotonic() + CLEANUP_GRACE
+                while True:
+                    remaining = termination_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if selector.get_map():
+                        overflow = (
+                            read_ready(selector, min(remaining, 0.05)) or overflow
+                        )
+                    else:
+                        time.sleep(min(remaining, 0.05))
+
+                terminated_by_harness = (
+                    signal_group(process, signal.SIGKILL)
+                    or terminated_by_harness
+                )
+                try:
+                    process.wait(timeout=CLEANUP_GRACE)
+                except subprocess.TimeoutExpired as error:
+                    if failure is None:
+                        failure = error
+
+                drain_deadline = time.monotonic() + DRAIN_GRACE
+                while selector.get_map():
+                    remaining = drain_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    overflow = read_ready(selector, remaining) or overflow
+                selector.close()
+                process.stdout.close()
+                process.stderr.close()
+
+            if isinstance(failure, (TimeoutError, InterruptedError)):
+                result = 124
+                diagnostic = str(failure)
+            elif failure is not None:
+                result = 70
+                diagnostic = str(failure)
+            elif overflow:
+                result = 70
+                diagnostic = "WebSocket smoke output exceeded its bound"
+            elif HEADER_END not in output:
+                result = normalized_returncode(process.returncode)
+                diagnostic = (
+                    "WebSocket proxy exited before its response header "
+                    f"with status {process.returncode}"
+                )
+            elif process.returncode not in (None, 0) and not (
+                terminated_by_harness
+                and process.returncode in (-signal.SIGTERM, -signal.SIGKILL)
+            ):
+                result = normalized_returncode(process.returncode)
+                diagnostic = f"WebSocket proxy exited with status {process.returncode}"
+            else:
+                result = 0
+                diagnostic = None
+
+            if diagnostic:
+                if errors and not errors.endswith(b"\n"):
+                    append_bounded(errors, b"\n")
+                append_bounded(
+                    errors,
+                    f"atlas Codex proxy smoke: {diagnostic}\n".encode(),
+                )
+
+            sys.stdout.buffer.write(output)
+            sys.stdout.buffer.flush()
+            sys.stderr.buffer.write(errors)
+            sys.stderr.buffer.flush()
+            raise SystemExit(result)
           - /usr/sbin/runuser
           - --user
           - "{{ vps_codex_remote_user }}"
@@ -141,12 +345,23 @@
         stdin_add_newline: false
       register: vps_codex_proxy_websocket_smoke
       changed_when: false
-      failed_when: vps_codex_proxy_websocket_smoke.rc not in [0, 1, 124]
+      failed_when: vps_codex_proxy_websocket_smoke.rc != 0
 
     - name: Confirm the Codex proxy completed the WebSocket upgrade
       ansible.builtin.assert:
         that:
+          - vps_codex_proxy_websocket_smoke.rc == 0
           - "'HTTP/1.1 101' in vps_codex_proxy_websocket_smoke.stdout"
+          - >-
+            vps_codex_proxy_websocket_smoke.stdout is search(
+            '(?im)^connection: upgrade\r?$')
+          - >-
+            vps_codex_proxy_websocket_smoke.stdout is search(
+            '(?im)^upgrade: websocket\r?$')
+          - >-
+            vps_codex_proxy_websocket_smoke.stdout is search(
+            '(?im)^sec-websocket-accept: '
+            ~ 's3pPLMBiTxaQ9kYGzzhZRbK\+xOo=\r?$')
         fail_msg: >-
           The private App Server socket exists, but its Codex proxy did not
           complete a WebSocket upgrade.
