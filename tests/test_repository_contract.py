@@ -545,12 +545,65 @@ class SupplyChainContractTests(unittest.TestCase):
         self.assertNotIn("--ignore-unfixed", scan)
         self.assertNotIn("--ignorefile", scan)
         self.assertNotIn("self-hosted", workflow_text)
+
+    def test_required_ci_runs_the_complete_canonical_check(self) -> None:
         validate = yaml.load(
             (ROOT / ".github/workflows/validate.yml").read_text(encoding="utf-8"),
             Loader=yaml.BaseLoader,
         )
-        validate_command = validate["jobs"]["check"]["steps"][-1]["run"]
-        self.assertIn("check-postgres-image", validate_command)
+        self.assertEqual(list(validate["jobs"]), ["check"])
+        validate_job = validate["jobs"]["check"]
+        self.assertEqual(validate_job["name"], "Repository contract")
+        for bypass in (
+            "if",
+            "continue-on-error",
+            "env",
+            "defaults",
+            "strategy",
+            "container",
+        ):
+            self.assertNotIn(bypass, validate_job)
+        validate_steps = [
+            step
+            for step in validate_job["steps"]
+            if step.get("name") == "Validate repository"
+        ]
+        self.assertEqual(len(validate_steps), 1)
+        validate_step = validate_steps[0]
+        self.assertEqual(validate_step["run"], "make check")
+        for bypass in (
+            "if",
+            "continue-on-error",
+            "working-directory",
+            "env",
+            "shell",
+        ):
+            self.assertNotIn(bypass, validate_step)
+
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        check_dependencies = re.search(r"(?m)^check: ([^#\n]+)", makefile)
+        platform_dependencies = re.search(
+            r"(?m)^check-platform: ([^#\n]+)", makefile
+        )
+        self.assertIsNotNone(check_dependencies)
+        self.assertIsNotNone(platform_dependencies)
+        assert check_dependencies is not None
+        assert platform_dependencies is not None
+        self.assertEqual(
+            check_dependencies.group(1).split(),
+            ["check-fast", "check-platform"],
+        )
+        self.assertEqual(
+            platform_dependencies.group(1).split(),
+            [
+                "check-platform-config",
+                "check-public-static-edge",
+                "check-surplasse-adapter",
+                "check-prometheus",
+                "check-caddy",
+                "check-postgres-image",
+            ],
+        )
 
     def test_renovate_never_promotes_custom_images(self) -> None:
         config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
