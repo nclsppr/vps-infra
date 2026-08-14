@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -11,7 +12,8 @@ import unittest
 from pathlib import Path
 
 import yaml
-from jinja2 import Environment
+from ansible.parsing.dataloader import DataLoader
+from ansible.template import Templar, trust_as_template
 
 try:
     import tomllib
@@ -39,7 +41,8 @@ class CodexCliContractTests(unittest.TestCase):
             if task["name"]
             == "Open a bounded WebSocket upgrade through the Codex proxy"
         )
-        argv = smoke["ansible.builtin.command"]["argv"]
+        command = smoke["ansible.builtin.command"]
+        argv = command["argv"]
         self.assertEqual(
             argv[:3],
             [
@@ -66,14 +69,13 @@ class CodexCliContractTests(unittest.TestCase):
         )
         self.assertNotIn("/usr/bin/timeout", argv)
         self.assertNotIn("/usr/bin/runuser", argv)
+        self.assertNotIn("stdin", command)
+        self.assertNotIn("stdin_add_newline", command)
         watchdog_start = argv[3].index(
             "signal.setitimer(signal.ITIMER_REAL, WATCHDOG_TIMEOUT)"
         )
         watchdog_stop = argv[3].index(
             "signal.setitimer(signal.ITIMER_REAL, 0)"
-        )
-        self.assertLess(
-            watchdog_start, argv[3].index("request = sys.stdin.buffer.read(4097)")
         )
         self.assertLess(watchdog_start, argv[3].index("process = subprocess.Popen("))
         self.assertGreater(watchdog_stop, argv[3].index("finally:"))
@@ -82,14 +84,25 @@ class CodexCliContractTests(unittest.TestCase):
         self.assertNotIn("os.waitid", argv[3])
         self.assertNotIn("process.poll()", argv[3])
         self.assertNotIn("leader_cleanup_signal_sent", argv[3])
+        self.assertNotIn("sys.stdin", argv[3])
+        self.assertIn("process.stdin.write(REQUEST)", argv[3])
         self.assertIn("elif process.returncode != 0:", argv[3])
 
-        request = (
-            Environment()
-            .from_string(smoke["ansible.builtin.command"]["stdin"])
-            .render()
-            .encode()
+        rendered_harness = str(
+            Templar(loader=DataLoader()).template(trust_as_template(argv[3]))
         )
+        self.assertEqual(rendered_harness, argv[3])
+        harness_tree = ast.parse(rendered_harness)
+        request_assignment = next(
+            node
+            for node in harness_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "REQUEST"
+                for target in node.targets
+            )
+        )
+        request = ast.literal_eval(request_assignment.value)
         self.assertEqual(
             request,
             b"GET /rpc HTTP/1.1\r\n"
@@ -99,66 +112,54 @@ class CodexCliContractTests(unittest.TestCase):
             b"Sec-WebSocket-Version: 13\r\n"
             b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         )
+        self.assertEqual(len(request), 158)
         child = """
 import select
 import sys
 
-request = sys.stdin.buffer.read(%d)
+expected = %r
+request = sys.stdin.buffer.read(len(expected))
 ready, _, _ = select.select([sys.stdin.buffer], [], [], 0)
-if len(request) != %d or ready:
+if request != expected or ready:
     raise SystemExit(71)
 sys.stdout.buffer.write(
     b"HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\n\\r\\n"
 )
 sys.stdout.buffer.flush()
 sys.stdin.buffer.read()
-""" % (len(request), len(request))
-        harness = subprocess.run(
-            [sys.executable, "-I", "-c", argv[3], sys.executable, "-I", "-c", child],
-            input=request,
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-        self.assertEqual(harness.returncode, 0, harness.stderr.decode())
-        self.assertIn(b"HTTP/1.1 101", harness.stdout)
-
-        watchdog_harness = argv[3].replace(
-            "READ_TIMEOUT = 5.0", "READ_TIMEOUT = 30.0"
-        ).replace("WATCHDOG_TIMEOUT = 10.0", "WATCHDOG_TIMEOUT = 0.1")
-        pre_input_watchdog = subprocess.Popen(
+""" % request
+        harness = subprocess.Popen(
             [
                 sys.executable,
                 "-I",
                 "-c",
-                watchdog_harness,
+                rendered_harness,
                 sys.executable,
                 "-I",
                 "-c",
-                (
-                    "import sys,time; "
-                    "print('CHILD_STARTED', file=sys.stderr, flush=True); "
-                    "time.sleep(30)"
-                ),
+                child,
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        pre_input_started = time.monotonic()
-        self.assertEqual(pre_input_watchdog.wait(timeout=3), 124)
-        self.assertLess(time.monotonic() - pre_input_started, 2)
-        assert pre_input_watchdog.stdin is not None
-        assert pre_input_watchdog.stdout is not None
-        assert pre_input_watchdog.stderr is not None
-        pre_input_watchdog.stdin.close()
-        self.assertEqual(pre_input_watchdog.stdout.read(), b"")
-        pre_input_errors = pre_input_watchdog.stderr.read()
-        pre_input_watchdog.stdout.close()
-        pre_input_watchdog.stderr.close()
-        self.assertIn(b"WebSocket smoke watchdog expired", pre_input_errors)
-        self.assertNotIn(b"CHILD_STARTED", pre_input_errors)
+        harness_started = time.monotonic()
+        self.assertEqual(harness.wait(timeout=10), 0)
+        self.assertLess(time.monotonic() - harness_started, 3)
+        assert harness.stdin is not None
+        assert harness.stdout is not None
+        assert harness.stderr is not None
+        harness.stdin.close()
+        harness_output = harness.stdout.read()
+        harness_errors = harness.stderr.read()
+        harness.stdout.close()
+        harness.stderr.close()
+        self.assertEqual(harness_errors, b"")
+        self.assertIn(b"HTTP/1.1 101", harness_output)
 
+        watchdog_harness = rendered_harness.replace(
+            "READ_TIMEOUT = 5.0", "READ_TIMEOUT = 30.0"
+        ).replace("WATCHDOG_TIMEOUT = 10.0", "WATCHDOG_TIMEOUT = 0.1")
         watchdog_child = """
 import os
 import sys
@@ -180,7 +181,6 @@ time.sleep(30)
                 "-c",
                 watchdog_child,
             ],
-            input=request,
             capture_output=True,
             check=False,
             timeout=5,
@@ -229,7 +229,7 @@ raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
                 sys.executable,
                 "-I",
                 "-c",
-                argv[3],
+                rendered_harness,
                 sys.executable,
                 "-I",
                 "-c",
@@ -239,7 +239,6 @@ raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
                 "-c",
                 runuser_proxy,
             ],
-            input=request,
             capture_output=True,
             check=False,
             timeout=10,
@@ -257,13 +256,12 @@ raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
                 sys.executable,
                 "-I",
                 "-c",
-                argv[3],
+                rendered_harness,
                 sys.executable,
                 "-I",
                 "-c",
                 failed_child,
             ],
-            input=request,
             capture_output=True,
             check=False,
             timeout=10,
@@ -284,13 +282,12 @@ raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
                 sys.executable,
                 "-I",
                 "-c",
-                argv[3],
+                rendered_harness,
                 sys.executable,
                 "-I",
                 "-c",
                 delayed_failure_child,
             ],
-            input=request,
             capture_output=True,
             check=False,
             timeout=10,
@@ -310,13 +307,12 @@ raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
                 sys.executable,
                 "-I",
                 "-c",
-                argv[3],
+                rendered_harness,
                 sys.executable,
                 "-I",
                 "-c",
                 crashed_child,
             ],
-            input=request,
             capture_output=True,
             check=False,
             timeout=10,
@@ -387,7 +383,7 @@ raise SystemExit(%d)
             exit_status: int,
             term_behavior: str,
             *,
-            harness_source: str = argv[3],
+            harness_source: str = rendered_harness,
             leader_exit_delay: float = 0.0,
         ) -> subprocess.CompletedProcess[bytes]:
             started = time.monotonic()
@@ -404,7 +400,6 @@ raise SystemExit(%d)
                         exit_status, term_behavior, leader_exit_delay
                     ),
                 ],
-                input=request,
                 capture_output=True,
                 check=False,
                 timeout=10,
@@ -436,13 +431,13 @@ raise SystemExit(%d)
         # exits rc=0 while the harness is paused immediately before TERM, and a
         # descendant keeps the anchored process group alive. Linux killpg then
         # succeeds on the zombie group without changing the final rc=0 truth.
-        race_harness = argv[3].replace(
+        race_harness = rendered_harness.replace(
             "        signal_group(process, signal.SIGTERM)",
             "        time.sleep(0.4)\n"
             "        signal_group(process, signal.SIGTERM)",
             1,
         )
-        self.assertNotEqual(race_harness, argv[3])
+        self.assertNotEqual(race_harness, rendered_harness)
         natural_0 = run_descendant_exit_case(
             0,
             "ignore",
@@ -468,13 +463,12 @@ sys.stdin.buffer.read()
                 sys.executable,
                 "-I",
                 "-c",
-                argv[3],
+                rendered_harness,
                 sys.executable,
                 "-I",
                 "-c",
                 overflow_child,
             ],
-            input=request,
             capture_output=True,
             check=False,
             timeout=10,
@@ -501,13 +495,12 @@ sys.stdin.buffer.read()
                 sys.executable,
                 "-I",
                 "-c",
-                argv[3],
+                rendered_harness,
                 sys.executable,
                 "-I",
                 "-c",
                 misleading_child,
             ],
-            input=request,
             capture_output=True,
             check=False,
             timeout=10,
