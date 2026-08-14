@@ -319,7 +319,13 @@
                     f"atlas Codex proxy smoke: {diagnostic}\n".encode(),
                 )
 
-            sys.stdout.buffer.write(output)
+            header_end = output.find(HEADER_END)
+            if header_end >= 0:
+                emitted_output = output[:header_end + len(HEADER_END)]
+            else:
+                emitted_output = output
+
+            sys.stdout.buffer.write(emitted_output)
             sys.stdout.buffer.flush()
             sys.stderr.buffer.write(errors)
             sys.stderr.buffer.flush()
@@ -351,7 +357,9 @@
       ansible.builtin.assert:
         that:
           - vps_codex_proxy_websocket_smoke.rc == 0
-          - "'HTTP/1.1 101' in vps_codex_proxy_websocket_smoke.stdout"
+          - >-
+            vps_codex_proxy_websocket_smoke.stdout_lines[0:1] ==
+            ['HTTP/1.1 101 Switching Protocols']
           - >-
             vps_codex_proxy_websocket_smoke.stdout is search(
             '(?im)^connection: upgrade\r?$')

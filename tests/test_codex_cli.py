@@ -269,6 +269,46 @@ sys.stdin.buffer.read()
         self.assertEqual(overflow.returncode, 70, overflow.stderr.decode())
         self.assertEqual(len(overflow.stdout), 16384)
         self.assertIn(b"output exceeded its bound", overflow.stderr)
+
+        misleading_child = """
+import sys
+
+sys.stdin.buffer.read(%d)
+sys.stdout.buffer.write(
+    b"HTTP/1.1 500 Broken\\r\\nContent-Length: 91\\r\\n\\r\\n"
+    b"HTTP/1.1 101 Switching Protocols\\r\\n"
+    b"Connection: Upgrade\\r\\nUpgrade: websocket\\r\\n"
+    b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\\r\\n\\r\\n"
+)
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read()
+""" % len(request)
+        misleading = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                argv[7],
+                sys.executable,
+                "-I",
+                "-c",
+                misleading_child,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(misleading.returncode, 0, misleading.stderr.decode())
+        self.assertEqual(
+            misleading.stdout,
+            b"HTTP/1.1 500 Broken\r\nContent-Length: 91\r\n\r\n",
+        )
+        status_assertion = smoke_block["block"][2]["ansible.builtin.assert"]["that"][1]
+        self.assertIn(
+            "stdout_lines[0:1] == ['HTTP/1.1 101 Switching Protocols']",
+            status_assertion,
+        )
         converge_tasks = yaml.safe_load(
             (ROLE / "tasks/converge.yml").read_text(encoding="utf-8")
         )
