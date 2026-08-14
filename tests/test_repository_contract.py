@@ -605,6 +605,40 @@ class SupplyChainContractTests(unittest.TestCase):
             ],
         )
 
+    def test_smtp_decision_and_runbook_are_linked_without_reusing_adr_0006(
+        self,
+    ) -> None:
+        decisions = sorted((ROOT / "docs/decisions").glob("[0-9][0-9][0-9][0-9]-*.md"))
+        by_number: dict[str, list[str]] = {}
+        for decision in decisions:
+            by_number.setdefault(decision.name[:4], []).append(decision.name)
+        self.assertEqual(
+            by_number["0006"],
+            ["0006-private-codex-app-server.md"],
+        )
+        self.assertEqual(
+            by_number["0007"],
+            ["0007-relais-email-transactionnel-surplasse.md"],
+        )
+
+        repository_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        adapter_readme = (ROOT / "applications/surplasse/README.md").read_text(
+            encoding="utf-8"
+        )
+        smtp_decision = (
+            ROOT / "docs/decisions/0007-relais-email-transactionnel-surplasse.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "docs/decisions/0007-relais-email-transactionnel-surplasse.md",
+            repository_readme,
+        )
+        self.assertIn("docs/operations/surplasse-smtp.md", repository_readme)
+        self.assertIn(
+            "../../docs/operations/surplasse-smtp.md",
+            adapter_readme,
+        )
+        self.assertIn("../operations/surplasse-smtp.md", smtp_decision)
+
     def test_renovate_never_promotes_custom_images(self) -> None:
         config = json.loads((ROOT / "renovate.json").read_text(encoding="utf-8"))
         managers = config["customManagers"]

@@ -266,6 +266,14 @@ platform/
       inchangées ;
 - [ ] ne publier que les composants affectés ;
 - [ ] garder SBOM, provenance, attestations et Trivy ;
+- [ ] select a managed transactional email relay and accept its DPA, limits,
+      support terms, and costs;
+- [ ] preserve the OVH MX records and publish one reviewed SPF record, the
+      exact DKIM records, and a DMARC record;
+- [ ] prove from Atlas that the Backend can use port `587` with required
+      STARTTLS, then prove delivery, bounce handling, and operator alerting;
+- [ ] inspect the exact Backend image and the started process to prove the
+      effective SMTP and TLS configuration, not only the Compose declaration;
 - [ ] ajouter la promotion vers `vps-infra`.
 
 ## Phase 5 — livrer le contrôleur de releases

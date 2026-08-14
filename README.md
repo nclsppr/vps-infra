@@ -167,6 +167,7 @@ Cette décision est détaillée dans
 - [Reconstruction depuis zéro](docs/rebuild.md)
 - [Accès OVHcloud à préparer](docs/operations/acces-ovhcloud.md)
 - [Codex CLI on Atlas](docs/operations/codex-cli.md)
+- [Surplasse SMTP relay preparation](docs/operations/surplasse-smtp.md)
 - [Sauvegarde PostgreSQL et répétition de restauration](docs/operations/postgresql-backup.md)
 - [Contrat des secrets](secrets/README.md)
 - [Sources et preuves d’audit](docs/references.md)
@@ -177,6 +178,7 @@ Cette décision est détaillée dans
 - [ADR-0004 - Parkventory static demo](docs/decisions/0004-parkventory-static-demo.md)
 - [ADR-0005 - dedicated Codex CLI account](docs/decisions/0005-dedicated-codex-cli-account.md)
 - [ADR-0006 - private Codex App Server](docs/decisions/0006-private-codex-app-server.md)
+- [ADR-0007 - managed transactional email relay for Surplasse](docs/decisions/0007-relais-email-transactionnel-surplasse.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas

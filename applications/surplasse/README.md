@@ -44,7 +44,10 @@ The adapter also stays locked for these integration reasons:
   `.disabled` suffix;
 - the Caddy service does not receive scoped OVH DNS credentials;
 - the application secret files, restore proof, DNS cutover, and public smoke
-  proof do not exist in the release contract.
+  proof do not exist in the release contract;
+- no managed transactional email provider is selected or provisioned;
+- SPF, DKIM, DMARC, STARTTLS from Atlas, final delivery, bounce handling, and
+  operator alerting do not have reviewed evidence;
 - the source branch, image provenance, Stripe Connect production adapter, and
   Surplasse integration bundle do not have complete release evidence.
 
@@ -97,8 +100,24 @@ Every single-line input must end with one newline. The Stripe key must be a
 live secret key. Both webhook values must have the Stripe signing-secret
 prefix, and the two values must be distinct. The OVH values must match their
 documented token lengths. The application secret and consumer key must be
-distinct. The SMTP host must be a DNS name and the port must be in the TCP
-port range.
+distinct. The secret materializer accepts a DNS name and a bounded TCP port as
+operator input. This input validation is not SMTP readiness evidence.
+
+The rendered adapter requires a lowercase DNS name, port `587`,
+`SMTP_START_TLS=REQUIRED`, `SMTP_TLS=false`,
+`QUARKUS_MAILER_AUTH_METHODS=PLAIN LOGIN`, the fixed sender, and the exact
+secret paths. A later provider-selection change must bind the SMTP host to a
+reviewed public provider contract. The adapter rejects every additional Backend
+environment key declared in Compose. This rule prevents a declared Quarkus,
+global TLS, or Java option from silently changing the reviewed contract. It
+does not detect a value embedded in the image or exported by its entrypoint.
+The `smtp-effective-runtime-configuration` gate stays closed until the exact
+image and a sanitized view of the started process prove the effective values.
+
+Atlas runs no Postfix, Exim, or other mail transfer agent. The Backend connects
+directly to a managed transactional email relay. Follow the
+[SMTP relay runbook](../../docs/operations/surplasse-smtp.md) before provider
+selection, DNS changes, secret installation, or activation.
 
 The helper parses the JWKS as strict UTF-8 JSON. It rejects duplicate JSON
 keys, private RSA parameters, keys other than RS256 signing keys, an RSA key
