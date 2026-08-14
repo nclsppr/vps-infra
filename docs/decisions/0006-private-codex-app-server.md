@@ -42,9 +42,11 @@ Atlas uses these boundaries when `vps_codex_remote_enabled` is true:
 3. `atlas-codex-app-server.service` runs the exact pinned Codex executable as
    `codex` below `atlas-codex.slice`. It listens only on the managed Unix socket
    below `/srv/codex/home/.codex/app-server-control`. It is enabled at boot,
-   restarts after failure, denies IPv4 and IPv6 socket binding, and retains the
+   restarts after failure, allows the UDP bind required by the pinned musl DNS
+   resolver, and denies other IPv4 and IPv6 socket binding. It retains the
    filesystem, device, capability, memory, CPU, and task boundaries from the
-   interactive launcher. It opens no firewall port.
+   interactive launcher. It opens no firewall port, and UFW denies undeclared
+   inbound traffic.
 4. OpenSSH applies a root-owned `ForceCommand` gate to every `codex-remote`
    connection. The gate never evaluates the caller's command string. It parses
    the current desktop login-shell envelope and maps only the path probe,
@@ -92,6 +94,7 @@ Git.
 - The current desktop SSH workflow works through its expected login shell and
   command names while the privilege transition remains argument-bounded.
 - All App Server and proxy work shares the existing aggregate resource limits.
+- The pinned musl client can resolve DNS without permitting a TCP listener.
 
 ### Negative
 
@@ -107,6 +110,8 @@ Git.
   connect.
 - Mobile control still depends on the desktop app. Running the App Server on
   Atlas does not make Atlas a standalone ChatGPT mobile backend.
+- The runtime may bind a transient UDP client socket for DNS. UFW remains the
+  independent inbound boundary for every undeclared port.
 
 ## Rollback
 

@@ -43,6 +43,7 @@
       - --property=ExecStart
       - --property=Environment
       - --property=RestrictAddressFamilies
+      - --property=SocketBindAllow
       - --property=SocketBindDeny
   register: vps_codex_app_server_properties
   changed_when: false
@@ -87,6 +88,9 @@
       - >-
         vps_codex_app_server_properties.stdout is search(
         '(?m)^RestrictAddressFamilies=.*AF_UNIX')
+      - >-
+        vps_codex_app_server_properties.stdout is search(
+        '(?m)^SocketBindAllow=.*udp')
       - >-
         vps_codex_app_server_properties.stdout is search(
         '(?m)^SocketBindDeny=.*ipv4')

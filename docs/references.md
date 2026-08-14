@@ -78,6 +78,12 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
   disponibilité d’Ubuntu 26.04 LTS dans le catalogue d’images OVHcloud.
 - [Ansible — Playbooks](https://docs.ansible.com/projects/ansible-core/devel/playbook_guide/playbooks_intro.html) :
   playbooks versionnables, idempotence et mode `--check`.
+- [systemd — resource control](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html#SocketBindAllow=) :
+  priorité des règles `SocketBindAllow` sur `SocketBindDeny` et filtrage des
+  appels `bind(2)` par famille d’adresses, protocole et port.
+- [musl libc — DNS resolver](https://git.musl-libc.org/cgit/musl/tree/src/network/res_msend.c) :
+  socket UDP et bind local éphémère utilisés par la résolution DNS du binaire
+  Linux musl épinglé.
 - [OVHcloud — documentation VPS](https://help.ovhcloud.com/csm/fr-documentation-bare-metal-cloud-virtual-private-servers?id=kb_browse_cat&kb_id=203c4f65551974502d4c6e78b7421996) :
   installation, KVM, SSH, snapshots et opérations propres à la gamme VPS.
 - [OVHcloud — diagnostic VPS](https://help.ovhcloud.com/csm/fr-documentation-bare-metal-cloud-virtual-private-servers-troubleshooting?id=kb_browse_cat&kb_id=203c4f65551974502d4c6e78b7421996) :
