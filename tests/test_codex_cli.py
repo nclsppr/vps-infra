@@ -41,19 +41,15 @@ class CodexCliContractTests(unittest.TestCase):
         )
         argv = smoke["ansible.builtin.command"]["argv"]
         self.assertEqual(
-            argv[:7],
+            argv[:3],
             [
-                "/usr/bin/timeout",
-                "--signal=TERM",
-                "--kill-after=5s",
-                "10s",
                 "/usr/bin/python3",
                 "-I",
                 "-c",
             ],
         )
         self.assertEqual(
-            argv[8:],
+            argv[4:],
             [
                 "/usr/sbin/runuser",
                 "--user",
@@ -68,7 +64,25 @@ class CodexCliContractTests(unittest.TestCase):
                 "--runtime-validation",
             ],
         )
+        self.assertNotIn("/usr/bin/timeout", argv)
         self.assertNotIn("/usr/bin/runuser", argv)
+        watchdog_start = argv[3].index(
+            "signal.setitimer(signal.ITIMER_REAL, WATCHDOG_TIMEOUT)"
+        )
+        watchdog_stop = argv[3].index(
+            "signal.setitimer(signal.ITIMER_REAL, 0)"
+        )
+        self.assertLess(
+            watchdog_start, argv[3].index("request = sys.stdin.buffer.read(4097)")
+        )
+        self.assertLess(watchdog_start, argv[3].index("process = subprocess.Popen("))
+        self.assertGreater(watchdog_stop, argv[3].index("finally:"))
+        self.assertNotIn("128 + signal.SIGTERM", argv[3])
+        self.assertNotIn("128 + signal.SIGKILL", argv[3])
+        self.assertNotIn("os.waitid", argv[3])
+        self.assertNotIn("process.poll()", argv[3])
+        self.assertNotIn("leader_cleanup_signal_sent", argv[3])
+        self.assertIn("elif process.returncode != 0:", argv[3])
 
         request = (
             Environment()
@@ -100,7 +114,7 @@ sys.stdout.buffer.flush()
 sys.stdin.buffer.read()
 """ % (len(request), len(request))
         harness = subprocess.run(
-            [sys.executable, "-I", "-c", argv[7], sys.executable, "-I", "-c", child],
+            [sys.executable, "-I", "-c", argv[3], sys.executable, "-I", "-c", child],
             input=request,
             capture_output=True,
             check=False,
@@ -109,13 +123,141 @@ sys.stdin.buffer.read()
         self.assertEqual(harness.returncode, 0, harness.stderr.decode())
         self.assertIn(b"HTTP/1.1 101", harness.stdout)
 
+        watchdog_harness = argv[3].replace(
+            "READ_TIMEOUT = 5.0", "READ_TIMEOUT = 30.0"
+        ).replace("WATCHDOG_TIMEOUT = 10.0", "WATCHDOG_TIMEOUT = 0.1")
+        pre_input_watchdog = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                watchdog_harness,
+                sys.executable,
+                "-I",
+                "-c",
+                (
+                    "import sys,time; "
+                    "print('CHILD_STARTED', file=sys.stderr, flush=True); "
+                    "time.sleep(30)"
+                ),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        pre_input_started = time.monotonic()
+        self.assertEqual(pre_input_watchdog.wait(timeout=3), 124)
+        self.assertLess(time.monotonic() - pre_input_started, 2)
+        assert pre_input_watchdog.stdin is not None
+        assert pre_input_watchdog.stdout is not None
+        assert pre_input_watchdog.stderr is not None
+        pre_input_watchdog.stdin.close()
+        self.assertEqual(pre_input_watchdog.stdout.read(), b"")
+        pre_input_errors = pre_input_watchdog.stderr.read()
+        pre_input_watchdog.stdout.close()
+        pre_input_watchdog.stderr.close()
+        self.assertIn(b"WebSocket smoke watchdog expired", pre_input_errors)
+        self.assertNotIn(b"CHILD_STARTED", pre_input_errors)
+
+        watchdog_child = """
+import os
+import sys
+import time
+
+sys.stdin.buffer.read(%d)
+print(f"WATCHDOG_CHILD={os.getpid()}", file=sys.stderr, flush=True)
+time.sleep(30)
+""" % len(request)
+        watchdog_started = time.monotonic()
+        watchdog_expired = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                watchdog_harness,
+                sys.executable,
+                "-I",
+                "-c",
+                watchdog_child,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertLess(time.monotonic() - watchdog_started, 3)
+        self.assertEqual(watchdog_expired.returncode, 124)
+        self.assertIn(b"WebSocket smoke watchdog expired", watchdog_expired.stderr)
+        watchdog_child_match = re.search(
+            rb"WATCHDOG_CHILD=([0-9]+)", watchdog_expired.stderr
+        )
+        self.assertIsNotNone(watchdog_child_match)
+        watchdog_child_pid = int(watchdog_child_match.group(1))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(watchdog_child_pid, 0)
+
+        runuser_proxy = """
+import select
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+request = sys.stdin.buffer.read(%d)
+ready, _, _ = select.select([sys.stdin.buffer], [], [], 0)
+if len(request) != %d or ready:
+    raise SystemExit(71)
+sys.stdout.buffer.write(
+    b"HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\n\\r\\n"
+)
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read()
+time.sleep(30)
+""" % (len(request), len(request))
+        runuser_wrapper = """
+import signal
+import subprocess
+import sys
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen(sys.argv[1:])
+returncode = child.wait()
+raise SystemExit(returncode if returncode >= 0 else 128 - returncode)
+"""
+        mapped_sigterm = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                argv[3],
+                sys.executable,
+                "-I",
+                "-c",
+                runuser_wrapper,
+                sys.executable,
+                "-I",
+                "-c",
+                runuser_proxy,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(mapped_sigterm.returncode, 143)
+        self.assertIn(b"HTTP/1.1 101", mapped_sigterm.stdout)
+        self.assertIn(
+            b"WebSocket proxy exited with status 143",
+            mapped_sigterm.stderr,
+        )
+
         failed_child = child + "\nraise SystemExit(72)\n"
         rejected = subprocess.run(
             [
                 sys.executable,
                 "-I",
                 "-c",
-                argv[7],
+                argv[3],
                 sys.executable,
                 "-I",
                 "-c",
@@ -142,7 +284,7 @@ sys.stdin.buffer.read()
                 sys.executable,
                 "-I",
                 "-c",
-                argv[7],
+                argv[3],
                 sys.executable,
                 "-I",
                 "-c",
@@ -154,7 +296,10 @@ sys.stdin.buffer.read()
             timeout=10,
         )
         self.assertEqual(delayed_rejected.returncode, 74)
-        self.assertIn(b"WebSocket proxy exited with status 74", delayed_rejected.stderr)
+        self.assertIn(
+            b"WebSocket proxy exited with status 74",
+            delayed_rejected.stderr,
+        )
 
         crashed_child = child + (
             "\nimport os, signal\n"
@@ -165,7 +310,7 @@ sys.stdin.buffer.read()
                 sys.executable,
                 "-I",
                 "-c",
-                argv[7],
+                argv[3],
                 sys.executable,
                 "-I",
                 "-c",
@@ -179,11 +324,32 @@ sys.stdin.buffer.read()
         self.assertEqual(crashed.returncode, 139)
         self.assertIn(b"WebSocket proxy exited with status -11", crashed.stderr)
 
-        descendant_child = """
+        def descendant_exit_child(
+            exit_status: int,
+            term_behavior: str,
+            leader_exit_delay: float = 0.0,
+        ) -> str:
+            if term_behavior == "ignore":
+                term_setup = "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            elif term_behavior == "exit":
+                term_setup = (
+                    "signal.signal(signal.SIGTERM, lambda *_: "
+                    "(os.write(2, b'DESCENDANT_TERM\\n'), sys.exit(0))); "
+                )
+            else:  # pragma: no cover - test fixture misuse
+                raise AssertionError(f"unsupported TERM behavior: {term_behavior}")
+            descendant_program = (
+                "import os,signal,sys,time; "
+                + term_setup
+                + "os.write(int(sys.argv[1]), b'R'); "
+                "os.close(int(sys.argv[1])); time.sleep(30)"
+            )
+            return """
 import os
 import select
 import subprocess
 import sys
+import time
 
 request = sys.stdin.buffer.read(%d)
 ready, _, _ = select.select([sys.stdin.buffer], [], [], 0)
@@ -194,8 +360,7 @@ descendant = subprocess.Popen([
     sys.executable,
     "-I",
     "-c",
-    "import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-    "os.write(int(sys.argv[1]), b'R'); os.close(int(sys.argv[1])); time.sleep(30)",
+    %r,
     str(ready_writer),
 ], pass_fds=(ready_writer,))
 os.close(ready_writer)
@@ -208,39 +373,87 @@ sys.stdout.buffer.write(
 )
 sys.stdout.buffer.flush()
 sys.stdin.buffer.read()
-raise SystemExit(73)
-""" % (len(request), len(request))
-        started = time.monotonic()
-        held_pipe = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-c",
-                argv[7],
-                sys.executable,
-                "-I",
-                "-c",
-                descendant_child,
-            ],
-            input=request,
-            capture_output=True,
-            check=False,
-            timeout=10,
+time.sleep(%r)
+raise SystemExit(%d)
+""" % (
+                len(request),
+                len(request),
+                descendant_program,
+                leader_exit_delay,
+                exit_status,
+            )
+
+        def run_descendant_exit_case(
+            exit_status: int,
+            term_behavior: str,
+            *,
+            harness_source: str = argv[3],
+            leader_exit_delay: float = 0.0,
+        ) -> subprocess.CompletedProcess[bytes]:
+            started = time.monotonic()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    harness_source,
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    descendant_exit_child(
+                        exit_status, term_behavior, leader_exit_delay
+                    ),
+                ],
+                input=request,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertEqual(result.returncode, exit_status, result.stderr.decode())
+            if exit_status == 0:
+                self.assertNotIn(b"atlas Codex proxy smoke:", result.stderr)
+            else:
+                self.assertIn(
+                    f"WebSocket proxy exited with status {exit_status}".encode(),
+                    result.stderr,
+                )
+            descendant_match = re.search(rb"DESCENDANT=([0-9]+)", result.stderr)
+            self.assertIsNotNone(descendant_match)
+            descendant_pid = int(descendant_match.group(1))
+            descendant_deadline = time.monotonic() + 2
+            while time.monotonic() < descendant_deadline:
+                try:
+                    os.kill(descendant_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("proxy smoke descendant survived process-group cleanup")
+            return result
+
+        # Widen the former waitid-to-killpg race deterministically: the leader
+        # exits rc=0 while the harness is paused immediately before TERM, and a
+        # descendant keeps the anchored process group alive. Linux killpg then
+        # succeeds on the zombie group without changing the final rc=0 truth.
+        race_harness = argv[3].replace(
+            "        signal_group(process, signal.SIGTERM)",
+            "        time.sleep(0.4)\n"
+            "        signal_group(process, signal.SIGTERM)",
+            1,
         )
-        self.assertLess(time.monotonic() - started, 3)
-        self.assertEqual(held_pipe.returncode, 73, held_pipe.stderr.decode())
-        descendant_match = re.search(rb"DESCENDANT=([0-9]+)", held_pipe.stderr)
-        self.assertIsNotNone(descendant_match)
-        descendant_pid = int(descendant_match.group(1))
-        descendant_deadline = time.monotonic() + 2
-        while time.monotonic() < descendant_deadline:
-            try:
-                os.kill(descendant_pid, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.01)
-        else:
-            self.fail("proxy smoke descendant survived process-group cleanup")
+        self.assertNotEqual(race_harness, argv[3])
+        natural_0 = run_descendant_exit_case(
+            0,
+            "ignore",
+            harness_source=race_harness,
+            leader_exit_delay=0.6,
+        )
+        self.assertIn(b"HTTP/1.1 101", natural_0.stdout)
+        natural_143 = run_descendant_exit_case(143, "ignore")
+        self.assertNotIn(b"DESCENDANT_TERM", natural_143.stderr)
+        natural_137 = run_descendant_exit_case(137, "exit")
+        self.assertIn(b"DESCENDANT_TERM", natural_137.stderr)
 
         overflow_child = """
 import sys
@@ -255,7 +468,7 @@ sys.stdin.buffer.read()
                 sys.executable,
                 "-I",
                 "-c",
-                argv[7],
+                argv[3],
                 sys.executable,
                 "-I",
                 "-c",
@@ -288,7 +501,7 @@ sys.stdin.buffer.read()
                 sys.executable,
                 "-I",
                 "-c",
-                argv[7],
+                argv[3],
                 sys.executable,
                 "-I",
                 "-c",
