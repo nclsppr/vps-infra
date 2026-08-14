@@ -120,7 +120,7 @@
           - --signal=TERM
           - --kill-after=5s
           - 10s
-          - /usr/bin/runuser
+          - /usr/sbin/runuser
           - --user
           - "{{ vps_codex_remote_user }}"
           - --
