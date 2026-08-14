@@ -16,6 +16,8 @@ vps_ssh_port: 22
 # key is not a secret. The automation must not create one.
 vps_admin_authorized_keys: []
 vps_deploy_authorized_keys: []
+vps_codex_remote_enabled: false
+vps_codex_remote_authorized_keys: []
 vps_live_apply_enabled: false
 # This value must be a full Git SHA that is reachable from origin/main.
 # Convergence rejects an empty value, branch, tag, or commit outside main.

@@ -99,22 +99,96 @@
     - name: Publish and verify all active Codex surfaces
       ansible.builtin.include_tasks: activate.yml
 
+    - name: Enter Codex runtime validation before commit
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/mv
+          - --no-target-directory
+          - "{{ vps_codex_activation_rollback_root }}/activation-started"
+          - "{{ vps_codex_activation_rollback_root }}/runtime-validation-started"
+      changed_when: false
+
+    - name: Verify the private Codex App Server before activation commit
+      ansible.builtin.include_tasks: verify_app_server.yml
+      vars:
+        vps_codex_verify_proxy_smoke: true
+      when: vps_codex_remote_enabled | bool
+
+    - name: Verify private Codex App Server disablement before activation commit
+      ansible.builtin.include_tasks: verify_app_server_disabled.yml
+      when: not (vps_codex_remote_enabled | bool)
+
   rescue:
-    - name: Inspect failed Codex activation publication state
+    - name: Stop the private Codex App Server after activation failure
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - stop
+          - "{{ vps_codex_app_server_unit }}"
+      register: vps_codex_failed_activation_app_server_stop
+      changed_when: false
+      failed_when: vps_codex_failed_activation_app_server_stop.rc not in [0, 5]
+
+    - name: Read private Codex App Server state after activation failure
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - "{{ vps_codex_app_server_unit }}"
+      register: vps_codex_failed_activation_app_server_state
+      changed_when: false
+      failed_when: vps_codex_failed_activation_app_server_state.rc not in [0, 3, 4]
+
+    - name: Prove the private Codex App Server stopped before rollback
+      ansible.builtin.assert:
+        that:
+          - vps_codex_failed_activation_app_server_state.rc in [3, 4]
+          - >-
+            vps_codex_failed_activation_app_server_state.stdout in
+            ['inactive', 'unknown']
+        fail_msg: >-
+          The failed Codex App Server remained active, so rollback was stopped
+          for explicit inspection.
+
+    - name: Inspect failed Codex activation publication markers
       ansible.builtin.stat:
-        path: "{{ vps_codex_activation_rollback_root }}/activation-started"
+        path: "{{ item }}"
         follow: false
-      register: vps_codex_failed_activation_started
+      loop:
+        - "{{ vps_codex_activation_rollback_root }}/activation-started"
+        - "{{ vps_codex_activation_rollback_root }}/runtime-validation-started"
+      register: vps_codex_failed_activation_markers
+
+    - name: Select failed Codex activation publication markers
+      ansible.builtin.set_fact:
+        vps_codex_failed_activation_started: >-
+          {{ vps_codex_failed_activation_markers.results[0].stat }}
+        vps_codex_failed_runtime_validation_started: >-
+          {{ vps_codex_failed_activation_markers.results[1].stat }}
+
+    - name: Refuse ambiguous failed Codex activation publication markers
+      ansible.builtin.assert:
+        that:
+          - >-
+            not (vps_codex_failed_activation_started.exists and
+                 vps_codex_failed_runtime_validation_started.exists)
+        fail_msg: >-
+          Both Codex publication markers exist. Recovery state was preserved
+          for explicit inspection.
 
     - name: Remove an incomplete pre-publication Codex snapshot
       ansible.builtin.file:
         path: "{{ vps_codex_activation_rollback_root }}"
         state: absent
-      when: not vps_codex_failed_activation_started.stat.exists
+      when:
+        - not vps_codex_failed_activation_started.exists
+        - not vps_codex_failed_runtime_validation_started.exists
 
     - name: Restore the prior Codex activation after publication failure
       ansible.builtin.include_tasks: rollback_activation.yml
-      when: vps_codex_failed_activation_started.stat.exists
+      when: >-
+        vps_codex_failed_activation_started.exists or
+        vps_codex_failed_runtime_validation_started.exists
 
     - name: Refuse the failed Codex activation
       ansible.builtin.fail:
@@ -137,6 +211,11 @@
     path: "{{ vps_codex_activation_rollback_root }}"
     state: absent
   changed_when: false
+  when: not ansible_check_mode
+
+- name: Mark the current Codex activation as committed
+  ansible.builtin.set_fact:
+    vps_codex_activation_committed: true
   when: not ansible_check_mode
 
 - name: Predict active Codex surface drift

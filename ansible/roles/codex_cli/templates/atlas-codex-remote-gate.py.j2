@@ -1,0 +1,199 @@
+#!/usr/bin/python3 -I
+"""Map the Codex desktop SSH envelope to fixed Atlas launcher actions."""
+
+from __future__ import annotations
+
+import os
+import pwd
+import re
+import shlex
+import sys
+
+
+_REMOTE_USER = "{{ vps_codex_remote_user }}"
+_LAUNCHER = "/usr/local/sbin/atlas-codex"
+_MARKED_PAYLOAD = re.compile(
+    r"^printf '%b' '(?P<marker>(?:(?:\\[0-2][0-7]{2}|\\3[0-7]{2})){8})'; "
+    r'PATH="\${CODEX_INSTALL_DIR:-\$HOME/\.local/bin}:\$PATH"; '
+    r"export PATH; (?P<command>.+)$"
+)
+_PATH_PROBES = {
+    "if command -v codex >/dev/null 2>&1; then exit 0; fi; exit 86",
+    "if command -v 'codex' >/dev/null 2>&1; then exit 0; fi; exit 86",
+}
+_VERSION_COMMANDS = {"codex --version", "'codex' --version"}
+_APP_SERVER_COMMANDS = {
+    "codex -c features.code_mode_host=true app-server --listen unix://",
+    "'codex' -c features.code_mode_host=true app-server --listen 'unix://'",
+}
+_PROXY_COMMANDS = {"codex app-server proxy", "'codex' app-server proxy"}
+
+
+class RejectedCommand(ValueError):
+    """The SSH command is outside the reviewed desktop protocol."""
+
+
+def _decode_marker(encoded: str) -> bytes:
+    return bytes(int(encoded[index + 1 : index + 4], 8) for index in range(0, 32, 4))
+
+
+def _unwrap(original: str) -> tuple[str, bytes]:
+    if not original or len(original) > 16384 or "\x00" in original:
+        raise RejectedCommand("missing or oversized SSH command")
+
+    if original in _VERSION_COMMANDS | _APP_SERVER_COMMANDS | _PROXY_COMMANDS:
+        return original.replace("'codex'", "codex").replace("'unix://'", "unix://"), b""
+    if original in {"command -v codex", "command -v 'codex'"}:
+        return "command -v codex", b""
+
+    try:
+        envelope = shlex.split(original, posix=True)
+    except ValueError as error:
+        raise RejectedCommand("malformed SSH command envelope") from error
+    if len(envelope) != 5 or envelope[:2] != ["sh", "-c"] or envelope[3] != "sh":
+        raise RejectedCommand("unexpected SSH command envelope")
+
+    match = _MARKED_PAYLOAD.fullmatch(envelope[4])
+    if match is None:
+        raise RejectedCommand("unexpected Codex desktop payload")
+    try:
+        marker = _decode_marker(match.group("marker"))
+    except ValueError as error:
+        raise RejectedCommand("invalid Codex desktop marker") from error
+    return match.group("command"), marker
+
+
+def _classify(original: str) -> tuple[str, bytes]:
+    command, marker = _unwrap(original)
+    normalized = command.replace("'codex'", "codex").replace("'unix://'", "unix://")
+
+    if command in _PATH_PROBES or normalized == "command -v codex":
+        return "path", marker
+    if normalized == "codex --version":
+        return "version", marker
+    if normalized == "codex -c features.code_mode_host=true app-server --listen unix://":
+        return "app-server", marker
+    if normalized == "codex app-server proxy":
+        return "proxy", marker
+
+    if (
+        command.startswith(
+            'if [ "${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}" = "true" ]; '
+            'then exit 0; fi; umask 077; mkdir -p -- '
+            '"${CODEX_HOME:-$HOME/.codex}/app-server-control" && '
+        )
+        and " app-server --listen " in command
+        and command.endswith(
+            '>"${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server.log" '
+            "2>&1 &"
+        )
+    ):
+        return "app-server", marker
+
+    if (
+        command.startswith('if [ -S "${SSH_AUTH_SOCK:-}" ]; then ')
+        and (command.endswith("&& exec codex app-server proxy") or
+             command.endswith("&& exec 'codex' app-server proxy"))
+    ):
+        return "proxy", marker
+
+    raise RejectedCommand("SSH command is not a reviewed Codex desktop action")
+
+
+def _exec_launcher(action: str, runtime_validation: bool) -> None:
+    option = {
+        "version": "--remote-version",
+        "app-server": "--remote-app-server",
+        "proxy": "--remote-proxy",
+    }[action]
+    if action == "proxy" and runtime_validation:
+        option = "--validate-remote-proxy"
+    environment = {
+        "LANG": "C.UTF-8",
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+    os.execve(
+        "/usr/bin/sudo",
+        ["sudo", "-n", _LAUNCHER, option],
+        environment,
+    )
+
+
+def _marked_envelope(command: str) -> tuple[str, bytes]:
+    encoded_marker = "".join(f"\\{value:03o}" for value in b"ATLASWS1")
+    payload = (
+        f"printf '%b' '{encoded_marker}'; "
+        'PATH="${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH"; '
+        f"export PATH; {command}"
+    )
+    return shlex.join(["sh", "-c", "desktop-login-shell", "sh", payload]), b"ATLASWS1"
+
+
+def _self_test() -> None:
+    fixtures = {
+        "path": "if command -v codex >/dev/null 2>&1; then exit 0; fi; exit 86",
+        "version": "codex --version",
+        "app-server": (
+            'if [ "${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}" = "true" ]; '
+            'then exit 0; fi; umask 077; mkdir -p -- '
+            '"${CODEX_HOME:-$HOME/.codex}/app-server-control" && '
+            'nohup codex -c features.code_mode_host=true app-server --listen '
+            'unix:// >"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+            'app-server.log" 2>&1 &'
+        ),
+        "proxy": (
+            'if [ -S "${SSH_AUTH_SOCK:-}" ]; then true; fi && '
+            "exec codex app-server proxy"
+        ),
+    }
+    for expected_action, command in fixtures.items():
+        envelope, expected_marker = _marked_envelope(command)
+        action, marker = _classify(envelope)
+        if action != expected_action or marker != expected_marker:
+            raise AssertionError(f"Codex SSH fixture failed: {expected_action}")
+    invalid_marker_payload = (
+        "printf '%b' '" + "\\777" * 8 + "'; "
+        'PATH="${CODEX_INSTALL_DIR:-$HOME/.local/bin}:$PATH"; '
+        "export PATH; codex --version"
+    )
+    rejected_commands = {
+        "arbitrary command": "id; codex --version",
+        "invalid marker": shlex.join(
+            ["sh", "-c", "desktop-login-shell", "sh", invalid_marker_payload]
+        ),
+    }
+    for description, original in rejected_commands.items():
+        try:
+            _classify(original)
+        except RejectedCommand:
+            continue
+        raise AssertionError(f"{description} was accepted")
+
+
+def main() -> int:
+    if os.getuid() == 0 and sys.argv == [sys.argv[0], "--self-test"]:
+        _self_test()
+        return 0
+    runtime_validation = sys.argv == [sys.argv[0], "--runtime-validation"]
+    if sys.argv != [sys.argv[0]] and not runtime_validation:
+        raise RejectedCommand("arguments are forbidden")
+    if pwd.getpwuid(os.getuid()).pw_name != _REMOTE_USER:
+        raise RejectedCommand("wrong Unix identity")
+
+    action, marker = _classify(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+    if marker:
+        os.write(1, marker)
+    if action == "path":
+        if not marker:
+            os.write(1, b"/usr/local/bin/codex\n")
+        return 0
+    _exec_launcher(action, runtime_validation)
+    raise AssertionError("unreachable")
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RejectedCommand as error:
+        print(f"Codex SSH command rejected: {error}", file=sys.stderr)
+        raise SystemExit(64) from error

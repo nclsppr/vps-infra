@@ -1,0 +1,183 @@
+---
+- name: Start the private Codex App Server for verified lifecycle
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - start
+      - "{{ vps_codex_app_server_unit }}"
+  changed_when: false
+
+- name: Wait for the private Codex App Server socket
+  ansible.builtin.wait_for:
+    path: "{{ vps_codex_app_server_socket }}"
+    state: present
+    timeout: 15
+
+- name: Inspect the private Codex App Server socket
+  ansible.builtin.stat:
+    path: "{{ vps_codex_app_server_socket }}"
+    follow: false
+  register: vps_codex_app_server_socket_state
+
+- name: Read effective private Codex App Server properties
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - "{{ vps_codex_app_server_unit }}"
+      - --property=ActiveState
+      - --property=SubState
+      - --property=UnitFileState
+      - --property=User
+      - --property=Group
+      - --property=Slice
+      - --property=Restart
+      - --property=NoNewPrivileges
+      - --property=PrivateDevices
+      - --property=ProtectHome
+      - --property=ProtectSystem
+      - --property=MainPID
+      - --property=FragmentPath
+      - --property=DropInPaths
+      - --property=ExecCondition
+      - --property=ExecStart
+      - --property=Environment
+      - --property=RestrictAddressFamilies
+      - --property=SocketBindDeny
+  register: vps_codex_app_server_properties
+  changed_when: false
+
+- name: Prove the private Codex App Server lifecycle and identity
+  ansible.builtin.assert:
+    that:
+      - vps_codex_app_server_socket_state.stat.issock
+      - not vps_codex_app_server_socket_state.stat.islnk
+      - vps_codex_app_server_socket_state.stat.pw_name == vps_codex_user
+      - vps_codex_app_server_socket_state.stat.gr_name == vps_codex_group
+      - vps_codex_app_server_socket_state.stat.mode == '0600'
+      - "'ActiveState=active' in vps_codex_app_server_properties.stdout_lines"
+      - "'SubState=running' in vps_codex_app_server_properties.stdout_lines"
+      - "'UnitFileState=enabled' in vps_codex_app_server_properties.stdout_lines"
+      - "'User=' ~ vps_codex_user in vps_codex_app_server_properties.stdout_lines"
+      - "'Group=' ~ vps_codex_group in vps_codex_app_server_properties.stdout_lines"
+      - "'Slice=atlas-codex.slice' in vps_codex_app_server_properties.stdout_lines"
+      - "'Restart=always' in vps_codex_app_server_properties.stdout_lines"
+      - "'NoNewPrivileges=yes' in vps_codex_app_server_properties.stdout_lines"
+      - "'PrivateDevices=yes' in vps_codex_app_server_properties.stdout_lines"
+      - "'ProtectHome=yes' in vps_codex_app_server_properties.stdout_lines"
+      - "'ProtectSystem=strict' in vps_codex_app_server_properties.stdout_lines"
+      - >-
+        'FragmentPath=/etc/systemd/system/atlas-codex-app-server.service' in
+        vps_codex_app_server_properties.stdout_lines
+      - "'DropInPaths=' in vps_codex_app_server_properties.stdout_lines"
+      - >-
+        vps_codex_app_server_properties.stdout is search(
+        '(?m)^ExecCondition=.*atlas-codex --service-admission')
+      - >-
+        vps_codex_app_server_properties.stdout is search(
+        '(?m)^ExecCondition=.*atlas-codex --service-preflight')
+      - >-
+        vps_codex_app_server_properties.stdout is search(
+        '(?m)^ExecStart=.*' ~ (vps_codex_release_path | regex_escape) ~
+        '/bin/codex .*features\\.code_mode_host=true app-server --listen unix://')
+      - >-
+        vps_codex_app_server_properties.stdout is search(
+        '(?m)^Environment=.*CODEX_HOME=' ~
+        ((vps_codex_home ~ '/.codex') | regex_escape))
+      - >-
+        vps_codex_app_server_properties.stdout is search(
+        '(?m)^RestrictAddressFamilies=.*AF_UNIX')
+      - >-
+        vps_codex_app_server_properties.stdout is search(
+        '(?m)^SocketBindDeny=.*ipv4')
+      - >-
+        vps_codex_app_server_properties.stdout is search(
+        '(?m)^SocketBindDeny=.*ipv6')
+      - >-
+        vps_codex_app_server_properties.stdout_lines |
+        select('match', '^MainPID=[1-9][0-9]*$') | list | length == 1
+    fail_msg: >-
+      The private Codex App Server is not active, persistent, isolated, or
+      bound to its expected private Unix socket.
+
+- name: Prove the private Codex App Server WebSocket proxy
+  when: vps_codex_verify_proxy_smoke | default(false) | bool
+  block:
+    - name: Stop a stale Codex proxy verification unit
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - stop
+          - atlas-codex-proxy-verification.service
+      register: vps_codex_proxy_verification_initial_stop
+      changed_when: false
+      failed_when: vps_codex_proxy_verification_initial_stop.rc not in [0, 5]
+
+    - name: Open a bounded WebSocket upgrade through the Codex proxy
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/timeout
+          - --signal=TERM
+          - --kill-after=5s
+          - 10s
+          - /usr/bin/runuser
+          - --user
+          - "{{ vps_codex_remote_user }}"
+          - --
+          - /usr/bin/env
+          - -i
+          - LANG=C.UTF-8
+          - PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          - SSH_ORIGINAL_COMMAND=codex app-server proxy
+          - "{{ vps_codex_remote_gate_path }}"
+          - --runtime-validation
+        stdin: >-
+          {{ 'GET /rpc HTTP/1.1\r\n'
+             ~ 'Host: codex-app-server\r\n'
+             ~ 'Connection: Upgrade\r\n'
+             ~ 'Upgrade: websocket\r\n'
+             ~ 'Sec-WebSocket-Version: 13\r\n'
+             ~ 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' }}
+        stdin_add_newline: false
+      register: vps_codex_proxy_websocket_smoke
+      changed_when: false
+      failed_when: vps_codex_proxy_websocket_smoke.rc not in [0, 1, 124]
+
+    - name: Confirm the Codex proxy completed the WebSocket upgrade
+      ansible.builtin.assert:
+        that:
+          - "'HTTP/1.1 101' in vps_codex_proxy_websocket_smoke.stdout"
+        fail_msg: >-
+          The private App Server socket exists, but its Codex proxy did not
+          complete a WebSocket upgrade.
+
+  always:
+    - name: Stop the bounded Codex proxy verification unit
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - stop
+          - atlas-codex-proxy-verification.service
+      register: vps_codex_proxy_verification_final_stop
+      changed_when: false
+      failed_when: vps_codex_proxy_verification_final_stop.rc not in [0, 5]
+
+    - name: Read the bounded Codex proxy verification unit state
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - atlas-codex-proxy-verification.service
+      register: vps_codex_proxy_verification_final_state
+      changed_when: false
+      failed_when: vps_codex_proxy_verification_final_state.rc not in [3, 4]
+
+    - name: Prove the Codex proxy verification unit was collected
+      ansible.builtin.assert:
+        that:
+          - vps_codex_proxy_verification_final_state.rc in [3, 4]
+          - >-
+            vps_codex_proxy_verification_final_state.stdout in
+            ['inactive', 'unknown']
+        fail_msg: >-
+          The bounded Codex proxy verification unit survived its smoke test.

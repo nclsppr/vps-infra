@@ -1,0 +1,3 @@
+{% for key in vps_codex_remote_authorized_keys %}
+restrict {{ key | trim }}
+{% endfor %}

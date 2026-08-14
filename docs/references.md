@@ -158,6 +158,12 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
   precedence.
 - [OpenAI - permission profiles](https://learn.chatgpt.com/docs/permissions) :
   managed filesystem and network profiles used by the Atlas account.
+- [OpenAI - Codex App Server](https://learn.chatgpt.com/docs/app-server) :
+  local stdio and Unix socket transports, protocol lifecycle, and warning
+  against unauthenticated public or shared-network exposure.
+- [OpenAI - Codex remote connections](https://learn.chatgpt.com/docs/remote-connections) :
+  desktop-managed SSH App Server connection and the online desktop requirement
+  for phone control.
 - [OpenAI Codex CLI 0.147.0](https://github.com/openai/codex/releases/tag/rust-v0.147.0) :
   exact release represented by the pinned package and executable SHA-256
   values.

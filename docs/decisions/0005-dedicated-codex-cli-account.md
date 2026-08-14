@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted on 13 August 2026.
+Accepted on 13 August 2026. ADR-0006 amends the persistent-service and remote
+entry-point parts of this decision.
 
 ## Context
 
@@ -33,7 +34,10 @@ Ansible installs the official standalone Codex CLI package with these controls:
    package version, architecture-specific package archive digest, and installed
    executable digest. The package remains held between reviewed updates. The
    role and launcher validate the executable digest, owner, mode, setuid state,
-   and file capabilities before use.
+   and file capabilities before use. Once the Codex launcher exists, ordinary
+   convergence refuses any package version change because package state is
+   outside the Codex activation snapshot. A separate package migration must
+   capture and prove a restorable prior package before changing this boundary.
 3. The `codex` system account has a locked password, no SSH key, no direct SSH
    login, no sudo rule, no supplementary group, and no Docker socket access.
 4. The account owns only `/srv/codex/home` and `/srv/codex/workspaces`. Both are

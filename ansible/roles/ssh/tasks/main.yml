@@ -5,11 +5,20 @@
       - (ansible_user | default('')) == vps_admin_user
       - vps_admin_user is match('^[a-z_][a-z0-9_-]{0,30}$')
       - vps_deploy_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - vps_codex_remote_user is match('^[a-z_][a-z0-9_-]{0,30}$')
+      - vps_codex_remote_enabled is boolean
       - vps_admin_user not in ['root', vps_deploy_user]
+      - >-
+        vps_codex_remote_user not in
+        ['root', vps_admin_user, vps_deploy_user, vps_codex_user]
       - vps_admin_authorized_keys | length > 0
+      - >-
+        not (vps_codex_remote_enabled | bool) or
+        vps_codex_remote_authorized_keys | length > 0
       - vps_ssh_port | int == 22
       - ansible_port | int == vps_ssh_port | int
       - vps_deploy_gate_path == '/usr/local/libexec/vps/forced-command'
+      - vps_codex_remote_gate_path == '/usr/local/sbin/atlas-codex-remote-gate'
     fail_msg: >-
       SSH hardening requires a verified administrator connection, at least one
       declared key, and the final SSH port.
@@ -169,6 +178,41 @@
   changed_when: false
   check_mode: false
   when: not ansible_check_mode
+
+- name: Read effective Codex remote SSH policy
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/sshd
+      - -T
+      - -C
+      - "user={{ vps_codex_remote_user }},host=localhost,addr=127.0.0.1"
+  register: vps_sshd_codex_remote_policy
+  changed_when: false
+  check_mode: false
+  when:
+    - not ansible_check_mode
+    - vps_codex_remote_enabled | bool
+
+- name: Prove Codex remote SSH permits no forwarding or terminal
+  ansible.builtin.assert:
+    that:
+      - "'authenticationmethods publickey' in vps_sshd_codex_remote_policy.stdout"
+      - "'disableforwarding yes' in vps_sshd_codex_remote_policy.stdout"
+      - "'permittty no' in vps_sshd_codex_remote_policy.stdout"
+      - "'permituserrc no' in vps_sshd_codex_remote_policy.stdout"
+      - "'permituserenvironment no' in vps_sshd_codex_remote_policy.stdout"
+      - "'allowagentforwarding no' in vps_sshd_codex_remote_policy.stdout"
+      - "'allowtcpforwarding no' in vps_sshd_codex_remote_policy.stdout"
+      - "'passwordauthentication no' in vps_sshd_codex_remote_policy.stdout"
+      - >-
+        'forcecommand ' ~ vps_codex_remote_gate_path in
+        vps_sshd_codex_remote_policy.stdout
+    fail_msg: >-
+      The effective OpenSSH policy for the Codex remote gateway is
+      insufficient.
+  when:
+    - not ansible_check_mode
+    - vps_codex_remote_enabled | bool
 
 - name: Prove password and root authentication are effectively disabled
   ansible.builtin.assert:

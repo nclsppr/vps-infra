@@ -122,6 +122,109 @@
   loop_control:
     label: "{{ item.dest }}"
 
+- name: Install the bounded Codex remote SSH command gate
+  ansible.builtin.template:
+    src: atlas-codex-remote-gate.py.j2
+    dest: "{{ vps_codex_remote_gate_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: vps_codex_remote_enabled | bool
+
+- name: Install restricted Codex remote public keys transactionally
+  ansible.builtin.template:
+    src: codex-remote-authorized-keys.j2
+    dest: "/home/{{ vps_codex_remote_user }}/.ssh/authorized_keys"
+    owner: root
+    group: root
+    mode: "0644"
+  when: vps_codex_remote_enabled | bool
+
+- name: Remove Codex remote SSH authorization transactionally
+  ansible.builtin.file:
+    path: "/home/{{ vps_codex_remote_user }}/.ssh/authorized_keys"
+    state: absent
+  when: not (vps_codex_remote_enabled | bool)
+
+- name: Validate current Codex desktop SSH command envelopes
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_codex_remote_gate_path }}"
+      - --self-test
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - vps_codex_remote_enabled | bool
+
+- name: Remove the Codex remote SSH command gate when disabled
+  ansible.builtin.file:
+    path: "{{ vps_codex_remote_gate_path }}"
+    state: absent
+  when: not (vps_codex_remote_enabled | bool)
+
+- name: Install the private Codex App Server unit
+  ansible.builtin.template:
+    src: atlas-codex-app-server.service.j2
+    dest: /etc/systemd/system/atlas-codex-app-server.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd for the Codex session boundary
+  when: vps_codex_remote_enabled | bool
+
+- name: Remove the private Codex App Server unit when disabled
+  ansible.builtin.file:
+    path: /etc/systemd/system/atlas-codex-app-server.service
+    state: absent
+  notify: Reload systemd for the Codex session boundary
+  when: not (vps_codex_remote_enabled | bool)
+
+- name: Validate the private Codex App Server unit
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemd-analyze
+      - verify
+      - /etc/systemd/system/atlas-codex-app-server.service
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - vps_codex_remote_enabled | bool
+
+- name: Enable the private Codex App Server transactionally
+  ansible.builtin.file:
+    src: /etc/systemd/system/atlas-codex-app-server.service
+    dest: /etc/systemd/system/multi-user.target.wants/atlas-codex-app-server.service
+    state: link
+    owner: root
+    group: root
+    follow: false
+  when: vps_codex_remote_enabled | bool
+
+- name: Remove private Codex App Server boot activation when disabled
+  ansible.builtin.file:
+    path: /etc/systemd/system/multi-user.target.wants/atlas-codex-app-server.service
+    state: absent
+  when: not (vps_codex_remote_enabled | bool)
+
+- name: Install the exact Codex remote sudo gateway
+  ansible.builtin.template:
+    src: codex-remote.sudoers.j2
+    dest: "{{ vps_codex_remote_sudoers_path }}"
+    owner: root
+    group: root
+    mode: "0440"
+    validate: /usr/sbin/visudo -cf %s
+  when: vps_codex_remote_enabled | bool
+
+- name: Remove the Codex remote sudo gateway when disabled
+  ansible.builtin.file:
+    path: "{{ vps_codex_remote_sudoers_path }}"
+    state: absent
+  when: not (vps_codex_remote_enabled | bool)
+
+- name: Load the private Codex App Server unit before lifecycle checks
+  ansible.builtin.meta: flush_handlers
+
 - name: Prove ordinary direct Codex invocation uses the guarded entry point
   ansible.builtin.command:
     argv:
@@ -138,7 +241,7 @@
     that:
       - vps_codex_direct_entrypoint_probe.rc == 77
       - >-
-        'sudo atlas-codex' in
+        'Atlas sandbox or its SSH gateway' in
         (vps_codex_direct_entrypoint_probe.stdout ~
          vps_codex_direct_entrypoint_probe.stderr)
     fail_msg: "The ordinary direct Codex entry point bypassed the launcher."
@@ -158,6 +261,46 @@
     that:
       - vps_codex_groups.stdout.split() == [vps_codex_group]
     fail_msg: "The Codex account has an unexpected supplementary group."
+
+- name: Read the Codex remote gateway account groups
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/id
+      - -nG
+      - "{{ vps_codex_remote_user }}"
+  register: vps_codex_remote_groups
+  changed_when: false
+  check_mode: false
+  when: vps_codex_remote_enabled | bool
+
+- name: Prove the Codex remote gateway has only its primary group
+  ansible.builtin.assert:
+    that:
+      - vps_codex_remote_groups.stdout.split() == [vps_codex_remote_group]
+    fail_msg: >-
+      The Codex remote gateway account has an unexpected supplementary group.
+  when: vps_codex_remote_enabled | bool
+
+- name: Probe prohibited Codex remote gateway capabilities
+  ansible.builtin.command:
+    argv:
+      - /bin/bash
+      - -c
+      - >-
+        test ! -r {{ vps_codex_home }}/.codex/auth.json &&
+        test ! -r {{ vps_codex_home }}/.codex/config.toml &&
+        test ! -r /etc/vps/secrets &&
+        test ! -r /srv/vps/repository &&
+        test ! -r /run/containerd/containerd.sock &&
+        test ! -r /var/run/docker.sock &&
+        ! /usr/bin/sudo -n /usr/bin/true
+  become: true
+  become_user: "{{ vps_codex_remote_user }}"
+  changed_when: false
+  check_mode: false
+  when:
+    - not ansible_check_mode
+    - vps_codex_remote_enabled | bool
 
 - name: Probe prohibited Codex account capabilities
   ansible.builtin.command:

@@ -98,6 +98,7 @@ class CodexCliContractTests(unittest.TestCase):
         protected_paths = requirements["permissions"]["filesystem"]["deny_read"]
         for protected_path in (
             "/etc/vps",
+            "/home/{{ vps_codex_remote_user }}",
             "/srv/codex/home/.codex",
             "/home/vpsadmin",
             "/root",
@@ -157,6 +158,120 @@ class CodexCliContractTests(unittest.TestCase):
         self.assertNotIn("sudo", str(user))
         self.assertNotIn("docker", str(user))
 
+        remote_user_task = by_name[
+            "Create the unprivileged Codex remote gateway account"
+        ]
+        remote_user = remote_user_task["ansible.builtin.user"]
+        self.assertEqual(remote_user["name"], "{{ vps_codex_remote_user }}")
+        self.assertEqual(remote_user["groups"], "")
+        self.assertFalse(remote_user["append"])
+        self.assertFalse(remote_user["system"])
+        self.assertFalse(remote_user["create_home"])
+        self.assertTrue(remote_user["password_lock"])
+        self.assertEqual(
+            remote_user_task["when"], "vps_codex_remote_enabled | bool"
+        )
+        self.assertNotIn("sudo", str(remote_user))
+        self.assertNotIn("docker", str(remote_user))
+        remote_home = by_name[
+            "Create the root-owned Codex remote home boundary"
+        ]["ansible.builtin.file"]
+        self.assertEqual(remote_home["owner"], "root")
+        self.assertEqual(remote_home["group"], "root")
+        self.assertEqual(remote_home["mode"], "0755")
+        self.assertIs(remote_home["follow"], False)
+        remote_ssh = by_name[
+            "Create the private Codex remote SSH directory"
+        ]["ansible.builtin.file"]
+        self.assertEqual(remote_ssh["owner"], "root")
+        self.assertEqual(remote_ssh["group"], "root")
+        self.assertEqual(remote_ssh["mode"], "0755")
+        self.assertIs(remote_ssh["follow"], False)
+        remote_keys = by_name[
+            "Install restricted Codex remote public keys transactionally"
+        ]["ansible.builtin.template"]
+        self.assertEqual(remote_keys["owner"], "root")
+        self.assertEqual(remote_keys["group"], "root")
+        self.assertEqual(remote_keys["mode"], "0644")
+        remote_state = by_name[
+            "Create the root-owned Codex remote state boundary"
+        ]["ansible.builtin.file"]
+        self.assertEqual(remote_state["owner"], "root")
+        self.assertEqual(remote_state["group"], "root")
+        self.assertEqual(remote_state["mode"], "0755")
+        self.assertIs(remote_state["follow"], False)
+        remote_control = by_name[
+            "Create the writable Codex remote control directory"
+        ]["ansible.builtin.file"]
+        self.assertEqual(remote_control["owner"], "{{ vps_codex_remote_user }}")
+        self.assertEqual(remote_control["group"], "{{ vps_codex_remote_group }}")
+        self.assertEqual(remote_control["mode"], "0700")
+        self.assertIs(remote_control["follow"], False)
+
+        remote_boundary_probe = by_name[
+            "Inspect existing Codex remote filesystem boundaries"
+        ]
+        self.assertIs(
+            remote_boundary_probe["ansible.builtin.stat"]["follow"], False
+        )
+        self.assertEqual(
+            {item["path"]: item for item in remote_boundary_probe["loop"]},
+            {
+                "/home/{{ vps_codex_remote_user }}": {
+                    "path": "/home/{{ vps_codex_remote_user }}",
+                    "type": "directory",
+                    "owner": "root",
+                    "group": "root",
+                    "mode": "0755",
+                },
+                "/home/{{ vps_codex_remote_user }}/.ssh": {
+                    "path": "/home/{{ vps_codex_remote_user }}/.ssh",
+                    "type": "directory",
+                    "owner": "root",
+                    "group": "root",
+                    "mode": "0755",
+                },
+                "/home/{{ vps_codex_remote_user }}/.ssh/authorized_keys": {
+                    "path": (
+                        "/home/{{ vps_codex_remote_user }}/.ssh/authorized_keys"
+                    ),
+                    "type": "file",
+                    "owner": "root",
+                    "group": "root",
+                    "mode": "0644",
+                },
+                "/home/{{ vps_codex_remote_user }}/.codex": {
+                    "path": "/home/{{ vps_codex_remote_user }}/.codex",
+                    "type": "directory",
+                    "owner": "root",
+                    "group": "root",
+                    "mode": "0755",
+                },
+                "/home/{{ vps_codex_remote_user }}/.codex/app-server-control": {
+                    "path": (
+                        "/home/{{ vps_codex_remote_user }}/.codex/"
+                        "app-server-control"
+                    ),
+                    "type": "directory",
+                    "owner": "{{ vps_codex_remote_user }}",
+                    "group": "{{ vps_codex_remote_group }}",
+                    "mode": "0700",
+                },
+            },
+        )
+        remote_boundary_guard = " ".join(
+            by_name[
+                "Refuse unsafe existing Codex remote filesystem boundaries"
+            ]["ansible.builtin.assert"]["that"]
+        )
+        for boundary in (
+            "not item.stat.islnk",
+            "item.stat.pw_name == item.item.owner",
+            "item.stat.gr_name == item.item.group",
+            "item.stat.mode == item.item.mode",
+        ):
+            self.assertIn(boundary, remote_boundary_guard)
+
         download = by_name["Download the exact official Codex release archive"][
             "ansible.builtin.get_url"
         ]
@@ -190,6 +305,25 @@ class CodexCliContractTests(unittest.TestCase):
             by_name["Install the exact Ubuntu bubblewrap package"]["register"],
             "vps_codex_bubblewrap_install",
         )
+        bubblewrap_upgrade_guard = by_name[
+            "Refuse a non-transactional bubblewrap change for an existing runtime"
+        ]["ansible.builtin.assert"]
+        self.assertIn(
+            "'installed ' ~ vps_codex_bubblewrap_version",
+            " ".join(bubblewrap_upgrade_guard["that"]),
+        )
+        self.assertIn(
+            "vps_codex_surfaces_before_bubblewrap.results",
+            " ".join(bubblewrap_upgrade_guard["that"]),
+        )
+        self.assertIn(
+            "dedicated package migration",
+            bubblewrap_upgrade_guard["fail_msg"],
+        )
+        self.assertEqual(
+            by_name["Install the exact Ubuntu bubblewrap package"]["when"],
+            "vps_codex_bubblewrap_bootstrap_required | bool",
+        )
         self.assertEqual(
             by_name["Hold the reviewed Ubuntu bubblewrap package"][
                 "ansible.builtin.dpkg_selections"
@@ -221,6 +355,12 @@ class CodexCliContractTests(unittest.TestCase):
             )
 
         task_names = list(by_name)
+        self.assertLess(
+            task_names.index(
+                "Refuse a non-transactional bubblewrap change for an existing runtime"
+            ),
+            task_names.index("Install the exact Ubuntu bubblewrap package"),
+        )
         self.assertLess(
             task_names.index("Validate the published Codex release"),
             task_names.index("Atomically select the verified Codex release"),
@@ -286,24 +426,30 @@ class CodexCliContractTests(unittest.TestCase):
             "--property=TasksMax={{ vps_codex_tasks_max }}",
             "--property=NoNewPrivileges=yes",
             "--property=ProtectSystem=strict",
-            "InaccessiblePaths=-/etc/vps -/home/deploy -/home/ubuntu "
+            "--property=ProtectHome=yes",
+            "InaccessiblePaths=-/etc/vps -/home/deploy "
+            "-/home/{{ vps_codex_remote_user }} -/home/ubuntu "
             "-/home/vpsadmin -/root -/run/containerd/containerd.sock "
             "-/run/docker.sock -/srv/vps -/var/lib/docker "
             "-/var/lib/vps-controller -/var/run/docker.sock",
             "--property=ProtectProc=invisible",
             "--property=PrivateDevices=yes",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
-            "DeviceAllow=char-netlink rw",
+            "SocketBindDeny=ipv4",
+            "SocketBindDeny=ipv6",
             "TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size={{ vps_codex_tmpfs_size_mb }}M,mode=1777",
             "TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,noexec,size={{ vps_codex_tmpfs_size_mb }}M,mode=1777",
-            "--property=RuntimeMaxSec=12h",
+            '--property=RuntimeMaxSec="$runtime_max"',
             "--slice=atlas-codex.slice",
         ):
             self.assertIn(boundary, launcher)
+        self.assertIn("runtime_max=12h", launcher)
+        self.assertIn("runtime_max=30s", launcher)
         self.assertIn("session_unit=atlas-codex-session", launcher)
         self.assertIn(
             "session_unit=atlas-codex-activation-verification", launcher
         )
+        self.assertIn("session_unit=atlas-codex-proxy-verification", launcher)
         self.assertIn('--unit="$session_unit"', launcher)
         self.assertIn("{{ vps_codex_storage_image_path }}", launcher)
         self.assertIn(
@@ -344,8 +490,13 @@ class CodexCliContractTests(unittest.TestCase):
             ROLE / "templates/codex-entrypoint.j2"
         ).read_text(encoding="utf-8")
         self.assertIn("/atlas-codex.slice/", entrypoint)
-        self.assertIn("sudo atlas-codex", entrypoint)
+        self.assertIn("/usr/bin/sudo -n /usr/local/sbin/atlas-codex", entrypoint)
         self.assertIn("exit 77", entrypoint)
+        self.assertIn("--remote-version", entrypoint)
+        self.assertIn("--remote-app-server", entrypoint)
+        self.assertIn("--remote-proxy", entrypoint)
+        self.assertNotIn("--validate-remote-proxy", entrypoint)
+        self.assertNotIn('exec /usr/bin/sudo -n "$@"', entrypoint)
 
         policy_transaction = yaml.safe_load(
             (ROLE / "tasks/policy_transaction.yml").read_text(encoding="utf-8")
@@ -361,19 +512,133 @@ class CodexCliContractTests(unittest.TestCase):
             },
         )
 
-    def test_codex_is_not_an_ssh_or_system_service_identity(self) -> None:
+    def test_codex_remote_gateway_is_dedicated_and_bounded(self) -> None:
         ssh_template = (
             ROOT / "ansible/roles/ssh/templates/00-vps-infra.conf.j2"
         ).read_text(encoding="utf-8")
         self.assertEqual(
             next(line for line in ssh_template.splitlines() if line.startswith("AllowUsers")),
-            "AllowUsers {{ vps_admin_user }} {{ vps_deploy_user }}",
+            "AllowUsers {{ vps_admin_user }} {{ vps_deploy_user }}"
+            "{% if vps_codex_remote_enabled | bool %} "
+            "{{ vps_codex_remote_user }}{% endif %}",
         )
+        self.assertIn("Match User {{ vps_codex_remote_user }}", ssh_template)
+        self.assertIn(
+            "ForceCommand {{ vps_codex_remote_gate_path }}", ssh_template
+        )
+        self.assertEqual(ssh_template.count("PermitUserEnvironment no"), 1)
+        self.assertLess(
+            ssh_template.index("PermitUserEnvironment no"),
+            ssh_template.index("Match User {{ vps_deploy_user }}"),
+        )
+        for boundary in (
+            "DisableForwarding yes",
+            "PermitTTY no",
+            "PermitUserRC no",
+            "AllowAgentForwarding no",
+            "AllowTcpForwarding no",
+            "PermitTunnel no",
+        ):
+            self.assertIn(boundary, ssh_template)
+
         role_text = "\n".join(
             path.read_text(encoding="utf-8") for path in ROLE.rglob("*") if path.is_file()
         )
-        self.assertNotIn("codex.service", role_text)
-        self.assertNotIn("authorized_keys", role_text)
+        self.assertNotIn("app-server daemon bootstrap", role_text)
+
+        service = (
+            ROLE / "templates/atlas-codex-app-server.service.j2"
+        ).read_text(encoding="utf-8")
+        for boundary in (
+            "User={{ vps_codex_user }}",
+            "Group={{ vps_codex_group }}",
+            "Slice=atlas-codex.slice",
+            "app-server --listen unix://",
+            "Restart=always",
+            "NoNewPrivileges=yes",
+            "CapabilityBoundingSet=",
+            "ProtectHome=yes",
+            "ProtectSystem=strict",
+            "SocketBindDeny=ipv4",
+            "SocketBindDeny=ipv6",
+            "WantedBy=multi-user.target",
+        ):
+            self.assertIn(boundary, service)
+        self.assertIn(
+            "ExecCondition=+/usr/local/sbin/atlas-codex --service-admission",
+            service,
+        )
+        self.assertIn(
+            "ExecCondition=+/usr/local/sbin/atlas-codex --service-preflight",
+            service,
+        )
+        self.assertNotIn("RestartPreventExitStatus", service)
+        self.assertNotIn("--remote-control", service)
+        self.assertNotIn("RuntimeMaxSec", service)
+
+        authorized_keys = (
+            ROLE / "templates/codex-remote-authorized-keys.j2"
+        ).read_text(encoding="utf-8")
+        self.assertIn("restrict {{ key | trim }}", authorized_keys)
+
+        sudoers = (
+            ROLE / "templates/codex-remote.sudoers.j2"
+        ).read_text(encoding="utf-8")
+        self.assertIn("!setenv", sudoers)
+        self.assertIn("NOPASSWD:NOSETENV", sudoers)
+        self.assertEqual(sudoers.count("NOPASSWD:NOSETENV"), 4)
+        for command in (
+            "--remote-version",
+            "--remote-app-server",
+            "--remote-proxy",
+            "--validate-remote-proxy",
+        ):
+            self.assertIn(
+                "/usr/local/sbin/atlas-codex " + command,
+                sudoers,
+            )
+        self.assertNotIn("ALL=(ALL", sudoers)
+
+        activation_tasks = yaml.safe_load(
+            (ROLE / "tasks/activate.yml").read_text(encoding="utf-8")
+        )
+        activation_by_name = {
+            task["name"]: task for task in activation_tasks
+        }
+        gate_self_test = activation_by_name[
+            "Validate current Codex desktop SSH command envelopes"
+        ]
+        self.assertEqual(
+            gate_self_test["ansible.builtin.command"]["argv"],
+            ["{{ vps_codex_remote_gate_path }}", "--self-test"],
+        )
+        self.assertIs(gate_self_test["changed_when"], False)
+        self.assertEqual(
+            gate_self_test["when"],
+            ["not ansible_check_mode", "vps_codex_remote_enabled | bool"],
+        )
+
+        gate_template_path = (
+            ROLE / "templates/atlas-codex-remote-gate.py.j2"
+        )
+        gate_source = gate_template_path.read_text(encoding="utf-8")
+        rendered_gate = gate_source.replace(
+            "{{ vps_codex_remote_user }}", "codex-remote"
+        )
+        self.assertNotIn("{{", rendered_gate)
+        gate_namespace: dict[str, object] = {
+            "__name__": "atlas_codex_remote_gate_contract_test"
+        }
+        exec(
+            compile(rendered_gate, str(gate_template_path), "exec"),
+            gate_namespace,
+        )
+        gate_namespace["_self_test"]()
+        self.assertIn(
+            'option = "--validate-remote-proxy"', rendered_gate
+        )
+        self.assertIn('"\\\\777" * 8', rendered_gate)
+        self.assertIn("invalid Codex desktop marker", rendered_gate)
 
         site = yaml.safe_load(
             (ROOT / "ansible/playbooks/site.yml").read_text(encoding="utf-8")
@@ -462,6 +727,22 @@ class CodexCliContractTests(unittest.TestCase):
             (ROLE / "tasks/converge.yml").read_text(encoding="utf-8")
         )
         by_name = {task["name"]: task for task in tasks}
+        predictive_surfaces = str(
+            by_name[
+                "Inspect installed Codex boundaries before a predictive check"
+            ]["loop"]
+        )
+        for remote_surface in (
+            "/etc/systemd/system/atlas-codex-app-server.service",
+            (
+                "/etc/systemd/system/multi-user.target.wants/"
+                "atlas-codex-app-server.service"
+            ),
+            "/etc/sudoers.d/92-codex-remote-codex",
+            ".ssh/authorized_keys",
+            "/usr/local/sbin/atlas-codex-remote-gate",
+        ):
+            self.assertIn(remote_surface, predictive_surfaces)
         preflight = by_name[
             "Refuse a predictive check before normal Codex convergence"
         ]
@@ -578,11 +859,42 @@ class CodexCliContractTests(unittest.TestCase):
                 "/srv/codex/home/.codex/config.toml",
                 "/etc/codex/requirements.toml",
                 "/etc/systemd/system/atlas-codex.slice",
+                "/etc/systemd/system/atlas-codex-app-server.service",
+                (
+                    "/etc/systemd/system/multi-user.target.wants/"
+                    "atlas-codex-app-server.service"
+                ),
+                "/etc/sudoers.d/92-codex-remote-codex",
+                "/home/{{ vps_codex_remote_user }}/.ssh/authorized_keys",
+                "/usr/local/sbin/atlas-codex-remote-gate",
                 "/usr/local/sbin/atlas-codex",
                 "/usr/local/bin/codex",
                 "/usr/local/bin/codex-code-mode-host",
                 "/opt/codex/current",
             },
+        )
+        activation_surfaces = {
+            item["path"]: item
+            for item in defaults["vps_codex_activation_surfaces"]
+        }
+        self.assertEqual(
+            activation_surfaces[
+                "/etc/systemd/system/multi-user.target.wants/"
+                "atlas-codex-app-server.service"
+            ]["type"],
+            "link",
+        )
+        self.assertEqual(
+            activation_surfaces["/usr/local/sbin/atlas-codex-remote-gate"][
+                "type"
+            ],
+            "file",
+        )
+        self.assertEqual(
+            activation_surfaces[
+                "/home/{{ vps_codex_remote_user }}/.ssh/authorized_keys"
+            ]["type"],
+            "file",
         )
 
         main_tasks = yaml.safe_load(
@@ -608,6 +920,13 @@ class CodexCliContractTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("--runtime", mask)
+        stop_app_server = block_by_name[
+            "Stop the private Codex App Server behind the interlock"
+        ]["ansible.builtin.command"]["argv"]
+        self.assertEqual(
+            stop_app_server,
+            ["/usr/bin/systemctl", "stop", "{{ vps_codex_app_server_unit }}"],
+        )
         strict = block_by_name[
             "Prove no Codex session survived interlock acquisition"
         ]["ansible.builtin.assert"]["that"]
@@ -615,9 +934,71 @@ class CodexCliContractTests(unittest.TestCase):
         always_by_name = {
             task["name"]: task for task in transaction["always"]
         }
+        always_names = list(always_by_name)
+        self.assertLess(
+            always_names.index(
+                "Prove final private Codex App Server lifecycle surfaces are coherent"
+            ),
+            always_names.index("Release the persistent Codex session mask"),
+        )
+        self.assertLess(
+            always_names.index("Remove the Codex convergence maintenance marker"),
+            always_names.index(
+                "Reverify the committed private Codex App Server after "
+                "interlock release"
+            ),
+        )
+        self.assertLess(
+            always_names.index("Remove the Codex convergence maintenance marker"),
+            always_names.index(
+                "Reverify the restored private Codex App Server after "
+                "interlock release"
+            ),
+        )
         self.assertIn(
             "not vps_codex_final_rollback_state.stat.exists",
             always_by_name["Release the persistent Codex session mask"]["when"],
+        )
+        self.assertEqual(
+            always_by_name[
+                "Reverify the committed private Codex App Server after "
+                "interlock release"
+            ]["ansible.builtin.include_tasks"],
+            "verify_app_server.yml",
+        )
+        self.assertIs(
+            always_by_name[
+                "Reverify the committed private Codex App Server after "
+                "interlock release"
+            ]["vars"]["vps_codex_verify_proxy_smoke"],
+            False,
+        )
+        self.assertIn(
+            "vps_codex_activation_committed | default(false) | bool",
+            always_by_name[
+                "Reverify the committed private Codex App Server after "
+                "interlock release"
+            ]["when"],
+        )
+        self.assertEqual(
+            always_by_name[
+                "Reverify the restored private Codex App Server after "
+                "interlock release"
+            ]["ansible.builtin.include_tasks"],
+            "verify_restored_app_server.yml",
+        )
+        self.assertIn(
+            "not (vps_codex_activation_committed | default(false) | bool)",
+            always_by_name[
+                "Reverify the restored private Codex App Server after "
+                "interlock release"
+            ]["when"],
+        )
+        self.assertEqual(
+            always_by_name[
+                "Reverify private Codex App Server disablement after interlock release"
+            ]["ansible.builtin.include_tasks"],
+            "verify_app_server_disabled.yml",
         )
 
         main_by_name = {task["name"]: task for task in main_tasks}
@@ -709,6 +1090,7 @@ class CodexCliContractTests(unittest.TestCase):
         activation_transaction = activation[0]
         commit = activation[1]
         cleanup = activation[2]
+        committed_fact = activation[3]
         activation_names = [
             task["name"] for task in activation_transaction["block"]
         ]
@@ -716,9 +1098,54 @@ class CodexCliContractTests(unittest.TestCase):
             activation_names.index("Record the complete Codex activation snapshot"),
             activation_names.index("Record the Codex activation publication boundary"),
         )
+        self.assertLess(
+            activation_names.index("Publish and verify all active Codex surfaces"),
+            activation_names.index("Enter Codex runtime validation before commit"),
+        )
+        self.assertLess(
+            activation_names.index("Enter Codex runtime validation before commit"),
+            activation_names.index(
+                "Verify the private Codex App Server before activation commit"
+            ),
+        )
+        activation_block_by_name = {
+            task["name"]: task for task in activation_transaction["block"]
+        }
+        runtime_validation = activation_block_by_name[
+            "Enter Codex runtime validation before commit"
+        ]["ansible.builtin.command"]["argv"]
         self.assertEqual(
-            activation_names[-1],
-            "Publish and verify all active Codex surfaces",
+            runtime_validation,
+            [
+                "/usr/bin/mv",
+                "--no-target-directory",
+                (
+                    "{{ vps_codex_activation_rollback_root }}/"
+                    "activation-started"
+                ),
+                (
+                    "{{ vps_codex_activation_rollback_root }}/"
+                    "runtime-validation-started"
+                ),
+            ],
+        )
+        self.assertEqual(
+            activation_block_by_name[
+                "Verify the private Codex App Server before activation commit"
+            ]["ansible.builtin.include_tasks"],
+            "verify_app_server.yml",
+        )
+        self.assertIs(
+            activation_block_by_name[
+                "Verify the private Codex App Server before activation commit"
+            ]["vars"]["vps_codex_verify_proxy_smoke"],
+            True,
+        )
+        self.assertEqual(
+            activation_block_by_name[
+                "Verify private Codex App Server disablement before activation commit"
+            ]["ansible.builtin.include_tasks"],
+            "verify_app_server_disabled.yml",
         )
         self.assertEqual(
             commit["name"], "Record the verified Codex activation commit"
@@ -727,16 +1154,92 @@ class CodexCliContractTests(unittest.TestCase):
         self.assertEqual(
             cleanup["name"], "Remove committed Codex activation recovery state"
         )
-        rescue_names = {
-            task["name"] for task in activation_transaction["rescue"]
+        self.assertEqual(
+            committed_fact["name"],
+            "Mark the current Codex activation as committed",
+        )
+        self.assertIs(
+            committed_fact["ansible.builtin.set_fact"][
+                "vps_codex_activation_committed"
+            ],
+            True,
+        )
+        rescue_by_name = {
+            task["name"]: task for task in activation_transaction["rescue"]
         }
         self.assertIn(
             "Restore the prior Codex activation after publication failure",
-            rescue_names,
+            rescue_by_name,
+        )
+        failed_markers = rescue_by_name[
+            "Inspect failed Codex activation publication markers"
+        ]["loop"]
+        self.assertEqual(
+            failed_markers,
+            [
+                (
+                    "{{ vps_codex_activation_rollback_root }}/"
+                    "activation-started"
+                ),
+                (
+                    "{{ vps_codex_activation_rollback_root }}/"
+                    "runtime-validation-started"
+                ),
+            ],
+        )
+        self.assertIn(
+            "vps_codex_failed_runtime_validation_started.exists",
+            rescue_by_name[
+                "Restore the prior Codex activation after publication failure"
+            ]["when"],
         )
         self.assertNotIn(
             "Remove committed Codex activation recovery state",
             activation_names,
+        )
+
+        recovery_tasks = yaml.safe_load(
+            (ROLE / "tasks/recover_activation.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        recovery_by_name = {task["name"]: task for task in recovery_tasks}
+        recovery_markers = recovery_by_name[
+            "Inspect durable Codex activation recovery state"
+        ]["loop"]
+        self.assertEqual(
+            recovery_markers[3],
+            (
+                "{{ vps_codex_activation_rollback_root }}/"
+                "runtime-validation-started"
+            ),
+        )
+        recovery_selection = recovery_by_name[
+            "Select durable Codex activation recovery markers"
+        ]["ansible.builtin.set_fact"]
+        self.assertEqual(
+            recovery_selection["vps_codex_recovery_runtime_state"],
+            "{{ vps_codex_recovery_state.results[3].stat }}",
+        )
+        recovery_guard = " ".join(
+            recovery_by_name[
+                "Refuse unsafe Codex activation recovery state"
+            ]["ansible.builtin.assert"]["that"]
+        )
+        recovery_guard = " ".join(recovery_guard.split())
+        self.assertIn(
+            "not (vps_codex_recovery_started_state.exists and "
+            "vps_codex_recovery_runtime_state.exists)",
+            recovery_guard,
+        )
+        interrupted_rollback = " ".join(
+            recovery_by_name[
+                "Roll back an interrupted Codex activation"
+            ]["when"]
+        )
+        self.assertIn(
+            "vps_codex_recovery_runtime_state.exists",
+            interrupted_rollback,
         )
 
         activation_tasks = yaml.safe_load(
@@ -753,6 +1256,14 @@ class CodexCliContractTests(unittest.TestCase):
             if task["name"] == "Create the Codex release selector candidate"
         )["ansible.builtin.file"]
         self.assertIs(selector_candidate["follow"], False)
+        activation_task_by_name = {
+            task["name"]: task for task in activation_tasks
+        }
+        app_server_link = activation_task_by_name[
+            "Enable the private Codex App Server transactionally"
+        ]["ansible.builtin.file"]
+        self.assertEqual(app_server_link["state"], "link")
+        self.assertIs(app_server_link["follow"], False)
 
     def test_runtime_probes_use_unique_disposable_directories(self) -> None:
         policy = (
@@ -802,6 +1313,8 @@ class CodexCliContractTests(unittest.TestCase):
                 "Release the persistent Codex session mask",
                 "Remove the Codex convergence maintenance marker",
                 "Remove the released Codex session mask ownership record",
+                "Stop the private Codex App Server behind the interlock",
+                "Stop transient Codex remote gateway units behind the interlock",
             },
             "tasks/activation_transaction.yml": {
                 "Create the private Codex activation snapshot",
@@ -809,8 +1322,27 @@ class CodexCliContractTests(unittest.TestCase):
                 "Record originally absent Codex activation surfaces",
                 "Record the complete Codex activation snapshot",
                 "Record the Codex activation publication boundary",
+                "Enter Codex runtime validation before commit",
+                "Stop the private Codex App Server after activation failure",
+                "Read private Codex App Server state after activation failure",
                 "Record the verified Codex activation commit",
                 "Remove committed Codex activation recovery state",
+            },
+            "tasks/verify_app_server.yml": {
+                "Start the private Codex App Server for verified lifecycle",
+                "Read effective private Codex App Server properties",
+                "Stop a stale Codex proxy verification unit",
+                "Open a bounded WebSocket upgrade through the Codex proxy",
+                "Stop the bounded Codex proxy verification unit",
+                "Read the bounded Codex proxy verification unit state",
+            },
+            "tasks/verify_app_server_disabled.yml": {
+                "Read disabled private Codex App Server state",
+                "Read disabled private Codex App Server boot state",
+            },
+            "tasks/verify_restored_app_server.yml": {
+                "Start the restored private Codex App Server",
+                "Read effective restored private Codex App Server properties",
             },
             "tasks/policy_transaction.yml": {
                 "Create a private remote Codex policy staging directory",

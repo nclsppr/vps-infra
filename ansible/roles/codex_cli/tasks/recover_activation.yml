@@ -7,6 +7,7 @@
     - "{{ vps_codex_activation_rollback_root }}"
     - "{{ vps_codex_activation_rollback_root }}/snapshot-complete"
     - "{{ vps_codex_activation_rollback_root }}/activation-started"
+    - "{{ vps_codex_activation_rollback_root }}/runtime-validation-started"
     - "{{ vps_codex_activation_rollback_root }}/commit-complete"
   register: vps_codex_recovery_state
 
@@ -15,7 +16,8 @@
     vps_codex_recovery_root_state: "{{ vps_codex_recovery_state.results[0].stat }}"
     vps_codex_recovery_snapshot_state: "{{ vps_codex_recovery_state.results[1].stat }}"
     vps_codex_recovery_started_state: "{{ vps_codex_recovery_state.results[2].stat }}"
-    vps_codex_recovery_commit_state: "{{ vps_codex_recovery_state.results[3].stat }}"
+    vps_codex_recovery_runtime_state: "{{ vps_codex_recovery_state.results[3].stat }}"
+    vps_codex_recovery_commit_state: "{{ vps_codex_recovery_state.results[4].stat }}"
 
 - name: Refuse unsafe Codex activation recovery state
   ansible.builtin.assert:
@@ -31,9 +33,16 @@
         not vps_codex_recovery_started_state.exists or
         vps_codex_recovery_snapshot_state.exists
       - >-
+        not vps_codex_recovery_runtime_state.exists or
+        vps_codex_recovery_snapshot_state.exists
+      - >-
+        not (vps_codex_recovery_started_state.exists and
+             vps_codex_recovery_runtime_state.exists)
+      - >-
         not vps_codex_recovery_commit_state.exists or
         (vps_codex_recovery_snapshot_state.exists and
-         vps_codex_recovery_started_state.exists)
+         (vps_codex_recovery_started_state.exists or
+          vps_codex_recovery_runtime_state.exists))
     fail_msg: >-
       Codex activation recovery markers are incomplete or unsafe. The session
       remains persistently masked for manual inspection.
@@ -45,6 +54,7 @@
   when:
     - vps_codex_recovery_root_state.exists
     - not vps_codex_recovery_started_state.exists
+    - not vps_codex_recovery_runtime_state.exists
 
 - name: Accept a fully verified interrupted Codex activation commit
   ansible.builtin.file:
@@ -58,5 +68,7 @@
   ansible.builtin.include_tasks: rollback_activation.yml
   when:
     - vps_codex_recovery_root_state.exists
-    - vps_codex_recovery_started_state.exists
+    - >-
+      vps_codex_recovery_started_state.exists or
+      vps_codex_recovery_runtime_state.exists
     - not vps_codex_recovery_commit_state.exists

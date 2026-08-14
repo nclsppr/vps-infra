@@ -39,9 +39,9 @@ Le premier socle exécutable est livré :
 - GitHub CLI 2.97.0 with archive and executable checksums, plus a fail-closed
   static OCI materializer for Personal, Papers Empire, and the Parkventory
   demo;
-- Codex CLI 0.147.0 from the standalone OpenAI package, isolated behind a
-  dedicated account, managed permissions, and a bounded transient systemd
-  session;
+- Codex CLI 0.147.0 from the standalone OpenAI package, with an isolated
+  runtime account, a separate bounded SSH gateway, managed permissions, and a
+  private persistent App Server Unix socket;
 - PostgreSQL 17, observabilité commune et provisioning Grafana ;
 - manifeste de production, schéma, vérificateur de preuves GitHub et contrôleur
   de déploiement borné ;
@@ -176,6 +176,7 @@ Cette décision est détaillée dans
 - [ADR-0003 — builds hors production](docs/decisions/0003-builds-hors-du-vps-de-production.md)
 - [ADR-0004 - Parkventory static demo](docs/decisions/0004-parkventory-static-demo.md)
 - [ADR-0005 - dedicated Codex CLI account](docs/decisions/0005-dedicated-codex-cli-account.md)
+- [ADR-0006 - private Codex App Server](docs/decisions/0006-private-codex-app-server.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas
