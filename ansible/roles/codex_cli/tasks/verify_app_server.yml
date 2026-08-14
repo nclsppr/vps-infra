@@ -129,6 +129,15 @@
 
             CAPTURE_LIMIT = 16384
             HEADER_END = b"\r\n\r\n"
+            # Keep wire bytes in Python so Ansible cannot escape CRLF framing.
+            REQUEST = (
+                b"GET /rpc HTTP/1.1\r\n"
+                b"Host: codex-app-server\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Sec-WebSocket-Version: 13\r\n"
+                b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
             READ_TIMEOUT = 5.0
             CLEANUP_GRACE = 0.5
             DRAIN_GRACE = 0.25
@@ -197,9 +206,6 @@
                 watchdog_armed = True
                 signal.setitimer(signal.ITIMER_REAL, WATCHDOG_TIMEOUT)
 
-                request = sys.stdin.buffer.read(4097)
-                if not request or len(request) > 4096:
-                    raise ValueError("invalid WebSocket smoke request")
                 if len(sys.argv) < 2:
                     raise ValueError("missing WebSocket proxy command")
 
@@ -232,7 +238,7 @@
                     process.stderr.fileno(), selectors.EVENT_READ, errors
                 )
 
-                process.stdin.write(request)
+                process.stdin.write(REQUEST)
                 process.stdin.flush()
                 deadline = time.monotonic() + READ_TIMEOUT
                 while HEADER_END not in output:
@@ -376,14 +382,6 @@
           - SSH_ORIGINAL_COMMAND=codex app-server proxy
           - "{{ vps_codex_remote_gate_path }}"
           - --runtime-validation
-        stdin: >-
-          {{ 'GET /rpc HTTP/1.1\r\n'
-             ~ 'Host: codex-app-server\r\n'
-             ~ 'Connection: Upgrade\r\n'
-             ~ 'Upgrade: websocket\r\n'
-             ~ 'Sec-WebSocket-Version: 13\r\n'
-             ~ 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n' }}
-        stdin_add_newline: false
       register: vps_codex_proxy_websocket_smoke
       changed_when: false
       failed_when: vps_codex_proxy_websocket_smoke.rc != 0
