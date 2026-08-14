@@ -116,10 +116,6 @@
     - name: Open a bounded WebSocket upgrade through the Codex proxy
       ansible.builtin.command:
         argv:
-          - /usr/bin/timeout
-          - --signal=TERM
-          - --kill-after=5s
-          - 10s
           - /usr/bin/python3
           - -I
           - -c
@@ -136,6 +132,7 @@
             READ_TIMEOUT = 5.0
             CLEANUP_GRACE = 0.5
             DRAIN_GRACE = 0.25
+            WATCHDOG_TIMEOUT = 10.0
 
 
             def normalized_returncode(returncode):
@@ -179,45 +176,62 @@
                 raise InterruptedError(f"received {signal.Signals(signum).name}")
 
 
-            request = sys.stdin.buffer.read(4097)
-            if not request or len(request) > 4096:
-                raise SystemExit("invalid WebSocket smoke request")
-            if len(sys.argv) < 2:
-                raise SystemExit("missing WebSocket proxy command")
+            def watchdog(_signum, _frame):
+                raise TimeoutError("WebSocket smoke watchdog expired")
 
-            try:
-                process = subprocess.Popen(
-                    sys.argv[1:],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                    bufsize=0,
-                )
-            except OSError as error:
-                print(f"cannot start WebSocket proxy: {error}", file=sys.stderr)
-                raise SystemExit(127) from error
 
-            handled_signals = (signal.SIGTERM, signal.SIGHUP)
-            for handled_signal in handled_signals:
-                signal.signal(handled_signal, interrupt)
-
-            assert process.stdin is not None
-            assert process.stdout is not None
-            assert process.stderr is not None
-            for stream in (process.stdout, process.stderr):
-                os.set_blocking(stream.fileno(), False)
-
+            process = None
+            selector = None
             output = bytearray()
             errors = bytearray()
             failure = None
             overflow = False
-            terminated_by_harness = False
-            selector = selectors.DefaultSelector()
-            selector.register(process.stdout.fileno(), selectors.EVENT_READ, output)
-            selector.register(process.stderr.fileno(), selectors.EVENT_READ, errors)
+            start_failure = False
+            handled_signals = (signal.SIGTERM, signal.SIGHUP)
+            watchdog_armed = False
 
             try:
+                for handled_signal in handled_signals:
+                    signal.signal(handled_signal, interrupt)
+                signal.signal(signal.SIGALRM, watchdog)
+                watchdog_armed = True
+                signal.setitimer(signal.ITIMER_REAL, WATCHDOG_TIMEOUT)
+
+                request = sys.stdin.buffer.read(4097)
+                if not request or len(request) > 4096:
+                    raise ValueError("invalid WebSocket smoke request")
+                if len(sys.argv) < 2:
+                    raise ValueError("missing WebSocket proxy command")
+
+                try:
+                    process = subprocess.Popen(
+                        sys.argv[1:],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        start_new_session=True,
+                        bufsize=0,
+                    )
+                except OSError as error:
+                    start_failure = True
+                    raise RuntimeError(
+                        f"cannot start WebSocket proxy: {error}"
+                    ) from error
+
+                assert process.stdin is not None
+                assert process.stdout is not None
+                assert process.stderr is not None
+                for stream in (process.stdout, process.stderr):
+                    os.set_blocking(stream.fileno(), False)
+
+                selector = selectors.DefaultSelector()
+                selector.register(
+                    process.stdout.fileno(), selectors.EVENT_READ, output
+                )
+                selector.register(
+                    process.stderr.fileno(), selectors.EVENT_READ, errors
+                )
+
                 process.stdin.write(request)
                 process.stdin.flush()
                 deadline = time.monotonic() + READ_TIMEOUT
@@ -233,60 +247,84 @@
             except BaseException as error:
                 failure = error
             finally:
+                if watchdog_armed:
+                    signal.signal(signal.SIGALRM, signal.SIG_IGN)
+                    signal.setitimer(signal.ITIMER_REAL, 0)
                 for handled_signal in handled_signals:
                     signal.signal(handled_signal, signal.SIG_IGN)
-                try:
-                    process.stdin.close()
-                except (BrokenPipeError, OSError):
-                    pass
-                process.stdin = None
+                if process is not None:
+                    if process.stdin is not None:
+                        try:
+                            process.stdin.close()
+                        except (BrokenPipeError, OSError):
+                            pass
+                        process.stdin = None
 
-                cleanup_deadline = time.monotonic() + CLEANUP_GRACE
-                while True:
-                    remaining = cleanup_deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    if selector.get_map():
-                        overflow = (
-                            read_ready(selector, min(remaining, 0.05)) or overflow
-                        )
-                    else:
-                        time.sleep(min(remaining, 0.05))
+                    cleanup_deadline = time.monotonic() + CLEANUP_GRACE
+                    try:
+                        while True:
+                            remaining = cleanup_deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            if selector is not None and selector.get_map():
+                                overflow = (
+                                    read_ready(selector, min(remaining, 0.05))
+                                    or overflow
+                                )
+                            else:
+                                time.sleep(min(remaining, 0.05))
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
 
-                terminated_by_harness = signal_group(process, signal.SIGTERM)
-                termination_deadline = time.monotonic() + CLEANUP_GRACE
-                while True:
-                    remaining = termination_deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    if selector.get_map():
-                        overflow = (
-                            read_ready(selector, min(remaining, 0.05)) or overflow
-                        )
-                    else:
-                        time.sleep(min(remaining, 0.05))
+                    signal_group(process, signal.SIGTERM)
+                    termination_deadline = time.monotonic() + CLEANUP_GRACE
+                    try:
+                        while True:
+                            remaining = termination_deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            if selector is not None and selector.get_map():
+                                overflow = (
+                                    read_ready(selector, min(remaining, 0.05))
+                                    or overflow
+                                )
+                            else:
+                                time.sleep(min(remaining, 0.05))
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
 
-                terminated_by_harness = (
                     signal_group(process, signal.SIGKILL)
-                    or terminated_by_harness
-                )
-                try:
-                    process.wait(timeout=CLEANUP_GRACE)
-                except subprocess.TimeoutExpired as error:
-                    if failure is None:
-                        failure = error
+                    try:
+                        process.wait(timeout=CLEANUP_GRACE)
+                    except subprocess.TimeoutExpired as error:
+                        if failure is None:
+                            failure = error
 
-                drain_deadline = time.monotonic() + DRAIN_GRACE
-                while selector.get_map():
-                    remaining = drain_deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    overflow = read_ready(selector, remaining) or overflow
-                selector.close()
-                process.stdout.close()
-                process.stderr.close()
+                    if selector is not None:
+                        drain_deadline = time.monotonic() + DRAIN_GRACE
+                        try:
+                            while selector.get_map():
+                                remaining = drain_deadline - time.monotonic()
+                                if remaining <= 0:
+                                    break
+                                overflow = (
+                                    read_ready(selector, remaining) or overflow
+                                )
+                        except BaseException as error:
+                            if failure is None:
+                                failure = error
+                        selector.close()
+                    if process.stdout is not None:
+                        process.stdout.close()
+                    if process.stderr is not None:
+                        process.stderr.close()
 
-            if isinstance(failure, (TimeoutError, InterruptedError)):
+            if start_failure:
+                result = 127
+                diagnostic = str(failure)
+            elif isinstance(failure, (TimeoutError, InterruptedError)):
                 result = 124
                 diagnostic = str(failure)
             elif failure is not None:
@@ -301,10 +339,7 @@
                     "WebSocket proxy exited before its response header "
                     f"with status {process.returncode}"
                 )
-            elif process.returncode not in (None, 0) and not (
-                terminated_by_harness
-                and process.returncode in (-signal.SIGTERM, -signal.SIGKILL)
-            ):
+            elif process.returncode != 0:
                 result = normalized_returncode(process.returncode)
                 diagnostic = f"WebSocket proxy exited with status {process.returncode}"
             else:
