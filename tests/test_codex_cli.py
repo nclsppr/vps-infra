@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
+import time
 import unittest
 from pathlib import Path
 
 import yaml
+from jinja2 import Environment
 
 try:
     import tomllib
@@ -36,12 +41,20 @@ class CodexCliContractTests(unittest.TestCase):
         )
         argv = smoke["ansible.builtin.command"]["argv"]
         self.assertEqual(
-            argv,
+            argv[:7],
             [
                 "/usr/bin/timeout",
                 "--signal=TERM",
                 "--kill-after=5s",
                 "10s",
+                "/usr/bin/python3",
+                "-I",
+                "-c",
+            ],
+        )
+        self.assertEqual(
+            argv[8:],
+            [
                 "/usr/sbin/runuser",
                 "--user",
                 "{{ vps_codex_remote_user }}",
@@ -54,6 +67,247 @@ class CodexCliContractTests(unittest.TestCase):
                 "{{ vps_codex_remote_gate_path }}",
                 "--runtime-validation",
             ],
+        )
+        self.assertNotIn("/usr/bin/runuser", argv)
+
+        request = (
+            Environment()
+            .from_string(smoke["ansible.builtin.command"]["stdin"])
+            .render()
+            .encode()
+        )
+        self.assertEqual(
+            request,
+            b"GET /rpc HTTP/1.1\r\n"
+            b"Host: codex-app-server\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Sec-WebSocket-Version: 13\r\n"
+            b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        child = """
+import select
+import sys
+
+request = sys.stdin.buffer.read(%d)
+ready, _, _ = select.select([sys.stdin.buffer], [], [], 0)
+if len(request) != %d or ready:
+    raise SystemExit(71)
+sys.stdout.buffer.write(
+    b"HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\n\\r\\n"
+)
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read()
+""" % (len(request), len(request))
+        harness = subprocess.run(
+            [sys.executable, "-I", "-c", argv[7], sys.executable, "-I", "-c", child],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(harness.returncode, 0, harness.stderr.decode())
+        self.assertIn(b"HTTP/1.1 101", harness.stdout)
+
+        failed_child = child + "\nraise SystemExit(72)\n"
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                argv[7],
+                sys.executable,
+                "-I",
+                "-c",
+                failed_child,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(b"HTTP/1.1 101", rejected.stdout)
+        self.assertIn(b"WebSocket proxy exited with status 72", rejected.stderr)
+
+        delayed_failure_child = child.replace(
+            "sys.stdin.buffer.read()\n",
+            "sys.stdin.buffer.read()\n"
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "time.sleep(0.6)\n",
+        ) + "\nraise SystemExit(74)\n"
+        delayed_rejected = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                argv[7],
+                sys.executable,
+                "-I",
+                "-c",
+                delayed_failure_child,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(delayed_rejected.returncode, 74)
+        self.assertIn(b"WebSocket proxy exited with status 74", delayed_rejected.stderr)
+
+        crashed_child = child + (
+            "\nimport os, signal\n"
+            "os.kill(os.getpid(), signal.SIGSEGV)\n"
+        )
+        crashed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                argv[7],
+                sys.executable,
+                "-I",
+                "-c",
+                crashed_child,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(crashed.returncode, 139)
+        self.assertIn(b"WebSocket proxy exited with status -11", crashed.stderr)
+
+        descendant_child = """
+import os
+import select
+import subprocess
+import sys
+
+request = sys.stdin.buffer.read(%d)
+ready, _, _ = select.select([sys.stdin.buffer], [], [], 0)
+if len(request) != %d or ready:
+    raise SystemExit(71)
+ready_reader, ready_writer = os.pipe()
+descendant = subprocess.Popen([
+    sys.executable,
+    "-I",
+    "-c",
+    "import os,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "os.write(int(sys.argv[1]), b'R'); os.close(int(sys.argv[1])); time.sleep(30)",
+    str(ready_writer),
+], pass_fds=(ready_writer,))
+os.close(ready_writer)
+if os.read(ready_reader, 1) != b"R":
+    raise SystemExit(75)
+os.close(ready_reader)
+print(f"DESCENDANT={descendant.pid}", file=sys.stderr, flush=True)
+sys.stdout.buffer.write(
+    b"HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\n\\r\\n"
+)
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read()
+raise SystemExit(73)
+""" % (len(request), len(request))
+        started = time.monotonic()
+        held_pipe = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                argv[7],
+                sys.executable,
+                "-I",
+                "-c",
+                descendant_child,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(held_pipe.returncode, 73, held_pipe.stderr.decode())
+        descendant_match = re.search(rb"DESCENDANT=([0-9]+)", held_pipe.stderr)
+        self.assertIsNotNone(descendant_match)
+        descendant_pid = int(descendant_match.group(1))
+        descendant_deadline = time.monotonic() + 2
+        while time.monotonic() < descendant_deadline:
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("proxy smoke descendant survived process-group cleanup")
+
+        overflow_child = """
+import sys
+
+sys.stdin.buffer.read(%d)
+sys.stdout.buffer.write(b"x" * 20000)
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read()
+""" % len(request)
+        overflow = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                argv[7],
+                sys.executable,
+                "-I",
+                "-c",
+                overflow_child,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(overflow.returncode, 70, overflow.stderr.decode())
+        self.assertEqual(len(overflow.stdout), 16384)
+        self.assertIn(b"output exceeded its bound", overflow.stderr)
+
+        misleading_child = """
+import sys
+
+sys.stdin.buffer.read(%d)
+sys.stdout.buffer.write(
+    b"HTTP/1.1 500 Broken\\r\\nContent-Length: 91\\r\\n\\r\\n"
+    b"HTTP/1.1 101 Switching Protocols\\r\\n"
+    b"Connection: Upgrade\\r\\nUpgrade: websocket\\r\\n"
+    b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\\r\\n\\r\\n"
+)
+sys.stdout.buffer.flush()
+sys.stdin.buffer.read()
+""" % len(request)
+        misleading = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                argv[7],
+                sys.executable,
+                "-I",
+                "-c",
+                misleading_child,
+            ],
+            input=request,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(misleading.returncode, 0, misleading.stderr.decode())
+        self.assertEqual(
+            misleading.stdout,
+            b"HTTP/1.1 500 Broken\r\nContent-Length: 91\r\n\r\n",
+        )
+        status_assertion = smoke_block["block"][2]["ansible.builtin.assert"]["that"][1]
+        self.assertIn(
+            "stdout_lines[0:1] == ['HTTP/1.1 101 Switching Protocols']",
+            status_assertion,
         )
         converge_tasks = yaml.safe_load(
             (ROLE / "tasks/converge.yml").read_text(encoding="utf-8")
