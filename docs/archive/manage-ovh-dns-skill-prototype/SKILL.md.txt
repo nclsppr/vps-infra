@@ -1,0 +1,129 @@
+---
+name: manage-ovh-dns
+description: Inspecter, planifier, appliquer et vérifier une modification bornée de record DNS OVHcloud sur Atlas via le contrôleur root-owned ovh-dnsctl. Utiliser lorsque Nicolas demande à Codex de consulter, pointer, repointer, modifier ou vérifier un record DNS hébergé chez OVHcloud. Ne pas utiliser pour gérer les identifiants, appeler directement l'API OVH, modifier la délégation ou le mail, créer ou supprimer un record, importer une zone ou contourner une politique.
+---
+
+# Gérer un record DNS OVH
+
+Utiliser exclusivement cette capacité fixe :
+
+```text
+sudo -n -- /usr/local/libexec/vps/ovh-dnsctl <commande>
+```
+
+Le skill décrit la procédure. Le contrôleur root-owned constitue la frontière de
+sécurité et doit refuser toute action hors politique.
+
+## Préserver la frontière de sécurité
+
+- Ne jamais lire, rechercher, copier, afficher, valider ou sauvegarder les
+  fichiers d'identifiants OVH.
+- Ne jamais transmettre un identifiant dans les arguments, stdin, variables
+  d'environnement, prompts, logs ou fichiers de l'espace de travail.
+- Ne jamais appeler l'API OVH directement avec curl, un SDK, un navigateur ou
+  du code improvisé.
+- Ne jamais modifier le contrôleur, sa politique, ses plans, ses snapshots, sa
+  règle sudoers ou son marqueur d'activation.
+- Ne jamais tenter de contourner un refus du contrôleur.
+- Arrêter si le contrôleur est absent ou indisponible. Ne pas improviser une
+  autre voie d'accès à OVHcloud.
+
+## Vérifier la capacité
+
+Exécuter avant toute inspection ou planification :
+
+```text
+sudo -n -- /usr/local/libexec/vps/ovh-dnsctl doctor --json
+```
+
+Exiger une réponse saine et une capacité active. Ne pas déduire une zone, un
+record, un type, une cible ou un TTL qui ne figure pas dans la requête ou dans
+la sortie assainie du contrôleur.
+
+## Inspecter sans modifier
+
+Utiliser le FQDN et le type exacts :
+
+```text
+sudo -n -- /usr/local/libexec/vps/ovh-dnsctl inspect \
+  --record '<fqdn>' \
+  --type A \
+  --json
+```
+
+Rapporter l'état courant sans planifier ni appliquer lorsque la demande porte
+uniquement sur une consultation ou une vérification.
+
+## Planifier une modification
+
+La première version accepte seulement la modification d'un record `A` existant
+et unique. Elle n'accepte ni création, ni suppression, ni wildcard, ni `AAAA`,
+ni `CNAME`, ni `TXT`, ni `CAA`, ni `MX`, ni `NS`, ni `SOA`.
+
+```text
+sudo -n -- /usr/local/libexec/vps/ovh-dnsctl plan \
+  --record '<fqdn>' \
+  --type A \
+  --target '<ipv4>' \
+  --ttl '<ttl>' \
+  --json
+```
+
+Présenter avant toute application :
+
+- le FQDN et le type ;
+- la valeur et le TTL actuels ;
+- la valeur et le TTL demandés ;
+- l'identifiant, le SHA-256 et l'expiration du plan ;
+- les avertissements et le statut de validation renvoyés par le contrôleur.
+
+## Appliquer après confirmation explicite
+
+Ne jamais appliquer un plan sur la seule base d'une demande d'inspection ou de
+planification. Obtenir une confirmation explicite portant sur le plan exact,
+après présentation du diff.
+
+```text
+sudo -n -- /usr/local/libexec/vps/ovh-dnsctl apply \
+  --plan-id '<plan-id>' \
+  --plan-sha256 '<sha256>' \
+  --json
+```
+
+Ne pas repasser la cible ou le TTL à `apply`. Le contrôleur doit appliquer
+uniquement le plan root-owned déjà enregistré et revalider l'état avant mutation.
+
+Rapporter séparément :
+
+- le résultat de l'appel API OVHcloud ;
+- le rafraîchissement de zone ;
+- la relecture du record par l'API ;
+- la vérification sur les serveurs DNS autoritatifs.
+
+## Gérer un résultat ambigu
+
+Si le résultat est `applied_unverified`, exécuter une seule vérification :
+
+```text
+sudo -n -- /usr/local/libexec/vps/ovh-dnsctl verify \
+  --plan-id '<plan-id>' \
+  --json
+```
+
+Ne jamais relancer `apply` et ne jamais effectuer un rollback automatique.
+
+## Conditions d'arrêt
+
+Arrêter sans essayer une autre commande lorsque :
+
+- le record, la cible ou le TTL est ambigu ;
+- aucun record ou plusieurs records correspondent ;
+- le contrôleur refuse le FQDN, le type, la cible ou le TTL ;
+- le plan est expiré, déjà consommé ou altéré ;
+- la politique, la zone ou le record a changé après la planification ;
+- l'API et les serveurs DNS autoritatifs divergent ;
+- l'opération exige une création, une suppression, une modification mail, une
+  délégation, un wildcard ou IPv6.
+
+Conserver le message de refus assaini. Ne jamais rechercher les identifiants
+pour expliquer un échec.

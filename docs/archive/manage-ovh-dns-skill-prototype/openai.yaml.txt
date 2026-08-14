@@ -1,0 +1,7 @@
+interface:
+  display_name: "Manage OVH DNS"
+  short_description: "Planifier et appliquer des changements DNS OVH"
+  default_prompt: "Use $manage-ovh-dns pour préparer et exécuter un changement DNS OVH contrôlé."
+
+policy:
+  allow_implicit_invocation: false
