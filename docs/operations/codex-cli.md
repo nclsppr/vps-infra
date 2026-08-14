@@ -186,10 +186,12 @@ the Atlas task.
 Place only disposable, explicitly approved material below
 `/srv/codex/workspaces`. The secret filename globs in managed policy are a
 defense-in-depth check, not a secret-management system and not a guarantee that
-every sensitive filename will be recognized. The primary rule is that no
-credential, private key, production secret, database dump, Docker credential,
-protected infrastructure mirror, or live application state enters a Codex
-workspace.
+every sensitive filename will be recognized. Linux glob expansion is capped at
+32 path components so an adversarial workspace cannot force an unbounded scan.
+The managed release probe proves denial at 18 components. Deeper content is
+outside that shell-sandbox guarantee. The primary rule is that no credential,
+private key, production secret, database dump, Docker credential, protected
+infrastructure mirror, or live application state enters a Codex workspace.
 
 Codex on Atlas is not a CI runner and must not build or publish application
 releases. Start it from the selected workspace:
@@ -310,7 +312,8 @@ sudo systemctl is-enabled atlas-codex-app-server.service
 sudo systemctl is-active atlas-codex-app-server.service
 sudo systemctl show atlas-codex-app-server.service \
   -p User -p Group -p Slice -p Restart -p NoNewPrivileges \
-  -p PrivateDevices -p ProtectHome -p ProtectSystem
+  -p PrivateDevices -p ProtectHome -p ProtectSystem \
+  -p SocketBindAllow -p SocketBindDeny
 sudo stat -c '%F %U:%G %a %n' \
   /srv/codex/home/.codex/app-server-control/app-server-control.sock
 sudo ss -lntup
@@ -318,11 +321,12 @@ sudo ss -lntup
 
 The first two commands must return `enabled` and `active`. The service must run
 as `codex:codex` in `atlas-codex.slice`, and the path must be a socket owned by
-`codex`. The listener list must contain no Codex TCP or UDP socket. UFW remains
-limited to the existing SSH, HTTP, and HTTPS rules.
+`codex`. Effective bind policy must allow UDP for the pinned musl DNS resolver
+and deny IPv4 and IPv6 binds otherwise. The listener list must contain no Codex
+TCP listener. A transient UDP DNS client socket is allowed. UFW remains limited
+to the existing SSH, HTTP, and HTTPS rules and denies undeclared inbound ports.
 
-The listener inspection command succeeds and must contain no Codex TCP or UDP
-socket. Never print `auth.json` or session files while diagnosing a login.
+Never print `auth.json` or session files while diagnosing a login.
 
 ## Upgrade and rollback
 

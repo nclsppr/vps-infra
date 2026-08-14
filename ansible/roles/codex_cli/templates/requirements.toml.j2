@@ -18,6 +18,7 @@ description = "Edit only the selected workspace without command network access."
 extends = ":workspace"
 
 [permissions.atlas_workspace.filesystem]
+glob_scan_max_depth = 32
 ":root" = "deny"
 ":minimal" = "read"
 "/opt/codex" = "read"

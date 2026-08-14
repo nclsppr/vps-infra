@@ -597,7 +597,7 @@ sys.stdin.buffer.read()
         self.assertFalse(profile["network"]["enabled"])
         self.assertEqual(profile["filesystem"][":root"], "deny")
         self.assertEqual(profile["filesystem"][":minimal"], "read")
-        self.assertNotIn("glob_scan_max_depth", profile["filesystem"])
+        self.assertEqual(profile["filesystem"]["glob_scan_max_depth"], 32)
         denied = profile["filesystem"][":workspace_roots"]
         self.assertTrue(denied)
         self.assertEqual(set(denied.values()), {"deny"})
@@ -942,6 +942,7 @@ sys.stdin.buffer.read()
             "--property=ProtectProc=invisible",
             "--property=PrivateDevices=yes",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+            "SocketBindAllow=udp",
             "SocketBindDeny=ipv4",
             "SocketBindDeny=ipv6",
             "TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size={{ vps_codex_tmpfs_size_mb }}M,mode=1777",
@@ -1066,11 +1067,16 @@ sys.stdin.buffer.read()
             "CapabilityBoundingSet=",
             "ProtectHome=yes",
             "ProtectSystem=strict",
+            "SocketBindAllow=udp",
             "SocketBindDeny=ipv4",
             "SocketBindDeny=ipv6",
             "WantedBy=multi-user.target",
         ):
             self.assertIn(boundary, service)
+        self.assertLess(
+            service.index("SocketBindAllow=udp"),
+            service.index("SocketBindDeny=ipv4"),
+        )
         self.assertIn(
             "ExecCondition=+/usr/local/sbin/atlas-codex --service-admission",
             service,
@@ -1082,6 +1088,12 @@ sys.stdin.buffer.read()
         self.assertNotIn("RestartPreventExitStatus", service)
         self.assertNotIn("--remote-control", service)
         self.assertNotIn("RuntimeMaxSec", service)
+
+        verification = (
+            ROLE / "tasks/verify_app_server.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--property=SocketBindAllow", verification)
+        self.assertIn("(?m)^SocketBindAllow=.*udp", verification)
 
         authorized_keys = (
             ROLE / "templates/codex-remote-authorized-keys.j2"

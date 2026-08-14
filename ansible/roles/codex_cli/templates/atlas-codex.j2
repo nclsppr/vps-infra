@@ -207,6 +207,7 @@ exec /usr/bin/systemd-run \
   --property='InaccessiblePaths=-/etc/vps -/home/deploy -/home/{{ vps_codex_remote_user }} -/home/ubuntu -/home/vpsadmin -/root -/run/containerd/containerd.sock -/run/docker.sock -/srv/vps -/var/lib/docker -/var/lib/vps-controller -/var/run/docker.sock' \
   --property=ReadWritePaths={{ vps_codex_storage_root }} \
   --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' \
+  --property='SocketBindAllow=udp' \
   --property='SocketBindDeny=ipv4' \
   --property='SocketBindDeny=ipv6' \
   --property=RestrictSUIDSGID=yes \

@@ -52,6 +52,7 @@ ProtectSystem=strict
 InaccessiblePaths=-/etc/vps -/home/deploy -/home/{{ vps_codex_remote_user }} -/home/ubuntu -/home/vpsadmin -/root -/run/containerd/containerd.sock -/run/docker.sock -/srv/vps -/var/lib/docker -/var/lib/vps-controller -/var/run/docker.sock
 ReadWritePaths={{ vps_codex_storage_root }}
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SocketBindAllow=udp
 SocketBindDeny=ipv4
 SocketBindDeny=ipv6
 RestrictSUIDSGID=yes
