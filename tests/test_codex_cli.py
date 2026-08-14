@@ -19,6 +19,53 @@ ROLE = ROOT / "ansible/roles/codex_cli"
 
 
 class CodexCliContractTests(unittest.TestCase):
+    def test_app_server_proxy_smoke_uses_the_ubuntu_runuser_path(self) -> None:
+        tasks = yaml.safe_load(
+            (ROLE / "tasks/verify_app_server.yml").read_text(encoding="utf-8")
+        )
+        smoke_block = next(
+            task
+            for task in tasks
+            if task["name"] == "Prove the private Codex App Server WebSocket proxy"
+        )
+        smoke = next(
+            task
+            for task in smoke_block["block"]
+            if task["name"]
+            == "Open a bounded WebSocket upgrade through the Codex proxy"
+        )
+        argv = smoke["ansible.builtin.command"]["argv"]
+        self.assertEqual(
+            argv,
+            [
+                "/usr/bin/timeout",
+                "--signal=TERM",
+                "--kill-after=5s",
+                "10s",
+                "/usr/sbin/runuser",
+                "--user",
+                "{{ vps_codex_remote_user }}",
+                "--",
+                "/usr/bin/env",
+                "-i",
+                "LANG=C.UTF-8",
+                "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+                "SSH_ORIGINAL_COMMAND=codex app-server proxy",
+                "{{ vps_codex_remote_gate_path }}",
+                "--runtime-validation",
+            ],
+        )
+        converge_tasks = yaml.safe_load(
+            (ROLE / "tasks/converge.yml").read_text(encoding="utf-8")
+        )
+        prerequisites = next(
+            task
+            for task in converge_tasks
+            if task["name"]
+            == "Install bounded storage and package verification dependencies"
+        )
+        self.assertIn("util-linux", prerequisites["ansible.builtin.apt"]["name"])
+
     def test_release_artifacts_and_executables_are_digest_pinned(self) -> None:
         defaults = yaml.safe_load(
             (ROLE / "defaults/main.yml").read_text(encoding="utf-8")
