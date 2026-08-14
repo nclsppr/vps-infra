@@ -4,6 +4,15 @@
     that:
       - vps_codex_user == 'codex'
       - vps_codex_group == 'codex'
+      - vps_codex_remote_user == 'codex-remote'
+      - vps_codex_remote_group == 'codex-remote'
+      - vps_codex_remote_enabled is boolean
+      - >-
+        not (vps_codex_remote_enabled | bool) or
+        vps_codex_remote_authorized_keys | length > 0
+      - >-
+        (vps_codex_remote_enabled | bool) or
+        vps_codex_remote_authorized_keys | length == 0
       - vps_codex_storage_root == '/srv/codex'
       - vps_codex_storage_image_path == '/var/lib/vps-infra/codex-storage.ext4'
       - vps_codex_storage_size_mb | int == 6144
@@ -25,6 +34,16 @@
       - >-
         vps_codex_activation_rollback_root ==
         '/var/lib/vps-infra/codex-activation-rollback'
+      - vps_codex_app_server_unit == 'atlas-codex-app-server.service'
+      - >-
+        vps_codex_app_server_socket ==
+        '/srv/codex/home/.codex/app-server-control/app-server-control.sock'
+      - >-
+        vps_codex_remote_sudoers_path ==
+        '/etc/sudoers.d/92-codex-remote-codex'
+      - >-
+        vps_codex_remote_gate_path ==
+        '/usr/local/sbin/atlas-codex-remote-gate'
       - vps_codex_release_base_url == 'https://releases.openai.com/codex/releases'
       - vps_codex_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
       - >-
@@ -33,6 +52,9 @@
       - ansible_facts.architecture in vps_codex_artifacts
       - ansible_facts.architecture in vps_codex_bubblewrap_artifacts
       - vps_codex_user not in ['root', vps_admin_user, vps_deploy_user]
+      - >-
+        vps_codex_remote_user not in
+        ['root', vps_admin_user, vps_deploy_user, vps_codex_user]
     fail_msg: >-
       The Codex CLI role accepts only the dedicated, unprivileged Atlas
       identity and a pinned official release artifact.
@@ -53,6 +75,35 @@
       {{ vps_codex_install_root }}/releases/{{ vps_codex_version }}-{{
       vps_codex_artifacts[ansible_facts.architecture].target }}
 
+- name: Validate Codex remote public key syntax
+  ansible.builtin.assert:
+    that:
+      - >-
+        item is match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
+      - "'\n' not in item"
+      - "'\r' not in item"
+    fail_msg: >-
+      A Codex remote public key is invalid or already contains SSH options.
+  loop: "{{ vps_codex_remote_authorized_keys }}"
+  loop_control:
+    label: declared Codex remote key
+
+- name: Cryptographically parse Codex remote public keys
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ssh-keygen
+      - -l
+      - -f
+      - /dev/stdin
+    stdin: "{{ item }}\n"
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - vps_codex_remote_enabled | bool
+  loop: "{{ vps_codex_remote_authorized_keys }}"
+  loop_control:
+    label: declared Codex remote key
+
 - name: Read the Codex account before a predictive check
   ansible.builtin.getent:
     database: passwd
@@ -64,15 +115,23 @@
   ansible.builtin.stat:
     path: "{{ item }}"
     follow: false
-  loop:
-    - "{{ vps_codex_storage_root }}"
-    - "{{ vps_codex_storage_image_path }}"
-    - "{{ vps_codex_home }}"
-    - "{{ vps_codex_home }}/.codex/config.toml"
-    - /etc/codex/requirements.toml
-    - /etc/systemd/system/atlas-codex.slice
-    - "{{ vps_codex_release_path }}"
-    - /usr/local/sbin/atlas-codex
+  loop: >-
+    {{
+      [vps_codex_storage_root,
+       vps_codex_storage_image_path,
+       vps_codex_home,
+       vps_codex_home ~ '/.codex/config.toml',
+       '/etc/codex/requirements.toml',
+       '/etc/systemd/system/atlas-codex.slice',
+       vps_codex_release_path,
+       '/usr/local/sbin/atlas-codex'] +
+      (['/etc/systemd/system/atlas-codex-app-server.service',
+        '/etc/systemd/system/multi-user.target.wants/atlas-codex-app-server.service',
+        '/etc/sudoers.d/92-codex-remote-codex',
+        '/home/' ~ vps_codex_remote_user ~ '/.ssh/authorized_keys',
+        '/usr/local/sbin/atlas-codex-remote-gate']
+       if (vps_codex_remote_enabled | bool) else [])
+    }}
   register: vps_codex_predictive_state
   when: ansible_check_mode
 
@@ -146,6 +205,50 @@
       The signed Ubuntu package index does not bind the pinned bubblewrap
       version to the reviewed architecture-specific archive digest.
 
+- name: Read the installed bubblewrap version before reconciliation
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg-query
+      - --show
+      - --showformat=${db:Status-Status} ${Version}
+      - bubblewrap
+  register: vps_codex_prior_bubblewrap
+  changed_when: false
+  failed_when: vps_codex_prior_bubblewrap.rc not in [0, 1]
+  check_mode: false
+
+- name: Inspect managed Codex surfaces before bubblewrap bootstrap
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - /usr/local/sbin/atlas-codex
+    - /opt/codex/current
+    - /etc/systemd/system/atlas-codex-app-server.service
+  register: vps_codex_surfaces_before_bubblewrap
+
+- name: Refuse a non-transactional bubblewrap change for an existing runtime
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_codex_prior_bubblewrap.rc == 1 or
+        vps_codex_prior_bubblewrap.stdout ==
+        'installed ' ~ vps_codex_bubblewrap_version
+      - >-
+        vps_codex_prior_bubblewrap.rc != 1 or
+        vps_codex_surfaces_before_bubblewrap.results |
+        selectattr('stat.exists', 'equalto', true) | list | length == 0
+    fail_msg: >-
+      The installed bubblewrap version differs from the reviewed version while
+      a Codex runtime already exists, or the package is missing from a managed
+      runtime. Preserve the current state and use a dedicated package migration
+      with package-level rollback.
+
+- name: Select whether bubblewrap requires first-install bootstrap
+  ansible.builtin.set_fact:
+    vps_codex_bubblewrap_bootstrap_required: >-
+      {{ vps_codex_prior_bubblewrap.rc == 1 }}
+
 - name: Install the exact Ubuntu bubblewrap package
   ansible.builtin.apt:
     name: bubblewrap={{ vps_codex_bubblewrap_version }}
@@ -157,6 +260,7 @@
   environment:
     DEBIAN_FRONTEND: noninteractive
     NEEDRESTART_MODE: a
+  when: vps_codex_bubblewrap_bootstrap_required | bool
 
 - name: Hold the reviewed Ubuntu bubblewrap package
   ansible.builtin.dpkg_selections:
@@ -241,6 +345,122 @@
     create_home: false
     password_lock: true
     state: present
+
+- name: Create the Codex remote gateway group
+  ansible.builtin.group:
+    name: "{{ vps_codex_remote_group }}"
+    system: false
+    state: present
+  when: vps_codex_remote_enabled | bool
+
+- name: Create the unprivileged Codex remote gateway account
+  ansible.builtin.user:
+    name: "{{ vps_codex_remote_user }}"
+    comment: Private Codex App Server SSH gateway managed by Ansible
+    home: "/home/{{ vps_codex_remote_user }}"
+    shell: /bin/bash
+    group: "{{ vps_codex_remote_group }}"
+    groups: ""
+    append: false
+    system: false
+    create_home: false
+    password_lock: true
+    state: present
+  when: vps_codex_remote_enabled | bool
+
+- name: Inspect existing Codex remote filesystem boundaries
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+  loop:
+    - path: "/home/{{ vps_codex_remote_user }}"
+      type: directory
+      owner: root
+      group: root
+      mode: "0755"
+    - path: "/home/{{ vps_codex_remote_user }}/.ssh"
+      type: directory
+      owner: root
+      group: root
+      mode: "0755"
+    - path: "/home/{{ vps_codex_remote_user }}/.ssh/authorized_keys"
+      type: file
+      owner: root
+      group: root
+      mode: "0644"
+    - path: "/home/{{ vps_codex_remote_user }}/.codex"
+      type: directory
+      owner: root
+      group: root
+      mode: "0755"
+    - path: "/home/{{ vps_codex_remote_user }}/.codex/app-server-control"
+      type: directory
+      owner: "{{ vps_codex_remote_user }}"
+      group: "{{ vps_codex_remote_group }}"
+      mode: "0700"
+  loop_control:
+    label: "{{ item.path }}"
+  register: vps_codex_remote_boundary_state
+  when: vps_codex_remote_enabled | bool
+
+- name: Refuse unsafe existing Codex remote filesystem boundaries
+  ansible.builtin.assert:
+    that:
+      - >-
+        not item.stat.exists or
+        (not item.stat.islnk and
+         ((item.item.type == 'directory' and item.stat.isdir) or
+          (item.item.type == 'file' and item.stat.isreg)) and
+         item.stat.pw_name == item.item.owner and
+         item.stat.gr_name == item.item.group and
+         item.stat.mode == item.item.mode)
+    fail_msg: >-
+      A Codex remote filesystem boundary has an unexpected type, owner, group,
+      or mode. It was preserved for explicit inspection.
+  loop: "{{ vps_codex_remote_boundary_state.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when: vps_codex_remote_enabled | bool
+
+- name: Create the root-owned Codex remote home boundary
+  ansible.builtin.file:
+    path: "/home/{{ vps_codex_remote_user }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+    follow: false
+  when: vps_codex_remote_enabled | bool
+
+- name: Create the private Codex remote SSH directory
+  ansible.builtin.file:
+    path: "/home/{{ vps_codex_remote_user }}/.ssh"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+    follow: false
+  when: vps_codex_remote_enabled | bool
+
+- name: Create the root-owned Codex remote state boundary
+  ansible.builtin.file:
+    path: "/home/{{ vps_codex_remote_user }}/.codex"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+    follow: false
+  when: vps_codex_remote_enabled | bool
+
+- name: Create the writable Codex remote control directory
+  ansible.builtin.file:
+    path: "/home/{{ vps_codex_remote_user }}/.codex/app-server-control"
+    state: directory
+    owner: "{{ vps_codex_remote_user }}"
+    group: "{{ vps_codex_remote_group }}"
+    mode: "0700"
+    follow: false
+  when: vps_codex_remote_enabled | bool
 
 - name: Inspect the bounded Codex storage root
   ansible.builtin.stat:

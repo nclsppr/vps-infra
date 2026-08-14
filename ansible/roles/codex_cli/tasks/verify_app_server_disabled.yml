@@ -1,0 +1,46 @@
+---
+- name: Inspect disabled Codex App Server activation surfaces
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - /etc/systemd/system/atlas-codex-app-server.service
+    - /etc/systemd/system/multi-user.target.wants/atlas-codex-app-server.service
+  register: vps_codex_disabled_app_server_surfaces
+
+- name: Read disabled private Codex App Server state
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - "{{ vps_codex_app_server_unit }}"
+  register: vps_codex_disabled_app_server_state
+  changed_when: false
+  failed_when: vps_codex_disabled_app_server_state.rc not in [0, 3, 4]
+
+- name: Read disabled private Codex App Server boot state
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-enabled
+      - "{{ vps_codex_app_server_unit }}"
+  register: vps_codex_disabled_app_server_boot_state
+  changed_when: false
+  failed_when: vps_codex_disabled_app_server_boot_state.rc not in [0, 1, 3, 4]
+
+- name: Prove the private Codex App Server is fully disabled
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_codex_disabled_app_server_surfaces.results |
+        selectattr('stat.exists', 'equalto', true) | list | length == 0
+      - vps_codex_disabled_app_server_state.rc in [3, 4]
+      - >-
+        vps_codex_disabled_app_server_state.stdout in ['inactive', 'unknown']
+      - vps_codex_disabled_app_server_boot_state.rc != 0
+      - >-
+        vps_codex_disabled_app_server_boot_state.stdout not in
+        ['enabled', 'enabled-runtime', 'linked', 'linked-runtime', 'alias']
+    fail_msg: >-
+      The private Codex App Server unit, boot link, or running process survived
+      remote-access disablement.

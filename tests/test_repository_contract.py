@@ -1762,6 +1762,15 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             ],
             (
                 "codex_cli",
+                "Read the installed bubblewrap version before reconciliation",
+            ): [
+                "/usr/bin/dpkg-query",
+                "--show",
+                "--showformat=${db:Status-Status} ${Version}",
+                "bubblewrap",
+            ],
+            (
+                "codex_cli",
                 "Read the installed bubblewrap version after reconciliation",
             ): [
                 "/usr/bin/dpkg-query",
@@ -1852,6 +1861,11 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "-nG",
                 "{{ vps_codex_user }}",
             ],
+            ("codex_cli", "Read the Codex remote gateway account groups"): [
+                "/usr/bin/id",
+                "-nG",
+                "{{ vps_codex_remote_user }}",
+            ],
             (
                 "codex_cli",
                 "Prove ordinary direct Codex invocation uses the guarded entry point",
@@ -1870,6 +1884,17 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "test ! -r /var/run/docker.sock && "
                 "test -x {{ vps_codex_storage_root }} && "
                 "test -w {{ vps_codex_workspace_root }} && "
+                "! /usr/bin/sudo -n /usr/bin/true",
+            ],
+            ("codex_cli", "Probe prohibited Codex remote gateway capabilities"): [
+                "/bin/bash",
+                "-c",
+                "test ! -r {{ vps_codex_home }}/.codex/auth.json && "
+                "test ! -r {{ vps_codex_home }}/.codex/config.toml && "
+                "test ! -r /etc/vps/secrets && "
+                "test ! -r /srv/vps/repository && "
+                "test ! -r /run/containerd/containerd.sock && "
+                "test ! -r /var/run/docker.sock && "
                 "! /usr/bin/sudo -n /usr/bin/true",
             ],
             ("deploy", "Read the infrastructure mirror origin"): [
@@ -1946,6 +1971,12 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "-T",
                 "-C",
                 "user={{ vps_admin_user }},host=localhost,addr=127.0.0.1",
+            ],
+            ("ssh", "Read effective Codex remote SSH policy"): [
+                "/usr/sbin/sshd",
+                "-T",
+                "-C",
+                "user={{ vps_codex_remote_user }},host=localhost,addr=127.0.0.1",
             ],
         }
         observed: dict[tuple[str, str], list[str]] = {}

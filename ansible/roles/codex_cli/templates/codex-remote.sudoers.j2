@@ -1,0 +1,7 @@
+Defaults:{{ vps_codex_remote_user }} env_reset
+Defaults:{{ vps_codex_remote_user }} secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Defaults:{{ vps_codex_remote_user }} !setenv
+{{ vps_codex_remote_user }} ALL=(root) NOPASSWD:NOSETENV: /usr/local/sbin/atlas-codex --remote-version
+{{ vps_codex_remote_user }} ALL=(root) NOPASSWD:NOSETENV: /usr/local/sbin/atlas-codex --remote-app-server
+{{ vps_codex_remote_user }} ALL=(root) NOPASSWD:NOSETENV: /usr/local/sbin/atlas-codex --remote-proxy
+{{ vps_codex_remote_user }} ALL=(root) NOPASSWD:NOSETENV: /usr/local/sbin/atlas-codex --validate-remote-proxy

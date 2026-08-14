@@ -1,13 +1,103 @@
 #!/bin/sh
 set -eu
 
+refuse_maintenance() {
+  if [ -e /run/atlas-codex-maintenance ] || \
+     [ -e {{ vps_codex_activation_rollback_root }} ]; then
+    printf '%s\n' 'Codex convergence or recovery is in progress; retry later' >&2
+    exit 75
+  fi
+}
+
+admit_service_start() {
+  if [ -e {{ vps_codex_activation_rollback_root }} ]; then
+    if [ -e /run/atlas-codex-maintenance ] && \
+       [ ! -e {{ vps_codex_activation_rollback_root }}/activation-started ] && \
+       [ -e {{ vps_codex_activation_rollback_root }}/runtime-validation-started ]; then
+      return 0
+    fi
+    printf '%s\n' 'Codex activation recovery blocks App Server startup' >&2
+    return 1
+  fi
+
+  if [ -e /run/atlas-codex-maintenance ]; then
+    printf '%s\n' 'Codex convergence blocks App Server startup' >&2
+    return 1
+  fi
+}
+
+verify_runtime() {
+  if ! printf '%s  %s\n' \
+    '{{ vps_codex_bubblewrap_artifact.executable_sha256 }}' \
+    /usr/bin/bwrap \
+    | /usr/bin/sha256sum --check --status; then
+    printf '%s\n' 'The Codex sandbox executable digest is not approved' >&2
+    exit 69
+  fi
+
+  workspace_source=$(
+    /usr/bin/findmnt --noheadings --output SOURCE \
+      --mountpoint {{ vps_codex_storage_root }}
+  ) || {
+    printf '%s\n' 'Codex storage is not mounted' >&2
+    exit 69
+  }
+
+  workspace_backing=$(
+    /usr/sbin/losetup --noheadings --output BACK-FILE "$workspace_source"
+  ) || {
+    printf '%s\n' 'Codex storage has no loop backing file' >&2
+    exit 69
+  }
+
+  if [ "$workspace_backing" != "{{ vps_codex_storage_image_path }}" ]; then
+    printf '%s\n' 'Codex storage has an unexpected backing file' >&2
+    exit 69
+  fi
+}
+
+require_remote_caller() {
+  if [ "$(/usr/bin/id --user)" -ne 0 ] || \
+     [ "${SUDO_USER:-}" != "{{ vps_codex_remote_user }}" ]; then
+    printf '%s\n' 'This command is reserved for the Codex SSH gateway' >&2
+    exit 77
+  fi
+  refuse_maintenance
+}
+
+require_proxy_validation_caller() {
+  if [ "$(/usr/bin/id --user)" -ne 0 ] || \
+     [ "${SUDO_USER:-}" != "{{ vps_codex_remote_user }}" ] || \
+     [ ! -e /run/atlas-codex-maintenance ] || \
+     [ -e {{ vps_codex_activation_rollback_root }}/activation-started ] || \
+     [ ! -e {{ vps_codex_activation_rollback_root }}/runtime-validation-started ]; then
+    printf '%s\n' 'This proxy validation is outside an active Codex transaction' >&2
+    exit 77
+  fi
+}
+
+wait_for_app_server() {
+  attempt=0
+  while [ "$attempt" -lt 100 ]; do
+    if /usr/bin/systemctl is-active --quiet \
+         {{ vps_codex_app_server_unit }} && \
+       [ -S {{ vps_codex_app_server_socket }} ]; then
+      return 0
+    fi
+    /usr/bin/sleep 0.1
+    attempt=$((attempt + 1))
+  done
+
+  printf '%s\n' 'The private Codex App Server did not become ready' >&2
+  exit 69
+}
+
+runtime_max=12h
+
 case "${1:-}" in
   "")
     test "$#" -eq 0
-    if [ -e /run/atlas-codex-maintenance ]; then
-      printf '%s\n' 'Codex convergence is in progress; retry after it completes' >&2
-      exit 75
-    fi
+    refuse_maintenance
     session_unit=atlas-codex-session
     set -- --pty /bin/bash --noprofile --norc
     ;;
@@ -18,39 +108,60 @@ case "${1:-}" in
       /bin/bash -c \
       'grep -Fq /atlas-codex.slice/ /proc/self/cgroup && test "$(systemctl show atlas-codex-activation-verification.service --property=ProtectProc --value)" = invisible && test "$(command -v bwrap)" = /usr/bin/bwrap && test -r /proc/self/cmdline && test ! -r /proc/1/cmdline && test ! -r /etc/vps && test ! -x /etc/vps && test ! -r /home/vpsadmin && test ! -x /home/vpsadmin && test ! -r /srv/vps && test ! -x /srv/vps && test ! -r /var/lib/docker && test ! -x /var/lib/docker && test ! -r /var/lib/vps-controller && test ! -x /var/lib/vps-controller && test ! -r /run/containerd/containerd.sock && test ! -r /run/docker.sock && test ! -r /var/run/docker.sock && test "$(findmnt --noheadings --output FSTYPE -T /tmp)" = tmpfs && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)nosuid(,|$)" && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)nodev(,|$)" && findmnt --noheadings --output OPTIONS -T /tmp | grep -Eq "(^|,)noexec(,|$)" && exec {{ vps_codex_release_path }}/bin/codex sandbox --include-managed-config --permission-profile atlas_workspace --cd {{ vps_codex_workspace_root }} /bin/bash -c "test ! -r {{ vps_codex_home }}/.codex/config.toml && test ! -r /etc/vps && test ! -r /srv/vps && test ! -r /run/docker.sock"'
     ;;
+  --service-preflight)
+    test "$#" -eq 1
+    test "$(/usr/bin/id --user)" -eq 0
+    verify_runtime
+    exit 0
+    ;;
+  --service-admission)
+    test "$#" -eq 1
+    test "$(/usr/bin/id --user)" -eq 0
+    admit_service_start
+    exit 0
+    ;;
+  --remote-app-server)
+    test "$#" -eq 1
+    require_remote_caller
+    verify_runtime
+    /usr/bin/systemctl start {{ vps_codex_app_server_unit }}
+    wait_for_app_server
+    exit 0
+    ;;
+  --remote-version)
+    test "$#" -eq 1
+    require_remote_caller
+    session_unit="atlas-codex-version-$$"
+    set -- --pipe /bin/sh -c \
+      'test ! -e /run/atlas-codex-maintenance || exit 75; exec "$@"' \
+      atlas-codex-version {{ vps_codex_release_path }}/bin/codex --version
+    ;;
+  --remote-proxy)
+    test "$#" -eq 1
+    require_remote_caller
+    wait_for_app_server
+    session_unit="atlas-codex-proxy-$$"
+    set -- --pipe /bin/sh -c \
+      'test ! -e /run/atlas-codex-maintenance || exit 75; exec "$@"' \
+      atlas-codex-proxy \
+      {{ vps_codex_release_path }}/bin/codex app-server proxy
+    ;;
+  --validate-remote-proxy)
+    test "$#" -eq 1
+    require_proxy_validation_caller
+    wait_for_app_server
+    session_unit=atlas-codex-proxy-verification
+    runtime_max=30s
+    set -- --pipe \
+      {{ vps_codex_release_path }}/bin/codex app-server proxy
+    ;;
   *)
-    printf '%s\n' 'atlas-codex accepts only the internal --verify argument' >&2
+    printf '%s\n' 'atlas-codex received an unsupported argument' >&2
     exit 64
     ;;
 esac
 
-if ! printf '%s  %s\n' \
-  '{{ vps_codex_bubblewrap_artifact.executable_sha256 }}' \
-  /usr/bin/bwrap \
-  | /usr/bin/sha256sum --check --status; then
-  printf '%s\n' 'The Codex sandbox executable digest is not approved' >&2
-  exit 69
-fi
-
-workspace_source=$(
-  /usr/bin/findmnt --noheadings --output SOURCE \
-    --mountpoint {{ vps_codex_storage_root }}
-) || {
-  printf '%s\n' 'Codex storage is not mounted' >&2
-  exit 69
-}
-
-workspace_backing=$(
-  /usr/sbin/losetup --noheadings --output BACK-FILE "$workspace_source"
-) || {
-  printf '%s\n' 'Codex storage has no loop backing file' >&2
-  exit 69
-}
-
-if [ "$workspace_backing" != "{{ vps_codex_storage_image_path }}" ]; then
-  printf '%s\n' 'Codex storage has an unexpected backing file' >&2
-  exit 69
-fi
+verify_runtime
 
 exec /usr/bin/systemd-run \
   --quiet \
@@ -87,17 +198,19 @@ exec /usr/bin/systemd-run \
   --property='TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,noexec,size={{ vps_codex_tmpfs_size_mb }}M,mode=1777' \
   --property=ProtectClock=yes \
   --property=ProtectControlGroups=yes \
+  --property=ProtectHome=yes \
   --property=ProtectKernelLogs=yes \
   --property=ProtectKernelModules=yes \
   --property=ProtectKernelTunables=yes \
   --property=ProtectProc=invisible \
   --property=ProtectSystem=strict \
-  --property='InaccessiblePaths=-/etc/vps -/home/deploy -/home/ubuntu -/home/vpsadmin -/root -/run/containerd/containerd.sock -/run/docker.sock -/srv/vps -/var/lib/docker -/var/lib/vps-controller -/var/run/docker.sock' \
+  --property='InaccessiblePaths=-/etc/vps -/home/deploy -/home/{{ vps_codex_remote_user }} -/home/ubuntu -/home/vpsadmin -/root -/run/containerd/containerd.sock -/run/docker.sock -/srv/vps -/var/lib/docker -/var/lib/vps-controller -/var/run/docker.sock' \
   --property=ReadWritePaths={{ vps_codex_storage_root }} \
   --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK' \
-  --property='DeviceAllow=char-netlink rw' \
+  --property='SocketBindDeny=ipv4' \
+  --property='SocketBindDeny=ipv6' \
   --property=RestrictSUIDSGID=yes \
-  --property=RuntimeMaxSec=12h \
+  --property=RuntimeMaxSec="$runtime_max" \
   --property=SystemCallArchitectures=native \
   --property=TimeoutStopSec=30s \
   "$@"

@@ -1,9 +1,32 @@
 #!/bin/sh
 set -eu
 
-if ! /usr/bin/grep -Fq /atlas-codex.slice/ /proc/self/cgroup; then
-  printf '%s\n' 'Codex must run through sudo atlas-codex' >&2
-  exit 77
+if /usr/bin/grep -Fq /atlas-codex.slice/ /proc/self/cgroup; then
+  exec {{ vps_codex_install_root }}/current/bin/{{ vps_codex_entrypoint }} "$@"
 fi
 
-exec {{ vps_codex_install_root }}/current/bin/{{ vps_codex_entrypoint }} "$@"
+{% if vps_codex_entrypoint == 'codex' %}
+if [ "$(/usr/bin/id --user --name)" = "{{ vps_codex_remote_user }}" ]; then
+  if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
+    exec /usr/bin/sudo -n /usr/local/sbin/atlas-codex --remote-version
+  fi
+
+  if [ "$#" -eq 5 ] && \
+     [ "$1" = "-c" ] && \
+     [ "$2" = "features.code_mode_host=true" ] && \
+     [ "$3" = "app-server" ] && \
+     [ "$4" = "--listen" ] && \
+     [ "$5" = "unix://" ]; then
+    exec /usr/bin/sudo -n /usr/local/sbin/atlas-codex --remote-app-server
+  fi
+
+  if [ "$#" -eq 2 ] && \
+     [ "$1" = "app-server" ] && \
+     [ "$2" = "proxy" ]; then
+    exec /usr/bin/sudo -n /usr/local/sbin/atlas-codex --remote-proxy
+  fi
+fi
+{% endif %}
+
+printf '%s\n' 'Codex must run inside the Atlas sandbox or its SSH gateway' >&2
+exit 77

@@ -29,8 +29,11 @@ Host convergence also installs the standalone Codex CLI package without Node
 or npm. The `codex_cli` role pins the release archive and every executable,
 publishes it atomically, and runs it only through the isolated `codex` account.
 The enforced launcher applies aggregate resource limits and keeps all state on
-a dedicated 6 GiB filesystem. It installs no SSH key, persistent service,
-port, application checkout, or credential.
+a dedicated 6 GiB filesystem. Optional desktop access uses a separate
+unprivileged SSH gateway and a persistent App Server bound only to a Unix
+socket. A root-owned forced command maps only the current desktop protocol to
+fixed launcher actions, so the gateway cannot obtain an arbitrary shell. It
+installs no public Codex port, application checkout, or credential.
 See [`docs/operations/codex-cli.md`](../docs/operations/codex-cli.md).
 
 Confirm the SSH host-key fingerprint through the OVHcloud console before you

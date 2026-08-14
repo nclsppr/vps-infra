@@ -1,6 +1,10 @@
 ---
 vps_codex_user: codex
 vps_codex_group: codex
+vps_codex_remote_user: codex-remote
+vps_codex_remote_group: codex-remote
+vps_codex_remote_enabled: false
+vps_codex_remote_authorized_keys: []
 vps_codex_storage_root: /srv/codex
 vps_codex_storage_image_path: /var/lib/vps-infra/codex-storage.ext4
 vps_codex_storage_size_mb: 6144
@@ -12,6 +16,10 @@ vps_codex_cache_root: /var/cache/vps-infra/codex
 vps_codex_convergence_unit: atlas-codex-convergence.service
 vps_codex_session_mask_owner: /var/lib/vps-infra/codex-session-mask.owner
 vps_codex_activation_rollback_root: /var/lib/vps-infra/codex-activation-rollback
+vps_codex_app_server_unit: atlas-codex-app-server.service
+vps_codex_app_server_socket: /srv/codex/home/.codex/app-server-control/app-server-control.sock
+vps_codex_remote_gate_path: /usr/local/sbin/atlas-codex-remote-gate
+vps_codex_remote_sudoers_path: /etc/sudoers.d/92-codex-remote-codex
 vps_codex_version: "0.147.0"
 vps_codex_release_base_url: https://releases.openai.com/codex/releases
 vps_codex_bubblewrap_version: 0.11.1-1ubuntu0.1
@@ -42,6 +50,21 @@ vps_codex_activation_surfaces:
     type: file
   - path: /etc/systemd/system/atlas-codex.slice
     backup: atlas-codex.slice
+    type: file
+  - path: /etc/systemd/system/atlas-codex-app-server.service
+    backup: atlas-codex-app-server.service
+    type: file
+  - path: /etc/systemd/system/multi-user.target.wants/atlas-codex-app-server.service
+    backup: atlas-codex-app-server.enabled
+    type: link
+  - path: /etc/sudoers.d/92-codex-remote-codex
+    backup: codex-remote.sudoers
+    type: file
+  - path: "/home/{{ vps_codex_remote_user }}/.ssh/authorized_keys"
+    backup: codex-remote.authorized-keys
+    type: file
+  - path: /usr/local/sbin/atlas-codex-remote-gate
+    backup: atlas-codex-remote-gate
     type: file
   - path: /usr/local/sbin/atlas-codex
     backup: atlas-codex

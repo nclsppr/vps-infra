@@ -1,0 +1,61 @@
+# Managed by Ansible. The Codex App Server listens on a private Unix socket.
+[Unit]
+Description=Private Atlas Codex App Server
+Documentation=https://learn.chatgpt.com/docs/app-server
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor={{ vps_codex_storage_root }}
+ConditionPathIsMountPoint={{ vps_codex_storage_root }}
+ConditionPathExists=!{{ vps_codex_activation_rollback_root }}/activation-started
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User={{ vps_codex_user }}
+Group={{ vps_codex_group }}
+Slice=atlas-codex.slice
+WorkingDirectory={{ vps_codex_workspace_root }}
+Environment=HOME={{ vps_codex_home }}
+Environment=CODEX_HOME={{ vps_codex_home }}/.codex
+Environment=SHELL=/bin/bash
+Environment=USER={{ vps_codex_user }}
+Environment=LOGNAME={{ vps_codex_user }}
+Environment=LANG=C.UTF-8
+Environment=PATH={{ vps_codex_release_path }}/codex-path:/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin
+ExecCondition=+/usr/local/sbin/atlas-codex --service-admission
+ExecCondition=+/usr/local/sbin/atlas-codex --service-preflight
+ExecCondition=/usr/bin/test -w {{ vps_codex_workspace_root }}
+ExecStartPre=/usr/bin/rm --force {{ vps_codex_app_server_socket }}
+ExecStart={{ vps_codex_release_path }}/bin/codex -c features.code_mode_host=true app-server --listen unix://
+Restart=always
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=30s
+UMask=0077
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateDevices=yes
+PrivateTmp=no
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size={{ vps_codex_tmpfs_size_mb }}M,mode=1777
+TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,noexec,size={{ vps_codex_tmpfs_size_mb }}M,mode=1777
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+InaccessiblePaths=-/etc/vps -/home/deploy -/home/{{ vps_codex_remote_user }} -/home/ubuntu -/home/vpsadmin -/root -/run/containerd/containerd.sock -/run/docker.sock -/srv/vps -/var/lib/docker -/var/lib/vps-controller -/var/run/docker.sock
+ReadWritePaths={{ vps_codex_storage_root }}
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SocketBindDeny=ipv4
+SocketBindDeny=ipv6
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

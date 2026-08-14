@@ -5,11 +5,12 @@ PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
+PermitUserEnvironment no
 UsePAM yes
 MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
-AllowUsers {{ vps_admin_user }} {{ vps_deploy_user }}
+AllowUsers {{ vps_admin_user }} {{ vps_deploy_user }}{% if vps_codex_remote_enabled | bool %} {{ vps_codex_remote_user }}{% endif %}
 
 Match User {{ vps_deploy_user }}
     AuthenticationMethods publickey
@@ -21,4 +22,17 @@ Match User {{ vps_deploy_user }}
     PermitTunnel no
     ForceCommand {{ vps_deploy_gate_path }}
 
+{% if vps_codex_remote_enabled | bool %}
+Match User {{ vps_codex_remote_user }}
+    AuthenticationMethods publickey
+    DisableForwarding yes
+    PermitTTY no
+    PermitUserRC no
+    X11Forwarding no
+    AllowAgentForwarding no
+    AllowTcpForwarding no
+    PermitTunnel no
+    ForceCommand {{ vps_codex_remote_gate_path }}
+
+{% endif %}
 Match all

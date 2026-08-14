@@ -1,0 +1,122 @@
+---
+- name: Start the restored private Codex App Server
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - start
+      - "{{ vps_codex_app_server_unit }}"
+  changed_when: false
+
+- name: Wait for the restored private Codex App Server socket
+  ansible.builtin.wait_for:
+    path: "{{ vps_codex_app_server_socket }}"
+    state: present
+    timeout: 15
+
+- name: Inspect the restored private Codex App Server socket
+  ansible.builtin.stat:
+    path: "{{ vps_codex_app_server_socket }}"
+    follow: false
+  register: vps_codex_restored_app_server_socket_state
+
+- name: Read effective restored private Codex App Server properties
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - show
+      - "{{ vps_codex_app_server_unit }}"
+      - --property=ActiveState
+      - --property=SubState
+      - --property=UnitFileState
+      - --property=User
+      - --property=Group
+      - --property=Slice
+      - --property=Restart
+      - --property=NoNewPrivileges
+      - --property=PrivateDevices
+      - --property=ProtectHome
+      - --property=ProtectSystem
+      - --property=MainPID
+      - --property=FragmentPath
+      - --property=DropInPaths
+      - --property=ExecStart
+      - --property=Environment
+      - --property=RestrictAddressFamilies
+      - --property=SocketBindDeny
+  register: vps_codex_restored_app_server_properties
+  changed_when: false
+
+- name: Prove the restored private Codex App Server lifecycle and boundary
+  ansible.builtin.assert:
+    that:
+      - vps_codex_restored_app_server_socket_state.stat.issock
+      - not vps_codex_restored_app_server_socket_state.stat.islnk
+      - >-
+        vps_codex_restored_app_server_socket_state.stat.pw_name ==
+        vps_codex_user
+      - >-
+        vps_codex_restored_app_server_socket_state.stat.gr_name ==
+        vps_codex_group
+      - vps_codex_restored_app_server_socket_state.stat.mode == '0600'
+      - >-
+        'ActiveState=active' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'SubState=running' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'UnitFileState=enabled' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'User=' ~ vps_codex_user in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'Group=' ~ vps_codex_group in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'Slice=atlas-codex.slice' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'Restart=always' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'NoNewPrivileges=yes' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'PrivateDevices=yes' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'ProtectHome=yes' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'ProtectSystem=strict' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'FragmentPath=/etc/systemd/system/atlas-codex-app-server.service' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        'DropInPaths=' in
+        vps_codex_restored_app_server_properties.stdout_lines
+      - >-
+        vps_codex_restored_app_server_properties.stdout is search(
+        '(?m)^ExecStart=.*/opt/codex/releases/[^ ]+/bin/codex '
+        ~ '.*features\\.code_mode_host=true app-server --listen unix://')
+      - >-
+        vps_codex_restored_app_server_properties.stdout is search(
+        '(?m)^Environment=.*CODEX_HOME=' ~
+        ((vps_codex_home ~ '/.codex') | regex_escape))
+      - >-
+        vps_codex_restored_app_server_properties.stdout is search(
+        '(?m)^RestrictAddressFamilies=.*AF_UNIX')
+      - >-
+        vps_codex_restored_app_server_properties.stdout is search(
+        '(?m)^SocketBindDeny=.*ipv4')
+      - >-
+        vps_codex_restored_app_server_properties.stdout is search(
+        '(?m)^SocketBindDeny=.*ipv6')
+      - >-
+        vps_codex_restored_app_server_properties.stdout_lines |
+        select('match', '^MainPID=[1-9][0-9]*$') | list | length == 1
+    fail_msg: >-
+      The prior private Codex App Server surfaces were restored, but their
+      lifecycle or isolation boundary is not safe to resume automatically.

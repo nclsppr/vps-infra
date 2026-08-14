@@ -2,11 +2,13 @@
 
 ## Installed boundary
 
-Host convergence installs Codex CLI 0.147.0 as an interactive, unprivileged
-operator tool. It has no persistent service and opens no port. The supported
-launcher admits at most one Codex session at a time through the fixed
-`atlas-codex-session` unit. That unit runs below `atlas-codex.slice`, so CPU,
-memory, and task limits are also enforced in aggregate at the slice boundary.
+Host convergence installs Codex CLI 0.147.0 as an unprivileged operator tool.
+When the external public configuration enables remote access, it also runs a
+persistent App Server on a private Unix socket. Codex opens no TCP or UDP port.
+The interactive launcher still admits at most one shell through the fixed
+`atlas-codex-session` unit. The shell, persistent App Server, and SSH proxy
+units all run below `atlas-codex.slice`, so CPU, memory, and task limits are
+enforced in aggregate.
 
 The installed paths are:
 
@@ -15,6 +17,10 @@ The installed paths are:
 /opt/codex/current
 /usr/local/bin/codex
 /usr/local/bin/codex-code-mode-host
+/usr/local/sbin/atlas-codex-remote-gate
+/etc/systemd/system/atlas-codex-app-server.service
+/etc/systemd/system/multi-user.target.wants/atlas-codex-app-server.service
+/etc/sudoers.d/92-codex-remote-codex
 /etc/codex/requirements.toml
 /var/lib/vps-infra/codex-storage.ext4
 /srv/codex/home/.codex/config.toml
@@ -42,12 +48,12 @@ user namespace restrictions or grant network administration capabilities. The
 packaged `bwrap` remains part of the verified release inventory but is not
 placed on the runtime `PATH`.
 
-The `codex` account has no direct SSH login, sudo, Docker group, production
-repository access, controller access, or secret access. The supported session
-also makes `/etc/vps`, all of `/srv/vps`, administrator homes, Docker state,
-and controller state inaccessible in its mount namespace, including files
-that would otherwise be world-readable. Use the existing administrator SSH
-identity, then deliberately cross into the bounded account:
+The runtime `codex` account has no direct SSH login, sudo, Docker group,
+production repository access, controller access, or secret access. The
+supported session also makes `/etc/vps`, all of `/srv/vps`, administrator
+homes, Docker state, and controller state inaccessible in its mount namespace,
+including files that would otherwise be world-readable. Use the existing
+administrator SSH identity, then deliberately cross into the bounded account:
 
 ```bash
 ssh <administrator-alias>
@@ -62,9 +68,11 @@ host trust root: root can deliberately bypass any local launcher or sandbox.
 The boundary limits a Codex session; it does not constrain a malicious or
 compromised administrator.
 
-Do not add `codex` to `AllowUsers`, install an SSH key in its home, or grant it
-sudo or Docker access. A future production mutation must use a separate,
-root-owned, argument-bounded helper reviewed through its own decision record.
+Do not add the runtime `codex` account to `AllowUsers`, install an SSH key in
+its home, or grant it sudo or Docker access. Remote desktop access uses the
+separate `codex-remote` gateway defined by ADR-0006. That gateway has no access
+to the runtime home. A forced-command parser rejects arbitrary SSH commands.
+Sudo admits three exact desktop actions and one transaction-only proxy smoke.
 Do not substitute `sudo -iu codex`: sudo retains the administrator cgroup, so
 that shell would miss the CPU, memory, task, lifetime, temporary filesystem,
 and service sandbox applied by `atlas-codex`.
@@ -107,6 +115,72 @@ request or receive an escape from that boundary. Web search and external
 integrations are also disabled. Loosening a managed boundary requires a
 reviewed infrastructure change, not an interactive approval or CLI flag.
 
+## Enable the private desktop connection
+
+Remote access is false by default. Put only the dedicated public key in the
+external public-variable file used by convergence:
+
+```yaml
+vps_codex_remote_enabled: true
+vps_codex_remote_authorized_keys:
+  - "ssh-ed25519 AAAA... codex@operator"
+```
+
+Never place the private key or the concrete production variable file in this
+repository. Use a key dedicated to this gateway. Do not reuse the
+administrator key.
+
+After the reviewed change is merged to `main`, converge Atlas. Then add a
+local SSH alias on the desktop that runs the Codex app:
+
+```sshconfig
+Host atlas-codex
+    HostName <atlas-hostname>
+    User codex-remote
+    Port 22
+    IdentityFile ~/.ssh/atlas_codex_ed25519
+    IdentitiesOnly yes
+    AddKeysToAgent yes
+    UseKeychain yes
+    StrictHostKeyChecking yes
+    ControlMaster no
+```
+
+Prove the gateway without printing any credential or state file:
+
+```bash
+ssh -o BatchMode=yes atlas-codex 'command -v codex'
+ssh -o BatchMode=yes atlas-codex 'codex --version'
+if ssh -o BatchMode=yes atlas-codex 'id'; then exit 1; fi
+if ssh -o BatchMode=yes atlas-codex 'sudo -n true'; then exit 1; fi
+```
+
+The first command must resolve to `/usr/local/bin/codex`, and the version must
+match the pinned release. The final two commands must fail because the
+root-owned forced command accepts neither a shell nor general sudo. SSH agent,
+TCP, X11, and tunnel forwarding are intentionally unavailable. The gateway
+home, `.codex` parent, and SSH keys are root-owned. Only
+`~/.codex/app-server-control` is writable by `codex-remote`.
+
+If the dedicated key was temporarily accepted by the administrator account,
+keep both administrator keys during the first convergence. Prove a new
+`atlas-codex` login and a separate new administrator login. Then remove only
+the exact dedicated public key from
+`/home/<administrator>/.ssh/authorized_keys` through an explicit key-retirement
+operation and remove it from `vps_admin_authorized_keys`. Run convergence
+again. Never retire the proven owner key in the same operation.
+
+In the Codex desktop app, add an SSH remote connection that uses
+`atlas-codex`. The app starts the bounded App Server command and reaches its
+Unix socket through `codex app-server proxy`. Do not configure a WebSocket URL
+or a public Atlas port. The managed `remote_control` feature remains false.
+
+For phone control, keep the signed-in desktop app awake and online, then use
+the same ChatGPT account on the phone. The phone controls the desktop session;
+it does not connect directly to Atlas. If the desktop sleeps, exits, loses its
+network, or loses the SSH key from its agent, the phone cannot start or resume
+the Atlas task.
+
 ## Prepare work
 
 Place only disposable, explicitly approved material below
@@ -146,14 +220,18 @@ It never stops the shared unit name. A competing convergence fails before
 mutation. If its controller disappears, the lease exits when that SSH process
 disappears. The lease also has a 24-hour maximum lifetime.
 
-Behind that controller lease, the role
-persistently masks the fixed session unit, proves it is strictly inactive,
-then snapshots every active policy, launcher, wrapper, slice, and release
-selector surface before publication. It removes the mask only after a fully
-verified activation or an exact verified rollback once publication starts. A
-failure before publication can safely release the mask because no active
-surface has changed. An interrupted published transaction is recovered on the
-next convergence; incomplete recovery remains masked.
+Behind that controller lease, the role publishes a maintenance marker, stops
+the persistent App Server, persistently masks the fixed interactive session,
+and proves both are inactive. It then snapshots every active policy, launcher,
+wrapper, forced-command gate, restricted SSH authorization, service, service
+boot link, sudo gateway, slice, and release selector surface before
+publication. During runtime validation it
+starts the service while the external gateway remains blocked, proves the
+effective unit and socket, and completes a bounded WebSocket upgrade through
+the gate, sudo rule, launcher, and proxy. Only then does it commit and release
+the interlocks. Any failure before commit stops the service and restores the
+exact snapshot. An interrupted published transaction is recovered on the next
+convergence; incomplete recovery remains interlocked.
 
 ## Sensitive state and capacity
 
@@ -169,7 +247,8 @@ file contents:
 ```bash
 sudo df -h /srv/codex
 sudo du -xhd1 /srv/codex/home/.codex /srv/codex/workspaces
-sudo systemctl status atlas-codex-session.service atlas-codex.slice --no-pager
+sudo systemctl status atlas-codex-app-server.service \
+  atlas-codex-session.service atlas-codex.slice --no-pager
 ```
 
 First allocation also requires the 6 GiB image plus 10 GiB of free host disk
@@ -201,8 +280,9 @@ make converge-check \
 
 The role proves the version, the loop-backed storage identity and mount
 options, sandbox startup inside the bounded systemd unit, exact primary group,
-and inability of both the outer session and managed command sandbox to read or
-traverse protected host paths. Lease, mask, snapshot, staging, and probe
+the persistent App Server identity and Unix socket, the SSH gateway policy,
+and the inability of the runtime, gateway, and managed command sandbox to read
+or traverse protected host paths. Lease, mask, snapshot, staging, and probe
 operations are temporary safety bookkeeping and do not report durable drift;
 a successful second normal convergence therefore reports `changed=0`. For a
 manual verification, enter through the supported launcher and run:
@@ -218,11 +298,31 @@ test ! -r /var/run/docker.sock
 sudo -n true
 ```
 
+The final `sudo -n true` command must fail.
+
 On Ubuntu, `command -v bwrap` inside that session must return
 `/usr/bin/bwrap`. This keeps the distribution AppArmor boundary active.
 
-The final command must fail. Never print `auth.json` or session files while
-diagnosing a login.
+Verify the persistent private service from the administrator account:
+
+```bash
+sudo systemctl is-enabled atlas-codex-app-server.service
+sudo systemctl is-active atlas-codex-app-server.service
+sudo systemctl show atlas-codex-app-server.service \
+  -p User -p Group -p Slice -p Restart -p NoNewPrivileges \
+  -p PrivateDevices -p ProtectHome -p ProtectSystem
+sudo stat -c '%F %U:%G %a %n' \
+  /srv/codex/home/.codex/app-server-control/app-server-control.sock
+sudo ss -lntup
+```
+
+The first two commands must return `enabled` and `active`. The service must run
+as `codex:codex` in `atlas-codex.slice`, and the path must be a socket owned by
+`codex`. The listener list must contain no Codex TCP or UDP socket. UFW remains
+limited to the existing SSH, HTTP, and HTTPS rules.
+
+The listener inspection command succeeds and must contain no Codex TCP or UDP
+socket. Never print `auth.json` or session files while diagnosing a login.
 
 ## Upgrade and rollback
 
@@ -231,9 +331,15 @@ network on Atlas. Upgrade through one pull request that changes the exact
 version, archive digests, executable digests, and expected package inventory.
 The role validates the new release, including a sandbox smoke test using the
 reviewed Ubuntu `bwrap`, before the active symlink changes and keeps older
-release directories for rollback. A `bubblewrap` security update also requires
-the reviewed package version, archive digest, and executable digest to change
-in Git before APT can change the held package during convergence.
+release directories for rollback. Normal convergence deliberately refuses to
+change the installed `bubblewrap` version once the Codex launcher exists. A
+security update to this host sandbox component requires a dedicated migration
+that pins the new package version and digests, captures a restorable package
+artifact, proves both package states, and restores the prior package together
+with the prior launcher if activation fails. Do not combine a simple defaults
+version bump with an ordinary Codex release upgrade.
 
-See [ADR-0005](../decisions/0005-dedicated-codex-cli-account.md) for the trust
-boundary and accepted tradeoffs.
+See [ADR-0005](../decisions/0005-dedicated-codex-cli-account.md) for the runtime
+trust boundary and
+[ADR-0006](../decisions/0006-private-codex-app-server.md) for the private SSH
+gateway and persistent App Server decision.

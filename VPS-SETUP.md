@@ -130,6 +130,8 @@ Critères :
 - [x] aucune toolchain applicative sur l’hôte ;
 - [x] Codex CLI autonome installé sous un compte dédié sans sudo, Docker,
       SSH direct ni accès aux secrets et releases de production ;
+- [ ] App Server Codex persistant sur socket Unix privé, accessible par une
+      passerelle SSH distincte et sans port public ;
 - [x] logs bornés, redémarrage et reboot vérifiés ;
 - [x] second passage Ansible sans changement ;
 - [x] bounded `--check --diff` invocation covered by CI and executed on the

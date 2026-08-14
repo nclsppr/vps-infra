@@ -7,3 +7,7 @@ vps_admin_authorized_keys:
 # Peut rester vide jusqu'à la création de l'environnement GitHub production.
 vps_deploy_authorized_keys:
   - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIREMPLACER cle-deploiement-github
+
+# Activer uniquement avec une clé dédiée à la connexion Codex desktop.
+vps_codex_remote_enabled: false
+vps_codex_remote_authorized_keys: []

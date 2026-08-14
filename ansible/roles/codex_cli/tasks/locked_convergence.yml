@@ -68,6 +68,70 @@
         mode: "0600"
       changed_when: false
 
+    - name: Stop transient Codex remote gateway units behind the interlock
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - stop
+          - atlas-codex-proxy-*.service
+          - atlas-codex-version-*.service
+      register: vps_codex_interlocked_remote_units_stop
+      changed_when: false
+      failed_when: vps_codex_interlocked_remote_units_stop.rc not in [0, 5]
+
+    - name: Read transient Codex remote gateway units behind the interlock
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - list-units
+          - --type=service
+          - --state=active
+          - --plain
+          - --no-legend
+          - atlas-codex-proxy-*.service
+          - atlas-codex-version-*.service
+      register: vps_codex_interlocked_remote_units
+      changed_when: false
+
+    - name: Prove no transient Codex remote gateway unit survived
+      ansible.builtin.assert:
+        that:
+          - vps_codex_interlocked_remote_units.stdout | trim == ''
+        fail_msg: >-
+          A transient Codex remote gateway unit survived interlock acquisition.
+          No host mutation was attempted.
+
+    - name: Stop the private Codex App Server behind the interlock
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - stop
+          - "{{ vps_codex_app_server_unit }}"
+      register: vps_codex_interlocked_app_server_stop
+      changed_when: false
+      failed_when: vps_codex_interlocked_app_server_stop.rc not in [0, 5]
+
+    - name: Read private Codex App Server state behind the interlock
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/systemctl
+          - is-active
+          - "{{ vps_codex_app_server_unit }}"
+      register: vps_codex_interlocked_app_server_state
+      changed_when: false
+      failed_when: vps_codex_interlocked_app_server_state.rc not in [0, 3, 4]
+
+    - name: Prove no private Codex App Server survived interlock acquisition
+      ansible.builtin.assert:
+        that:
+          - vps_codex_interlocked_app_server_state.rc in [3, 4]
+          - >-
+            vps_codex_interlocked_app_server_state.stdout in
+            ['inactive', 'unknown']
+        fail_msg: >-
+          The private Codex App Server is not strictly inactive after the
+          convergence interlock was acquired. No host mutation was attempted.
+
     - name: Persistently prevent a new fixed Codex session
       ansible.builtin.command:
         argv:
@@ -108,6 +172,49 @@
         path: "{{ vps_codex_activation_rollback_root }}"
         follow: false
       register: vps_codex_final_rollback_state
+
+    - name: Inspect private Codex App Server lifecycle surfaces after activation
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - /etc/systemd/system/atlas-codex-app-server.service
+        - /etc/systemd/system/multi-user.target.wants/atlas-codex-app-server.service
+      register: vps_codex_final_app_server_surfaces
+      when:
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+
+    - name: Select final private Codex App Server lifecycle surfaces
+      ansible.builtin.set_fact:
+        vps_codex_final_app_server_unit: >-
+          {{ vps_codex_final_app_server_surfaces.results[0].stat }}
+        vps_codex_final_app_server_boot_link: >-
+          {{ vps_codex_final_app_server_surfaces.results[1].stat }}
+      when:
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+
+    - name: Prove final private Codex App Server lifecycle surfaces are coherent
+      ansible.builtin.assert:
+        that:
+          - >-
+            (not vps_codex_final_app_server_unit.exists and
+             not vps_codex_final_app_server_boot_link.exists) or
+            (vps_codex_final_app_server_unit.isreg and
+             not vps_codex_final_app_server_unit.islnk and
+             vps_codex_final_app_server_unit.uid == 0 and
+             vps_codex_final_app_server_unit.gid == 0 and
+             vps_codex_final_app_server_unit.mode == '0644' and
+             vps_codex_final_app_server_boot_link.islnk and
+             vps_codex_final_app_server_boot_link.lnk_target ==
+             '/etc/systemd/system/atlas-codex-app-server.service')
+        fail_msg: >-
+          The private Codex App Server unit and boot link are incomplete or
+          unsafe after activation or rollback.
+      when:
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
 
     - name: Release the persistent Codex session mask
       ansible.builtin.command:
@@ -164,3 +271,34 @@
           Codex activation or rollback is incomplete. The persistent session
           mask and recovery state were deliberately preserved.
       when: vps_codex_session_interlock_owned | default(false) | bool
+
+    - name: Reverify the committed private Codex App Server after interlock release
+      ansible.builtin.include_tasks: verify_app_server.yml
+      vars:
+        vps_codex_verify_proxy_smoke: false
+      when:
+        - not ansible_check_mode
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+        - vps_codex_final_app_server_unit.exists
+        - vps_codex_final_app_server_boot_link.exists
+        - vps_codex_activation_committed | default(false) | bool
+
+    - name: Reverify the restored private Codex App Server after interlock release
+      ansible.builtin.include_tasks: verify_restored_app_server.yml
+      when:
+        - not ansible_check_mode
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+        - vps_codex_final_app_server_unit.exists
+        - vps_codex_final_app_server_boot_link.exists
+        - not (vps_codex_activation_committed | default(false) | bool)
+
+    - name: Reverify private Codex App Server disablement after interlock release
+      ansible.builtin.include_tasks: verify_app_server_disabled.yml
+      when:
+        - not ansible_check_mode
+        - vps_codex_session_interlock_owned | default(false) | bool
+        - not vps_codex_final_rollback_state.stat.exists
+        - not vps_codex_final_app_server_unit.exists
+        - not vps_codex_final_app_server_boot_link.exists
