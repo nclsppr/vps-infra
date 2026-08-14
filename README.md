@@ -183,3 +183,7 @@ Cette décision est détaillée dans
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas
 être exécuté.
+
+The recovered [`manage-ovh-dns` skill prototype](docs/archive/manage-ovh-dns-skill-prototype.md)
+is also inactive. It records a proposed security boundary. It does not prove
+that the referenced controller exists and it must not be installed or invoked.
