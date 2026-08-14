@@ -36,6 +36,7 @@ services:
       QUARKUS_DATASOURCE_USERNAME: surplasse_runtime
       QUARKUS_FLYWAY_MIGRATE_AT_START: "false"
       QUARKUS_HTTP_HOST: 0.0.0.0
+      QUARKUS_MAILER_AUTH_METHODS: PLAIN LOGIN
       SMTP_FROM: no-reply@surplasse.com
       SMTP_HOST: ${SURPLASSE_SMTP_HOST:?SURPLASSE_SMTP_HOST is required}
       SMTP_PASSWORD_FILE: /run/secrets/surplasse_smtp_password

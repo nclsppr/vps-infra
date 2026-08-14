@@ -255,6 +255,13 @@ must verify that artifact and the release manifest through independent trust
 roots. Environment variable allowlists and declared `_FILE` secret bindings
 remain required before application activation.
 
+For Surplasse, `validate-surplasse-adapter` requires the complete and exact
+Backend environment. It fixes the sender, secret paths, port `587`, required
+STARTTLS mode, and the `PLAIN LOGIN` authentication methods. It rejects every
+other Quarkus or Java override declared in Compose. This validation does not
+prove that the image or its entrypoint adds no configuration. Effective runtime
+configuration remains a separate release gate.
+
 `verify-github-evidence` confirms the repository, branch, commit, run attempt,
 and exact `.github/workflows/vps-release.yml` workflow through the public GitHub
 API. The `caddy-ovh-image` and `immutable-image-digests` gates must also name a

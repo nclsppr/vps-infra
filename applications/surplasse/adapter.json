@@ -4,6 +4,8 @@
     "application-release-controller",
     "caddy-app-network-and-fixed-address",
     "dns-cutover",
+    "email-delivery-observability",
+    "email-domain-authentication",
     "ovh-zone-scoped-dns-credentials",
     "postgres-app-network",
     "production-image-provenance",
@@ -12,7 +14,10 @@
     "protected-main",
     "public-smoke",
     "restore-proof",
+    "smtp-atlas-connectivity",
+    "smtp-effective-runtime-configuration",
     "stripe-connect-production-adapter",
+    "transactional-email-provider",
     "vps-integration-bundle"
   ],
   "integration": {

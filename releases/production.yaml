@@ -52,6 +52,8 @@
       "compose_project": "surplasse",
       "published_ports": [],
       "blocked_by": [
+        "email-delivery-observability",
+        "email-domain-authentication",
         "platform-extraction",
         "postgres-compatibility",
         "postgres-role-provisioning",
@@ -60,7 +62,10 @@
         "public-smoke",
         "restore-proof",
         "separated-migrations",
+        "smtp-atlas-connectivity",
+        "smtp-effective-runtime-configuration",
         "stripe-connect-production-adapter",
+        "transactional-email-provider",
         "vps-integration-bundle"
       ],
       "migrations": {
