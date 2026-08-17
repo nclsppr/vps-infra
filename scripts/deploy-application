@@ -1,0 +1,2842 @@
+#!/usr/bin/python3 -I
+"""Materialize and transactionally activate one immutable Compose application."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import contextlib
+import dataclasses
+import fcntl
+import hashlib
+import importlib.util
+import ipaddress
+import json
+import os
+import re
+import secrets
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterator, Mapping
+from urllib.parse import urlsplit
+
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+LIB_DIRECTORY = SCRIPT_DIRECTORY / "lib"
+sys.path.insert(0, str(LIB_DIRECTORY))
+
+from application_bundle import (  # noqa: E402
+    MAX_ARCHIVE_BYTES,
+    MAX_COMPONENT_MANIFEST_BYTES,
+    MAX_IMAGE_CONFIG_BYTES,
+    MAX_INVENTORY_BYTES,
+    MAX_MANIFEST_BYTES,
+    PROFILES,
+    ApplicationBundle,
+    ApplicationBundleError,
+    BundleProfile,
+    canonical_json,
+    content_digest,
+    materialize_files,
+    strict_json,
+    validate_bundle,
+    validate_component_index,
+    validate_image_config,
+    validate_integration_manifest,
+    validate_runtime_manifest,
+)
+from application_release import (  # noqa: E402
+    MAX_RELEASE_BYTES,
+    ApplicationPolicy,
+    ApplicationReleaseError,
+    ReleaseDescriptor,
+    load_production_contract,
+    validate_release_descriptor,
+    validate_release_manifest,
+)
+
+
+def _load_static_runtime() -> object:
+    path = SCRIPT_DIRECTORY / "deploy-static"
+    loader = SourceFileLoader("vps_static_controller_runtime", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the shared static controller runtime")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+STATIC = _load_static_runtime()
+
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+STATE_NAME_RE = re.compile(r"^[a-z0-9-]+(?:-[0-9a-f]{64})?\.json$")
+CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+CONFIG_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+CONFIG_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,511}$")
+
+APPLICATION_PRODUCTION_CONTRACT = Path(
+    "/srv/vps/repository/releases/application-production.json"
+)
+STATIC_PRODUCTION_CONTRACT = Path(
+    "/srv/vps/repository/releases/static-production.json"
+)
+APPLICATION_ROOT = Path("/srv/applications")
+APPLICATION_STATE_ROOT = Path("/var/lib/vps-application")
+ACTIVE_STATE_ROOT = APPLICATION_STATE_ROOT / "active"
+INVENTORY_STATE_ROOT = APPLICATION_STATE_ROOT / "inventories"
+QUARANTINE_ROOT = APPLICATION_STATE_ROOT / "quarantine"
+TRANSACTION_ROOT = APPLICATION_STATE_ROOT / "transactions"
+RUNTIME_CONFIG_ROOT = Path("/etc/vps/applications")
+CREDENTIAL_ROOT = Path("/etc/vps/secrets")
+STATIC_ACTIVE_STATE_ROOT = Path("/var/lib/vps-static/active")
+STATIC_TRANSACTION_ROOT = Path("/var/lib/vps-static/transactions")
+STATIC_PARKVENTORY_CURRENT = Path("/srv/www/parkventory/current")
+PUBLIC_EDGE_RUNTIME_ROOT = Path("/srv/vps/runtime/public-static-edge")
+PUBLIC_EDGE_CONTAINER = "vps-public-static-edge-caddy-1"
+RUNTIME_DIRECTORY_ENV = "VPS_APPLICATION_RUNTIME_DIRECTORY"
+VALIDATE_COMPOSE_PATH = SCRIPT_DIRECTORY / "validate-compose"
+DOCKER_PATH = Path("/usr/bin/docker")
+GIT_PATH = Path("/usr/bin/git")
+CURL_PATH = Path("/usr/bin/curl")
+LOCK_PATH = Path("/run/lock/vps-static.lock")
+MAX_STATE_BYTES = 512 * 1024
+MAX_RENDERED_COMPOSE_BYTES = 2 * 1024 * 1024
+MAX_CONFIG_BYTES = 16 * 1024
+MAX_PROBE_BODY_BYTES = 1024 * 1024
+SOURCE_REF = "refs/heads/main"
+
+
+class ApplicationDeploymentError(ValueError):
+    """The application deployment cannot proceed safely."""
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceIdentity:
+    source_repository: str
+    source_ref: str = SOURCE_REF
+
+
+@dataclasses.dataclass(frozen=True)
+class ApplicationState:
+    application: str
+    source_revision: str
+    release_reference: str
+    integration_reference: str
+    component_references: Mapping[str, str]
+    migration_inventory_digest: str
+    probe_inventory_digest: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "application": self.application,
+            "components": dict(self.component_references),
+            "integration_reference": self.integration_reference,
+            "migration_inventory_digest": self.migration_inventory_digest,
+            "probe_inventory_digest": self.probe_inventory_digest,
+            "release_reference": self.release_reference,
+            "schema": 1,
+            "source_revision": self.source_revision,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ApplicationTransaction:
+    candidate: ApplicationState
+    previous_state: ApplicationState | None
+    previous_target: str | None
+    expected_target: str
+    phase: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "application": self.candidate.application,
+            "candidate": self.candidate.as_dict(),
+            "expected_target": self.expected_target,
+            "phase": self.phase,
+            "previous_state": (
+                None if self.previous_state is None else self.previous_state.as_dict()
+            ),
+            "previous_target": self.previous_target,
+            "schema": 1,
+        }
+
+
+TRANSACTION_PHASES = frozenset(
+    {
+        "prepared",
+        "migration-running",
+        "migrated",
+        "started",
+        "probe-rejected",
+        "probed",
+    }
+)
+
+
+def fail(message: str) -> None:
+    raise ApplicationDeploymentError(message)
+
+
+def safe_environment(home: Path) -> dict[str, str]:
+    return {
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+
+
+def parse_digest_reference(reference: str, repository: str, label: str) -> str:
+    prefix = f"{repository}@"
+    if not reference.startswith(prefix):
+        fail(f"{label} must use the exact repository {repository}")
+    digest = reference.removeprefix(prefix)
+    if SHA256_RE.fullmatch(digest) is None:
+        fail(f"{label} must be one untagged immutable sha256 reference")
+    return digest
+
+
+def release_name(state: ApplicationState) -> str:
+    digest = parse_digest_reference(
+        state.release_reference,
+        f"ghcr.io/nclsppr/{state.application}/application-release",
+        "application release reference",
+    )
+    return digest.replace(":", "-")
+
+
+def release_target(state: ApplicationState) -> str:
+    return f"releases/{release_name(state)}"
+
+
+def validate_state(state: ApplicationState) -> None:
+    profile = PROFILES.get(state.application)
+    if profile is None:
+        fail("application state is outside the allowlist")
+    if SHA40_RE.fullmatch(state.source_revision) is None:
+        fail("application state source revision is invalid")
+    parse_digest_reference(
+        state.release_reference,
+        f"ghcr.io/nclsppr/{state.application}/application-release",
+        "application state release reference",
+    )
+    parse_digest_reference(
+        state.integration_reference,
+        profile.integration_repository,
+        "application state integration reference",
+    )
+    if set(state.component_references) != set(profile.component_repositories):
+        fail("application state component set is invalid")
+    for name, repository in profile.component_repositories.items():
+        parse_digest_reference(
+            state.component_references[name],
+            repository,
+            f"application state component {name}",
+        )
+    if SHA256_RE.fullmatch(state.migration_inventory_digest) is None:
+        fail("application state migration inventory digest is invalid")
+    if SHA256_RE.fullmatch(state.probe_inventory_digest) is None:
+        fail("application state probe inventory digest is invalid")
+
+
+def state_from_value(value: object, label: str) -> ApplicationState:
+    if not isinstance(value, dict) or set(value) != {
+        "application",
+        "components",
+        "integration_reference",
+        "migration_inventory_digest",
+        "probe_inventory_digest",
+        "release_reference",
+        "schema",
+        "source_revision",
+    }:
+        fail(f"{label} has an invalid shape")
+    if value["schema"] != 1 or isinstance(value["schema"], bool):
+        fail(f"{label} schema is invalid")
+    components = value["components"]
+    if not isinstance(components, dict) or any(
+        not isinstance(key, str) or not isinstance(reference, str)
+        for key, reference in components.items()
+    ):
+        fail(f"{label} components are invalid")
+    string_fields = (
+        "application",
+        "integration_reference",
+        "migration_inventory_digest",
+        "probe_inventory_digest",
+        "release_reference",
+        "source_revision",
+    )
+    if any(not isinstance(value[field], str) for field in string_fields):
+        fail(f"{label} contains a non-string field")
+    state = ApplicationState(
+        application=value["application"],
+        source_revision=value["source_revision"],
+        release_reference=value["release_reference"],
+        integration_reference=value["integration_reference"],
+        component_references=dict(components),
+        migration_inventory_digest=value["migration_inventory_digest"],
+        probe_inventory_digest=value["probe_inventory_digest"],
+    )
+    validate_state(state)
+    return state
+
+
+def canonical_state(state: ApplicationState) -> bytes:
+    validate_state(state)
+    return canonical_json(state.as_dict())
+
+
+def transaction_from_value(value: object, label: str) -> ApplicationTransaction:
+    if not isinstance(value, dict) or set(value) != {
+        "application",
+        "candidate",
+        "expected_target",
+        "phase",
+        "previous_state",
+        "previous_target",
+        "schema",
+    }:
+        fail(f"{label} has an invalid shape")
+    if value["schema"] != 1 or isinstance(value["schema"], bool):
+        fail(f"{label} schema is invalid")
+    candidate = state_from_value(value["candidate"], f"{label} candidate")
+    if value["application"] != candidate.application:
+        fail(f"{label} application does not match its candidate")
+    previous = (
+        None
+        if value["previous_state"] is None
+        else state_from_value(value["previous_state"], f"{label} previous state")
+    )
+    if previous is not None and previous.application != candidate.application:
+        fail(f"{label} previous state belongs to another application")
+    previous_target = value["previous_target"]
+    if previous_target is not None and not isinstance(previous_target, str):
+        fail(f"{label} previous target is invalid")
+    if not isinstance(value["expected_target"], str) or not isinstance(
+        value["phase"], str
+    ):
+        fail(f"{label} target or phase is invalid")
+    transaction = ApplicationTransaction(
+        candidate=candidate,
+        previous_state=previous,
+        previous_target=previous_target,
+        expected_target=value["expected_target"],
+        phase=value["phase"],
+    )
+    validate_transaction(transaction)
+    return transaction
+
+
+def validate_transaction(transaction: ApplicationTransaction) -> None:
+    validate_state(transaction.candidate)
+    if transaction.previous_state is not None:
+        validate_state(transaction.previous_state)
+    if transaction.phase not in TRANSACTION_PHASES:
+        fail("application transaction phase is invalid")
+    if transaction.expected_target != release_target(transaction.candidate):
+        fail("application transaction expected target is invalid")
+    if transaction.previous_state is None:
+        if transaction.previous_target is not None:
+            fail("application transaction has a target without previous state")
+    elif transaction.previous_target != release_target(transaction.previous_state):
+        fail("application transaction previous target is invalid")
+
+
+def canonical_transaction(transaction: ApplicationTransaction) -> bytes:
+    validate_transaction(transaction)
+    return canonical_json(transaction.as_dict())
+
+
+def _state_bytes(directory: Path, name: str, label: str) -> bytes | None:
+    if STATE_NAME_RE.fullmatch(name) is None:
+        fail(f"{label} name is invalid")
+    return STATIC.read_protected_state_bytes(
+        directory,
+        name,
+        label,
+        maximum_size=MAX_STATE_BYTES,
+    )
+
+
+def read_state(directory: Path, name: str, label: str) -> ApplicationState | None:
+    raw = _state_bytes(directory, name, label)
+    if raw is None:
+        return None
+    value = strict_json(raw, label, maximum=MAX_STATE_BYTES)
+    if raw != canonical_json(value):
+        fail(f"{label} is not canonical JSON")
+    return state_from_value(value, label)
+
+
+def write_state(directory: Path, name: str, state: ApplicationState, label: str) -> None:
+    STATIC.write_protected_state_bytes(
+        directory,
+        name,
+        canonical_state(state),
+        label,
+        maximum_size=MAX_STATE_BYTES,
+    )
+
+
+def read_transaction(application: str) -> ApplicationTransaction | None:
+    raw = _state_bytes(
+        TRANSACTION_ROOT,
+        f"{application}.json",
+        "application transaction",
+    )
+    if raw is None:
+        return None
+    value = strict_json(raw, "application transaction", maximum=MAX_STATE_BYTES)
+    if raw != canonical_json(value):
+        fail("application transaction is not canonical JSON")
+    return transaction_from_value(value, "application transaction")
+
+
+def write_transaction(transaction: ApplicationTransaction) -> None:
+    STATIC.write_protected_state_bytes(
+        TRANSACTION_ROOT,
+        f"{transaction.candidate.application}.json",
+        canonical_transaction(transaction),
+        "application transaction",
+        maximum_size=MAX_STATE_BYTES,
+    )
+
+
+def remove_state(directory: Path, name: str, label: str) -> None:
+    STATIC.remove_protected_state_file(directory, name, label)
+
+
+def quarantine_name(state: ApplicationState) -> str:
+    return f"{state.application}-{release_name(state).removeprefix('sha256-')}.json"
+
+
+def require_protected_file(
+    path: Path,
+    label: str,
+    *,
+    allowed_modes: frozenset[int],
+    maximum_size: int,
+    expected_gid: int = 0,
+) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != expected_gid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) not in allowed_modes
+        or not 1 <= metadata.st_size <= maximum_size
+    ):
+        fail(f"{label} is not one protected root-owned file")
+    return metadata
+
+
+def require_protected_directory(path: Path, label: str, *, mode: int = 0o700) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        fail(f"{label} must be a protected root-owned directory with mode {mode:04o}")
+
+
+def validate_runtime() -> None:
+    # The application controller deliberately imports the static controller's
+    # isolated-worker and attestation primitives. Re-establish every precondition
+    # of that shared root runtime before checking the application-specific tree.
+    STATIC.validate_runtime()
+    if os.geteuid() != 0 or os.getegid() != 0:
+        fail("application deployment must run as root")
+    for path, label in (
+        (APPLICATION_STATE_ROOT, "application state root"),
+        (ACTIVE_STATE_ROOT, "application active-state directory"),
+        (INVENTORY_STATE_ROOT, "application inventory directory"),
+        (QUARANTINE_ROOT, "application quarantine directory"),
+        (TRANSACTION_ROOT, "application transaction directory"),
+        (RUNTIME_CONFIG_ROOT, "application runtime configuration directory"),
+    ):
+        require_protected_directory(path, label)
+    require_protected_directory(APPLICATION_ROOT, "application release root", mode=0o755)
+    for application in sorted(PROFILES):
+        app_root = APPLICATION_ROOT / application
+        releases = app_root / "releases"
+        require_protected_directory(app_root, f"{application} release root", mode=0o755)
+        require_protected_directory(releases, f"{application} releases", mode=0o755)
+    for path, label in (
+        (APPLICATION_PRODUCTION_CONTRACT, "application production contract"),
+        (STATIC_PRODUCTION_CONTRACT, "static production contract"),
+        (SCRIPT_DIRECTORY / "deploy-application", "application controller"),
+        (SCRIPT_DIRECTORY / "deploy-static", "shared static controller runtime"),
+        (VALIDATE_COMPOSE_PATH, "Compose policy validator"),
+        (LIB_DIRECTORY / "application_release.py", "application release policy"),
+        (LIB_DIRECTORY / "application_bundle.py", "application bundle policy"),
+    ):
+        require_protected_file(
+            path,
+            label,
+            allowed_modes=frozenset({0o444, 0o555, 0o644, 0o755}),
+            maximum_size=16 * 1024 * 1024,
+        )
+
+
+def validate_recovery_state_runtime() -> None:
+    """Validate only what is needed to prove that no transaction exists."""
+    if os.geteuid() != 0 or os.getegid() != 0:
+        fail("application recovery must run as root")
+    require_protected_directory(
+        APPLICATION_STATE_ROOT,
+        "application state root",
+    )
+    require_protected_directory(
+        TRANSACTION_ROOT,
+        "application transaction directory",
+    )
+    require_protected_directory(
+        APPLICATION_ROOT,
+        "application release root",
+        mode=0o755,
+    )
+    for application in sorted(PROFILES):
+        require_protected_directory(
+            APPLICATION_ROOT / application,
+            f"{application} release root",
+            mode=0o755,
+        )
+        require_protected_directory(
+            APPLICATION_ROOT / application / "releases",
+            f"{application} releases",
+            mode=0o755,
+        )
+    require_protected_file(
+        SCRIPT_DIRECTORY / "deploy-application",
+        "application controller",
+        allowed_modes=frozenset({0o555, 0o755}),
+        maximum_size=16 * 1024 * 1024,
+    )
+
+
+@contextlib.contextmanager
+def deployment_lock(timeout_seconds: int = 60) -> Iterator[None]:
+    if LOCK_PATH != Path("/run/lock/vps-static.lock"):
+        fail("application controller does not use the shared deployment lock")
+    descriptor = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            fail("shared deployment lock is not protected")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    fail("another static or application deployment holds the shared lock")
+                time.sleep(0.2)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def runtime_configuration(profile: BundleProfile) -> dict[str, str]:
+    path = RUNTIME_CONFIG_ROOT / f"{profile.application}.env"
+    metadata = require_protected_file(
+        path,
+        f"{profile.application} runtime configuration",
+        allowed_modes=frozenset({0o600}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read {profile.application} runtime configuration: {exc}")
+    if len(raw) != metadata.st_size or not raw.endswith(b"\n") or b"\r" in raw:
+        fail(f"{profile.application} runtime configuration framing is invalid")
+    result: dict[str, str] = {}
+    try:
+        lines = raw.decode("ascii", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ApplicationDeploymentError(
+            f"{profile.application} runtime configuration must be ASCII"
+        ) from exc
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if (
+            not separator
+            or CONFIG_KEY_RE.fullmatch(key) is None
+            or key in result
+            or CONFIG_VALUE_RE.fullmatch(value) is None
+        ):
+            fail(f"{profile.application} runtime configuration contains an invalid record")
+        result[key] = value
+    if tuple(sorted(result)) != tuple(sorted(profile.runtime_configuration_keys)):
+        fail(f"{profile.application} runtime configuration key allowlist differs")
+    return result
+
+
+def _registry_fetch(
+    repository: str,
+    digest: str,
+    destination: Path,
+    *,
+    kind: str,
+    maximum_size: int,
+    expected_size: int | None = None,
+) -> None:
+    STATIC.fetch_registry_object_isolated(
+        STATIC.RegistryFetchContract(
+            repository=repository,
+            kind=kind,
+            digest=digest,
+            maximum_size=maximum_size,
+            expected_size=expected_size,
+        ),
+        destination,
+    )
+
+
+def _fetch_reference(
+    reference: str,
+    repository: str,
+    destination: Path,
+    *,
+    maximum_size: int,
+) -> bytes:
+    digest = parse_digest_reference(reference, repository, "registry reference")
+    _registry_fetch(
+        repository,
+        digest,
+        destination,
+        kind="manifest",
+        maximum_size=maximum_size,
+    )
+    return STATIC.read_bounded_file(destination, maximum_size, "registry manifest")
+
+
+def _fetch_blob(
+    repository: str,
+    descriptor: object,
+    destination: Path,
+    *,
+    maximum_size: int,
+) -> bytes:
+    digest = descriptor.digest
+    size = descriptor.size
+    _registry_fetch(
+        repository,
+        digest,
+        destination,
+        kind="blob",
+        maximum_size=size,
+        expected_size=size,
+    )
+    return STATIC.read_bounded_file(destination, maximum_size, "registry blob")
+
+
+def _verify_provenance(
+    reference: str,
+    subject: Path,
+    trusted_root: Path,
+    profile: BundleProfile,
+    revision: str,
+    signer_workflow: str,
+    work: Path,
+    subject_media_type: str,
+    subject_maximum_size: int,
+) -> None:
+    STATIC.verify_github_provenance_isolated(
+        reference,
+        subject_path=subject,
+        trusted_root=trusted_root,
+        repository=profile.source_repository,
+        source_revision=revision,
+        source_ref=SOURCE_REF,
+        signer_workflow=signer_workflow,
+        trusted_directory=work,
+        subject_media_type=subject_media_type,
+        subject_maximum_size=subject_maximum_size,
+    )
+
+
+def _state_from_descriptor(
+    application: str,
+    revision: str,
+    release_reference: str,
+    descriptor: ReleaseDescriptor,
+) -> ApplicationState:
+    state = ApplicationState(
+        application=application,
+        source_revision=revision,
+        release_reference=release_reference,
+        integration_reference=descriptor.integration_reference,
+        component_references=dict(descriptor.component_references),
+        migration_inventory_digest=descriptor.migration_inventory_digest,
+        probe_inventory_digest=descriptor.probe_inventory_digest,
+    )
+    validate_state(state)
+    return state
+
+
+def fetch_and_validate_candidate(
+    policy: ApplicationPolicy,
+    profile: BundleProfile,
+    revision: str,
+    release_reference: str,
+    work: Path,
+) -> tuple[ApplicationState, ApplicationBundle, dict[str, bytes]]:
+    downloads = work / "downloads"
+    downloads.mkdir(mode=0o755)
+    release_manifest_path = downloads / "application-release-manifest.json"
+    release_manifest_raw = _fetch_reference(
+        release_reference,
+        policy.release_repository,
+        release_manifest_path,
+        maximum_size=MAX_RELEASE_BYTES,
+    )
+    expected_release_digest = parse_digest_reference(
+        release_reference, policy.release_repository, "application release reference"
+    )
+    if content_digest(release_manifest_raw) != expected_release_digest:
+        fail("application release manifest does not match its immutable reference")
+    release_layer = validate_release_manifest(release_manifest_raw, policy, revision)
+    release_descriptor_path = downloads / "application-release.json"
+    release_descriptor_raw = _fetch_blob(
+        policy.release_repository,
+        release_layer,
+        release_descriptor_path,
+        maximum_size=MAX_RELEASE_BYTES,
+    )
+    descriptor = validate_release_descriptor(release_descriptor_raw, policy, revision)
+    state = _state_from_descriptor(
+        policy.name, revision, release_reference, descriptor
+    )
+
+    trusted_root = STATIC.fetch_github_trusted_root_isolated(downloads)
+    evidence: dict[str, bytes] = {
+        "application-release.json": release_descriptor_raw,
+        "application-release-manifest.json": release_manifest_raw,
+    }
+    try:
+        _verify_provenance(
+            release_reference,
+            release_manifest_path,
+            trusted_root,
+            profile,
+            revision,
+            profile.release_signer_workflow,
+            downloads,
+            STATIC.OCI_MANIFEST_MEDIA_TYPE,
+            MAX_RELEASE_BYTES,
+        )
+        for component, reference in state.component_references.items():
+            repository = profile.component_repositories[component]
+            index_path = downloads / f"component-{component}-index.json"
+            index_raw = _fetch_reference(
+                reference,
+                repository,
+                index_path,
+                maximum_size=MAX_COMPONENT_MANIFEST_BYTES,
+            )
+            index = validate_component_index(
+                index_raw,
+                profile=profile,
+                component=component,
+                revision=revision,
+                expected_digest=parse_digest_reference(
+                    reference, repository, f"{component} image reference"
+                ),
+            )
+            _verify_provenance(
+                reference,
+                index_path,
+                trusted_root,
+                profile,
+                revision,
+                profile.component_signer_workflow,
+                downloads,
+                STATIC.OCI_INDEX_MEDIA_TYPE,
+                MAX_COMPONENT_MANIFEST_BYTES,
+            )
+            runtime_path = downloads / f"component-{component}-manifest.json"
+            runtime_raw = _fetch_reference(
+                f"{repository}@{index.runtime_manifest.digest}",
+                repository,
+                runtime_path,
+                maximum_size=MAX_COMPONENT_MANIFEST_BYTES,
+            )
+            config_descriptor = validate_runtime_manifest(
+                runtime_raw,
+                expected_digest=index.runtime_manifest.digest,
+                expected_size=index.runtime_manifest.size,
+            )
+            config_path = downloads / f"component-{component}-config.json"
+            config_raw = _fetch_blob(
+                repository,
+                config_descriptor,
+                config_path,
+                maximum_size=MAX_IMAGE_CONFIG_BYTES,
+            )
+            validate_image_config(
+                config_raw,
+                profile=profile,
+                revision=revision,
+                expected_digest=config_descriptor.digest,
+                expected_size=config_descriptor.size,
+            )
+            evidence[f"component-{component}-index.json"] = index_raw
+            evidence[f"component-{component}-manifest.json"] = runtime_raw
+            evidence[f"component-{component}-config.json"] = config_raw
+
+        integration_manifest_path = downloads / "integration-manifest.json"
+        integration_manifest_raw = _fetch_reference(
+            state.integration_reference,
+            profile.integration_repository,
+            integration_manifest_path,
+            maximum_size=MAX_MANIFEST_BYTES,
+        )
+        integration = validate_integration_manifest(
+            integration_manifest_raw,
+            profile,
+            revision,
+            parse_digest_reference(
+                state.integration_reference,
+                profile.integration_repository,
+                "integration reference",
+            ),
+        )
+        _verify_provenance(
+            state.integration_reference,
+            integration_manifest_path,
+            trusted_root,
+            profile,
+            revision,
+            profile.integration_signer_workflow,
+            downloads,
+            STATIC.OCI_MANIFEST_MEDIA_TYPE,
+            MAX_MANIFEST_BYTES,
+        )
+        archive_path = downloads / "integration.tar.gz"
+        inventory_path = downloads / "inventory.json"
+        archive_raw = _fetch_blob(
+            profile.integration_repository,
+            integration.archive,
+            archive_path,
+            maximum_size=MAX_ARCHIVE_BYTES,
+        )
+        inventory_raw = _fetch_blob(
+            profile.integration_repository,
+            integration.inventory,
+            inventory_path,
+            maximum_size=MAX_INVENTORY_BYTES,
+        )
+        bundle = validate_bundle(
+            archive_raw,
+            inventory_raw,
+            profile=profile,
+            revision=revision,
+            created=integration.created,
+            component_references=state.component_references,
+            migration_inventory_digest=state.migration_inventory_digest,
+            probe_inventory_digest=state.probe_inventory_digest,
+        )
+        evidence.update(
+            {
+                "integration-manifest.json": integration_manifest_raw,
+                "integration.tar.gz": archive_raw,
+                "inventory.json": inventory_raw,
+            }
+        )
+        return state, bundle, evidence
+    finally:
+        STATIC.unlink_trusted_file(trusted_root)
+
+
+def expected_service_images(state: ApplicationState) -> dict[str, str]:
+    result = dict(state.component_references)
+    result["migrator"] = result["backend"]
+    return result
+
+
+def image_environment(
+    bundle: ApplicationBundle,
+    state: ApplicationState,
+) -> dict[str, str]:
+    variables = bundle.contract.get("image_variables")
+    if not isinstance(variables, dict) or set(variables) != set(
+        state.component_references
+    ):
+        fail("integration image variable contract is invalid")
+    result: dict[str, str] = {}
+    for component, variable in variables.items():
+        if not isinstance(variable, str) or CONFIG_KEY_RE.fullmatch(variable) is None:
+            fail("integration image variable name is invalid")
+        result[variable] = state.component_references[component]
+    return result
+
+
+def compose_environment(
+    profile: BundleProfile,
+    bundle: ApplicationBundle,
+    state: ApplicationState,
+    home: Path,
+    configuration: Mapping[str, str],
+) -> dict[str, str]:
+    if set(configuration) != set(profile.runtime_configuration_keys):
+        fail("application runtime configuration snapshot differs from its profile")
+    result = safe_environment(home)
+    result.update(configuration)
+    result.update(image_environment(bundle, state))
+    return result
+
+
+def materialized_runtime_configuration(
+    release: Path,
+    profile: BundleProfile,
+) -> dict[str, str]:
+    path = release / "runtime-config.json"
+    require_protected_file(
+        path,
+        "materialized runtime configuration",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    raw = path.read_bytes()
+    value = strict_json(raw, "materialized runtime configuration", maximum=MAX_CONFIG_BYTES)
+    if raw != canonical_json(value) or not isinstance(value, dict):
+        fail("materialized runtime configuration is not canonical")
+    if set(value) != set(profile.runtime_configuration_keys) or any(
+        not isinstance(key, str)
+        or not isinstance(item, str)
+        or CONFIG_KEY_RE.fullmatch(key) is None
+        or CONFIG_VALUE_RE.fullmatch(item) is None
+        for key, item in value.items()
+    ):
+        fail("materialized runtime configuration differs from its profile")
+    result = dict(value)
+    environment_path = release / "runtime.env"
+    require_protected_file(
+        environment_path,
+        "materialized Compose environment",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    if environment_path.read_bytes() != canonical_runtime_environment(result):
+        fail("materialized Compose environment differs from its configuration")
+    return result
+
+
+def canonical_runtime_environment(configuration: Mapping[str, str]) -> bytes:
+    if not configuration:
+        fail("application runtime configuration cannot be empty")
+    return "".join(
+        f"{key}={configuration[key]}\n" for key in sorted(configuration)
+    ).encode("ascii")
+
+
+def compose_prefix(
+    release: Path,
+    profile: BundleProfile,
+    *,
+    precommit: bool = False,
+) -> list[str]:
+    command = [
+        str(DOCKER_PATH),
+        "compose",
+        "--project-name",
+        profile.application,
+        "--project-directory",
+        str(release / "integration"),
+        "--env-file",
+        str(release / "runtime.env"),
+        "--file",
+        str(release / "integration/compose.yaml"),
+    ]
+    if precommit:
+        command.extend(("--file", str(release / "precommit-compose.json")))
+    command.extend(("--profile", "migration"))
+    return command
+
+
+def _run_bounded_status(
+    command: list[str],
+    *,
+    environment: Mapping[str, str],
+    timeout: int,
+    maximum_stdout: int = MAX_RENDERED_COMPOSE_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+
+    def terminate() -> None:
+        if process is None or process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            with contextlib.suppress(OSError):
+                process.kill()
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            env=dict(environment),
+            cwd="/",
+            start_new_session=True,
+        )
+        if process.stdout is None or process.stderr is None:
+            fail(f"command {command[0]} did not expose bounded output pipes")
+        streams = {
+            process.stdout: (bytearray(), maximum_stdout),
+            process.stderr: (bytearray(), 64 * 1024),
+        }
+        for stream in streams:
+            selector.register(stream, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate()
+                fail(f"command {command[0]} failed: timed out after {timeout} seconds")
+            for key, _events in selector.select(timeout=min(remaining, 1.0)):
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                output, maximum = streams[stream]
+                if len(output) + len(chunk) > maximum:
+                    terminate()
+                    fail(f"command {command[0]} output exceeds the limit")
+                output.extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            terminate()
+            fail(f"command {command[0]} failed: timed out after {timeout} seconds")
+        returncode = process.wait(timeout=remaining)
+        try:
+            stdout = streams[process.stdout][0].decode("utf-8", errors="strict")
+            stderr = streams[process.stderr][0].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            fail(f"command {command[0]} returned non-UTF-8 output")
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+    except OSError as exc:
+        terminate()
+        fail(f"command {command[0]} failed: {exc}")
+    except subprocess.TimeoutExpired:
+        terminate()
+        fail(f"command {command[0]} failed: timed out after {timeout} seconds")
+    finally:
+        selector.close()
+        if process is not None:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+
+
+def _run_bounded(
+    command: list[str],
+    *,
+    environment: Mapping[str, str],
+    timeout: int,
+    maximum_stdout: int = MAX_RENDERED_COMPOSE_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    result = _run_bounded_status(
+        command,
+        environment=environment,
+        timeout=timeout,
+        maximum_stdout=maximum_stdout,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
+        fail(f"command {command[0]} failed: {detail[:1000]}")
+    return result
+
+
+def write_release_file(path: Path, raw: bytes, label: str) -> None:
+    if path.exists() or path.is_symlink() or not raw:
+        fail(f"cannot create {label}")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o444,
+        )
+        try:
+            view = memoryview(raw)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    fail(f"cannot create {label}: short write")
+                view = view[written:]
+            os.fchmod(descriptor, 0o444)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        fail(f"cannot create {label}: {exc}")
+
+
+def validate_secret_metadata(profile: BundleProfile, rendered: object) -> None:
+    if not isinstance(rendered, dict):
+        fail("rendered Compose document is not an object")
+    secrets_value = rendered.get("secrets")
+    if not isinstance(secrets_value, dict) or set(secrets_value) != set(
+        profile.credential_files
+    ):
+        fail("rendered Compose secret set differs from the exact application profile")
+    require_protected_directory(CREDENTIAL_ROOT, "application secret root")
+    require_protected_directory(
+        CREDENTIAL_ROOT / profile.application,
+        f"{profile.application} secret directory",
+    )
+    for name, expected_path in profile.credential_files.items():
+        value = secrets_value[name]
+        if not isinstance(value, dict) or value.get("file") != expected_path:
+            fail(f"rendered Compose secret {name} has an unexpected source")
+        require_protected_file(
+            Path(expected_path),
+            f"{profile.application} secret {name}",
+            # Compose file-backed secrets retain host ownership and mode. The
+            # 0700 parent keeps bytes host-root-only, while root:<container GID>
+            # 0440 lets the fixed non-root process read its bind-mounted file.
+            allowed_modes=frozenset({0o440}),
+            maximum_size=64 * 1024,
+            expected_gid=profile.credential_gid,
+        )
+
+
+def validate_application_compose_semantics(
+    profile: BundleProfile,
+    rendered: object,
+) -> None:
+    if not isinstance(rendered, dict):
+        fail("rendered Compose document is not an object")
+    services = rendered.get("services")
+    if not isinstance(services, dict):
+        fail("rendered Compose services are invalid")
+    migrator = services.get("migrator")
+    backend = services.get("backend")
+    if not isinstance(migrator, dict) or not isinstance(backend, dict):
+        fail("rendered Compose migration services are invalid")
+    if migrator.get("entrypoint") != [profile.migration_runner]:
+        fail("rendered Compose migrator entrypoint differs from the inventory")
+    environment = backend.get("environment")
+    if not isinstance(environment, dict):
+        fail("rendered Compose backend environment is invalid")
+    if environment.get("QUARKUS_FLYWAY_MIGRATE_AT_START") != "false":
+        fail("rendered Compose backend can perform automatic migrations")
+    if profile.application == "parkventory" and environment.get(
+        "PARKVENTORY_MIGRATION_ONLY"
+    ) != "false":
+        fail("rendered Parkventory backend can enter migration-only mode")
+    if set(profile.service_credentials) != {
+        *profile.component_repositories,
+        "migrator",
+    }:
+        fail("application service credential profile is incomplete")
+    for service_name, expected_sources in profile.service_credentials.items():
+        service = services.get(service_name)
+        if not isinstance(service, dict):
+            fail(f"rendered Compose service {service_name} is invalid")
+        raw_credentials = service.get("secrets", [])
+        if raw_credentials is None:
+            raw_credentials = []
+        if not isinstance(raw_credentials, list):
+            fail(f"rendered Compose service {service_name} secrets are invalid")
+        sources: list[str] = []
+        for item in raw_credentials:
+            if not isinstance(item, dict) or not isinstance(item.get("source"), str):
+                fail(f"rendered Compose service {service_name} secret is invalid")
+            sources.append(item["source"])
+        if tuple(sorted(sources)) != tuple(sorted(expected_sources)):
+            fail(
+                f"rendered Compose service {service_name} secrets differ from "
+                "the least-privilege profile"
+            )
+        if expected_sources and service.get("user") != (
+            f"{profile.credential_gid}:{profile.credential_gid}"
+        ):
+            fail(
+                f"rendered Compose service {service_name} user cannot read its "
+                "file-backed secrets"
+            )
+
+
+def candidate_restart_override(profile: BundleProfile) -> dict[str, object]:
+    return {
+        "services": {
+            service: {"restart": "no"}
+            for service in sorted(profile.component_repositories)
+        }
+    }
+
+
+def validate_candidate_restart_config(
+    profile: BundleProfile,
+    rendered: object,
+    candidate_rendered: object,
+) -> None:
+    if not isinstance(rendered, dict) or not isinstance(candidate_rendered, dict):
+        fail("rendered candidate Compose document is invalid")
+    expected = copy.deepcopy(rendered)
+    services = expected.get("services")
+    if not isinstance(services, dict):
+        fail("rendered candidate Compose services are invalid")
+    for service_name in profile.component_repositories:
+        service = services.get(service_name)
+        if not isinstance(service, dict):
+            fail(f"rendered candidate Compose service {service_name} is invalid")
+        service["restart"] = "no"
+    if candidate_rendered != expected:
+        fail("pre-commit Compose config changes more than runtime restart policy")
+
+
+def render_and_validate_compose(
+    staging: Path,
+    profile: BundleProfile,
+    bundle: ApplicationBundle,
+    state: ApplicationState,
+    configuration: Mapping[str, str],
+) -> None:
+    environment = compose_environment(
+        profile,
+        bundle,
+        state,
+        staging,
+        configuration,
+    )
+    rendered_result = _run_bounded(
+        [*compose_prefix(staging, profile), "config", "--format", "json"],
+        environment=environment,
+        timeout=60,
+    )
+    rendered_raw = rendered_result.stdout.encode("utf-8")
+    rendered = strict_json(
+        rendered_raw,
+        "rendered Compose document",
+        maximum=MAX_RENDERED_COMPOSE_BYTES,
+    )
+    expected_images_path = staging / "expected-images.json"
+    write_release_file(
+        expected_images_path,
+        canonical_json(expected_service_images(state)),
+        "expected image contract",
+    )
+    rendered_path = staging / "compose.json"
+    write_release_file(rendered_path, canonical_json(rendered), "rendered Compose document")
+    _run_bounded(
+        [
+            str(VALIDATE_COMPOSE_PATH),
+            "--expected-images",
+            str(expected_images_path),
+            profile.application,
+            str(rendered_path),
+        ],
+        environment=safe_environment(staging),
+        timeout=60,
+    )
+    validate_application_compose_semantics(profile, rendered)
+    validate_secret_metadata(profile, rendered)
+    write_release_file(
+        staging / "precommit-compose.json",
+        canonical_json(candidate_restart_override(profile)),
+        "pre-commit Compose override",
+    )
+    candidate_result = _run_bounded(
+        [
+            *compose_prefix(staging, profile, precommit=True),
+            "config",
+            "--format",
+            "json",
+        ],
+        environment=environment,
+        timeout=60,
+    )
+    candidate_rendered = strict_json(
+        candidate_result.stdout.encode("utf-8"),
+        "rendered pre-commit Compose document",
+        maximum=MAX_RENDERED_COMPOSE_BYTES,
+    )
+    validate_candidate_restart_config(profile, rendered, candidate_rendered)
+
+
+def filesystem_inventory(root: Path) -> dict[str, object]:
+    records: list[dict[str, object]] = []
+    for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        directories.sort()
+        files.sort()
+        for name in directories:
+            path = current_path / name
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                fail("materialized release contains an unsafe directory")
+            if metadata.st_uid != 0 or metadata.st_gid != 0 or metadata.st_mode & 0o022:
+                fail("materialized release directory is not protected")
+        for name in files:
+            path = current_path / name
+            relative = path.relative_to(root).as_posix()
+            if relative == "materialization.json":
+                continue
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o444
+            ):
+                fail("materialized release file is not protected")
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            records.append(
+                {
+                    "path": relative,
+                    "sha256": f"sha256:{digest.hexdigest()}",
+                    "size": metadata.st_size,
+                }
+            )
+    return {"files": records, "schema": 1}
+
+
+def fsync_release_tree(root: Path) -> None:
+    directories: list[Path] = []
+    for current, names, _files in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current)
+        directories.extend(current_path / name for name in sorted(names))
+        directories.append(current_path)
+    seen: set[Path] = set()
+    for path in directories:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            fail(f"cannot make materialized release directory durable: {exc}")
+
+
+def expose_release_directory(path: Path) -> None:
+    """Set the immutable release root mode independently from systemd's umask."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                fail("materialized application release staging path is invalid")
+            os.fchmod(descriptor, 0o755)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        fail(f"cannot protect materialized application release: {exc}")
+
+
+def cleanup_application_filesystem_residue(
+    application: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    if application not in PROFILES or expected_uid < 0 or expected_gid < 0:
+        fail("application filesystem cleanup target is invalid")
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        fail("application filesystem cleanup requires symlink-safe removal")
+    app_root = APPLICATION_ROOT / application
+    releases = app_root / "releases"
+    releases_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent = os.fstat(releases_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or stat.S_IMODE(parent.st_mode) != 0o755
+        ):
+            fail("application releases directory is unsafe during cleanup")
+        names = sorted(
+            name
+            for name in os.listdir(releases_fd)
+            if re.fullmatch(r"\.sha256-[0-9a-f]{64}-[0-9a-f]{16}", name)
+        )
+        if len(names) > 16:
+            fail("application filesystem cleanup exceeded its staging limit")
+        for name in names:
+            metadata = os.stat(name, dir_fd=releases_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+                or metadata.st_dev != parent.st_dev
+                or stat.S_IMODE(metadata.st_mode) not in {0o700, 0o755}
+            ):
+                fail("application staging residue is not one protected directory")
+            shutil.rmtree(name, dir_fd=releases_fd)
+        if names:
+            os.fsync(releases_fd)
+    finally:
+        os.close(releases_fd)
+
+    app_fd = os.open(app_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent = os.fstat(app_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or stat.S_IMODE(parent.st_mode) != 0o755
+        ):
+            fail("application root is unsafe during cleanup")
+        names = sorted(
+            name
+            for name in os.listdir(app_fd)
+            if re.fullmatch(r"\.current-[0-9a-f]{16}", name)
+        )
+        if len(names) > 16:
+            fail("application filesystem cleanup exceeded its link limit")
+        for name in names:
+            metadata = os.stat(name, dir_fd=app_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+            ):
+                fail("application current-link residue is not one protected symlink")
+            os.unlink(name, dir_fd=app_fd)
+        if names:
+            os.fsync(app_fd)
+    finally:
+        os.close(app_fd)
+
+
+def validate_materialized_release(release: Path, state: ApplicationState) -> None:
+    require_protected_directory(release, "materialized application release", mode=0o755)
+    inventory_path = release / "materialization.json"
+    require_protected_file(
+        inventory_path,
+        "materialized application inventory",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_STATE_BYTES,
+    )
+    raw = inventory_path.read_bytes()
+    value = strict_json(raw, "materialized application inventory", maximum=MAX_STATE_BYTES)
+    if raw != canonical_json(value) or value != filesystem_inventory(release):
+        fail("materialized application release differs from its inventory")
+    state_path = release / "state.json"
+    persisted_raw = state_path.read_bytes()
+    if persisted_raw != canonical_state(state):
+        fail("materialized application release state differs")
+
+
+def materialization_inventory_name(state: ApplicationState) -> str:
+    return (
+        f"{state.application}-"
+        f"{release_name(state).removeprefix('sha256-')}.json"
+    )
+
+
+def ensure_external_inventory(release: Path, state: ApplicationState) -> None:
+    raw = (release / "materialization.json").read_bytes()
+    name = materialization_inventory_name(state)
+    existing = STATIC.read_protected_state_bytes(
+        INVENTORY_STATE_ROOT,
+        name,
+        "application materialization inventory",
+        maximum_size=MAX_STATE_BYTES,
+    )
+    if existing is not None:
+        if existing != raw:
+            fail("external application inventory differs from its immutable release")
+        return
+    STATIC.write_protected_state_bytes(
+        INVENTORY_STATE_ROOT,
+        name,
+        raw,
+        "application materialization inventory",
+        maximum_size=MAX_STATE_BYTES,
+    )
+
+
+def materialize_candidate(
+    state: ApplicationState,
+    profile: BundleProfile,
+    bundle: ApplicationBundle,
+    evidence: Mapping[str, bytes],
+) -> Path:
+    app_root = APPLICATION_ROOT / profile.application
+    releases = app_root / "releases"
+    final = releases / release_name(state)
+    if final.exists() or final.is_symlink():
+        validate_materialized_release(final, state)
+        ensure_external_inventory(final, state)
+        return final
+    staging = releases / f".{release_name(state)}-{secrets.token_hex(8)}"
+    if staging.exists() or staging.is_symlink():
+        fail("application release staging name collided")
+    staging.mkdir(mode=0o700)
+    try:
+        integration = staging / "integration"
+        materialize_files(bundle, integration)
+        evidence_root = staging / "evidence"
+        evidence_root.mkdir(mode=0o700)
+        for name, raw in sorted(evidence.items()):
+            write_release_file(evidence_root / name, raw, f"release evidence {name}")
+        write_release_file(staging / "state.json", canonical_state(state), "release state")
+        configuration = runtime_configuration(profile)
+        write_release_file(
+            staging / "runtime-config.json",
+            canonical_json(configuration),
+            "runtime configuration snapshot",
+        )
+        write_release_file(
+            staging / "runtime.env",
+            canonical_runtime_environment(configuration),
+            "Compose environment snapshot",
+        )
+        render_and_validate_compose(
+            staging,
+            profile,
+            bundle,
+            state,
+            configuration,
+        )
+        inventory_raw = canonical_json(filesystem_inventory(staging))
+        write_release_file(
+            staging / "materialization.json",
+            inventory_raw,
+            "materialized release inventory",
+        )
+        expose_release_directory(staging)
+        fsync_release_tree(staging)
+        os.replace(staging, final)
+        parent_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    validate_materialized_release(final, state)
+    ensure_external_inventory(final, state)
+    return final
+
+
+def source_worker_environment(home: Path) -> dict[str, str]:
+    environment = safe_environment(home)
+    environment.update(
+        {
+            "GIT_ALLOW_PROTOCOL": "https",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
+def run_source_head_worker(repository: str, revision: str) -> None:
+    STATIC.require_unprivileged_worker("application source-head worker")
+    if repository not in {profile.source_repository for profile in PROFILES.values()}:
+        fail("application source-head repository is invalid")
+    if SHA40_RE.fullmatch(revision) is None:
+        fail("application source-head revision is invalid")
+    home = Path(os.environ.get("HOME", ""))
+    if not home.is_dir() or set(home.iterdir()):
+        fail("application source-head worker home is invalid")
+    result = _run_bounded(
+        [
+            str(GIT_PATH),
+            "-c",
+            "credential.helper=",
+            "-c",
+            "http.https://github.com/.extraheader=",
+            "ls-remote",
+            "--exit-code",
+            "--refs",
+            f"https://github.com/{repository}.git",
+            SOURCE_REF,
+        ],
+        environment=source_worker_environment(home),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    if result.stdout != f"{revision}\t{SOURCE_REF}\n" or result.stderr:
+        fail("application source revision is not the exact canonical branch HEAD")
+
+
+def assert_exact_source_head(profile: BundleProfile, revision: str) -> None:
+    state = STATIC.run_isolated_worker(
+        "apphead",
+        [
+            str(STATIC.PYTHON_PATH),
+            str(Path(__file__)),
+            "--source-head-worker",
+            profile.source_repository,
+            revision,
+        ],
+        inputs=(
+            Path(__file__),
+            SCRIPT_DIRECTORY / "deploy-static",
+            LIB_DIRECTORY / "application_bundle.py",
+            LIB_DIRECTORY / "application_release.py",
+            LIB_DIRECTORY / "platform_integration.py",
+        ),
+        runtime_seconds=60,
+        memory_max="128M",
+        memory_swap_max="64M",
+        file_size_max="4M",
+        network=True,
+    )
+    STATIC.cleanup_isolated_worker_state(state)
+
+
+def run_source_ancestry_worker(
+    repository: str,
+    active_revision: str,
+    candidate_revision: str,
+) -> None:
+    STATIC.require_unprivileged_worker("application source-ancestry worker")
+    if repository not in {profile.source_repository for profile in PROFILES.values()}:
+        fail("application source-ancestry repository is invalid")
+    if (
+        SHA40_RE.fullmatch(active_revision) is None
+        or SHA40_RE.fullmatch(candidate_revision) is None
+    ):
+        fail("application source-ancestry revision is invalid")
+    home = Path(os.environ.get("HOME", ""))
+    if not home.is_dir() or set(home.iterdir()):
+        fail("application source-ancestry worker home is invalid")
+    STATIC.verify_source_ancestry_repository(
+        SourceIdentity(repository),
+        active_revision,
+        candidate_revision,
+        home,
+    )
+    if set(home.iterdir()) != {home / "source-history.git"}:
+        fail("application source-ancestry worker left unexpected runtime files")
+
+
+def assert_source_revision_descends_from_active(
+    profile: BundleProfile,
+    active_revision: str,
+    candidate_revision: str,
+) -> None:
+    if active_revision == candidate_revision:
+        return
+    state = STATIC.run_isolated_worker(
+        "appancestry",
+        [
+            str(STATIC.PYTHON_PATH),
+            str(Path(__file__)),
+            "--source-ancestry-worker",
+            profile.source_repository,
+            active_revision,
+            candidate_revision,
+        ],
+        inputs=(
+            Path(__file__),
+            SCRIPT_DIRECTORY / "deploy-static",
+            LIB_DIRECTORY / "application_bundle.py",
+            LIB_DIRECTORY / "application_release.py",
+            LIB_DIRECTORY / "platform_integration.py",
+        ),
+        runtime_seconds=240,
+        memory_max="256M",
+        memory_swap_max="64M",
+        file_size_max="128M",
+        network=True,
+    )
+    STATIC.cleanup_isolated_worker_state(state)
+
+
+def current_target(current: Path, releases: Path) -> str | None:
+    try:
+        metadata = current.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        fail(f"cannot inspect application current link: {exc}")
+    if not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+        fail("application current path is not a protected symbolic link")
+    target = os.readlink(current)
+    if re.fullmatch(r"releases/sha256-[0-9a-f]{64}", target) is None:
+        fail("application current link has an unexpected target")
+    destination = current.parent / target
+    if destination.parent != releases:
+        fail("application current link escapes its release root")
+    require_protected_directory(destination, "current application release", mode=0o755)
+    return target
+
+
+def switch_current(current: Path, target: str | None, releases: Path) -> None:
+    if target is not None and re.fullmatch(r"releases/sha256-[0-9a-f]{64}", target) is None:
+        fail("application switch target is invalid")
+    app_root_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = f".current-{secrets.token_hex(8)}"
+    try:
+        if target is None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink("current", dir_fd=app_root_fd)
+        else:
+            destination = current.parent / target
+            if destination.parent != releases:
+                fail("application switch target escapes its release root")
+            require_protected_directory(destination, "application switch release", mode=0o755)
+            os.symlink(target, temporary, dir_fd=app_root_fd)
+            os.replace(temporary, "current", src_dir_fd=app_root_fd, dst_dir_fd=app_root_fd)
+        os.fsync(app_root_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=app_root_fd)
+        os.close(app_root_fd)
+
+
+def state_release(state: ApplicationState) -> Path:
+    return APPLICATION_ROOT / state.application / release_target(state)
+
+
+def bundle_from_release(release: Path, state: ApplicationState) -> ApplicationBundle:
+    profile = PROFILES[state.application]
+    evidence = release / "evidence"
+
+    def read_evidence(name: str, maximum: int) -> bytes:
+        path = evidence / name
+        require_protected_file(
+            path,
+            f"materialized integration evidence {name}",
+            allowed_modes=frozenset({0o444}),
+            maximum_size=maximum,
+        )
+        return path.read_bytes()
+
+    manifest_raw = read_evidence("integration-manifest.json", MAX_MANIFEST_BYTES)
+    integration = validate_integration_manifest(
+        manifest_raw,
+        profile,
+        state.source_revision,
+        parse_digest_reference(
+            state.integration_reference,
+            profile.integration_repository,
+            "materialized integration reference",
+        ),
+    )
+    archive_raw = read_evidence("integration.tar.gz", MAX_ARCHIVE_BYTES)
+    inventory_raw = read_evidence("inventory.json", MAX_INVENTORY_BYTES)
+    for raw, descriptor, label in (
+        (archive_raw, integration.archive, "archive"),
+        (inventory_raw, integration.inventory, "inventory"),
+    ):
+        if len(raw) != descriptor.size or content_digest(raw) != descriptor.digest:
+            fail(f"materialized integration {label} differs from its manifest")
+    bundle = validate_bundle(
+        archive_raw,
+        inventory_raw,
+        profile=profile,
+        revision=state.source_revision,
+        created=integration.created,
+        component_references=state.component_references,
+        migration_inventory_digest=state.migration_inventory_digest,
+        probe_inventory_digest=state.probe_inventory_digest,
+    )
+    for relative, expected in bundle.files.items():
+        path = release / "integration" / PurePosixPath(relative)
+        require_protected_file(
+            path,
+            f"materialized integration file {relative}",
+            allowed_modes=frozenset({0o444}),
+            maximum_size=5 * 1024 * 1024,
+        )
+        if path.read_bytes() != expected:
+            fail("materialized integration file differs from its admitted archive")
+    return bundle
+
+
+def _read_materialized_policy_file(
+    path: Path,
+    label: str,
+    *,
+    maximum_size: int = MAX_RENDERED_COMPOSE_BYTES,
+) -> bytes:
+    require_protected_file(
+        path,
+        label,
+        allowed_modes=frozenset({0o444}),
+        maximum_size=maximum_size,
+    )
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read {label}: {exc}")
+
+
+def validate_materialized_runtime_policy(
+    state: ApplicationState,
+) -> tuple[BundleProfile, ApplicationBundle, dict[str, str]]:
+    profile = PROFILES[state.application]
+    release = state_release(state)
+    validate_materialized_release(release, state)
+    bundle = bundle_from_release(release, state)
+    configuration = materialized_runtime_configuration(release, profile)
+    environment = compose_environment(
+        profile,
+        bundle,
+        state,
+        release,
+        configuration,
+    )
+    rendered_result = _run_bounded(
+        [*compose_prefix(release, profile), "config", "--format", "json"],
+        environment=environment,
+        timeout=60,
+    )
+    rendered = strict_json(
+        rendered_result.stdout.encode("utf-8"),
+        "rendered materialized Compose document",
+        maximum=MAX_RENDERED_COMPOSE_BYTES,
+    )
+    rendered_path = release / "compose.json"
+    if _read_materialized_policy_file(
+        rendered_path,
+        "materialized rendered Compose document",
+    ) != canonical_json(rendered):
+        fail("materialized Compose rendering differs from its admitted runtime inputs")
+    expected_images_path = release / "expected-images.json"
+    if _read_materialized_policy_file(
+        expected_images_path,
+        "materialized expected image contract",
+        maximum_size=MAX_STATE_BYTES,
+    ) != canonical_json(expected_service_images(state)):
+        fail("materialized expected image contract differs from the application state")
+    _run_bounded(
+        [
+            str(VALIDATE_COMPOSE_PATH),
+            "--expected-images",
+            str(expected_images_path),
+            profile.application,
+            str(rendered_path),
+        ],
+        environment=safe_environment(release),
+        timeout=60,
+    )
+    validate_application_compose_semantics(profile, rendered)
+    validate_secret_metadata(profile, rendered)
+    override_path = release / "precommit-compose.json"
+    if _read_materialized_policy_file(
+        override_path,
+        "materialized pre-commit Compose override",
+        maximum_size=MAX_CONFIG_BYTES,
+    ) != canonical_json(candidate_restart_override(profile)):
+        fail("materialized pre-commit Compose override differs from current policy")
+    candidate_result = _run_bounded(
+        [
+            *compose_prefix(release, profile, precommit=True),
+            "config",
+            "--format",
+            "json",
+        ],
+        environment=environment,
+        timeout=60,
+    )
+    candidate_rendered = strict_json(
+        candidate_result.stdout.encode("utf-8"),
+        "rendered materialized pre-commit Compose document",
+        maximum=MAX_RENDERED_COMPOSE_BYTES,
+    )
+    validate_candidate_restart_config(profile, rendered, candidate_rendered)
+    return profile, bundle, environment
+
+
+def _compose_for_state(
+    state: ApplicationState,
+    arguments: list[str],
+    *,
+    timeout: int,
+    precommit: bool = False,
+    validate_policy: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    release = state_release(state)
+    if validate_policy:
+        profile, _bundle, environment = validate_materialized_runtime_policy(state)
+    else:
+        profile = PROFILES[state.application]
+        validate_materialized_release(release, state)
+        bundle = bundle_from_release(release, state)
+        configuration = materialized_runtime_configuration(release, profile)
+        environment = compose_environment(
+            profile,
+            bundle,
+            state,
+            release,
+            configuration,
+        )
+    return _run_bounded(
+        [*compose_prefix(release, profile, precommit=precommit), *arguments],
+        environment=environment,
+        timeout=timeout,
+    )
+
+
+def pull_and_verify_images(state: ApplicationState) -> None:
+    profile = PROFILES[state.application]
+    environment = safe_environment(state_release(state))
+    for component, reference in state.component_references.items():
+        _run_bounded(
+            [str(DOCKER_PATH), "pull", "--platform", "linux/amd64", reference],
+            environment=environment,
+            timeout=600,
+        )
+        inspect = _run_bounded(
+            [
+                str(DOCKER_PATH),
+                "image",
+                "inspect",
+                "--format",
+                (
+                    "{{.Architecture}}\t{{.Os}}\t"
+                    "{{index .Config.Labels \"org.opencontainers.image.source\"}}\t"
+                    "{{index .Config.Labels \"org.opencontainers.image.revision\"}}\t"
+                    "{{index .Config.Labels \"org.opencontainers.image.version\"}}"
+                ),
+                reference,
+            ],
+            environment=environment,
+            timeout=60,
+            maximum_stdout=4096,
+        )
+        expected = (
+            f"amd64\tlinux\thttps://github.com/{profile.source_repository}\t"
+            f"{state.source_revision}\t{profile.image_version_prefix}{state.source_revision}\n"
+        )
+        if inspect.stdout != expected or inspect.stderr:
+            fail(f"pulled {component} image identity differs from its attested config")
+
+
+def migration_container_name(state: ApplicationState) -> str:
+    digest = parse_digest_reference(
+        state.release_reference,
+        f"ghcr.io/nclsppr/{state.application}/application-release",
+        "application release reference",
+    ).removeprefix("sha256:")
+    return f"vps-application-{state.application}-migrator-{digest}"
+
+
+def migration_container_id(state: ApplicationState) -> str | None:
+    name = migration_container_name(state)
+    result = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            f"name=^/{name}$",
+        ],
+        environment=safe_environment(state_release(state)),
+        timeout=30,
+        maximum_stdout=256,
+    )
+    if result.stderr:
+        fail("cannot establish the dedicated migration container set")
+    identifiers = result.stdout.splitlines()
+    if not identifiers:
+        return None
+    if len(identifiers) != 1 or CONTAINER_ID_RE.fullmatch(identifiers[0]) is None:
+        fail("dedicated migration container identity is ambiguous")
+    return identifiers[0]
+
+
+def require_migration_container_absent(state: ApplicationState) -> None:
+    if migration_container_id(state) is not None:
+        fail("dedicated migration container already exists")
+
+
+def validate_migration_container_identity(
+    state: ApplicationState,
+    container_id: str,
+) -> bool:
+    if CONTAINER_ID_RE.fullmatch(container_id) is None:
+        fail("dedicated migration container identifier is invalid")
+    name = migration_container_name(state)
+    expected_image = state.component_references["backend"]
+    inspected = _run_bounded_status(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            (
+                "{{.Name}}\t{{.Id}}\t{{.Config.Image}}\t"
+                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+                "{{index .Config.Labels \"com.docker.compose.service\"}}\t"
+                "{{index .Config.Labels \"com.docker.compose.oneoff\"}}"
+            ),
+            container_id,
+        ],
+        environment=safe_environment(state_release(state)),
+        timeout=30,
+        maximum_stdout=2048,
+    )
+    expected = (
+        f"/{name}\t{container_id}\t{expected_image}\t{state.application}\t"
+        "migrator\tTrue\n"
+    )
+    if inspected.returncode != 0:
+        if migration_container_id(state) is None:
+            return False
+        fail("cannot inspect the dedicated migration container exactly")
+    if inspected.stdout != expected or inspected.stderr:
+        fail("dedicated migration container identity differs from the journal")
+    return True
+
+
+def remove_migration_container(state: ApplicationState) -> None:
+    """Stop one interrupted migrator and observe stable absence before rollback."""
+    consecutive_absent = 0
+    for _attempt in range(8):
+        container_id = migration_container_id(state)
+        if container_id is None:
+            consecutive_absent += 1
+            if consecutive_absent == 2:
+                return
+            time.sleep(0.5)
+            continue
+        consecutive_absent = 0
+        if not validate_migration_container_identity(state, container_id):
+            consecutive_absent = 1
+            time.sleep(0.5)
+            continue
+        removed = _run_bounded_status(
+            [
+                str(DOCKER_PATH),
+                "container",
+                "rm",
+                "--force",
+                "--volumes",
+                container_id,
+            ],
+            environment=safe_environment(state_release(state)),
+            timeout=60,
+            maximum_stdout=256,
+        )
+        if removed.returncode != 0:
+            if migration_container_id(state) is None:
+                consecutive_absent = 1
+                time.sleep(0.5)
+                continue
+            fail("cannot remove the dedicated migration container exactly")
+        if removed.stdout != f"{container_id}\n" or removed.stderr:
+            fail("dedicated migration container removal is not exact")
+    fail("dedicated migration container did not reach stable absence")
+
+
+def run_migration(state: ApplicationState) -> None:
+    require_migration_container_absent(state)
+    _compose_for_state(
+        state,
+        [
+            "run",
+            "--rm",
+            "--name",
+            migration_container_name(state),
+            "--no-deps",
+            "--pull",
+            "never",
+            "migrator",
+        ],
+        timeout=900,
+    )
+    require_migration_container_absent(state)
+
+
+def start_runtime(state: ApplicationState, *, precommit: bool = False) -> None:
+    services = sorted(PROFILES[state.application].component_repositories)
+    _compose_for_state(
+        state,
+        [
+            "up",
+            "--detach",
+            "--wait",
+            "--wait-timeout",
+            "180",
+            "--no-build",
+            "--pull",
+            "never",
+            "--remove-orphans",
+            *services,
+        ],
+        timeout=300,
+        precommit=precommit,
+    )
+
+
+def stop_runtime(state: ApplicationState) -> None:
+    _compose_for_state(
+        state,
+        ["down", "--remove-orphans", "--timeout", "30"],
+        timeout=120,
+        validate_policy=False,
+    )
+
+
+def _probe_http(
+    url: str,
+    *,
+    expected_status: int,
+    expected_body: str | None,
+    work: Path,
+    resolve_host: str | None = None,
+) -> None:
+    output = work / f"probe-{secrets.token_hex(8)}.body"
+    try:
+        resolution_arguments = (
+            []
+            if resolve_host is None
+            else ["--resolve", f"{resolve_host}:443:127.0.0.1"]
+        )
+        result = _run_bounded(
+            [
+                str(CURL_PATH),
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--noproxy",
+                "*",
+                "--proto",
+                "=http,https",
+                "--max-redirs",
+                "0",
+                "--max-time",
+                "15",
+                "--max-filesize",
+                str(MAX_PROBE_BODY_BYTES),
+                *resolution_arguments,
+                "--output",
+                str(output),
+                "--write-out",
+                "%{http_code}",
+                url,
+            ],
+            environment=safe_environment(work),
+            timeout=20,
+            maximum_stdout=16,
+        )
+        if result.stdout != str(expected_status):
+            fail(f"application probe returned HTTP {result.stdout!r} for {url}")
+        raw = STATIC.read_bounded_file(output, MAX_PROBE_BODY_BYTES, "application probe body")
+        if expected_body is not None and expected_body.encode("utf-8") not in raw:
+            fail(f"application probe body did not contain its marker for {url}")
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            output.unlink()
+
+
+def runtime_container_id(state: ApplicationState, service: str) -> str:
+    if service not in PROFILES[state.application].component_repositories:
+        fail("application runtime service is outside the exact profile")
+    result = _compose_for_state(state, ["ps", "--quiet", service], timeout=30)
+    identifier = result.stdout.strip()
+    if CONTAINER_ID_RE.fullmatch(identifier) is None or result.stderr:
+        fail(f"application service {service} does not have one exact container")
+    return identifier
+
+
+def validate_runtime_container_identity(
+    state: ApplicationState,
+    service: str,
+    container_id: str,
+) -> None:
+    if CONTAINER_ID_RE.fullmatch(container_id) is None:
+        fail("application runtime container identifier is invalid")
+    inspected = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            (
+                "{{.Id}}\t{{.Config.Image}}\t"
+                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+                "{{index .Config.Labels \"com.docker.compose.service\"}}\t"
+                "{{.State.Status}}\t"
+                "{{if .State.Health}}{{.State.Health.Status}}{{end}}"
+            ),
+            container_id,
+        ],
+        environment=safe_environment(state_release(state)),
+        timeout=30,
+        maximum_stdout=2048,
+    )
+    expected = (
+        f"{container_id}\t{state.component_references[service]}\t"
+        f"{state.application}\t{service}\trunning\thealthy\n"
+    )
+    if inspected.stdout != expected or inspected.stderr:
+        fail(f"application service {service} container identity is not exact")
+
+
+def promote_runtime_restart_policy(state: ApplicationState) -> None:
+    for service in sorted(PROFILES[state.application].component_repositories):
+        container_id = runtime_container_id(state, service)
+        validate_runtime_container_identity(state, service, container_id)
+        updated = _run_bounded(
+            [
+                str(DOCKER_PATH),
+                "container",
+                "update",
+                "--restart",
+                "unless-stopped",
+                container_id,
+            ],
+            environment=safe_environment(state_release(state)),
+            timeout=30,
+            maximum_stdout=256,
+        )
+        if updated.stdout != f"{container_id}\n" or updated.stderr:
+            fail(f"application service {service} restart promotion is not exact")
+        if runtime_container_id(state, service) != container_id:
+            fail(f"application service {service} changed during restart promotion")
+        validate_runtime_container_identity(state, service, container_id)
+        restart = _run_bounded(
+            [
+                str(DOCKER_PATH),
+                "container",
+                "inspect",
+                "--format",
+                "{{.Id}}\t{{.HostConfig.RestartPolicy.Name}}",
+                container_id,
+            ],
+            environment=safe_environment(state_release(state)),
+            timeout=30,
+            maximum_stdout=256,
+        )
+        if restart.stdout != f"{container_id}\tunless-stopped\n" or restart.stderr:
+            fail(f"application service {service} restart policy was not promoted")
+
+
+def _service_address(state: ApplicationState, service: str) -> str:
+    identifier = runtime_container_id(state, service)
+    network = f"app_{state.application}"
+    inspect = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            f"{{{{with index .NetworkSettings.Networks \"{network}\"}}}}{{{{.IPAddress}}}}{{{{end}}}}",
+            identifier,
+        ],
+        environment=safe_environment(state_release(state)),
+        timeout=30,
+        maximum_stdout=256,
+    )
+    address = inspect.stdout.strip()
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError as exc:
+        raise ApplicationDeploymentError(
+            f"application service {service} returned an invalid address"
+        ) from exc
+    if not parsed.is_private or parsed.is_loopback or parsed.is_unspecified:
+        fail(f"application service {service} address is outside the private network")
+    return address
+
+
+def probe_runtime(state: ApplicationState, work: Path) -> None:
+    bundle = bundle_from_release(state_release(state), state)
+    internal = bundle.probes["internal"]
+    public = bundle.probes["public"]
+    assert isinstance(internal, list)
+    assert isinstance(public, list)
+    for probe in internal:
+        assert isinstance(probe, dict)
+        service = str(probe["service"])
+        parsed = urlsplit(str(probe["url"]))
+        address = _service_address(state, service)
+        route = parsed.path
+        url = f"http://{address}:{parsed.port}{route}"
+        _probe_http(
+            url,
+            expected_status=int(probe["status"]),
+            expected_body=(
+                str(probe["body_contains"])
+                if "body_contains" in probe
+                else None
+            ),
+            work=work,
+        )
+    profile = PROFILES[state.application]
+    for probe in public:
+        assert isinstance(probe, dict)
+        host = str(probe.get("host", profile.default_public_host))
+        _probe_http(
+            f"https://{host}{probe['path']}",
+            expected_status=int(probe["status"]),
+            expected_body=(
+                str(probe["body_contains"])
+                if "body_contains" in probe
+                else None
+            ),
+            work=work,
+            resolve_host=host,
+        )
+
+
+def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
+    profile = PROFILES[state.application]
+    release = state_release(state)
+    bundle = bundle_from_release(release, state)
+    route_relative = (
+        "caddy/surplasse.caddy"
+        if state.application == "surplasse"
+        else "caddy/parkventory.caddy"
+    )
+    route_path = PUBLIC_EDGE_RUNTIME_ROOT / "routes" / f"{state.application}.caddy"
+    require_protected_file(
+        route_path,
+        f"{state.application} public edge route",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    try:
+        route_bytes = route_path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read {state.application} public edge route: {exc}")
+    if route_bytes != bundle.files[route_relative]:
+        fail("public edge route is not the attested application route")
+    network = f"app_{state.application}"
+    inspected = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            (
+                "{{.State.Status}}\t"
+                "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
+                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+                f"{{{{if index .NetworkSettings.Networks \"{network}\"}}}}"
+                "attached{{end}}"
+            ),
+            PUBLIC_EDGE_CONTAINER,
+        ],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=256,
+    )
+    if inspected.stdout != "running\thealthy\tvps-public-static-edge\tattached\n" or inspected.stderr:
+        fail(
+            "public edge is not healthy and attached to the exact application network"
+        )
+    if profile.default_public_host not in route_bytes.decode("utf-8"):
+        fail("public edge route does not name the canonical application host")
+    public_probes = bundle.probes.get("public")
+    if not isinstance(public_probes, list):
+        fail("application public probe inventory is invalid")
+    identity_probes = [
+        probe
+        for probe in public_probes
+        if isinstance(probe, dict)
+        and isinstance(probe.get("path"), str)
+        and probe["path"].startswith("/.well-known/")
+        and isinstance(probe.get("body_contains"), str)
+    ]
+    if len(identity_probes) != 1:
+        fail("application edge identity probe is not exact")
+    identity = identity_probes[0]
+    host = str(identity.get("host", profile.default_public_host))
+    _probe_http(
+        f"https://{host}{identity['path']}",
+        expected_status=int(identity["status"]),
+        expected_body=str(identity["body_contains"]),
+        work=work,
+        resolve_host=host,
+    )
+
+
+def static_parkventory_owner_present() -> bool:
+    for path in (
+        STATIC_ACTIVE_STATE_ROOT / "parkventory.json",
+        STATIC_TRANSACTION_ROOT / "parkventory.json",
+        STATIC_PARKVENTORY_CURRENT,
+    ):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            fail(f"cannot inspect Parkventory static ownership path {path}: {exc}")
+        return True
+    return False
+
+
+def prepare_transaction(state: ApplicationState) -> tuple[bool, ApplicationState | None]:
+    application = state.application
+    app_root = APPLICATION_ROOT / application
+    releases = app_root / "releases"
+    recover_application(application)
+    if application == "parkventory" and static_parkventory_owner_present():
+        fail("Parkventory static state still owns the public application identity")
+    quarantined = read_state(
+        QUARANTINE_ROOT,
+        quarantine_name(state),
+        "quarantined application state",
+    )
+    if quarantined is not None:
+        if quarantined != state:
+            fail("application quarantine fingerprint collision")
+        fail("application candidate is quarantined after an earlier failure")
+    active = read_state(
+        ACTIVE_STATE_ROOT,
+        f"{application}.json",
+        "active application state",
+    )
+    target = current_target(app_root / "current", releases)
+    if application == "parkventory" and static_parkventory_owner_present():
+        fail("Parkventory static state still owns the public application identity")
+    if active is None and target is not None:
+        fail("application current link exists without active state")
+    if active is not None:
+        validate_materialized_release(state_release(active), active)
+        if target != release_target(active):
+            fail("active application state does not match the current link")
+        assert_source_revision_descends_from_active(
+            PROFILES[application],
+            active.source_revision,
+            state.source_revision,
+        )
+    if active == state:
+        return False, active
+    return True, active
+
+
+def restore_previous(transaction: ApplicationTransaction) -> None:
+    application = transaction.candidate.application
+    app_root = APPLICATION_ROOT / application
+    releases = app_root / "releases"
+    if transaction.previous_state is None:
+        stop_runtime(transaction.candidate)
+        switch_current(app_root / "current", None, releases)
+        remove_state(ACTIVE_STATE_ROOT, f"{application}.json", "active application state")
+    else:
+        validate_materialized_release(
+            state_release(transaction.previous_state), transaction.previous_state
+        )
+        start_runtime(transaction.previous_state)
+        switch_current(
+            app_root / "current", transaction.previous_target, releases
+        )
+        write_state(
+            ACTIVE_STATE_ROOT,
+            f"{application}.json",
+            transaction.previous_state,
+            "active application state",
+        )
+
+
+def application_tuple_is_active(transaction: ApplicationTransaction) -> bool:
+    application = transaction.candidate.application
+    app_root = APPLICATION_ROOT / application
+    releases = app_root / "releases"
+    active = read_state(
+        ACTIVE_STATE_ROOT,
+        f"{application}.json",
+        "active application state",
+    )
+    target = current_target(app_root / "current", releases)
+    return active == transaction.candidate and target == transaction.expected_target
+
+
+def recover_application(application: str) -> None:
+    if application not in PROFILES:
+        fail("application recovery target is outside the allowlist")
+    transaction = read_transaction(application)
+    if transaction is None:
+        return
+    if transaction.phase != "prepared":
+        remove_migration_container(transaction.candidate)
+    else:
+        require_migration_container_absent(transaction.candidate)
+    app_root = APPLICATION_ROOT / application
+    releases = app_root / "releases"
+    active = read_state(
+        ACTIVE_STATE_ROOT,
+        f"{application}.json",
+        "active application state",
+    )
+    target = current_target(app_root / "current", releases)
+    if application == "parkventory" and static_parkventory_owner_present():
+        if (
+            active is not None
+            or target is not None
+            or transaction.previous_state is not None
+            or transaction.previous_target is not None
+        ):
+            fail("Parkventory static and Compose recovery ownership overlap")
+        if transaction.phase != "prepared":
+            restore_previous(transaction)
+            write_state(
+                QUARANTINE_ROOT,
+                quarantine_name(transaction.candidate),
+                transaction.candidate,
+                "quarantined application state",
+            )
+        remove_state(
+            TRANSACTION_ROOT,
+            f"{application}.json",
+            "application transaction",
+        )
+        return
+    if transaction.phase == "probed" and not any(
+        active == expected_active and target == expected_target
+        for expected_active, expected_target in (
+            (transaction.previous_state, transaction.previous_target),
+            (transaction.previous_state, transaction.expected_target),
+            (transaction.candidate, transaction.expected_target),
+        )
+    ):
+        fail("probed application transaction found an unexpected active tuple")
+    if active == transaction.candidate and target == transaction.expected_target:
+        if transaction.phase != "probed":
+            fail("unprobed application transaction already owns the active tuple")
+        validate_materialized_release(
+            state_release(transaction.candidate),
+            transaction.candidate,
+        )
+        start_runtime(transaction.candidate, precommit=True)
+        promote_runtime_restart_policy(transaction.candidate)
+        remove_state(
+            TRANSACTION_ROOT,
+            f"{application}.json",
+            "application transaction",
+        )
+        return
+    if transaction.phase == "probed":
+        validate_materialized_release(
+            state_release(transaction.candidate), transaction.candidate
+        )
+        start_runtime(transaction.candidate, precommit=True)
+        switch_current(app_root / "current", transaction.expected_target, releases)
+        write_state(
+            ACTIVE_STATE_ROOT,
+            f"{application}.json",
+            transaction.candidate,
+            "active application state",
+        )
+        promote_runtime_restart_policy(transaction.candidate)
+        remove_state(
+            TRANSACTION_ROOT,
+            f"{application}.json",
+            "application transaction",
+        )
+        return
+    if active is not None and active != transaction.previous_state:
+        fail("interrupted application transaction found an unexpected active state")
+    allowed_targets = {transaction.previous_target, transaction.expected_target}
+    if target not in allowed_targets:
+        fail("interrupted application transaction found an unexpected current link")
+    if transaction.phase != "prepared":
+        restore_previous(transaction)
+        write_state(
+            QUARANTINE_ROOT,
+            quarantine_name(transaction.candidate),
+            transaction.candidate,
+            "quarantined application state",
+        )
+    else:
+        switch_current(app_root / "current", transaction.previous_target, releases)
+    remove_state(
+        TRANSACTION_ROOT,
+        f"{application}.json",
+        "application transaction",
+    )
+
+
+def commit_probed_candidate(transaction: ApplicationTransaction) -> None:
+    if transaction.phase != "probed":
+        fail("only a probed application transaction can be committed")
+    application = transaction.candidate.application
+    app_root = APPLICATION_ROOT / application
+    releases = app_root / "releases"
+    try:
+        write_transaction(transaction)
+        start_runtime(transaction.candidate, precommit=True)
+        switch_current(app_root / "current", transaction.expected_target, releases)
+        write_state(
+            ACTIVE_STATE_ROOT,
+            f"{application}.json",
+            transaction.candidate,
+            "active application state",
+        )
+        # Candidate containers run with restart=no until the durable active tuple
+        # exists. Promote that policy in place, preserving the exact container
+        # identities that passed the pre-commit health boundary.
+        promote_runtime_restart_policy(transaction.candidate)
+        remove_state(
+            TRANSACTION_ROOT,
+            f"{application}.json",
+            "application transaction",
+        )
+    except BaseException as commit_error:
+        try:
+            recover_application(application)
+            if application_tuple_is_active(transaction):
+                return
+        except BaseException as recovery_error:
+            raise ApplicationDeploymentError(
+                "application commit and forward recovery both failed: "
+                f"{commit_error}; {recovery_error}"
+            ) from recovery_error
+        raise commit_error
+
+
+def activate_candidate(state: ApplicationState, work: Path) -> None:
+    validate_materialized_runtime_policy(state)
+    proceed, previous = prepare_transaction(state)
+    if not proceed:
+        probe_runtime(state, work)
+        print(
+            f"application release already active and healthy: {state.application} "
+            f"{state.release_reference}"
+        )
+        return
+    application = state.application
+    app_root = APPLICATION_ROOT / application
+    releases = app_root / "releases"
+    transaction = ApplicationTransaction(
+        candidate=state,
+        previous_state=previous,
+        previous_target=current_target(app_root / "current", releases),
+        expected_target=release_target(state),
+        phase="prepared",
+    )
+    write_transaction(transaction)
+    try:
+        pull_and_verify_images(state)
+        validate_public_edge_cutover(state, work)
+        transaction = dataclasses.replace(transaction, phase="migration-running")
+        write_transaction(transaction)
+        run_migration(state)
+        transaction = dataclasses.replace(transaction, phase="migrated")
+        write_transaction(transaction)
+        start_runtime(state, precommit=True)
+        transaction = dataclasses.replace(transaction, phase="started")
+        write_transaction(transaction)
+        probe_runtime(state, work)
+        assert_exact_source_head(PROFILES[application], state.source_revision)
+    except BaseException as activation_error:
+        try:
+            current = read_transaction(application)
+            if current is not None and current.phase == "started":
+                write_transaction(dataclasses.replace(current, phase="probe-rejected"))
+            recover_application(application)
+        except BaseException as recovery_error:
+            raise ApplicationDeploymentError(
+                "application activation and immediate recovery both failed: "
+                f"{activation_error}; {recovery_error}"
+            ) from recovery_error
+        raise
+    commit_probed_candidate(dataclasses.replace(transaction, phase="probed"))
+
+
+def deployment_temporary_root(application: str, activate_live: bool) -> Path:
+    configured = os.environ.get(RUNTIME_DIRECTORY_ENV)
+    if not activate_live:
+        if configured is not None:
+            fail("application runtime directory is reserved for live activation")
+        return Path("/var/tmp")
+    expected = re.fullmatch(
+        rf"/run/(vps-application-live-{re.escape(application)}-[0-9a-f]{{24}})",
+        configured or "",
+    )
+    if expected is None:
+        fail("live activation requires its exact transient runtime directory")
+    root = Path(configured)
+    require_protected_directory(root, "live application runtime directory")
+    # The shared worker runtime remaps transient input files into each worker's
+    # private directory. The complete candidate can therefore remain in the
+    # root-only outer RuntimeDirectory instead of leaking into a global tmpfs.
+    return root
+
+
+def deploy(
+    application: str,
+    source_revision: str,
+    release_reference: str,
+    *,
+    activate_live: bool,
+) -> None:
+    profile = PROFILES.get(application)
+    if profile is None:
+        fail("application is outside the Compose allowlist")
+    if SHA40_RE.fullmatch(source_revision) is None:
+        fail("source revision must be one full lowercase Git SHA")
+    parse_digest_reference(
+        release_reference,
+        f"ghcr.io/nclsppr/{application}/application-release",
+        "application release reference",
+    )
+    require_protected_file(
+        APPLICATION_PRODUCTION_CONTRACT,
+        "application production contract",
+        allowed_modes=frozenset({0o444, 0o644}),
+        maximum_size=64 * 1024,
+    )
+    require_protected_file(
+        STATIC_PRODUCTION_CONTRACT,
+        "static production contract",
+        allowed_modes=frozenset({0o444, 0o644}),
+        maximum_size=64 * 1024,
+    )
+    contract = load_production_contract(
+        APPLICATION_PRODUCTION_CONTRACT,
+        STATIC_PRODUCTION_CONTRACT,
+    )
+    policy = next(item for item in contract.applications if item.name == application)
+    if not policy.enabled:
+        fail("application is disabled by the protected production contract")
+    validate_runtime()
+    with deployment_lock():
+        cleanup_application_filesystem_residue(application)
+        STATIC.refuse_isolated_worker_residue_locked()
+        if activate_live:
+            assert_exact_source_head(profile, source_revision)
+        temporary_root = deployment_temporary_root(application, activate_live)
+        with tempfile.TemporaryDirectory(
+            prefix=f"vps-application-{application}-",
+            dir=temporary_root,
+        ) as temporary_name:
+            temporary = Path(temporary_name)
+            temporary.chmod(0o755)
+            state, bundle, evidence = fetch_and_validate_candidate(
+                policy,
+                profile,
+                source_revision,
+                release_reference,
+                temporary,
+            )
+            release = materialize_candidate(state, profile, bundle, evidence)
+            if activate_live:
+                activate_candidate(state, temporary)
+                print(
+                    f"application release activated after migrations and probes: "
+                    f"{application} {release_reference}"
+                )
+            else:
+                print(
+                    f"application release materialized without activation: "
+                    f"{application} {release}"
+                )
+
+
+def recover_live(application: str | None) -> None:
+    validate_recovery_state_runtime()
+    applications = sorted(PROFILES) if application is None else [application]
+    if any(item not in PROFILES for item in applications):
+        fail("application recovery target is invalid")
+    with deployment_lock():
+        for item in applications:
+            cleanup_application_filesystem_residue(item)
+        if not any(read_transaction(item) is not None for item in applications):
+            return
+        validate_runtime()
+        for item in applications:
+            recover_application(item)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--activate-live", action="store_true")
+    parser.add_argument("application", choices=sorted(PROFILES))
+    parser.add_argument("source_revision")
+    parser.add_argument("release_reference")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if arguments and arguments[0] == "--source-head-worker":
+            if len(arguments) != 3:
+                fail("source-head worker argument count is invalid")
+            run_source_head_worker(arguments[1], arguments[2])
+            return 0
+        if arguments and arguments[0] == "--source-ancestry-worker":
+            if len(arguments) != 4:
+                fail("source-ancestry worker argument count is invalid")
+            run_source_ancestry_worker(arguments[1], arguments[2], arguments[3])
+            return 0
+        if arguments and arguments[0] == "--recover-live":
+            if len(arguments) not in {1, 2}:
+                fail("application recovery argument count is invalid")
+            recover_live(None if len(arguments) == 1 else arguments[1])
+            return 0
+        parsed = build_parser().parse_args(arguments)
+        deploy(
+            parsed.application,
+            parsed.source_revision,
+            parsed.release_reference,
+            activate_live=parsed.activate_live,
+        )
+    except (
+        OSError,
+        KeyError,
+        ApplicationBundleError,
+        ApplicationDeploymentError,
+        ApplicationReleaseError,
+        STATIC.StaticDeploymentError,
+    ) as exc:
+        print(f"application deployment refused: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

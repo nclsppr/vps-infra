@@ -88,17 +88,19 @@ Parkventory route before it activates Compose.
 
 ## Required follow-up
 
-The application applicator needs a separate reviewed change. It must use the
-same deployment lock as the static applicator. It must materialize releases in
-a new directory, validate secrets without storing them in release state, run
-dedicated migrations, execute internal and public probes, switch state
-atomically, and restore the previous release after failure. It must persist a
-transaction journal and quarantine a reproducibly bad release. A boot recovery
-unit must recover an interrupted transaction before either applicator runs.
+ADR-0010 delivers the reviewed application applicator, shared lock, forced SSH
+gate, and boot recovery service described below, while keeping both applications
+disabled. It uses the same deployment lock as the static applicator,
+materializes releases in a separate directory, validates secret metadata
+without storing secret bytes in release state, runs dedicated migrations,
+executes internal and public probes, switches state atomically, and restores the
+previous runtime after failure. It persists a transaction journal and
+quarantines a reproducibly bad release. Boot recovery handles an interrupted
+transaction before the public edge starts.
 
-The forced SSH boundary also needs a separate reviewed command. This admission
-change does not modify `scripts/deploy`, `scripts/forced-command`, sudo rules,
-systemd units, or Ansible installation tasks.
+The forced SSH boundary remains unusable for either application until a later
+review enables its protected contract entry and completes the platform, secret,
+database, and route cutover gates recorded by ADR-0010.
 
 ## Alternatives
 

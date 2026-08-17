@@ -133,7 +133,9 @@ applications:
 remplacée par une révision séparément auditée, **tout** `enabled: true` échoue,
 même avec des champs de preuve syntaxiquement complets. Le manifeste commité
 garde donc la plateforme et les quatre applications désactivées. Le marqueur
-hôte et l’applicateur live sont absents eux aussi.
+hôte et l’applicateur générique `apply-release` restent absents. Le contrôleur
+Compose séparé est installé mais refuse les deux entrées désactivées avant tout
+accès réseau ou runtime.
 
 ### Locked platform candidate declaration
 
@@ -268,13 +270,12 @@ Surplasse, il contient sous une allowlist stricte :
 - l’inventaire des migrations ;
 - le contrat de healthchecks et probes.
 
-Avant activation, la CI `vps-infra` devra tirer ce digest dans un répertoire
-jetable, valider chaque format avec l’image d’outil épinglée, rejeter tout chemin
-ou type de fichier inattendu, puis rendre la configuration plateforme complète.
-Le futur applicateur devra tirer le même digest et le matérialiser sous le
-répertoire runtime stable. C’est cette tranche encore verrouillée qui rendra une
-modification de routage, métrique, dashboard ou probe promouvable et rollbackable
-comme une version explicite, même si aucune image applicative ne change.
+Avant activation, le contrôleur `deploy-application` tire ce digest dans un
+répertoire jetable, vérifie les attestations, rejette tout chemin ou type de
+fichier inattendu, puis matérialise exactement le bundle sous un répertoire de
+release adressé par digest. Il ne modifie pas la release plateforme immuable :
+le routage, les réseaux et l’observabilité doivent être préparés dans une
+révision plateforme séparée avant que la migration applicative soit autorisée.
 
 Pour Parkventory, `blocked_by` est un état temporaire, pas une preuve. Un futur
 passage à `enabled: true` exigera les sections `components` et `integration`
@@ -429,9 +430,10 @@ candidate reaches the Atlas static lock at a time. The environment owns one
 dedicated key and the same strict known-hosts model. It sends only the canonical
 `deploy-static-live` command. Enabling this path does not set
 `VPS_DEPLOY_ENABLED`, create `/etc/vps/production-enabled`, or install
-`apply-release`. A future dynamic applicator must additionally share a
-host-wide application lock with this path; GitHub concurrency alone is not a
-sufficient exclusion boundary for operator-initiated commands.
+`apply-release`. The installed application controller additionally shares the
+exact host lock `/run/lock/vps-static.lock` with this path; GitHub concurrency
+alone is not a sufficient exclusion boundary for operator-initiated commands.
+No application workflow invokes it while both application entries are disabled.
 
 Le VPS n’héberge pas de runner GitHub Actions persistant. Un workflow arbitraire
 exécuté directement sur la machine de production aurait accès à ses volumes,
@@ -462,11 +464,12 @@ The delivered `deploy` script accepts only a full Git commit ID. It:
 8. records desired state only after all previous checks succeed;
 9. rejects `/etc/vps/production-enabled` while `activation_policy` is locked.
 
-The locked controller does not contain an applicator execution path. A future
-audited revision must add disk and Docker checks, an immutable checkout,
-configuration rendering, digest pulls, explicitly authorized migrations,
-targeted activation, probes, compatible rollback, and a durable journal. The
-production marker alone can never enable that future path.
+The generic locked controller still does not contain an applicator execution
+path. A separate installed `deploy-application` controller performs immutable
+digest pulls, configuration rendering, dedicated migrations, targeted Compose
+activation, probes, compatible runtime rollback, and durable journaling. It
+re-reads the protected application contract first, so the production marker or
+the presence of the executable cannot enable a disabled application.
 
 Les projets Compose ont des noms fixes (`vps-platform`, `surplasse` et
 `parkventory`) afin qu’un nouveau chemin de checkout ne crée pas de nouveaux
@@ -547,8 +550,8 @@ future production shape is a React frontend image plus a Java backend image,
 with a dedicated migrator and integration bundle. The static resolver and the
 Atlas gate reject a state where both the demo promotion and the Compose
 application are enabled or where an active dynamic manifest still serves it.
-The future application applicator must enforce the inverse guard against an
-existing static state and transfer the
+The installed application applicator enforces the inverse guard against an
+existing static state. A later reviewed cutover must transfer the
 `parkventory.com` route under one shared deployment lock.
 
 ### Activation
@@ -585,6 +588,24 @@ allowlist again before it starts `deploy-static --activate-live` in a transient
 systemd unit. The unit survives the SSH client and runs `--recover-live` from
 its stop hook. This design does not depend on sudoers argument regex support,
 which Atlas `sudo-rs` does not provide.
+
+The disabled Compose application boundary uses the parallel canonical record:
+
+```text
+deploy-application-live <surplasse|parkventory> <source-sha40> \
+  <application-release@sha256>
+```
+
+Its argument-free root gate independently revalidates stdin and starts
+`deploy-application --activate-live` in a transient systemd unit with an
+automatic recovery stop hook. The controller verifies the application release,
+all component image attestations and labels, the integration attestation and
+bundle bytes, rendered Compose, root-owned secret metadata, exact migration and
+probe inventories, source ancestry, and the canonical source HEAD. It never
+stores secret bytes. It refuses migration until the immutable public-edge route
+equals the attested route and Caddy is healthy on the exact application network.
+Both protected application entries remain disabled, so this boundary currently
+stops before runtime validation or network access.
 
 The application profile fixes the site repository, route repository, source
 repository, source ref, and signer workflow. The integration repository,

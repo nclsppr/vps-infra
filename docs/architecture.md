@@ -590,6 +590,8 @@ vps-infra/
     production.yaml
   scripts/
     deploy
+    deploy-application
+    deploy-application-live-gate
     deploy-static
     reconcile
     doctor
@@ -600,6 +602,16 @@ vps-infra/
     parkventory.sops.yaml
   docs/
 ```
+
+The disabled Compose controller materializes immutable releases below
+`/srv/applications/<application>/releases` and keeps root-only active,
+inventory, transaction, and quarantine records below
+`/var/lib/vps-application`. It shares `/run/lock/vps-static.lock` with the
+static controller. The boot recovery unit runs before the public edge. An
+application cannot reach its dedicated migration until its protected contract
+entry is enabled, Parkventory no longer has a static owner, and the immutable
+public edge already contains the exact attested route and application-network
+attachment. Route preparation remains a platform responsibility.
 
 Les fichiers SOPS sont chiffrés. La clé age privée est conservée hors du VPS et
 hors de Git, avec au moins une copie de récupération dans un gestionnaire de

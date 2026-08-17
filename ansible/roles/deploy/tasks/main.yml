@@ -11,6 +11,12 @@
       - >-
         vps_deploy_static_gate_path ==
         '/usr/local/libexec/vps/deploy-static-live-gate'
+      - >-
+        vps_deploy_application_path ==
+        '/usr/local/libexec/vps/deploy-application'
+      - >-
+        vps_deploy_application_gate_path ==
+        '/usr/local/libexec/vps/deploy-application-live-gate'
       - vps_deploy_schema_root == '/usr/local/share/vps-infra/schemas'
       - vps_deploy_repository_dir == '/srv/vps/repository'
       - vps_deploy_repository_url == 'https://github.com/nclsppr/vps-infra.git'
@@ -18,6 +24,10 @@
       - vps_deploy_state_dir == '/var/lib/vps-controller'
       - vps_static_state_dir == '/var/lib/vps-static'
       - vps_static_recovery_unit == 'vps-static-recover.service'
+      - vps_application_root == '/srv/applications'
+      - vps_application_config_dir == '/etc/vps/applications'
+      - vps_application_state_dir == '/var/lib/vps-application'
+      - vps_application_recovery_unit == 'vps-application-recover.service'
       - vps_deploy_production_marker == '/etc/vps/production-enabled'
       - vps_deploy_git_sha_length | int == 40
       - vps_infra_revision is match('^[0-9a-f]{40}$')
@@ -37,7 +47,8 @@
         match('^[0-9a-f]{64}$')
       - >-
         vps_deploy_executables | list | sort ==
-        ['check-public-safe', 'deploy', 'deploy-static',
+        ['check-public-safe', 'deploy', 'deploy-application',
+         'deploy-application-live-gate', 'deploy-static',
          'deploy-static-live-gate', 'doctor', 'forced-command',
          'parse-forced-command', 'plan-digests', 'reconcile',
          'validate-compose', 'validate-release', 'verify-github-evidence',
@@ -127,6 +138,28 @@
     - path: "{{ vps_static_state_dir }}/quarantine"
       mode: "0700"
     - path: "{{ vps_static_state_dir }}/transactions"
+      mode: "0700"
+    - path: "{{ vps_application_root }}"
+      mode: "0755"
+    - path: "{{ vps_application_root }}/surplasse"
+      mode: "0755"
+    - path: "{{ vps_application_root }}/surplasse/releases"
+      mode: "0755"
+    - path: "{{ vps_application_root }}/parkventory"
+      mode: "0755"
+    - path: "{{ vps_application_root }}/parkventory/releases"
+      mode: "0755"
+    - path: "{{ vps_application_config_dir }}"
+      mode: "0700"
+    - path: "{{ vps_application_state_dir }}"
+      mode: "0700"
+    - path: "{{ vps_application_state_dir }}/active"
+      mode: "0700"
+    - path: "{{ vps_application_state_dir }}/inventories"
+      mode: "0700"
+    - path: "{{ vps_application_state_dir }}/quarantine"
+      mode: "0700"
+    - path: "{{ vps_application_state_dir }}/transactions"
       mode: "0700"
     - path: "{{ vps_gh_cache_root }}"
       mode: "0755"
@@ -363,6 +396,8 @@
     - "{{ vps_deploy_repository_dir }}/scripts/lib/release_policy.py"
     - "{{ vps_deploy_repository_dir }}/scripts/lib/platform_proof.py"
     - "{{ vps_deploy_repository_dir }}/scripts/lib/platform_integration.py"
+    - "{{ vps_deploy_repository_dir }}/scripts/lib/application_release.py"
+    - "{{ vps_deploy_repository_dir }}/scripts/lib/application_bundle.py"
     - "{{ vps_deploy_repository_dir }}/schemas/production-release.schema.json"
   when: not ansible_check_mode
 
@@ -421,6 +456,26 @@
     mode: "0644"
   when: not ansible_check_mode
 
+- name: Install the immutable application release policy
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/lib/application_release.py"
+    dest: "{{ vps_deploy_install_root }}/lib/application_release.py"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Install the immutable application integration policy
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/lib/application_bundle.py"
+    dest: "{{ vps_deploy_install_root }}/lib/application_bundle.py"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  when: not ansible_check_mode
+
 - name: Install the production release schema from the proven mirror
   ansible.builtin.copy:
     src: "{{ vps_deploy_repository_dir }}/schemas/production-release.schema.json"
@@ -454,6 +509,14 @@
   ansible.builtin.template:
     src: vps-static-recover.service.j2
     dest: "/etc/systemd/system/{{ vps_static_recovery_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the application transaction recovery unit
+  ansible.builtin.template:
+    src: vps-application-recover.service.j2
+    dest: "/etc/systemd/system/{{ vps_application_recovery_unit }}"
     owner: root
     group: root
     mode: "0644"
@@ -495,10 +558,15 @@
     - "{{ vps_deploy_gate_path }}"
     - "{{ vps_deploy_controller_path }}"
     - "{{ vps_deploy_static_gate_path }}"
+    - "{{ vps_deploy_application_path }}"
+    - "{{ vps_deploy_application_gate_path }}"
     - "/etc/systemd/system/{{ vps_static_recovery_unit }}"
+    - "/etc/systemd/system/{{ vps_application_recovery_unit }}"
     - "{{ vps_deploy_install_root }}/lib/release_policy.py"
     - "{{ vps_deploy_install_root }}/lib/platform_proof.py"
     - "{{ vps_deploy_install_root }}/lib/platform_integration.py"
+    - "{{ vps_deploy_install_root }}/lib/application_release.py"
+    - "{{ vps_deploy_install_root }}/lib/application_bundle.py"
     - "{{ vps_deploy_schema_root }}/production-release.schema.json"
     - "{{ vps_deploy_revision_path }}"
   when: not ansible_check_mode
@@ -545,6 +613,13 @@
 - name: Enable static transaction recovery at boot
   ansible.builtin.systemd_service:
     name: "{{ vps_static_recovery_unit }}"
+    enabled: true
+    daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Enable application transaction recovery at boot
+  ansible.builtin.systemd_service:
+    name: "{{ vps_application_recovery_unit }}"
     enabled: true
     daemon_reload: true
   when: not ansible_check_mode

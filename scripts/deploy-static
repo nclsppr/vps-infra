@@ -116,6 +116,11 @@ APPLICATION_ACTIVE_MANIFEST_PATH = Path(
 APPLICATION_ACTIVE_STATE_PATH = Path(
     "/var/lib/vps-controller/active/state.json"
 )
+COMPOSE_APPLICATION_ACTIVE_ROOT = Path("/var/lib/vps-application/active")
+COMPOSE_APPLICATION_TRANSACTION_ROOT = Path(
+    "/var/lib/vps-application/transactions"
+)
+COMPOSE_APPLICATION_ROOT = Path("/srv/applications")
 STATIC_DEPLOYMENT_MODES = {
     "personal": "static-site",
     "papersempire": "static-site",
@@ -133,6 +138,40 @@ GH_BINARY_SHA256 = {
     "aarch64": "ccbb0f14178faefac1cb0f336a853071fa63a1d0df23ef5ab7a304fe3859e082",
 }
 MAX_MANIFEST_BYTES = 64 * 1024
+MAX_APPLICATION_INTEGRATION_MANIFEST_BYTES = 2 * MIB
+MAX_APPLICATION_COMPONENT_MANIFEST_BYTES = 4 * MIB
+MAX_APPLICATION_INTEGRATION_BLOB_BYTES = 16 * MIB
+MAX_APPLICATION_COMPONENT_BLOB_BYTES = 2 * MIB
+APPLICATION_RELEASE_REPOSITORIES = frozenset(
+    {
+        "ghcr.io/nclsppr/parkventory/application-release",
+        "ghcr.io/nclsppr/surplasse/application-release",
+    }
+)
+APPLICATION_INTEGRATION_REPOSITORIES = frozenset(
+    {
+        "ghcr.io/nclsppr/parkventory/vps-integration",
+        "ghcr.io/nclsppr/surplasse/vps-integration",
+    }
+)
+APPLICATION_COMPONENT_REPOSITORIES = frozenset(
+    {
+        "ghcr.io/nclsppr/parkventory/backend",
+        "ghcr.io/nclsppr/parkventory/frontend",
+        "ghcr.io/nclsppr/surplasse/backend",
+        "ghcr.io/nclsppr/surplasse/commande",
+        "ghcr.io/nclsppr/surplasse/dashboard",
+        "ghcr.io/nclsppr/surplasse/docs",
+        "ghcr.io/nclsppr/surplasse/onboarding",
+    }
+)
+PROVENANCE_SUBJECT_MAXIMUM_SIZES = frozenset(
+    {
+        MAX_MANIFEST_BYTES,
+        MAX_APPLICATION_INTEGRATION_MANIFEST_BYTES,
+        MAX_APPLICATION_COMPONENT_MANIFEST_BYTES,
+    }
+)
 MAX_REGISTRY_AUTH_RESPONSE_BYTES = 64 * 1024
 MAX_ROUTES_BYTES = 2 * MIB
 SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
@@ -2192,7 +2231,12 @@ def safe_environment(home: Path) -> dict[str, str]:
     }
 
 
-def run_attestation_fetch_worker(reference: str, output_path: Path) -> None:
+def run_attestation_fetch_worker(
+    reference: str,
+    subject_media_type: str,
+    subject_maximum_size: int,
+    output_path: Path,
+) -> None:
     require_unprivileged_worker("attestation fetch worker")
     worker_home = Path(os.environ.get("HOME", ""))
     if output_path.name != "attestation-bundles.jsonl" or output_path.parent != worker_home:
@@ -2204,6 +2248,8 @@ def run_attestation_fetch_worker(reference: str, output_path: Path) -> None:
             reference,
             scratch,
             safe_environment(worker_home),
+            subject_media_type=subject_media_type,
+            subject_maximum_size=subject_maximum_size,
         )
         source_fd = os.open(bundle_path, os.O_RDONLY | os.O_NOFOLLOW)
         try:
@@ -2633,9 +2679,18 @@ def verify_github_provenance_isolated(
     trusted_directory: Path,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    subject_media_type: str = OCI_MANIFEST_MEDIA_TYPE,
+    subject_maximum_size: int = MAX_MANIFEST_BYTES,
 ) -> None:
+    if subject_media_type not in {OCI_MANIFEST_MEDIA_TYPE, OCI_INDEX_MEDIA_TYPE}:
+        fail("provenance subject mediaType is outside the exact allowlist")
+    if subject_maximum_size not in PROVENANCE_SUBJECT_MAXIMUM_SIZES:
+        fail("provenance subject size bound is outside the exact allowlist")
     subject_digest = parse_digest_reference(reference, reference.rpartition("@")[0], "attestation reference")
-    actual_subject_digest, _ = sha256_file(subject_path, max_bytes=MAX_MANIFEST_BYTES)
+    actual_subject_digest, _ = sha256_file(
+        subject_path,
+        max_bytes=subject_maximum_size,
+    )
     if f"sha256:{actual_subject_digest}" != subject_digest:
         fail("local provenance subject does not match its immutable reference")
     trusted_bundle = trusted_directory / f"attestation-{secrets.token_hex(8)}.jsonl"
@@ -2647,6 +2702,8 @@ def verify_github_provenance_isolated(
                 str(Path(__file__)),
                 "--attestation-fetch-worker",
                 reference,
+                subject_media_type,
+                str(subject_maximum_size),
                 "{STATE_DIRECTORY}/attestation-bundles.jsonl",
             ],
             inputs=(Path(__file__), SCRIPT_DIRECTORY / "lib/platform_integration.py"),
@@ -3795,7 +3852,7 @@ def fetch_registry_object(
     endpoint = "manifests" if kind == "manifest" else "blobs"
     accept: str | None = None
     if kind == "manifest":
-        accept = OCI_MANIFEST_MEDIA_TYPE
+        accept = f"{OCI_MANIFEST_MEDIA_TYPE}, {OCI_INDEX_MEDIA_TYPE}"
     elif kind != "blob":
         fail(f"unsupported registry object kind {kind!r}")
     with private_registry_headers(
@@ -3849,7 +3906,14 @@ def fetch_attestation_bundles_bounded(
     reference: str,
     work_directory: Path,
     environment: dict[str, str],
+    *,
+    subject_media_type: str = OCI_MANIFEST_MEDIA_TYPE,
+    subject_maximum_size: int = MAX_MANIFEST_BYTES,
 ) -> Path:
+    if subject_media_type not in {OCI_MANIFEST_MEDIA_TYPE, OCI_INDEX_MEDIA_TYPE}:
+        fail("attestation subject mediaType is outside the exact allowlist")
+    if subject_maximum_size not in PROVENANCE_SUBJECT_MAXIMUM_SIZES:
+        fail("attestation subject size bound is outside the exact allowlist")
     repository, separator, subject_digest = reference.rpartition("@")
     if not separator:
         fail("attestation reference must contain an immutable digest")
@@ -3966,10 +4030,10 @@ def fetch_attestation_bundles_bounded(
             not isinstance(subject, dict)
             or set(subject) != {"digest", "mediaType", "size"}
             or subject.get("digest") != subject_digest
-            or subject.get("mediaType") != OCI_MANIFEST_MEDIA_TYPE
+            or subject.get("mediaType") != subject_media_type
             or not is_int(subject.get("size"))
             or subject.get("size") < 1
-            or subject.get("size") > MAX_MANIFEST_BYTES
+            or subject.get("size") > subject_maximum_size
         ):
             fail(f"attestation manifest {index_number} subject is invalid")
         layers = manifest["layers"]
@@ -4029,31 +4093,55 @@ def fetch_attestation_bundles_bounded(
     return combined
 
 
-def registry_repository_blob_limit(repository: str) -> int:
-    limits: dict[str, int] = {INTEGRATION_REPOSITORY: MAX_INTEGRATION_INVENTORY_SIZE}
+def registry_repository_limits(repository: str) -> tuple[int, int]:
+    limits: dict[str, tuple[int, int]] = {
+        INTEGRATION_REPOSITORY: (
+            MAX_MANIFEST_BYTES,
+            MAX_INTEGRATION_INVENTORY_SIZE,
+        )
+    }
     for profile in PROFILES.values():
-        limits[profile.site_repository] = profile.max_archive_bytes
-        limits[profile.routes_repository] = MAX_ROUTES_BYTES
-    maximum = limits.get(repository)
-    if maximum is None:
+        limits[profile.site_repository] = (
+            MAX_MANIFEST_BYTES,
+            profile.max_archive_bytes,
+        )
+        limits[profile.routes_repository] = (MAX_MANIFEST_BYTES, MAX_ROUTES_BYTES)
+    for application_repository in APPLICATION_RELEASE_REPOSITORIES:
+        limits[application_repository] = (MAX_MANIFEST_BYTES, MAX_MANIFEST_BYTES)
+    for application_repository in APPLICATION_INTEGRATION_REPOSITORIES:
+        limits[application_repository] = (
+            MAX_APPLICATION_INTEGRATION_MANIFEST_BYTES,
+            MAX_APPLICATION_INTEGRATION_BLOB_BYTES,
+        )
+    for application_repository in APPLICATION_COMPONENT_REPOSITORIES:
+        limits[application_repository] = (
+            MAX_APPLICATION_COMPONENT_MANIFEST_BYTES,
+            MAX_APPLICATION_COMPONENT_BLOB_BYTES,
+        )
+    result = limits.get(repository)
+    if result is None:
         fail("registry fetch repository is outside the production allowlist")
-    return maximum
+    return result
+
+
+def registry_repository_blob_limit(repository: str) -> int:
+    return registry_repository_limits(repository)[1]
 
 
 def validate_registry_fetch_contract(contract: RegistryFetchContract) -> None:
     registry_repository_path(contract.repository)
-    repository_limit = registry_repository_blob_limit(contract.repository)
+    manifest_limit, blob_limit = registry_repository_limits(contract.repository)
     if not SHA256_RE.fullmatch(contract.digest):
         fail("registry fetch contract digest is invalid")
     if contract.kind == "manifest":
-        if contract.maximum_size != MAX_MANIFEST_BYTES or contract.expected_size is not None:
+        if contract.maximum_size != manifest_limit or contract.expected_size is not None:
             fail("registry manifest fetch contract has invalid size bounds")
     elif contract.kind == "blob":
         if (
             not is_int(contract.maximum_size)
             or not is_int(contract.expected_size)
             or contract.maximum_size != contract.expected_size
-            or not 1 <= contract.maximum_size <= repository_limit
+            or not 1 <= contract.maximum_size <= blob_limit
         ):
             fail("registry blob fetch contract has invalid size bounds")
     else:
@@ -4504,6 +4592,27 @@ def assert_static_activation_mode(
     if active_application_enablement.get(application) is not False:
         fail(
             f"static deployment for {application} conflicts with its active application state"
+        )
+
+
+def refuse_compose_application_owner(application: str) -> None:
+    if application != "parkventory":
+        return
+    paths = (
+        COMPOSE_APPLICATION_ACTIVE_ROOT / "parkventory.json",
+        COMPOSE_APPLICATION_TRANSACTION_ROOT / "parkventory.json",
+        COMPOSE_APPLICATION_ROOT / "parkventory/current",
+    )
+    for path in paths:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            fail(f"cannot inspect Compose application ownership path {path}: {exc}")
+        fail(
+            "static deployment for parkventory conflicts with its Compose "
+            "active state, transaction, or current link"
         )
 
 
@@ -8000,6 +8109,7 @@ def deploy(
             fail(f"static release root {path} must not be writable by group or others")
 
     with deployment_lock():
+        refuse_compose_application_owner(application)
         cleanup_probe_containers(application)
         cleanup_static_filesystem_residue(application, app_root, releases)
         refuse_isolated_worker_residue_locked()
@@ -8417,14 +8527,23 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if arguments and arguments[0] == "--attestation-fetch-worker":
-            if len(arguments) != 3:
+            if len(arguments) != 5:
                 fail("attestation fetch worker received an invalid argument count")
-            _, reference, output = arguments
+            _, reference, subject_media_type, subject_maximum_size, output = arguments
+            if subject_maximum_size not in {
+                str(value) for value in PROVENANCE_SUBJECT_MAXIMUM_SIZES
+            }:
+                fail("attestation fetch worker received an invalid subject size bound")
             repository, separator, _ = reference.rpartition("@")
             if not separator:
                 fail("attestation fetch worker received a mutable reference")
             parse_digest_reference(reference, repository, "attestation reference")
-            run_attestation_fetch_worker(reference, Path(output))
+            run_attestation_fetch_worker(
+                reference,
+                subject_media_type,
+                int(subject_maximum_size),
+                Path(output),
+            )
             return 0
         if arguments and arguments[0] == "--trusted-root-fetch-worker":
             if len(arguments) != 2:

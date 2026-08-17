@@ -3,4 +3,5 @@ Defaults:{{ vps_deploy_user }} secure_path=/usr/local/sbin:/usr/local/bin:/usr/s
 Defaults:{{ vps_deploy_user }} !setenv
 Cmnd_Alias VPS_DEPLOY_SHA = {{ vps_deploy_controller_path }}
 Cmnd_Alias VPS_DEPLOY_STATIC_LIVE = {{ vps_deploy_static_gate_path }} ""
-{{ vps_deploy_user }} ALL=(root) NOPASSWD:NOSETENV: VPS_DEPLOY_SHA, VPS_DEPLOY_STATIC_LIVE
+Cmnd_Alias VPS_DEPLOY_APPLICATION_LIVE = {{ vps_deploy_application_gate_path }} ""
+{{ vps_deploy_user }} ALL=(root) NOPASSWD:NOSETENV: VPS_DEPLOY_SHA, VPS_DEPLOY_STATIC_LIVE, VPS_DEPLOY_APPLICATION_LIVE
