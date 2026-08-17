@@ -157,11 +157,66 @@
       "additionalProperties": false,
       "required": ["backend", "onboarding", "commande", "dashboard", "docs"],
       "properties": {
-        "backend": { "$ref": "#/$defs/component" },
-        "onboarding": { "$ref": "#/$defs/component" },
-        "commande": { "$ref": "#/$defs/component" },
-        "dashboard": { "$ref": "#/$defs/component" },
-        "docs": { "$ref": "#/$defs/component" }
+        "backend": {
+          "allOf": [
+            { "$ref": "#/$defs/component" },
+            {
+              "properties": {
+                "image": {
+                  "pattern": "^ghcr\\.io/nclsppr/surplasse/backend@sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        },
+        "onboarding": {
+          "allOf": [
+            { "$ref": "#/$defs/component" },
+            {
+              "properties": {
+                "image": {
+                  "pattern": "^ghcr\\.io/nclsppr/surplasse/onboarding@sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        },
+        "commande": {
+          "allOf": [
+            { "$ref": "#/$defs/component" },
+            {
+              "properties": {
+                "image": {
+                  "pattern": "^ghcr\\.io/nclsppr/surplasse/commande@sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        },
+        "dashboard": {
+          "allOf": [
+            { "$ref": "#/$defs/component" },
+            {
+              "properties": {
+                "image": {
+                  "pattern": "^ghcr\\.io/nclsppr/surplasse/dashboard@sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        },
+        "docs": {
+          "allOf": [
+            { "$ref": "#/$defs/component" },
+            {
+              "properties": {
+                "image": {
+                  "pattern": "^ghcr\\.io/nclsppr/surplasse/docs@sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        }
       }
     },
     "parkventoryComponents": {
@@ -169,8 +224,30 @@
       "additionalProperties": false,
       "required": ["backend", "frontend"],
       "properties": {
-        "backend": { "$ref": "#/$defs/component" },
-        "frontend": { "$ref": "#/$defs/component" }
+        "backend": {
+          "allOf": [
+            { "$ref": "#/$defs/component" },
+            {
+              "properties": {
+                "image": {
+                  "pattern": "^ghcr\\.io/nclsppr/parkventory/backend@sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        },
+        "frontend": {
+          "allOf": [
+            { "$ref": "#/$defs/component" },
+            {
+              "properties": {
+                "image": {
+                  "pattern": "^ghcr\\.io/nclsppr/parkventory/frontend@sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        }
       }
     }
   }

@@ -209,6 +209,21 @@ class ReleaseDescriptorTests(unittest.TestCase):
                     set(policy.component_repositories),
                 )
 
+    def test_shared_schema_rejects_component_repository_swaps(self):
+        schema = json.loads(
+            (ROOT / "schemas/application-release.schema.json").read_text()
+        )
+        validator = Draft202012Validator(schema)
+        for policy in self.contract.applications:
+            component_names = tuple(policy.component_repositories)
+            first, second = component_names[:2]
+            value = release_value(policy)
+            value["components"][first]["image"] = (
+                f"{policy.component_repositories[second]}@{DIGEST_A}"
+            )
+            with self.subTest(application=policy.name, component=first):
+                self.assertTrue(list(validator.iter_errors(value)))
+
     def test_descriptor_requires_canonical_bytes(self):
         policy = self.contract.applications[1]
         noncanonical = json.dumps(release_value(policy), indent=2).encode("utf-8")
