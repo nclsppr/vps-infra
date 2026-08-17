@@ -971,14 +971,28 @@ class StaticBundleContractTests(unittest.TestCase):
 
         attestation_bundle = Path("/run/root-only/deployment/bundle.jsonl")
         archive = Path("/run/root-only/deployment/site.tar.gz")
+        integration_inventory = Path(
+            "/run/root-only/deployment/platform-integration.inventory.json"
+        )
         extension_mapping = MATERIALIZER.isolated_worker_input_mapping(
             state_name,
-            (script_path, protected_input, attestation_bundle, archive),
-            (protected_input, attestation_bundle, archive),
+            (
+                script_path,
+                protected_input,
+                attestation_bundle,
+                archive,
+                integration_inventory,
+            ),
+            (
+                protected_input,
+                attestation_bundle,
+                archive,
+                integration_inventory,
+            ),
         )
         self.assertEqual(
             tuple(path.name for path in extension_mapping.values()),
-            ("01.json", "02.jsonl", "03.tar.gz"),
+            ("01.json", "02.jsonl", "03.tar.gz", "04.inventory.json"),
         )
         uppercase_bundle = Path("/run/root-only/deployment/bundle.JSONL")
         with self.assertRaisesRegex(
@@ -989,6 +1003,18 @@ class StaticBundleContractTests(unittest.TestCase):
                 state_name,
                 (script_path, uppercase_bundle),
                 (uppercase_bundle,),
+            )
+        overlong_suffix = Path(
+            "/run/root-only/deployment/input.abcdefghijklmnopq"
+        )
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "suffix is invalid",
+        ):
+            MATERIALIZER.isolated_worker_input_mapping(
+                state_name,
+                (script_path, overlong_suffix),
+                (overlong_suffix,),
             )
 
     def test_registry_worker_accepts_only_its_exact_json_remap(self) -> None:
