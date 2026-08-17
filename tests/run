@@ -6,6 +6,15 @@ export PYTHONDONTWRITEBYTECODE=1
 TESTS_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly TESTS_DIR
 readonly VALID_SHA=0123456789abcdef0123456789abcdef01234567
+readonly VALID_DIGEST=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+readonly PERSONAL_SITE="ghcr.io/nclsppr/personal/site@sha256:$VALID_DIGEST"
+readonly PERSONAL_ROUTES="ghcr.io/nclsppr/personal/routes@sha256:$VALID_DIGEST"
+readonly PAPERSEMPIRE_SITE="ghcr.io/nclsppr/papersempire/site@sha256:$VALID_DIGEST"
+readonly PAPERSEMPIRE_ROUTES="ghcr.io/nclsppr/papersempire/routes@sha256:$VALID_DIGEST"
+readonly PARKVENTORY_SITE="ghcr.io/nclsppr/parkventory-static-site@sha256:$VALID_DIGEST"
+readonly PARKVENTORY_ROUTES="ghcr.io/nclsppr/parkventory-static-routes@sha256:$VALID_DIGEST"
+readonly PLATFORM_INTEGRATION="ghcr.io/nclsppr/vps-infra/platform-integration@sha256:$VALID_DIGEST"
+readonly CADDY_IMAGE="ghcr.io/nclsppr/vps-infra/caddy:sha-$VALID_SHA@sha256:$VALID_DIGEST"
 
 if [[ $EUID -eq 0 ]]; then
   command -v setpriv >/dev/null 2>&1 || {
@@ -70,11 +79,24 @@ python3 "$TESTS_DIR/test_platform_proof.py"
 python3 "$TESTS_DIR/test_postgres_backup.py"
 python3 "$TESTS_DIR/test_codex_cli.py"
 python3 "$TESTS_DIR/test_repository_contract.py"
+python3 "$TESTS_DIR/test_static_release_resolver.py"
 python3 "$TESTS_DIR/test_static_materializer.py"
 python3 "$TESTS_DIR/test_surplasse_controller.py"
 
 parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "deploy $VALID_SHA")
 [[ $parsed == "$VALID_SHA" ]]
+
+personal_command="deploy-static-live personal $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE"
+papersempire_command="deploy-static-live papersempire $VALID_SHA $PAPERSEMPIRE_SITE $PAPERSEMPIRE_ROUTES $VALID_SHA $PLATFORM_INTEGRATION ghcr.io/nclsppr/vps-infra/caddy@sha256:$VALID_DIGEST"
+parkventory_command="deploy-static-live parkventory $VALID_SHA $PARKVENTORY_SITE $PARKVENTORY_ROUTES $VALID_SHA $PLATFORM_INTEGRATION ghcr.io/nclsppr/vps-infra/caddy:release_1.2-3@sha256:$VALID_DIGEST"
+
+for valid in \
+  "$personal_command" \
+  "$papersempire_command" \
+  "$parkventory_command"; do
+  parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "$valid")
+  [[ $parsed == "$valid" ]]
+done
 
 for invalid in \
   "" \
@@ -82,6 +104,7 @@ for invalid in \
   "deploy  $VALID_SHA" \
   "deploy ${VALID_SHA} " \
   "deploy 0123456789ABCDEF0123456789ABCDEF01234567" \
+  "deploy aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé" \
   "deploy ${VALID_SHA}; id" \
   "deploy ${VALID_SHA}$(printf '\nid')" \
   "deploy \$(id)" \
@@ -93,7 +116,35 @@ for invalid in \
   fi
 done
 
-for invalid in "" "doctor" "deploy ${VALID_SHA}; id"; do
+for invalid in \
+  "deploy-static-live" \
+  "deploy-static-live  personal $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE" \
+  "${personal_command} " \
+  "$personal_command extra" \
+  "deploy-static-live unknown $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE" \
+  "deploy-static-live personal 0123456789ABCDEF0123456789ABCDEF01234567 $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE" \
+  "deploy-static-live personal $VALID_SHA $PAPERSEMPIRE_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE" \
+  "deploy-static-live personal $VALID_SHA ghcr.io/nclsppr/personal/site:latest@sha256:$VALID_DIGEST $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE" \
+  "deploy-static-live personal $VALID_SHA $PERSONAL_SITE ghcr.io/nclsppr/papersempire/routes@sha256:$VALID_DIGEST $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE" \
+  "deploy-static-live personal $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA ghcr.io/nclsppr/vps-infra/platform-integration:latest@sha256:$VALID_DIGEST $CADDY_IMAGE" \
+  "deploy-static-live personal $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION ghcr.io/nclsppr/vps-infra/caddy:bad/tag@sha256:$VALID_DIGEST" \
+  "deploy-static-live personal $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION ghcr.io/nclsppr/vps-infra/caddy:tag@sha256:${VALID_DIGEST%?}" \
+  "deploy-static-live personal $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION ghcr.io/nclsppr/other/caddy@sha256:$VALID_DIGEST" \
+  "${personal_command}; id" \
+  "${personal_command}"$'\n''id' \
+  "${personal_command}"$'\t'; do
+  if "$TESTS_DIR/../scripts/parse-forced-command" "$invalid" >/dev/null 2>&1; then
+    echo "parser unexpectedly accepted static command: $invalid" >&2
+    exit 1
+  fi
+done
+
+for invalid in \
+  "" \
+  "doctor" \
+  "deploy ${VALID_SHA}; id" \
+  "deploy-static-live unknown $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE" \
+  "${personal_command}; id"; do
   if SSH_ORIGINAL_COMMAND=$invalid "$TESTS_DIR/../scripts/forced-command" >/dev/null 2>&1; then
     echo "forced-command wrapper unexpectedly accepted: $invalid" >&2
     exit 1

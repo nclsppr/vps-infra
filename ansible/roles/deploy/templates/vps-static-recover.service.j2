@@ -1,0 +1,22 @@
+[Unit]
+Description=Recover interrupted VPS static deployment transactions
+After=local-fs.target docker.service
+Before=vps-public-static-edge.service
+Requires=docker.service
+RequiresMountsFor=/srv/www /var/lib/vps-static
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=HOME=/root
+Environment=LANG=C
+Environment=LC_ALL=C
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+StandardInput=null
+ExecStart={{ vps_deploy_static_path }} --recover-live
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

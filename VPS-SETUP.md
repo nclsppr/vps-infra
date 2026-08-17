@@ -327,16 +327,20 @@ Critères :
       target if the post-replacement fsync fails;
 - [ ] retain a bounded set of previous static and application states for
       operator rollback;
-- [ ] rollback automatique des statiques et des échecs applicatifs
-      pré-migration ; arrêt explicite après migration sans compatibilité prouvée ;
-- [ ] digests en échec placés en quarantaine jusqu’au revert ou à une action
-      explicite ;
-- [ ] journal de déploiement durable ;
-- [ ] connect the materializer to a separately reviewed live applicator, then
-      add public TLS rollback, persistent quarantine, and release retention;
-- [x] environnement GitHub et concurrence globale configurés ; l’interrupteur
-      de production reste volontairement à `false` jusqu’aux preuves de la
-      phase 6.
+- [x] implement static rollback after strict live TLS failure; dynamic
+      pre-migration rollback remains pending;
+- [x] persist exact failed static tuples in quarantine until explicit operator
+      action; dynamic digest quarantine remains pending;
+- [x] add a durable prepared transaction and complete active tuple for static
+      deployments; the generic controller journal remains pending;
+- [x] connect the static materializer to the separately bounded ADR-0008 gate,
+      with public TLS rollback and transaction recovery;
+- [ ] converge the reviewed static gate on Atlas, provision its dedicated
+      GitHub environment identity, and set `VPS_STATIC_DEPLOY_ENABLED=true`;
+- [ ] retain old static releases with a reviewed garbage-collection policy;
+- [x] référence d’environnement GitHub, matrice séquentielle et concurrence
+      globale codées dans le workflow ; l’environnement réel, son identité et
+      l’interrupteur de production restent à provisionner en phase 6.
 
 ## Phase 6 — répétition générale
 

@@ -237,6 +237,13 @@ The Parkventory static release contains only the explicitly labeled demo. Its
 Compose application remains disabled. The static route has no proxy or API
 handler and does not prove backend readiness.
 
+This is a temporary delivery mode, not the final Parkventory topology. The
+production application will contain a React frontend image and a Java backend
+image, plus a dedicated migrator and integration bundle. The versioned static
+and application contracts are mutually exclusive. Before the Compose release
+can own `parkventory.com`, the static promotion must be disabled, in-flight
+static work drained, and the route transferred under a shared host lock.
+
 Each CI workflow creates a static archive, calculates its checksum, and
 publishes it as an OCI artifact in GHCR. The VPS manifest references its digest,
 not a mutable tag. ORAS remains pinned in the local and CI publication tooling.
@@ -292,6 +299,22 @@ annotations. The standalone `deploy-static` primitive:
 12. restores and fsyncs the previous `current` target if the activation fsync
     fails after replacement.
 
+The automated static form adds a second, narrower state machine around that
+primitive. GitHub Actions in `vps-infra` resolves only the exact canonical HEAD
+whose complete check-run set is finished and green, then converts the two
+`sha-<HEAD>` tags to immutable manifest digests. Atlas independently confirms
+the HEAD and proves in a bounded `DynamicUser` worker that a new revision
+descends from the managed active revision. It writes a transaction, switches the symlink, and probes the real edge
+with normal public TLS validation. A successful probe persists the full source,
+site, routes, integration, and Caddy tuple plus its protected route inventory.
+A failed probe restores the previous target first, then quarantines that exact
+tuple if the source HEAD and Caddy identity remain unchanged. Recovery also
+quarantines it conservatively if classification was interrupted; only a durable
+`superseded` phase keeps it retryable.
+An exact already-active tuple verifies the local filesystem, Caddy runtime, and
+a bounded public TLS sample without fetching GHCR again. The generic dynamic
+controller remains locked.
+
 A separate network-enabled `DynamicUser` execution uses the checksum-pinned
 GitHub CLI and its embedded TUF bootstrap roots to obtain one current Sigstore
 trusted-root snapshot per deployment. Its runtime, memory, per-file size,
@@ -324,10 +347,15 @@ The Caddy digest must match both the protected `CADDY_PLATFORM_IMAGE` promotion
 point and the exact integration package, but the platform does not have to be
 active. A failed validation or probe leaves `current` unchanged. Activation
 uses protected directory file descriptors and an exact relative symlink target.
-The local certificate probe does not replace the future strict public TLS
-probe. The future live applicator must still add public-failure rollback,
-persistent quarantine, and a policy that retains at least three old releases.
-The locked controller cannot invoke this primitive.
+The local certificate probe remains the pre-activation content and integration
+proof. The separate live form follows it with a strict TLS probe against the
+running public edge, persistent transaction recovery, rollback, active state,
+and quarantine. The activation runs in a transient systemd unit with a recovery
+stop hook; a boot oneshot completes recovery before the public edge. A policy
+that garbage-collects old releases is still pending. Recovery validates managed
+release bytes against the protected inventory and removes bounded labeled
+probe containers, staging directories, and temporary symlinks. The locked dynamic
+controller cannot invoke this primitive.
 
 For `personal`, CI must build the public directory from an allowlist. The
 checkout contains files such as `AGENTS.md`, `infos/`, and `.claude/`. These

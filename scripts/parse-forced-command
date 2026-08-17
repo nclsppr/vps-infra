@@ -1,30 +1,128 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 1 ]; then
-  echo "forced-command parser: expected exactly one command string" >&2
+LANG=C
+LC_ALL=C
+export LANG LC_ALL
+
+fail() {
+  echo "forced-command parser: $1" >&2
   exit 64
+}
+
+is_lower_sha40() {
+  [ "${#1}" -eq 40 ] || return 1
+  case "$1" in
+    *[!0123456789abcdef]*) return 1 ;;
+  esac
+}
+
+is_lower_sha256() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in
+    *[!0123456789abcdef]*) return 1 ;;
+  esac
+}
+
+is_digest_reference() {
+  reference=$1
+  repository=$2
+  prefix="${repository}@sha256:"
+  case "$reference" in
+    "$prefix"*) digest=${reference#"$prefix"} ;;
+    *) return 1 ;;
+  esac
+  is_lower_sha256 "$digest"
+}
+
+is_caddy_reference() {
+  reference=$1
+  base=ghcr.io/nclsppr/vps-infra/caddy
+  case "$reference" in
+    "$base"@sha256:*) repository=$base ;;
+    "$base":*@sha256:*) repository=${reference%@*} ;;
+    *) return 1 ;;
+  esac
+
+  digest=${reference##*@sha256:}
+  is_lower_sha256 "$digest" || return 1
+  [ "$reference" = "${repository}@sha256:${digest}" ] || return 1
+
+  if [ "$repository" != "$base" ]; then
+    tag=${repository#"$base":}
+    [ "${#tag}" -le 128 ] || return 1
+    case "$tag" in
+      ""|[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*) return 1 ;;
+    esac
+  fi
+}
+
+if [ "$#" -ne 1 ]; then
+  fail "expected exactly one command string"
 fi
 
 original_command=$1
 case "$original_command" in
-  "deploy "*) sha=${original_command#"deploy "} ;;
+  "deploy "*)
+    sha=${original_command#"deploy "}
+    if [ "$original_command" != "deploy $sha" ] || ! is_lower_sha40 "$sha"; then
+      fail "malformed deploy command"
+    fi
+    printf '%s\n' "$sha"
+    ;;
+  "deploy-static-live "*)
+    rest=${original_command#"deploy-static-live "}
+
+    application=${rest%% *}
+    [ "$application" != "$rest" ] || fail "malformed deploy-static-live command"
+    rest=${rest#* }
+    source_sha=${rest%% *}
+    [ "$source_sha" != "$rest" ] || fail "malformed deploy-static-live command"
+    rest=${rest#* }
+    site_reference=${rest%% *}
+    [ "$site_reference" != "$rest" ] || fail "malformed deploy-static-live command"
+    rest=${rest#* }
+    routes_reference=${rest%% *}
+    [ "$routes_reference" != "$rest" ] || fail "malformed deploy-static-live command"
+    rest=${rest#* }
+    integration_sha=${rest%% *}
+    [ "$integration_sha" != "$rest" ] || fail "malformed deploy-static-live command"
+    rest=${rest#* }
+    integration_reference=${rest%% *}
+    [ "$integration_reference" != "$rest" ] || fail "malformed deploy-static-live command"
+    caddy_reference=${rest#* }
+
+    case "$application" in
+      personal)
+        site_repository=ghcr.io/nclsppr/personal/site
+        routes_repository=ghcr.io/nclsppr/personal/routes
+        ;;
+      papersempire)
+        site_repository=ghcr.io/nclsppr/papersempire/site
+        routes_repository=ghcr.io/nclsppr/papersempire/routes
+        ;;
+      parkventory)
+        site_repository=ghcr.io/nclsppr/parkventory-static-site
+        routes_repository=ghcr.io/nclsppr/parkventory-static-routes
+        ;;
+      *) fail "application is outside the static-site allowlist" ;;
+    esac
+
+    is_lower_sha40 "$source_sha" || fail "source SHA must be 40 lowercase hexadecimal characters"
+    is_digest_reference "$site_reference" "$site_repository" || fail "site reference does not match the application allowlist"
+    is_digest_reference "$routes_reference" "$routes_repository" || fail "routes reference does not match the application allowlist"
+    is_lower_sha40 "$integration_sha" || fail "integration SHA must be 40 lowercase hexadecimal characters"
+    is_digest_reference \
+      "$integration_reference" \
+      ghcr.io/nclsppr/vps-infra/platform-integration || \
+      fail "platform integration reference is invalid"
+    is_caddy_reference "$caddy_reference" || fail "Caddy reference is invalid"
+
+    canonical_command="deploy-static-live $application $source_sha $site_reference $routes_reference $integration_sha $integration_reference $caddy_reference"
+    [ "$original_command" = "$canonical_command" ] || fail "deploy-static-live command must use one canonical space between arguments"
+    printf '%s\n' "$canonical_command"
+    ;;
   *)
-    echo "forced-command parser: only 'deploy <sha40>' is accepted" >&2
-    exit 64
+    fail "only deploy and deploy-static-live commands are accepted"
     ;;
 esac
-
-if [ "$original_command" != "deploy $sha" ] || [ "${#sha}" -ne 40 ]; then
-  echo "forced-command parser: malformed deploy command" >&2
-  exit 64
-fi
-
-case "$sha" in
-  *[!0-9a-f]*)
-    echo "forced-command parser: SHA must be 40 lowercase hexadecimal characters" >&2
-    exit 64
-    ;;
-esac
-
-printf '%s\n' "$sha"

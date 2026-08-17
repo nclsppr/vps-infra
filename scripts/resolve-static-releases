@@ -1,0 +1,965 @@
+#!/usr/bin/env python3
+"""Resolve deployable static releases from public, immutable evidence."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import http.client
+import json
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
+
+
+MIB = 1024 * 1024
+MAX_CHECK_RUNS_BYTES = 2 * MIB
+MAX_MANIFEST_BYTES = 64 * 1024
+MAX_AUTH_RESPONSE_BYTES = 64 * 1024
+MAX_CHECK_RUNS = 100
+# Three applications, two attempts, and six scheduled runs use at most 36
+# unauthenticated GitHub API requests per hour during a sustained outage.
+CHECK_RUN_ATTEMPTS = 2
+HTTP_TIMEOUT_SECONDS = 20
+HTTP_RETRY_DELAYS = (1.0, 2.0)
+TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+GOOD_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
+OCI_EMPTY_CONFIG = {
+    "mediaType": "application/vnd.oci.empty.v1+json",
+    "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "size": 2,
+    "data": "e30=",
+}
+SOURCE_ANNOTATION = "org.opencontainers.image.source"
+REVISION_ANNOTATION = "org.opencontainers.image.revision"
+CREATED_ANNOTATION = "org.opencontainers.image.created"
+TITLE_ANNOTATION = "org.opencontainers.image.title"
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+RFC3339_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+)
+BEARER_RE = re.compile(r"^[!-~]{1,8192}$")
+
+EXPECTED_INTEGRATION_REVISION = "bd919bc6754e3fb1a53a80e45c1925fac495e7f2"
+EXPECTED_INTEGRATION_ARTIFACT = (
+    "ghcr.io/nclsppr/vps-infra/platform-integration@"
+    "sha256:c32b085bd4ee586d11e759be09b52b6a044cd56411ea6a600e7e0c2021bbb7a3"
+)
+EXPECTED_CADDY_IMAGE = (
+    "ghcr.io/nclsppr/vps-infra/caddy:"
+    "sha-755565642f71918134151921f8eae63935951ad6@"
+    "sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f"
+)
+
+EXPECTED_APPLICATIONS: Mapping[str, Mapping[str, object]] = {
+    "personal": {
+        "mode": "static-site",
+        "source_repository": "nclsppr/personal",
+        "source_branch": "main",
+        "site_repository": "ghcr.io/nclsppr/personal/site",
+        "routes_repository": "ghcr.io/nclsppr/personal/routes",
+        "required_checks": ("Publish immutable VPS artifacts", "build"),
+        "max_site_layer_bytes": 50 * MIB,
+    },
+    "papersempire": {
+        "mode": "static-site",
+        "source_repository": "nclsppr/papersempire",
+        "source_branch": "master",
+        "site_repository": "ghcr.io/nclsppr/papersempire/site",
+        "routes_repository": "ghcr.io/nclsppr/papersempire/routes",
+        "required_checks": ("Publish immutable VPS artifacts", "build"),
+        "max_site_layer_bytes": 75 * MIB,
+    },
+    "parkventory": {
+        "mode": "temporary-static-demo",
+        "source_repository": "nclsppr/parkventory",
+        "source_branch": "main",
+        "site_repository": "ghcr.io/nclsppr/parkventory-static-site",
+        "routes_repository": "ghcr.io/nclsppr/parkventory-static-routes",
+        "required_checks": (
+            "Publish immutable VPS artifacts",
+            "build",
+            "verify",
+        ),
+        "max_site_layer_bytes": 50 * MIB,
+    },
+}
+
+
+class ResolverError(ValueError):
+    """The local contract or remote evidence is invalid."""
+
+
+class PendingEvidence(ResolverError):
+    """Remote evidence is incomplete or temporarily unavailable."""
+
+
+class BlockedEvidence(ResolverError):
+    """Remote evidence is complete and prevents deployment."""
+
+
+class HttpFailure(ResolverError):
+    """A bounded HTTP request failed."""
+
+    def __init__(self, status: int | None, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclasses.dataclass(frozen=True)
+class HttpResponse:
+    body: bytes
+    headers: Mapping[str, str]
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before an authorization header can leave its endpoint."""
+
+    def redirect_request(self, *_arguments: object, **_keywords: object) -> None:
+        raise HttpFailure(None, "HTTPS redirects are not permitted")
+
+
+@dataclasses.dataclass(frozen=True)
+class ApplicationContract:
+    name: str
+    enabled: bool
+    mode: str
+    source_repository: str
+    source_branch: str
+    site_repository: str
+    routes_repository: str
+    required_checks: tuple[str, ...]
+    max_site_layer_bytes: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ReleaseContract:
+    integration_revision: str
+    integration_artifact: str
+    caddy_image: str
+    applications: tuple[ApplicationContract, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class Resolution:
+    application: str
+    status: str
+    reason: str
+    source_revision: str | None = None
+    site_reference: str | None = None
+    routes_reference: str | None = None
+    integration_revision: str | None = None
+    integration_reference: str | None = None
+    caddy_image: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        value: dict[str, object] = {
+            "application": self.application,
+            "reason": self.reason,
+            "status": self.status,
+        }
+        optional = {
+            "source_revision": self.source_revision,
+            "site_reference": self.site_reference,
+            "routes_reference": self.routes_reference,
+            "integration_revision": self.integration_revision,
+            "integration_reference": self.integration_reference,
+            "caddy_image": self.caddy_image,
+        }
+        value.update({key: item for key, item in optional.items() if item is not None})
+        return value
+
+    def matrix_entry(self) -> dict[str, str]:
+        if self.status != "ready":
+            raise ResolverError("only ready resolutions can enter the deployment matrix")
+        fields = {
+            "application": self.application,
+            "source_revision": self.source_revision,
+            "site_reference": self.site_reference,
+            "routes_reference": self.routes_reference,
+            "integration_revision": self.integration_revision,
+            "integration_reference": self.integration_reference,
+            "caddy_image": self.caddy_image,
+        }
+        if any(value is None for value in fields.values()):
+            raise ResolverError("ready resolution is incomplete")
+        return {key: str(value) for key, value in fields.items()}
+
+
+def _reject_constant(value: str) -> None:
+    raise ResolverError(f"JSON constant {value!r} is not permitted")
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ResolverError(f"JSON object contains duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def strict_json_bytes(raw: bytes, label: str) -> object:
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        return json.loads(
+            text,
+            object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ResolverError(f"{label} is not strict UTF-8 JSON: {exc}") from exc
+
+
+def bounded_reason(error: BaseException) -> str:
+    value = "".join(
+        character if 0x20 <= ord(character) <= 0x7E else "?"
+        for character in str(error)
+    )
+    if len(value) <= 512:
+        return value
+    return value[:509] + "..."
+
+
+def require_exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> None:
+    actual = set(value)
+    if actual == expected:
+        return
+    details: list[str] = []
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing:
+        details.append(f"missing {', '.join(missing)}")
+    if extra:
+        details.append(f"unexpected {', '.join(extra)}")
+    raise ResolverError(f"{label} has invalid keys: {'; '.join(details)}")
+
+
+def _expect_string(value: object, expected: str, label: str) -> str:
+    if value != expected or not isinstance(value, str):
+        raise ResolverError(f"{label} must be {expected!r}")
+    return value
+
+
+def load_contract(
+    path: Path,
+    application_contract_path: Path | None = None,
+) -> ReleaseContract:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ResolverError(f"cannot read release contract {path}: {exc}") from exc
+    if len(raw) > 64 * 1024:
+        raise ResolverError("release contract exceeds 64 KiB")
+    value = strict_json_bytes(raw, "release contract")
+    if not isinstance(value, dict):
+        raise ResolverError("release contract must be a JSON object")
+    require_exact_keys(value, {"schema", "integration", "caddy_image", "applications"}, "release contract")
+    if type(value["schema"]) is not int or value["schema"] != 2:
+        raise ResolverError("release contract schema must be integer 2")
+
+    integration = value["integration"]
+    if not isinstance(integration, dict):
+        raise ResolverError("release contract integration must be an object")
+    require_exact_keys(integration, {"source_revision", "artifact"}, "release contract integration")
+    integration_revision = _expect_string(
+        integration["source_revision"],
+        EXPECTED_INTEGRATION_REVISION,
+        "integration source_revision",
+    )
+    integration_artifact = _expect_string(
+        integration["artifact"],
+        EXPECTED_INTEGRATION_ARTIFACT,
+        "integration artifact",
+    )
+    caddy_image = _expect_string(
+        value["caddy_image"], EXPECTED_CADDY_IMAGE, "caddy_image"
+    )
+
+    applications = value["applications"]
+    if not isinstance(applications, dict):
+        raise ResolverError("release contract applications must be an object")
+    if set(applications) != set(EXPECTED_APPLICATIONS):
+        raise ResolverError("release contract must contain the exact static application allowlist")
+
+    parsed_applications: list[ApplicationContract] = []
+    for name, expected in EXPECTED_APPLICATIONS.items():
+        candidate = applications[name]
+        if not isinstance(candidate, dict):
+            raise ResolverError(f"application {name} must be an object")
+        require_exact_keys(
+            candidate,
+            {
+                "enabled",
+                "mode",
+                "source_repository",
+                "source_branch",
+                "site_repository",
+                "routes_repository",
+                "required_checks",
+            },
+            f"application {name}",
+        )
+        enabled = candidate["enabled"]
+        if type(enabled) is not bool:
+            raise ResolverError(f"application {name} enabled must be a Boolean")
+        mode = _expect_string(
+            candidate["mode"],
+            str(expected["mode"]),
+            f"application {name} mode",
+        )
+        required_checks = candidate["required_checks"]
+        expected_checks = expected["required_checks"]
+        if not isinstance(required_checks, list) or tuple(required_checks) != expected_checks:
+            raise ResolverError(f"application {name} required_checks do not match the allowlist")
+        for key in (
+            "source_repository",
+            "source_branch",
+            "site_repository",
+            "routes_repository",
+        ):
+            _expect_string(candidate[key], str(expected[key]), f"application {name} {key}")
+        parsed_applications.append(
+            ApplicationContract(
+                name=name,
+                enabled=enabled,
+                mode=mode,
+                source_repository=str(expected["source_repository"]),
+                source_branch=str(expected["source_branch"]),
+                site_repository=str(expected["site_repository"]),
+                routes_repository=str(expected["routes_repository"]),
+                required_checks=tuple(str(item) for item in expected_checks),
+                max_site_layer_bytes=int(expected["max_site_layer_bytes"]),
+            )
+        )
+    contract = ReleaseContract(
+        integration_revision=integration_revision,
+        integration_artifact=integration_artifact,
+        caddy_image=caddy_image,
+        applications=tuple(parsed_applications),
+    )
+    if application_contract_path is not None:
+        validate_application_exclusivity(contract, application_contract_path)
+    return contract
+
+
+def load_application_enablement(path: Path) -> Mapping[str, bool]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ResolverError(f"cannot read application production contract {path}: {exc}") from exc
+    if not 1 <= len(raw) <= 64 * 1024:
+        raise ResolverError("application production contract exceeds 64 KiB")
+    value = strict_json_bytes(raw, "application production contract")
+    if not isinstance(value, dict):
+        raise ResolverError("application production contract must be a JSON object")
+    applications = value.get("applications")
+    if not isinstance(applications, dict):
+        raise ResolverError("application production contract applications must be an object")
+
+    enabled: dict[str, bool] = {}
+    for name in EXPECTED_APPLICATIONS:
+        application = applications.get(name)
+        if not isinstance(application, dict):
+            raise ResolverError(
+                f"application production contract must contain application {name}"
+            )
+        application_enabled = application.get("enabled")
+        if type(application_enabled) is not bool:
+            raise ResolverError(
+                f"application production contract {name} enabled must be a Boolean"
+            )
+        enabled[name] = application_enabled
+    return enabled
+
+
+def validate_application_exclusivity(
+    static_contract: ReleaseContract,
+    application_contract_path: Path,
+) -> None:
+    application_enablement = load_application_enablement(application_contract_path)
+    conflicts = sorted(
+        application.name
+        for application in static_contract.applications
+        if application.enabled and application_enablement[application.name]
+    )
+    if conflicts:
+        raise ResolverError(
+            "static and application production contracts both enable: "
+            + ", ".join(conflicts)
+        )
+
+
+class BoundedHttpClient:
+    """Perform HTTPS GET requests without proxies, redirects, or unbounded reads."""
+
+    def __init__(
+        self,
+        *,
+        opener: object | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        retry_delays: Sequence[float] = HTTP_RETRY_DELAYS,
+    ) -> None:
+        context = ssl.create_default_context()
+        self._opener = opener or urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            RejectRedirects(),
+            urllib.request.HTTPSHandler(context=context),
+        )
+        self._sleeper = sleeper
+        self._retry_delays = tuple(retry_delays)
+
+    def get(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        max_bytes: int,
+        attempts: int = 3,
+    ) -> HttpResponse:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.fragment:
+            raise ResolverError("HTTP client accepts only absolute HTTPS URLs")
+        if attempts < 1 or attempts > len(self._retry_delays) + 1:
+            raise ResolverError("HTTP attempt count is outside the retry limit")
+        if max_bytes < 1 or max_bytes > MAX_CHECK_RUNS_BYTES:
+            raise ResolverError("HTTP response bound is outside the global limit")
+
+        request_headers = {
+            "Accept-Encoding": "identity",
+            "User-Agent": "vps-infra-static-release-resolver/1",
+            **headers,
+        }
+        last_failure: HttpFailure | None = None
+        for attempt in range(attempts):
+            request = urllib.request.Request(url, headers=request_headers, method="GET")
+            try:
+                response = self._opener.open(request, timeout=HTTP_TIMEOUT_SECONDS)
+                with response:
+                    if response.geturl() != url:
+                        raise HttpFailure(None, "HTTPS response redirected outside the exact endpoint")
+                    status = response.getcode()
+                    if status != 200:
+                        raise HttpFailure(status, f"HTTPS endpoint returned status {status}")
+                    content_length = response.headers.get("Content-Length")
+                    if content_length is not None:
+                        if not content_length.isdecimal() or int(content_length) > max_bytes:
+                            raise HttpFailure(None, "HTTPS Content-Length exceeds the response bound")
+                    content_encoding = response.headers.get("Content-Encoding")
+                    if content_encoding is not None and content_encoding.lower() != "identity":
+                        raise HttpFailure(None, "HTTPS response uses an unexpected content encoding")
+                    body = response.read(max_bytes + 1)
+                    if len(body) > max_bytes:
+                        raise HttpFailure(None, "HTTPS response exceeds the response bound")
+                    normalized_headers = {
+                        key.lower(): value.strip() for key, value in response.headers.items()
+                    }
+                    return HttpResponse(body=body, headers=normalized_headers)
+            except urllib.error.HTTPError as exc:
+                failure = HttpFailure(exc.code, f"HTTPS endpoint returned status {exc.code}")
+                exc.close()
+            except HttpFailure:
+                raise
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,
+                TimeoutError,
+                OSError,
+            ) as exc:
+                failure = HttpFailure(None, f"HTTPS request failed: {exc}")
+
+            last_failure = failure
+            is_transient = failure.status is None or failure.status in TRANSIENT_HTTP_STATUSES
+            if not is_transient or attempt + 1 >= attempts:
+                raise failure
+            self._sleeper(self._retry_delays[attempt])
+        if last_failure is None:
+            raise HttpFailure(None, "HTTPS request did not run")
+        raise last_failure
+
+
+def resolve_head(application: ApplicationContract) -> str:
+    remote = f"https://github.com/{application.source_repository}.git"
+    reference = f"refs/heads/{application.source_branch}"
+    environment = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "GIT_ALLOW_PROTOCOL": "https",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "http.https://github.com/.extraheader=",
+                "ls-remote",
+                "--exit-code",
+                "--refs",
+                remote,
+                reference,
+            ],
+            check=False,
+            capture_output=True,
+            cwd="/",
+            env=environment,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PendingEvidence(f"canonical-head-unavailable: {exc}") from exc
+    if result.returncode != 0:
+        raise PendingEvidence(f"canonical-head-unavailable: git-exit-{result.returncode}")
+    if len(result.stdout) > 1024:
+        raise BlockedEvidence("canonical-head-response-too-large")
+    try:
+        lines = result.stdout.decode("ascii", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise BlockedEvidence("canonical-head-response-is-not-ascii") from exc
+    expected_suffix = f"\t{reference}"
+    if len(lines) != 1 or not lines[0].endswith(expected_suffix):
+        raise BlockedEvidence("canonical-head-response-is-ambiguous")
+    revision = lines[0][: -len(expected_suffix)]
+    if not SHA40_RE.fullmatch(revision):
+        raise BlockedEvidence("canonical-head-is-not-a-lowercase-sha")
+    return revision
+
+
+def _api_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def check_candidate(
+    client: BoundedHttpClient,
+    application: ApplicationContract,
+    revision: str,
+) -> None:
+    url = (
+        f"https://api.github.com/repos/{application.source_repository}/commits/"
+        f"{revision}/check-runs?filter=latest&per_page={MAX_CHECK_RUNS}"
+    )
+    try:
+        response = client.get(
+            url,
+            headers=_api_headers(),
+            max_bytes=MAX_CHECK_RUNS_BYTES,
+            attempts=CHECK_RUN_ATTEMPTS,
+        )
+    except HttpFailure as exc:
+        if exc.status in TRANSIENT_HTTP_STATUSES | {403, 404} or exc.status is None:
+            raise PendingEvidence("check-runs-temporarily-unavailable") from exc
+        raise BlockedEvidence(f"check-runs-http-{exc.status}") from exc
+    value = strict_json_bytes(response.body, "check-runs response")
+    if not isinstance(value, dict):
+        raise BlockedEvidence("check-runs-response-is-not-an-object")
+    if set(value) != {"total_count", "check_runs"}:
+        raise BlockedEvidence("check-runs-response-has-unexpected-keys")
+    total_count = value["total_count"]
+    runs = value["check_runs"]
+    if type(total_count) is not int or total_count < 0 or total_count > MAX_CHECK_RUNS:
+        raise BlockedEvidence("check-run-count-exceeds-limit")
+    if not isinstance(runs, list) or len(runs) != total_count:
+        raise BlockedEvidence("check-run-count-is-inconsistent")
+
+    observed_names: set[str] = set()
+    successful_names: set[str] = set()
+    incomplete = False
+    for item in runs:
+        if not isinstance(item, dict):
+            raise BlockedEvidence("check-run-is-not-an-object")
+        required_fields = {"name", "status", "conclusion", "head_sha"}
+        if not required_fields.issubset(item):
+            raise BlockedEvidence("check-run-is-missing-required-fields")
+        name = item["name"]
+        status = item["status"]
+        conclusion = item["conclusion"]
+        head_sha = item["head_sha"]
+        if not isinstance(name, str) or not 1 <= len(name) <= 256:
+            raise BlockedEvidence("check-run-name-is-invalid")
+        if head_sha != revision:
+            raise BlockedEvidence("check-run-head-sha-does-not-match")
+        observed_names.add(name)
+        if not isinstance(status, str):
+            raise BlockedEvidence("check-run-status-is-invalid")
+        if status != "completed":
+            if status not in {"queued", "in_progress", "pending", "requested", "waiting"}:
+                raise BlockedEvidence("check-run-status-is-invalid")
+            incomplete = True
+            continue
+        if not isinstance(conclusion, str) or conclusion not in GOOD_CONCLUSIONS:
+            raise BlockedEvidence("check-run-not-green")
+        if conclusion == "success":
+            successful_names.add(name)
+
+    missing = [name for name in application.required_checks if name not in observed_names]
+    if missing:
+        raise PendingEvidence(f"required-checks-missing:{','.join(missing)}")
+    if incomplete:
+        raise PendingEvidence("check-runs-in-progress")
+    unsuccessful_required = [
+        name for name in application.required_checks if name not in successful_names
+    ]
+    if unsuccessful_required:
+        raise BlockedEvidence(
+            f"required-checks-not-successful:{','.join(unsuccessful_required)}"
+        )
+
+
+def _registry_path(repository: str) -> str:
+    prefix = "ghcr.io/"
+    if not repository.startswith(prefix):
+        raise ResolverError("registry repository is outside ghcr.io")
+    path = repository.removeprefix(prefix)
+    if not re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+", path):
+        raise ResolverError("registry repository path is invalid")
+    return path
+
+
+def _registry_bearer(client: BoundedHttpClient, repository: str) -> str:
+    repository_path = _registry_path(repository)
+    query = urllib.parse.urlencode(
+        {"service": "ghcr.io", "scope": f"repository:{repository_path}:pull"}
+    )
+    try:
+        response = client.get(
+            f"https://ghcr.io/token?{query}",
+            headers={"Accept": "application/json"},
+            max_bytes=MAX_AUTH_RESPONSE_BYTES,
+            attempts=3,
+        )
+    except HttpFailure as exc:
+        if exc.status == 404 or exc.status in TRANSIENT_HTTP_STATUSES or exc.status is None:
+            raise PendingEvidence("registry-token-temporarily-unavailable") from exc
+        raise BlockedEvidence(f"registry-token-http-{exc.status}") from exc
+    value = strict_json_bytes(response.body, "registry token response")
+    if not isinstance(value, dict):
+        raise BlockedEvidence("registry-token-response-is-not-an-object")
+    bearer = value.get("token", value.get("access_token"))
+    if not isinstance(bearer, str) or BEARER_RE.fullmatch(bearer) is None:
+        raise BlockedEvidence("registry-token-is-invalid")
+    return bearer
+
+
+def _validate_manifest(
+    raw: bytes,
+    application: ApplicationContract,
+    revision: str,
+    *,
+    kind: str,
+) -> None:
+    if kind == "site":
+        artifact_type = "application/vnd.vps-infra.static-site.v1"
+        layer_media_type = "application/vnd.vps-infra.static-site.v1+tar+gzip"
+        title = "site.tar.gz"
+        maximum_size = application.max_site_layer_bytes
+    elif kind == "routes":
+        artifact_type = "application/vnd.vps-infra.route-inventory.v1"
+        layer_media_type = "application/vnd.vps-infra.route-inventory.v1+json"
+        title = "routes.json"
+        maximum_size = 2 * MIB
+    else:
+        raise ResolverError("unsupported static manifest kind")
+
+    value = strict_json_bytes(raw, f"{kind} manifest")
+    if not isinstance(value, dict):
+        raise BlockedEvidence(f"{kind}-manifest-is-not-an-object")
+    expected_keys = {"schemaVersion", "mediaType", "artifactType", "config", "layers", "annotations"}
+    if set(value) != expected_keys:
+        raise BlockedEvidence(f"{kind}-manifest-has-unexpected-keys")
+    if type(value["schemaVersion"]) is not int or value["schemaVersion"] != 2:
+        raise BlockedEvidence(f"{kind}-manifest-schema-is-invalid")
+    if value["mediaType"] != OCI_MANIFEST_MEDIA_TYPE or value["artifactType"] != artifact_type:
+        raise BlockedEvidence(f"{kind}-manifest-media-type-is-invalid")
+    if value["config"] != OCI_EMPTY_CONFIG:
+        raise BlockedEvidence(f"{kind}-manifest-config-is-invalid")
+
+    layers = value["layers"]
+    if not isinstance(layers, list) or len(layers) != 1 or not isinstance(layers[0], dict):
+        raise BlockedEvidence(f"{kind}-manifest-layer-count-is-invalid")
+    layer = layers[0]
+    if set(layer) != {"mediaType", "digest", "size", "annotations"}:
+        raise BlockedEvidence(f"{kind}-manifest-layer-has-unexpected-keys")
+    if layer["mediaType"] != layer_media_type:
+        raise BlockedEvidence(f"{kind}-manifest-layer-media-type-is-invalid")
+    if not isinstance(layer["digest"], str) or SHA256_RE.fullmatch(layer["digest"]) is None:
+        raise BlockedEvidence(f"{kind}-manifest-layer-digest-is-invalid")
+    if type(layer["size"]) is not int or not 1 <= layer["size"] <= maximum_size:
+        raise BlockedEvidence(f"{kind}-manifest-layer-size-is-invalid")
+    if layer["annotations"] != {TITLE_ANNOTATION: title}:
+        raise BlockedEvidence(f"{kind}-manifest-layer-title-is-invalid")
+
+    annotations = value["annotations"]
+    expected_annotations = {CREATED_ANNOTATION, SOURCE_ANNOTATION, REVISION_ANNOTATION}
+    if not isinstance(annotations, dict) or set(annotations) != expected_annotations:
+        raise BlockedEvidence(f"{kind}-manifest-annotations-are-invalid")
+    if annotations[SOURCE_ANNOTATION] != f"https://github.com/{application.source_repository}":
+        raise BlockedEvidence(f"{kind}-manifest-source-does-not-match")
+    if annotations[REVISION_ANNOTATION] != revision:
+        raise BlockedEvidence(f"{kind}-manifest-revision-does-not-match")
+    created = annotations[CREATED_ANNOTATION]
+    if not isinstance(created, str) or RFC3339_RE.fullmatch(created) is None:
+        raise BlockedEvidence(f"{kind}-manifest-created-is-invalid")
+
+
+def resolve_manifest(
+    client: BoundedHttpClient,
+    application: ApplicationContract,
+    revision: str,
+    *,
+    kind: str,
+) -> str:
+    if kind not in {"site", "routes"}:
+        raise ResolverError("unsupported static manifest kind")
+    repository = (
+        application.site_repository if kind == "site" else application.routes_repository
+    )
+    repository_path = _registry_path(repository)
+    bearer = _registry_bearer(client, repository)
+    tag = f"sha-{revision}"
+    try:
+        response = client.get(
+            f"https://ghcr.io/v2/{repository_path}/manifests/{tag}",
+            headers={
+                "Accept": OCI_MANIFEST_MEDIA_TYPE,
+                "Authorization": f"Bearer {bearer}",
+            },
+            max_bytes=MAX_MANIFEST_BYTES,
+            attempts=3,
+        )
+    except HttpFailure as exc:
+        if exc.status == 404:
+            raise PendingEvidence(f"{kind}-manifest-not-published") from exc
+        if exc.status in TRANSIENT_HTTP_STATUSES or exc.status is None:
+            raise PendingEvidence(f"{kind}-manifest-temporarily-unavailable") from exc
+        raise BlockedEvidence(f"{kind}-manifest-http-{exc.status}") from exc
+
+    content_type = response.headers.get("content-type", "").split(";", maxsplit=1)[0]
+    if content_type != OCI_MANIFEST_MEDIA_TYPE:
+        raise BlockedEvidence(f"{kind}-manifest-content-type-is-invalid")
+    digest = f"sha256:{hashlib.sha256(response.body).hexdigest()}"
+    advertised_digest = response.headers.get("docker-content-digest")
+    if advertised_digest is not None and advertised_digest != digest:
+        raise BlockedEvidence(f"{kind}-manifest-digest-header-does-not-match")
+    _validate_manifest(response.body, application, revision, kind=kind)
+    return f"{repository}@{digest}"
+
+
+def resolve_application(
+    contract: ReleaseContract,
+    application: ApplicationContract,
+    *,
+    client: BoundedHttpClient,
+    head_resolver: Callable[[ApplicationContract], str] = resolve_head,
+    manifest_resolver: Callable[..., str] = resolve_manifest,
+) -> Resolution:
+    if not application.enabled:
+        return Resolution(
+            application=application.name,
+            status="disabled",
+            reason="disabled-by-static-production-contract",
+        )
+    revision: str | None = None
+    try:
+        revision = head_resolver(application)
+        if SHA40_RE.fullmatch(revision) is None:
+            raise BlockedEvidence("canonical-head-is-not-a-lowercase-sha")
+        check_candidate(client, application, revision)
+        site_reference = manifest_resolver(
+            client, application, revision, kind="site"
+        )
+        routes_reference = manifest_resolver(
+            client, application, revision, kind="routes"
+        )
+        if head_resolver(application) != revision:
+            raise PendingEvidence("canonical-head-changed-during-resolution")
+        return Resolution(
+            application=application.name,
+            status="ready",
+            reason="candidate-ready",
+            source_revision=revision,
+            site_reference=site_reference,
+            routes_reference=routes_reference,
+            integration_revision=contract.integration_revision,
+            integration_reference=contract.integration_artifact,
+            caddy_image=contract.caddy_image,
+        )
+    except PendingEvidence as exc:
+        return Resolution(
+            application=application.name,
+            status="pending",
+            reason=bounded_reason(exc),
+            source_revision=revision,
+        )
+    except (BlockedEvidence, ResolverError) as exc:
+        return Resolution(
+            application=application.name,
+            status="blocked",
+            reason=bounded_reason(exc),
+            source_revision=revision,
+        )
+    except Exception as exc:
+        return Resolution(
+            application=application.name,
+            status="blocked",
+            reason=f"resolver-internal-error:{type(exc).__name__}",
+            source_revision=revision,
+        )
+
+
+def resolve_all(
+    contract: ReleaseContract,
+    *,
+    client: BoundedHttpClient,
+    head_resolver: Callable[[ApplicationContract], str] = resolve_head,
+    manifest_resolver: Callable[..., str] = resolve_manifest,
+) -> tuple[Resolution, ...]:
+    return tuple(
+        resolve_application(
+            contract,
+            application,
+            client=client,
+            head_resolver=head_resolver,
+            manifest_resolver=manifest_resolver,
+        )
+        for application in contract.applications
+    )
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def write_result(path: Path, resolutions: Sequence[Resolution]) -> None:
+    payload = {
+        "applications": [resolution.as_dict() for resolution in resolutions],
+        "schema": 1,
+    }
+    path.write_text(_canonical_json(payload) + "\n", encoding="ascii")
+
+
+def write_github_output(path: Path, resolutions: Sequence[Resolution]) -> None:
+    ready = [resolution.matrix_entry() for resolution in resolutions if resolution.status == "ready"]
+    counts = {
+        status: sum(resolution.status == status for resolution in resolutions)
+        for status in ("ready", "pending", "blocked", "disabled")
+    }
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(f"matrix={_canonical_json({'include': ready})}\n")
+        for status, count in counts.items():
+            stream.write(f"{status}_count={count}\n")
+
+
+def write_step_summary(path: Path, resolutions: Sequence[Resolution]) -> None:
+    lines = [
+        "## Static release reconciliation",
+        "",
+        "| Application | Status | Canonical revision | Reason |",
+        "| --- | --- | --- | --- |",
+    ]
+    for resolution in resolutions:
+        revision = resolution.source_revision or "not resolved"
+        reason = (
+            resolution.reason.replace("|", "-")
+            .replace("`", "'")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+        lines.append(
+            f"| `{resolution.application}` | **{resolution.status}** | `{revision}` | `{reason}` |"
+        )
+    lines.append("")
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--contract",
+        type=Path,
+        default=Path("releases/static-production.json"),
+        help="versioned static production contract",
+    )
+    parser.add_argument(
+        "--application-contract",
+        type=Path,
+        help=(
+            "versioned application production contract; defaults to production.yaml "
+            "next to the static contract"
+        ),
+    )
+    parser.add_argument("--output", type=Path, help="write the complete resolution JSON")
+    parser.add_argument("--github-output", type=Path, help="append the ready deployment matrix")
+    parser.add_argument("--step-summary", type=Path, help="append a readable status table")
+    parser.add_argument(
+        "--validate-contract",
+        action="store_true",
+        help="validate the local contract without network access",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        application_contract = arguments.application_contract or arguments.contract.with_name(
+            "production.yaml"
+        )
+        contract = load_contract(arguments.contract, application_contract)
+        if arguments.validate_contract:
+            print(f"static release contract valid: {arguments.contract}")
+            return 0
+        resolutions = resolve_all(contract, client=BoundedHttpClient())
+        if arguments.output is not None:
+            write_result(arguments.output, resolutions)
+        else:
+            print(
+                _canonical_json(
+                    {
+                        "applications": [item.as_dict() for item in resolutions],
+                        "schema": 1,
+                    }
+                )
+            )
+        if arguments.github_output is not None:
+            write_github_output(arguments.github_output, resolutions)
+        if arguments.step_summary is not None:
+            write_step_summary(arguments.step_summary, resolutions)
+        for resolution in resolutions:
+            if resolution.status not in {"ready", "disabled"}:
+                reason = (
+                    resolution.reason.replace("%", "%25")
+                    .replace("\r", "%0D")
+                    .replace("\n", "%0A")
+                )
+                print(
+                    f"::{ 'warning' if resolution.status == 'pending' else 'error' } "
+                    f"title={resolution.application} static release::{reason}"
+                )
+        return 0
+    except (OSError, ResolverError) as exc:
+        print(f"static release resolution failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

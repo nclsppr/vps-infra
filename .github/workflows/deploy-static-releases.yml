@@ -1,0 +1,192 @@
+---
+name: Deploy static releases
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-vps
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve canonical static releases
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.releases.outputs.matrix }}
+      ready_count: ${{ steps.releases.outputs.ready_count }}
+      pending_count: ${{ steps.releases.outputs.pending_count }}
+      blocked_count: ${{ steps.releases.outputs.blocked_count }}
+      disabled_count: ${{ steps.releases.outputs.disabled_count }}
+    steps:
+      - name: Check out the reconciliation contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve exact canonical candidates
+        id: releases
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ./scripts/resolve-static-releases \
+            --contract releases/static-production.json \
+            --application-contract releases/production.yaml \
+            --output "${RUNNER_TEMP}/static-releases.json" \
+            --github-output "${GITHUB_OUTPUT}" \
+            --step-summary "${GITHUB_STEP_SUMMARY}"
+
+  deploy:
+    name: Deploy ${{ matrix.application }}
+    needs: resolve
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      needs.resolve.result == 'success' &&
+      needs.resolve.outputs.ready_count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    environment:
+      name: static-production
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Report disabled static deployment
+        if: vars.VPS_STATIC_DEPLOY_ENABLED != 'true'
+        shell: bash
+        env:
+          APPLICATION: ${{ matrix.application }}
+        run: |
+          set -Eeuo pipefail
+          echo "::warning title=${APPLICATION} static deployment::VPS_STATIC_DEPLOY_ENABLED is not true"
+          printf 'Static deployment for %s is disabled by the static-production environment.\n' \
+            "${APPLICATION}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Request the exact static deployment
+        if: vars.VPS_STATIC_DEPLOY_ENABLED == 'true'
+        shell: bash
+        env:
+          APPLICATION: ${{ matrix.application }}
+          SOURCE_REVISION: ${{ matrix.source_revision }}
+          SITE_REFERENCE: ${{ matrix.site_reference }}
+          ROUTES_REFERENCE: ${{ matrix.routes_reference }}
+          INTEGRATION_REVISION: ${{ matrix.integration_revision }}
+          INTEGRATION_REFERENCE: ${{ matrix.integration_reference }}
+          CADDY_IMAGE: ${{ matrix.caddy_image }}
+          VPS_STATIC_HOST: ${{ secrets.VPS_STATIC_HOST }}
+          VPS_STATIC_DEPLOY_USER: ${{ vars.VPS_STATIC_DEPLOY_USER }}
+          VPS_STATIC_DEPLOY_PORT: ${{ vars.VPS_STATIC_DEPLOY_PORT }}
+          VPS_STATIC_SSH_PRIVATE_KEY: ${{ secrets.VPS_STATIC_SSH_PRIVATE_KEY }}
+          VPS_STATIC_KNOWN_HOSTS: ${{ secrets.VPS_STATIC_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+
+          case "${APPLICATION}" in
+            personal)
+              source_remote='https://github.com/nclsppr/personal.git'
+              source_ref='refs/heads/main'
+              site_repository='ghcr.io/nclsppr/personal/site'
+              routes_repository='ghcr.io/nclsppr/personal/routes'
+              ;;
+            papersempire)
+              source_remote='https://github.com/nclsppr/papersempire.git'
+              source_ref='refs/heads/master'
+              site_repository='ghcr.io/nclsppr/papersempire/site'
+              routes_repository='ghcr.io/nclsppr/papersempire/routes'
+              ;;
+            parkventory)
+              source_remote='https://github.com/nclsppr/parkventory.git'
+              source_ref='refs/heads/main'
+              site_repository='ghcr.io/nclsppr/parkventory-static-site'
+              routes_repository='ghcr.io/nclsppr/parkventory-static-routes'
+              ;;
+            *)
+              echo "application is outside the static deployment allowlist" >&2
+              exit 1
+              ;;
+          esac
+
+          sha_pattern='^[0-9a-f]{40}$'
+          digest_pattern='sha256:[0-9a-f]{64}'
+          site_repository_pattern=${site_repository//./\\.}
+          routes_repository_pattern=${routes_repository//./\\.}
+          [[ ${SOURCE_REVISION} =~ ${sha_pattern} ]]
+          [[ ${INTEGRATION_REVISION} =~ ${sha_pattern} ]]
+          [[ ${SITE_REFERENCE} =~ ^${site_repository_pattern}@${digest_pattern}$ ]]
+          [[ ${ROUTES_REFERENCE} =~ ^${routes_repository_pattern}@${digest_pattern}$ ]]
+          [[ ${INTEGRATION_REFERENCE} =~ ^ghcr\.io/nclsppr/vps-infra/platform-integration@${digest_pattern}$ ]]
+          [[ ${CADDY_IMAGE} =~ ^ghcr\.io/nclsppr/vps-infra/caddy:sha-[0-9a-f]{40}@${digest_pattern}$ ]]
+
+          git_home="${RUNNER_TEMP}/static-release-git-home"
+          install -d -m 0700 "${git_home}"
+          if ! canonical_line=$(
+            /usr/bin/env -i \
+              PATH=/usr/local/bin:/usr/bin:/bin \
+              HOME="${git_home}" \
+              LANG=C \
+              LC_ALL=C \
+              GIT_ALLOW_PROTOCOL=https \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/timeout --signal=TERM --kill-after=5s 30s \
+              /usr/bin/git -C / \
+                -c credential.helper= \
+                -c http.https://github.com/.extraheader= \
+                ls-remote \
+                --exit-code --refs "${source_remote}" "${source_ref}"
+          ); then
+            echo "::warning title=${APPLICATION} static deployment::canonical HEAD could not be confirmed before SSH"
+            printf 'Skipped %s because its canonical HEAD could not be confirmed before SSH.\n' \
+              "${APPLICATION}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          expected_line="${SOURCE_REVISION}"$'\t'"${source_ref}"
+          if [[ ${#canonical_line} -gt 256 || ${canonical_line} != "${expected_line}" ]]; then
+            echo "::warning title=${APPLICATION} static deployment::canonical HEAD changed before SSH"
+            printf 'Skipped %s because its canonical HEAD changed before SSH.\n' \
+              "${APPLICATION}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          [[ ${VPS_STATIC_DEPLOY_USER} =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+          [[ ${VPS_STATIC_HOST} =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]]
+          [[ ${VPS_STATIC_DEPLOY_PORT} =~ ^[0-9]{1,5}$ ]]
+          (( 10#${VPS_STATIC_DEPLOY_PORT} >= 1 && 10#${VPS_STATIC_DEPLOY_PORT} <= 65535 ))
+          test -n "${VPS_STATIC_SSH_PRIVATE_KEY}"
+          test -n "${VPS_STATIC_KNOWN_HOSTS}"
+          (( ${#VPS_STATIC_SSH_PRIVATE_KEY} <= 65536 ))
+          (( ${#VPS_STATIC_KNOWN_HOSTS} <= 65536 ))
+
+          ssh_directory="${RUNNER_TEMP}/static-deploy-ssh"
+          install -d -m 0700 "${ssh_directory}"
+          trap 'rm -f -- "${ssh_directory}/key" "${ssh_directory}/known_hosts"' EXIT
+          printf '%s\n' "${VPS_STATIC_SSH_PRIVATE_KEY}" > "${ssh_directory}/key"
+          printf '%s\n' "${VPS_STATIC_KNOWN_HOSTS}" > "${ssh_directory}/known_hosts"
+          chmod 0600 "${ssh_directory}/key" "${ssh_directory}/known_hosts"
+
+          remote_command="deploy-static-live ${APPLICATION} ${SOURCE_REVISION} ${SITE_REFERENCE} ${ROUTES_REFERENCE} ${INTEGRATION_REVISION} ${INTEGRATION_REFERENCE} ${CADDY_IMAGE}"
+          ssh \
+            -i "${ssh_directory}/key" \
+            -p "${VPS_STATIC_DEPLOY_PORT}" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o ConnectionAttempts=2 \
+            -o IdentitiesOnly=yes \
+            -o ServerAliveCountMax=3 \
+            -o ServerAliveInterval=30 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${ssh_directory}/known_hosts" \
+            "${VPS_STATIC_DEPLOY_USER}@${VPS_STATIC_HOST}" \
+            "${remote_command}"
+
+          printf 'Atlas accepted the exact %s candidate %s.\n' \
+            "${APPLICATION}" "${SOURCE_REVISION}" >> "${GITHUB_STEP_SUMMARY}"

@@ -28,7 +28,7 @@ import unicodedata
 import urllib.parse
 import zlib
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator
+from typing import Any, BinaryIO, Iterator, Mapping
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIRECTORY / "lib"))
@@ -95,11 +95,34 @@ PYTHON_PATH = Path("/usr/bin/python3")
 SYSTEMD_RUN_PATH = Path("/usr/bin/systemd-run")
 SYSTEMCTL_PATH = Path("/usr/bin/systemctl")
 IP_PATH = Path("/usr/sbin/ip")
+GIT_PATH = Path("/usr/bin/git")
 SYSTEMD_WORKER_LOGICAL_ROOT = Path("/run/vps-static-jobs")
 SYSTEMD_WORKER_PRIVATE_ROOT = Path("/run/private/vps-static-jobs")
 SYSTEMD_CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
 SYSTEMD_WORKER_UNIT = "vpsw-static.service"
 PLATFORM_ENV_PATH = Path("/srv/vps/repository/platform/.env.example")
+STATIC_PRODUCTION_CONTRACT_PATH = Path(
+    "/srv/vps/repository/releases/static-production.json"
+)
+APPLICATION_PRODUCTION_CONTRACT_PATH = Path(
+    "/srv/vps/repository/releases/production.yaml"
+)
+APPLICATION_ACTIVE_MANIFEST_PATH = Path(
+    "/var/lib/vps-controller/active/manifest.json"
+)
+APPLICATION_ACTIVE_STATE_PATH = Path(
+    "/var/lib/vps-controller/active/state.json"
+)
+STATIC_DEPLOYMENT_MODES = {
+    "personal": "static-site",
+    "papersempire": "static-site",
+    "parkventory": "temporary-static-demo",
+}
+STATIC_REQUIRED_CHECKS = {
+    "personal": ("Publish immutable VPS artifacts", "build"),
+    "papersempire": ("Publish immutable VPS artifacts", "build"),
+    "parkventory": ("Publish immutable VPS artifacts", "build", "verify"),
+}
 READ_CHUNK = 1024 * 1024
 GH_VERSION = "2.97.0"
 GH_BINARY_SHA256 = {
@@ -124,6 +147,18 @@ TRUSTED_ROOT_SHA256 = (
     "sha256:65ca537f6ed8a47fd0e560c421baa1f6c1efb8b25fc200d8c5c02c0e92eb2b9c"
 )
 MAX_ISOLATED_WORKER_INODES = 16_384
+STATIC_STATE_ROOT = Path("/var/lib/vps-static")
+STATIC_ACTIVE_STATE_ROOT = STATIC_STATE_ROOT / "active"
+STATIC_INVENTORY_STATE_ROOT = STATIC_STATE_ROOT / "inventories"
+STATIC_QUARANTINE_ROOT = STATIC_STATE_ROOT / "quarantine"
+STATIC_TRANSACTION_ROOT = STATIC_STATE_ROOT / "transactions"
+MAX_STATIC_STATE_BYTES = 4096
+STATIC_PROBE_LABEL = "com.nclsppr.vps-static-probe"
+STATIC_PROBE_APPLICATION_LABEL = "com.nclsppr.vps-static-application"
+STATIC_RUNTIME_DIRECTORY_ENV = "VPS_STATIC_RUNTIME_DIRECTORY"
+MAX_RESIDUAL_PROBE_CONTAINERS = 16
+PROBE_CONTAINER_LIST_TIMEOUT_SECONDS = 10
+PROBE_CONTAINER_REMOVE_TIMEOUT_SECONDS = 30
 
 
 class StaticDeploymentError(ValueError):
@@ -139,6 +174,7 @@ class StaticProfile:
     signer_workflow: str
     canonical_domain: str
     redirect_domains: tuple[str, ...]
+    live_redirect_domains: tuple[str, ...]
     site_repository: str
     routes_repository: str
     max_archive_bytes: int
@@ -213,6 +249,51 @@ class IsolatedWorkerState:
     gid: int
 
 
+@dataclasses.dataclass(frozen=True)
+class DeploymentState:
+    application: str
+    source_revision: str
+    site_reference: str
+    routes_reference: str
+    integration_revision: str
+    integration_reference: str
+    caddy_image: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "application": self.application,
+            "caddy_image": self.caddy_image,
+            "integration_reference": self.integration_reference,
+            "integration_revision": self.integration_revision,
+            "routes_reference": self.routes_reference,
+            "schema": 1,
+            "site_reference": self.site_reference,
+            "source_revision": self.source_revision,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class DeploymentTransaction:
+    candidate: DeploymentState
+    previous_state: DeploymentState | None
+    previous_target: str | None
+    expected_target: str
+    phase: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "application": self.candidate.application,
+            "candidate": self.candidate.as_dict(),
+            "expected_target": self.expected_target,
+            "phase": self.phase,
+            "previous_state": (
+                None if self.previous_state is None else self.previous_state.as_dict()
+            ),
+            "previous_target": self.previous_target,
+            "schema": 1,
+        }
+
+
 PROFILES = {
     "personal": StaticProfile(
         application="personal",
@@ -222,6 +303,7 @@ PROFILES = {
         signer_workflow="nclsppr/personal/.github/workflows/vps-release.yml",
         canonical_domain="nicolaspieper.com",
         redirect_domains=("www.nicolaspieper.com", "nicolas.pieper.fr"),
+        live_redirect_domains=("www.nicolaspieper.com",),
         site_repository="ghcr.io/nclsppr/personal/site",
         routes_repository="ghcr.io/nclsppr/personal/routes",
         max_archive_bytes=50 * MIB,
@@ -242,6 +324,7 @@ PROFILES = {
         signer_workflow="nclsppr/papersempire/.github/workflows/vps-release.yml",
         canonical_domain="papersempire.com",
         redirect_domains=(),
+        live_redirect_domains=("www.papersempire.com",),
         site_repository="ghcr.io/nclsppr/papersempire/site",
         routes_repository="ghcr.io/nclsppr/papersempire/routes",
         max_archive_bytes=75 * MIB,
@@ -262,6 +345,7 @@ PROFILES = {
         signer_workflow="nclsppr/parkventory/.github/workflows/vps-release.yml",
         canonical_domain="parkventory.com",
         redirect_domains=("www.parkventory.com",),
+        live_redirect_domains=("www.parkventory.com",),
         site_repository="ghcr.io/nclsppr/parkventory-static-site",
         routes_repository="ghcr.io/nclsppr/parkventory-static-routes",
         max_archive_bytes=50 * MIB,
@@ -482,6 +566,619 @@ def parse_digest_reference(reference: str, repository: str, label: str) -> str:
     if not SHA256_RE.fullmatch(digest):
         fail(f"{label} must end in one lowercase sha256 digest")
     return digest
+
+
+def validate_deployment_state(state: DeploymentState) -> None:
+    profile = PROFILES.get(state.application)
+    if profile is None:
+        fail("deployment state application is outside the static-site allowlist")
+    if not SHA40_RE.fullmatch(state.source_revision):
+        fail("deployment state source revision is invalid")
+    if not SHA40_RE.fullmatch(state.integration_revision):
+        fail("deployment state integration revision is invalid")
+    parse_digest_reference(
+        state.site_reference,
+        profile.site_repository,
+        "deployment state site reference",
+    )
+    parse_digest_reference(
+        state.routes_reference,
+        profile.routes_repository,
+        "deployment state routes reference",
+    )
+    parse_digest_reference(
+        state.integration_reference,
+        INTEGRATION_REPOSITORY,
+        "deployment state integration reference",
+    )
+    if not CADDY_IMAGE_RE.fullmatch(state.caddy_image):
+        fail("deployment state Caddy image is invalid")
+
+
+def canonical_deployment_state(state: DeploymentState) -> bytes:
+    validate_deployment_state(state)
+    return (
+        json.dumps(
+            state.as_dict(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def deployment_state_from_value(value: object, label: str) -> DeploymentState:
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    require_exact_keys(
+        value,
+        {
+            "application",
+            "caddy_image",
+            "integration_reference",
+            "integration_revision",
+            "routes_reference",
+            "schema",
+            "site_reference",
+            "source_revision",
+        },
+        label,
+    )
+    string_keys = (
+        "application",
+        "caddy_image",
+        "integration_reference",
+        "integration_revision",
+        "routes_reference",
+        "site_reference",
+        "source_revision",
+    )
+    if value["schema"] != 1 or any(
+        not isinstance(value[key], str) for key in string_keys
+    ):
+        fail(f"{label} contains invalid values")
+    state = DeploymentState(
+        application=value["application"],
+        source_revision=value["source_revision"],
+        site_reference=value["site_reference"],
+        routes_reference=value["routes_reference"],
+        integration_revision=value["integration_revision"],
+        integration_reference=value["integration_reference"],
+        caddy_image=value["caddy_image"],
+    )
+    validate_deployment_state(state)
+    return state
+
+
+def parse_deployment_state(data: bytes, label: str) -> DeploymentState:
+    value = strict_json_bytes(data, label, canonical=True)
+    return deployment_state_from_value(value, label)
+
+
+def open_static_state_directory(
+    path: Path,
+    label: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        fail(f"cannot open {label}: {exc}")
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        fail(f"{label} must be a protected owned directory with mode 0700")
+    return descriptor
+
+
+def read_protected_state_bytes(
+    directory: Path,
+    name: str,
+    label: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+    maximum_size: int = MAX_STATIC_STATE_BYTES,
+) -> bytes | None:
+    if re.fullmatch(r"[a-z0-9-]+(?:-[0-9a-f]{64})?\.json", name) is None:
+        fail(f"{label} file name is invalid")
+    directory_fd = open_static_state_directory(
+        directory,
+        f"{label} directory",
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    try:
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            fail(f"cannot open {label}: {exc}")
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or not 1 <= metadata.st_size <= maximum_size
+            ):
+                fail(f"{label} is not one protected state file")
+            chunks: list[bytes] = []
+            remaining = maximum_size + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(READ_CHUNK, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            final = os.fstat(descriptor)
+            if (
+                len(data) > maximum_size
+                or final.st_dev != metadata.st_dev
+                or final.st_ino != metadata.st_ino
+                or final.st_size != metadata.st_size
+                or len(data) != metadata.st_size
+            ):
+                fail(f"{label} changed while it was read")
+            return data
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory_fd)
+
+
+def read_deployment_state_file(
+    directory: Path,
+    name: str,
+    label: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> DeploymentState | None:
+    data = read_protected_state_bytes(
+        directory,
+        name,
+        label,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if data is None:
+        return None
+    return parse_deployment_state(data, label)
+
+
+def write_protected_state_bytes(
+    directory: Path,
+    name: str,
+    encoded: bytes,
+    label: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+    maximum_size: int = MAX_STATIC_STATE_BYTES,
+) -> None:
+    if re.fullmatch(r"[a-z0-9-]+(?:-[0-9a-f]{64})?\.json", name) is None:
+        fail(f"{label} file name is invalid")
+    if not 1 <= len(encoded) <= maximum_size:
+        fail(f"{label} exceeds the state size limit")
+    directory_fd = open_static_state_directory(
+        directory,
+        f"{label} directory",
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    temporary_name = f".{name}-{secrets.token_hex(8)}"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except OSError as exc:
+        fail(f"cannot write {label}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        os.close(directory_fd)
+
+
+def write_deployment_state_file(
+    directory: Path,
+    name: str,
+    state: DeploymentState,
+    label: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    write_protected_state_bytes(
+        directory,
+        name,
+        canonical_deployment_state(state),
+        label,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+
+
+def remove_protected_state_file(
+    directory: Path,
+    name: str,
+    label: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    if re.fullmatch(r"[a-z0-9-]+(?:-[0-9a-f]{64})?\.json", name) is None:
+        fail(f"{label} file name is invalid")
+    directory_fd = open_static_state_directory(
+        directory,
+        f"{label} directory",
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    try:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return
+        os.fsync(directory_fd)
+    except OSError as exc:
+        fail(f"cannot remove {label}: {exc}")
+    finally:
+        os.close(directory_fd)
+
+
+def fsync_static_state_directory(
+    directory: Path,
+    label: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    descriptor = open_static_state_directory(
+        directory,
+        label,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        fail(f"cannot make {label} durable: {exc}")
+    finally:
+        os.close(descriptor)
+
+
+def restore_previous_active_state(transaction: DeploymentTransaction) -> None:
+    name = f"{transaction.candidate.application}.json"
+    if transaction.previous_state is None:
+        remove_protected_state_file(
+            STATIC_ACTIVE_STATE_ROOT,
+            name,
+            "active deployment state",
+        )
+        return
+    write_deployment_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        name,
+        transaction.previous_state,
+        "active deployment state",
+    )
+
+
+def restore_deployment_transaction(
+    transaction: DeploymentTransaction,
+    current: Path,
+    releases: Path,
+) -> None:
+    if transaction.previous_state is not None:
+        validate_persisted_release(transaction.previous_state, releases)
+    restore_current_target(current, transaction.previous_target, releases)
+    restore_previous_active_state(transaction)
+
+
+def rollback_deployment_transaction(
+    transaction: DeploymentTransaction,
+    current: Path,
+    releases: Path,
+    *,
+    quarantine: bool,
+) -> None:
+    restore_deployment_transaction(transaction, current, releases)
+    if quarantine:
+        write_deployment_state_file(
+            STATIC_QUARANTINE_ROOT,
+            quarantine_name(transaction.candidate),
+            transaction.candidate,
+            "quarantined deployment state",
+        )
+    remove_protected_state_file(
+        STATIC_TRANSACTION_ROOT,
+        f"{transaction.candidate.application}.json",
+        "deployment transaction",
+    )
+
+
+def deployment_state_fingerprint(state: DeploymentState) -> str:
+    return hashlib.sha256(canonical_deployment_state(state)).hexdigest()
+
+
+def quarantine_name(state: DeploymentState) -> str:
+    return f"{state.application}-{deployment_state_fingerprint(state)}.json"
+
+
+def inventory_state_name(state: DeploymentState) -> str:
+    return f"{state.application}-{deployment_state_fingerprint(state)}.json"
+
+
+def persisted_inventory_from_bytes(
+    encoded: bytes,
+    state: DeploymentState,
+) -> InventoryContract:
+    profile = PROFILES[state.application]
+    value = strict_json_bytes(encoded, "persisted route inventory", canonical=True)
+    if not isinstance(value, dict) or not isinstance(value.get("site"), dict):
+        fail("persisted route inventory does not contain site metadata")
+    site = value["site"]
+    archive_bytes = site.get("archive_bytes")
+    archive_sha256 = site.get("archive_sha256")
+    if (
+        not is_int(archive_bytes)
+        or archive_bytes < 0
+        or not isinstance(archive_sha256, str)
+        or HEX_SHA256_RE.fullmatch(archive_sha256) is None
+    ):
+        fail("persisted route inventory contains invalid site metadata")
+    site_layer = LayerContract(
+        manifest_digest=parse_digest_reference(
+            state.site_reference,
+            profile.site_repository,
+            "persisted route inventory site reference",
+        ),
+        layer_digest=f"sha256:{archive_sha256}",
+        layer_size=archive_bytes,
+        created="1970-01-01T00:00:00Z",
+    )
+    return validate_inventory_bytes(
+        encoded,
+        profile,
+        state.source_revision,
+        site_layer,
+    )
+
+
+def read_persisted_inventory(state: DeploymentState) -> InventoryContract:
+    encoded = read_protected_state_bytes(
+        STATIC_INVENTORY_STATE_ROOT,
+        inventory_state_name(state),
+        "persisted route inventory",
+        maximum_size=MAX_ROUTES_BYTES,
+    )
+    if encoded is None:
+        fail("active deployment is missing its protected route inventory")
+    return persisted_inventory_from_bytes(encoded, state)
+
+
+def validate_persisted_release(
+    state: DeploymentState,
+    releases: Path,
+) -> InventoryContract:
+    """Revalidate one managed release before recovery serves or commits it."""
+
+    inventory = read_persisted_inventory(state)
+    release_target = release_target_for_state(state)
+    release_name = release_target.removeprefix("releases/")
+    if release_target != f"releases/{release_name}":
+        fail("persisted release target is invalid")
+    filesystem_inventory(
+        releases / release_name,
+        inventory,
+        expected_uid=0,
+        expected_gid=0,
+    )
+    return inventory
+
+
+def write_persisted_inventory(
+    state: DeploymentState,
+    inventory: InventoryContract,
+) -> None:
+    profile = PROFILES[state.application]
+    encoded = canonical_route_inventory_bytes(
+        inventory,
+        profile,
+        state.source_revision,
+    )
+    persisted_inventory_from_bytes(encoded, state)
+    name = inventory_state_name(state)
+    existing = read_protected_state_bytes(
+        STATIC_INVENTORY_STATE_ROOT,
+        name,
+        "persisted route inventory",
+        maximum_size=MAX_ROUTES_BYTES,
+    )
+    if existing is not None:
+        if existing != encoded:
+            fail("persisted route inventory does not match its immutable state key")
+        persisted_inventory_from_bytes(existing, state)
+        return
+    write_protected_state_bytes(
+        STATIC_INVENTORY_STATE_ROOT,
+        name,
+        encoded,
+        "persisted route inventory",
+        maximum_size=MAX_ROUTES_BYTES,
+    )
+
+
+def release_target_for_state(state: DeploymentState) -> str:
+    profile = PROFILES[state.application]
+    digest = parse_digest_reference(
+        state.site_reference,
+        profile.site_repository,
+        "deployment state site reference",
+    )
+    return f"releases/sha256-{digest.removeprefix('sha256:')}"
+
+
+def canonical_deployment_transaction(transaction: DeploymentTransaction) -> bytes:
+    validate_deployment_state(transaction.candidate)
+    if transaction.previous_state is not None:
+        validate_deployment_state(transaction.previous_state)
+        if transaction.previous_state.application != transaction.candidate.application:
+            fail("deployment transaction previous state application is invalid")
+        if release_target_for_state(transaction.previous_state) != transaction.previous_target:
+            fail("deployment transaction previous state does not match its target")
+    if transaction.expected_target != release_target_for_state(transaction.candidate):
+        fail("deployment transaction expected target does not match its candidate")
+    if transaction.phase not in {
+        "prepared",
+        "switched",
+        "probe-rejected",
+        "probe-failed",
+        "superseded",
+        "probed",
+    }:
+        fail("deployment transaction phase is invalid")
+    if transaction.previous_target is not None and re.fullmatch(
+        r"releases/sha256-[0-9a-f]{64}",
+        transaction.previous_target,
+    ) is None:
+        fail("deployment transaction previous target is invalid")
+    return (
+        json.dumps(
+            transaction.as_dict(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def parse_deployment_transaction(data: bytes, label: str) -> DeploymentTransaction:
+    value = strict_json_bytes(data, label, canonical=True)
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    require_exact_keys(
+        value,
+        {
+            "application",
+            "candidate",
+            "expected_target",
+            "phase",
+            "previous_state",
+            "previous_target",
+            "schema",
+        },
+        label,
+    )
+    if (
+        value["schema"] != 1
+        or not isinstance(value["phase"], str)
+        or value["phase"]
+        not in {
+            "prepared",
+            "switched",
+            "probe-rejected",
+            "probe-failed",
+            "superseded",
+            "probed",
+        }
+        or not isinstance(value["application"], str)
+        or not isinstance(value["expected_target"], str)
+        or (
+            value["previous_target"] is not None
+            and not isinstance(value["previous_target"], str)
+        )
+    ):
+        fail(f"{label} contains invalid values")
+    candidate = deployment_state_from_value(value["candidate"], f"{label} candidate")
+    if value["application"] != candidate.application:
+        fail(f"{label} application does not match its candidate")
+    previous_state_value = value["previous_state"]
+    if previous_state_value is None:
+        previous_state = None
+    else:
+        previous_state = deployment_state_from_value(
+            previous_state_value,
+            f"{label} previous state",
+        )
+    transaction = DeploymentTransaction(
+        candidate=candidate,
+        previous_state=previous_state,
+        previous_target=value["previous_target"],
+        expected_target=value["expected_target"],
+        phase=value["phase"],
+    )
+    canonical_deployment_transaction(transaction)
+    return transaction
+
+
+def read_deployment_transaction(
+    application: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> DeploymentTransaction | None:
+    data = read_protected_state_bytes(
+        STATIC_TRANSACTION_ROOT,
+        f"{application}.json",
+        "deployment transaction",
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if data is None:
+        return None
+    return parse_deployment_transaction(data, "deployment transaction")
+
+
+def write_deployment_transaction(
+    transaction: DeploymentTransaction,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    write_protected_state_bytes(
+        STATIC_TRANSACTION_ROOT,
+        f"{transaction.candidate.application}.json",
+        canonical_deployment_transaction(transaction),
+        "deployment transaction",
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
 
 
 def parse_created(value: Any, label: str) -> str:
@@ -865,6 +1562,15 @@ def validate_inventory(
     site_layer: LayerContract,
 ) -> InventoryContract:
     raw = read_bounded_file(path, MAX_ROUTES_BYTES, "route inventory")
+    return validate_inventory_bytes(raw, profile, source_revision, site_layer)
+
+
+def validate_inventory_bytes(
+    raw: bytes,
+    profile: StaticProfile,
+    source_revision: str,
+    site_layer: LayerContract,
+) -> InventoryContract:
     value = strict_json_bytes(raw, "route inventory", canonical=True)
     if not isinstance(value, dict):
         fail("route inventory must be a JSON object")
@@ -1940,6 +2646,214 @@ def run_checked(
     return result
 
 
+def assert_current_source_revision(
+    profile: StaticProfile,
+    source_revision: str,
+    work_directory: Path,
+) -> None:
+    repository_url = f"https://github.com/{profile.source_repository}.git"
+    command = [
+        str(GIT_PATH),
+        "-c",
+        "credential.helper=",
+        "ls-remote",
+        "--exit-code",
+        "--refs",
+        repository_url,
+        profile.source_ref,
+    ]
+    result: subprocess.CompletedProcess[str] | None = None
+    environment = safe_environment(work_directory)
+    environment.update(
+        {
+            "GIT_ALLOW_PROTOCOL": "https",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=work_directory,
+                env=environment,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is not None and result.returncode == 0:
+            break
+        if attempt < 2:
+            time.sleep(2**attempt)
+    if result is None or result.returncode != 0:
+        detail = "no diagnostic"
+        if result is not None:
+            detail = result.stderr.strip() or result.stdout.strip() or detail
+        fail(f"cannot resolve the canonical source branch: {detail[:1000]}")
+    expected = f"{source_revision}\t{profile.source_ref}\n"
+    if result.stdout != expected or result.stderr:
+        fail("candidate source revision is not the exact canonical branch head")
+
+
+def assert_source_revision_descends_from_active(
+    profile: StaticProfile,
+    active_revision: str,
+    candidate_revision: str,
+    work_directory: Path,
+) -> None:
+    if not SHA40_RE.fullmatch(active_revision) or not SHA40_RE.fullmatch(
+        candidate_revision
+    ):
+        fail("source ancestry check received an invalid revision")
+    if active_revision == candidate_revision:
+        return
+    state = run_isolated_worker(
+        "ancestry",
+        [
+            str(PYTHON_PATH),
+            str(Path(__file__)),
+            "--source-ancestry-worker",
+            profile.application,
+            active_revision,
+            candidate_revision,
+        ],
+        inputs=(Path(__file__), SCRIPT_DIRECTORY / "lib/platform_integration.py"),
+        runtime_seconds=240,
+        memory_max="256M",
+        memory_swap_max="64M",
+        file_size_max="128M",
+        network=True,
+    )
+    cleanup_isolated_worker_state(state)
+
+
+def verify_source_ancestry_repository(
+    profile: StaticProfile,
+    active_revision: str,
+    candidate_revision: str,
+    work_directory: Path,
+    *,
+    repository_url: str | None = None,
+    allowed_protocol: str = "https",
+) -> None:
+    if not SHA40_RE.fullmatch(active_revision) or not SHA40_RE.fullmatch(
+        candidate_revision
+    ):
+        fail("source ancestry check received an invalid revision")
+    if allowed_protocol not in {"file", "https"}:
+        fail("source ancestry check received an invalid transport")
+    if repository_url is None:
+        repository_url = f"https://github.com/{profile.source_repository}.git"
+    history = work_directory / "source-history.git"
+    environment = safe_environment(work_directory)
+    environment.update(
+        {
+            "GIT_ALLOW_PROTOCOL": allowed_protocol,
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+
+    def invoke(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd="/",
+                env=environment,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            fail(f"cannot verify source ancestry: {exc}")
+
+    initialized = invoke(
+        [str(GIT_PATH), "init", "--bare", "--quiet", str(history)],
+        30,
+    )
+    if initialized.returncode != 0:
+        detail = initialized.stderr.strip() or initialized.stdout.strip()
+        fail(f"cannot initialize source ancestry check: {detail[:1000]}")
+    fetched = invoke(
+        [
+            str(GIT_PATH),
+            "-C",
+            str(history),
+            "-c",
+            "credential.helper=",
+            "-c",
+            "http.https://github.com/.extraheader=",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--force",
+            "--filter=tree:0",
+            repository_url,
+            f"+{profile.source_ref}:refs/remotes/vps-static/canonical",
+            f"+{active_revision}:refs/remotes/vps-static/active",
+        ],
+        180,
+    )
+    if fetched.returncode != 0:
+        detail = fetched.stderr.strip() or fetched.stdout.strip()
+        fail(f"cannot fetch canonical source history: {detail[:1000]}")
+    resolved = invoke(
+        [
+            str(GIT_PATH),
+            "-C",
+            str(history),
+            "rev-parse",
+            "--verify",
+            "refs/remotes/vps-static/canonical^{commit}",
+        ],
+        30,
+    )
+    if resolved.returncode != 0 or resolved.stdout != f"{candidate_revision}\n":
+        fail("fetched canonical source history does not end at the candidate")
+    ancestry = invoke(
+        [
+            str(GIT_PATH),
+            "-C",
+            str(history),
+            "merge-base",
+            "--is-ancestor",
+            active_revision,
+            candidate_revision,
+        ],
+        30,
+    )
+    if ancestry.returncode == 1:
+        fail("candidate source revision does not descend from the active revision")
+    if ancestry.returncode != 0:
+        detail = ancestry.stderr.strip() or ancestry.stdout.strip()
+        fail(f"cannot prove candidate source ancestry: {detail[:1000]}")
+
+
+def run_source_ancestry_worker(
+    profile: StaticProfile,
+    active_revision: str,
+    candidate_revision: str,
+) -> None:
+    require_unprivileged_worker("source ancestry worker")
+    worker_home = Path(os.environ.get("HOME", ""))
+    if worker_home.name == "" or set(worker_home.iterdir()):
+        fail("source ancestry worker home is invalid")
+    verify_source_ancestry_repository(
+        profile,
+        active_revision,
+        candidate_revision,
+        worker_home,
+    )
+    if set(worker_home.iterdir()) != {worker_home / "source-history.git"}:
+        fail("source ancestry worker left unexpected runtime files")
+
+
 def isolated_worker_properties(
     state_name: str,
     *,
@@ -2549,6 +3463,7 @@ def download_https_bounded(
     temporary = destination.parent / f".{destination.name}-{secrets.token_hex(8)}"
     command = [
         str(CURL_PATH),
+        "--disable",
         "--fail",
         "--silent",
         "--show-error",
@@ -3228,6 +4143,259 @@ def read_promoted_caddy_image(path: Path, *, require_root_owner: bool) -> str:
     return caddy_image
 
 
+def read_static_production_pins(
+    path: Path,
+    *,
+    require_root_owner: bool,
+) -> tuple[str, str, str, frozenset[str]]:
+    try:
+        metadata = path.lstat()
+        raw = path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read static production contract {path}: {exc}")
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        fail("static production contract must be a regular file")
+    if require_root_owner and (metadata.st_uid != 0 or metadata.st_gid != 0):
+        fail("static production contract must be root-owned")
+    if metadata.st_mode & 0o022:
+        fail("static production contract must not be writable by group or others")
+    if not 1 <= len(raw) <= 64 * 1024:
+        fail("static production contract exceeds 64 KiB")
+    value = strict_json_bytes(
+        raw,
+        "static production contract",
+        canonical=False,
+    )
+    if not isinstance(value, dict):
+        fail("static production contract must be an object")
+    require_exact_keys(
+        value,
+        {"applications", "caddy_image", "integration", "schema"},
+        "static production contract",
+    )
+    if type(value["schema"]) is not int or value["schema"] != 2:
+        fail("static production contract schema must be integer 2")
+    applications = value["applications"]
+    if not isinstance(applications, dict) or set(applications) != set(PROFILES):
+        fail("static production contract application allowlist is invalid")
+    enabled_applications: set[str] = set()
+    for application, profile in PROFILES.items():
+        candidate = applications[application]
+        if not isinstance(candidate, dict):
+            fail(f"static production application {application} must be an object")
+        require_exact_keys(
+            candidate,
+            {
+                "enabled",
+                "mode",
+                "required_checks",
+                "routes_repository",
+                "site_repository",
+                "source_branch",
+                "source_repository",
+            },
+            f"static production application {application}",
+        )
+        enabled = candidate["enabled"]
+        if type(enabled) is not bool:
+            fail(f"static production application {application} enabled must be Boolean")
+        if enabled:
+            enabled_applications.add(application)
+        if candidate["mode"] != STATIC_DEPLOYMENT_MODES[application]:
+            fail(f"static production application {application} mode is invalid")
+        if candidate["source_repository"] != profile.source_repository:
+            fail(
+                f"static production application {application} source repository is invalid"
+            )
+        if candidate["source_branch"] != profile.source_ref.removeprefix(
+            "refs/heads/"
+        ):
+            fail(f"static production application {application} source branch is invalid")
+        if candidate["site_repository"] != profile.site_repository:
+            fail(f"static production application {application} site repository is invalid")
+        if candidate["routes_repository"] != profile.routes_repository:
+            fail(
+                f"static production application {application} routes repository is invalid"
+            )
+        required_checks = candidate["required_checks"]
+        if (
+            not isinstance(required_checks, list)
+            or tuple(required_checks) != STATIC_REQUIRED_CHECKS[application]
+        ):
+            fail(f"static production application {application} checks are invalid")
+    integration = value["integration"]
+    if not isinstance(integration, dict):
+        fail("static production contract integration must be an object")
+    require_exact_keys(
+        integration,
+        {"artifact", "source_revision"},
+        "static production integration",
+    )
+    revision = integration["source_revision"]
+    reference = integration["artifact"]
+    caddy_image = value["caddy_image"]
+    if not isinstance(revision, str) or SHA40_RE.fullmatch(revision) is None:
+        fail("static production integration revision is invalid")
+    if not isinstance(reference, str):
+        fail("static production integration reference is invalid")
+    parse_digest_reference(
+        reference,
+        INTEGRATION_REPOSITORY,
+        "static production integration reference",
+    )
+    if not isinstance(caddy_image, str) or CADDY_IMAGE_RE.fullmatch(caddy_image) is None:
+        fail("static production Caddy image is invalid")
+    return revision, reference, caddy_image, frozenset(enabled_applications)
+
+
+def read_application_production_enablement(
+    path: Path,
+    *,
+    require_root_owner: bool,
+) -> dict[str, bool]:
+    try:
+        metadata = path.lstat()
+        raw = path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read application production contract {path}: {exc}")
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        fail("application production contract must be a regular file")
+    if require_root_owner and (metadata.st_uid != 0 or metadata.st_gid != 0):
+        fail("application production contract must be root-owned")
+    if metadata.st_mode & 0o022:
+        fail("application production contract must not be writable by group or others")
+    if not 1 <= len(raw) <= 256 * 1024:
+        fail("application production contract exceeds 256 KiB")
+    return application_enablement_from_bytes(
+        raw,
+        "application production contract",
+    )
+
+
+def application_enablement_from_bytes(
+    raw: bytes,
+    label: str,
+) -> dict[str, bool]:
+    value = strict_json_bytes(
+        raw,
+        label,
+        canonical=False,
+    )
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    applications = value.get("applications")
+    if not isinstance(applications, dict):
+        fail(f"{label} applications must be an object")
+    enablement: dict[str, bool] = {}
+    for application in PROFILES:
+        candidate = applications.get(application)
+        if not isinstance(candidate, dict):
+            fail(f"{label} is missing application {application}")
+        enabled = candidate.get("enabled")
+        if type(enabled) is not bool:
+            fail(f"{label} {application} enabled must be Boolean")
+        enablement[application] = enabled
+    return enablement
+
+
+def assert_static_activation_mode(
+    application: str,
+    enabled_static_applications: frozenset[str],
+    application_enablement: Mapping[str, bool],
+    active_application_enablement: Mapping[str, bool],
+) -> None:
+    if application not in enabled_static_applications:
+        fail(f"static deployment for {application} is disabled by its promotion contract")
+    if application_enablement.get(application) is not False:
+        fail(
+            f"static deployment for {application} conflicts with its enabled application release"
+        )
+    if active_application_enablement.get(application) is not False:
+        fail(
+            f"static deployment for {application} conflicts with its active application state"
+        )
+
+
+def read_active_application_enablement(
+    manifest_path: Path,
+    state_path: Path,
+    *,
+    require_root_owner: bool,
+) -> dict[str, bool]:
+    metadata: dict[Path, os.stat_result | None] = {}
+    for path in (manifest_path, state_path):
+        try:
+            metadata[path] = path.lstat()
+        except FileNotFoundError:
+            metadata[path] = None
+        except OSError as exc:
+            fail(f"cannot inspect active application state {path}: {exc}")
+    if metadata[manifest_path] is None and metadata[state_path] is None:
+        return {application: False for application in PROFILES}
+    if metadata[manifest_path] is None or metadata[state_path] is None:
+        fail("active application state pair is incomplete")
+
+    manifest_metadata = metadata[manifest_path]
+    state_metadata = metadata[state_path]
+    if manifest_metadata is None or state_metadata is None:
+        fail("active application state pair is incomplete")
+    for path, item_metadata, label in (
+        (manifest_path, manifest_metadata, "active application manifest"),
+        (state_path, state_metadata, "active application metadata"),
+    ):
+        if not stat.S_ISREG(item_metadata.st_mode) or stat.S_ISLNK(
+            item_metadata.st_mode
+        ):
+            fail(f"{label} must be a regular file: {path}")
+        if require_root_owner and (
+            item_metadata.st_uid != 0 or item_metadata.st_gid != 0
+        ):
+            fail(f"{label} must be root-owned")
+        if item_metadata.st_mode & 0o022:
+            fail(f"{label} must not be writable by group or others")
+    try:
+        manifest_raw = manifest_path.read_bytes()
+        state_raw = state_path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read active application state pair: {exc}")
+    if not 1 <= len(manifest_raw) <= 256 * 1024:
+        fail("active application manifest exceeds 256 KiB")
+    if not 1 <= len(state_raw) <= 16 * 1024:
+        fail("active application metadata exceeds 16 KiB")
+    state_value = strict_json_bytes(
+        state_raw,
+        "active application metadata",
+        canonical=False,
+    )
+    if not isinstance(state_value, dict):
+        fail("active application metadata must be an object")
+    require_exact_keys(
+        state_value,
+        {"commit", "manifest_sha256", "recorded_at", "schema"},
+        "active application metadata",
+    )
+    if type(state_value["schema"]) is not int or state_value["schema"] != 1:
+        fail("active application metadata schema must be integer 1")
+    commit = state_value["commit"]
+    manifest_digest = state_value["manifest_sha256"]
+    recorded_at = state_value["recorded_at"]
+    if not isinstance(commit, str) or SHA40_RE.fullmatch(commit) is None:
+        fail("active application metadata commit is invalid")
+    if (
+        not isinstance(manifest_digest, str)
+        or HEX_SHA256_RE.fullmatch(manifest_digest) is None
+    ):
+        fail("active application metadata manifest digest is invalid")
+    if not isinstance(recorded_at, str) or RFC3339_RE.fullmatch(recorded_at) is None:
+        fail("active application metadata timestamp is invalid")
+    if hashlib.sha256(manifest_raw).hexdigest() != manifest_digest:
+        fail("active application manifest does not match its metadata digest")
+    return application_enablement_from_bytes(
+        manifest_raw,
+        "active application manifest",
+    )
+
+
 def validate_runtime() -> None:
     if os.geteuid() != 0:
         fail("production materialization requires root")
@@ -3243,6 +4411,7 @@ def validate_runtime() -> None:
         SYSTEMD_RUN_PATH,
         SYSTEMCTL_PATH,
         IP_PATH,
+        GIT_PATH,
     ):
         assert_protected_executable(executable)
     require_isolated_worker_tmpfs()
@@ -4821,18 +5990,26 @@ def wait_for_probe(
     port: int,
     work_directory: Path,
     deadline: float,
+    *,
+    insecure: bool = True,
 ) -> None:
     environment = safe_environment(work_directory)
     while True:
         timeout = remaining_probe_seconds(deadline, "readiness probe", cap=2)
         try:
-            ready = subprocess.run(
+            command = [
+                str(CURL_PATH),
+                "--disable",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--proto",
+                "=https",
+            ]
+            if insecure:
+                command.append("--insecure")
+            command.extend(
                 [
-                    str(CURL_PATH),
-                    "--fail",
-                    "--silent",
-                    "--show-error",
-                    "--insecure",
                     "--resolve",
                     f"{host}:{port}:127.0.0.1",
                     "--max-time",
@@ -4840,7 +6017,10 @@ def wait_for_probe(
                     "--output",
                     "/dev/null",
                     f"https://{host}:{port}/",
-                ],
+                ]
+            )
+            ready = subprocess.run(
+                command,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -4899,6 +6079,74 @@ def cleanup_probe_container(name: str, environment: dict[str, str]) -> None:
         fail("temporary Caddy container cleanup left a container behind")
 
 
+def residual_probe_container_ids(
+    application: str,
+    environment: dict[str, str],
+) -> tuple[str, ...]:
+    if application not in PROFILES:
+        fail("temporary Caddy cleanup application is invalid")
+    command = [
+        str(DOCKER_PATH),
+        "container",
+        "ls",
+        "--all",
+        "--no-trunc",
+        "--filter",
+        f"label={STATIC_PROBE_LABEL}=true",
+        "--filter",
+        f"label={STATIC_PROBE_APPLICATION_LABEL}={application}",
+        "--format",
+        (
+            "{{.ID}}\t{{.Names}}\t"
+            f"{{{{.Label \"{STATIC_PROBE_LABEL}\"}}}}\t"
+            f"{{{{.Label \"{STATIC_PROBE_APPLICATION_LABEL}\"}}}}"
+        ),
+    ]
+    result = run_checked(
+        command,
+        environment=environment,
+        timeout=PROBE_CONTAINER_LIST_TIMEOUT_SECONDS,
+    )
+    if result.stderr or len(result.stdout.encode("utf-8")) > 16 * 1024:
+        fail("temporary Caddy cleanup returned an invalid container list")
+    records = result.stdout.splitlines()
+    if len(records) > MAX_RESIDUAL_PROBE_CONTAINERS:
+        fail("temporary Caddy cleanup exceeded its container limit")
+    identifiers: list[str] = []
+    for record in records:
+        fields = record.split("\t")
+        if (
+            len(fields) != 4
+            or re.fullmatch(r"[0-9a-f]{64}", fields[0]) is None
+            or re.fullmatch(r"vps-static-probe-[0-9a-f]{16}", fields[1]) is None
+            or fields[2] != "true"
+            or fields[3] != application
+        ):
+            fail("temporary Caddy cleanup found an unexpected container identity")
+        identifiers.append(fields[0])
+    return tuple(identifiers)
+
+
+def cleanup_probe_containers(application: str) -> None:
+    environment = safe_environment(Path("/nonexistent"))
+    identifiers = residual_probe_container_ids(application, environment)
+    if not identifiers:
+        return
+    try:
+        subprocess.run(
+            [str(DOCKER_PATH), "rm", "--force", *identifiers],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=PROBE_CONTAINER_REMOVE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if residual_probe_container_ids(application, environment):
+        fail("temporary Caddy residue cleanup left a container behind")
+
+
 def assert_probe_response(
     host: str,
     port: int,
@@ -4912,14 +6160,17 @@ def assert_probe_response(
     expected_cache_control: str | None = None,
     accept_encoding: str | None = None,
     expected_content_encoding: str | None = None,
+    insecure: bool = True,
 ) -> None:
     response = work_directory / f"response-{secrets.token_hex(8)}"
     headers = work_directory / f"headers-{secrets.token_hex(8)}"
     command = [
         str(CURL_PATH),
+        "--disable",
         "--silent",
         "--show-error",
-        "--insecure",
+        "--proto",
+        "=https",
         "--path-as-is",
         "--resolve",
         f"{host}:{port}:127.0.0.1",
@@ -4932,6 +6183,8 @@ def assert_probe_response(
         "--write-out",
         "%{http_code}",
     ]
+    if insecure:
+        command.append("--insecure")
     if accept_encoding is not None:
         command.extend(["--header", f"Accept-Encoding: {accept_encoding}"])
     command.append(f"https://{host}:{port}{route}")
@@ -4974,6 +6227,209 @@ def assert_probe_response(
         for path in (response, headers):
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
+
+
+def assert_release_http_contract(
+    profile: StaticProfile,
+    inventory: InventoryContract,
+    port: int,
+    work_directory: Path,
+    deadline: float,
+    *,
+    insecure: bool,
+    redirect_domains: tuple[str, ...] | None = None,
+) -> None:
+    for item in inventory.files:
+        if item.route.startswith("/assets/"):
+            cache_control = "public, max-age=3600"
+        elif item.route == "/" or item.route.endswith(".html") or item.route.endswith("/"):
+            cache_control = "no-cache"
+        else:
+            cache_control = None
+        assert_probe_response(
+            profile.canonical_domain,
+            port,
+            item.route,
+            work_directory,
+            deadline,
+            expected_status=200,
+            expected_sha256=item.sha256,
+            expected_cache_control=cache_control,
+            insecure=insecure,
+        )
+    not_found = next((item for item in inventory.files if item.file == "404.html"), None)
+    if not_found is None:
+        fail("route inventory must contain 404.html for production Caddy error handling")
+    assert_probe_response(
+        profile.canonical_domain,
+        port,
+        f"/.vps-probe-missing-{secrets.token_hex(8)}",
+        work_directory,
+        deadline,
+        expected_status=404,
+        expected_sha256=not_found.sha256,
+        expected_cache_control="no-cache",
+        insecure=insecure,
+    )
+    html_item = next(
+        (item for item in inventory.files if item.file.endswith(".html") and item.size > 1024),
+        None,
+    )
+    if html_item is None:
+        fail("route inventory must contain an HTML item larger than 1024 bytes")
+    assert_probe_response(
+        profile.canonical_domain,
+        port,
+        html_item.route,
+        work_directory,
+        deadline,
+        expected_status=200,
+        accept_encoding="gzip",
+        expected_content_encoding="gzip",
+        insecure=insecure,
+    )
+    redirects = profile.redirect_domains if redirect_domains is None else redirect_domains
+    for redirect_domain in redirects:
+        assert_probe_response(
+            redirect_domain,
+            port,
+            "/probe?value=1",
+            work_directory,
+            deadline,
+            expected_status=308,
+            expected_location=f"https://{profile.canonical_domain}/probe?value=1",
+            insecure=insecure,
+        )
+
+
+def probe_live_release(
+    inventory: InventoryContract,
+    profile: StaticProfile,
+    work_directory: Path,
+    max_probe_seconds: int,
+) -> None:
+    probe_deadline = time.monotonic() + max_probe_seconds
+    wait_for_probe(
+        profile.canonical_domain,
+        443,
+        work_directory,
+        probe_deadline,
+        insecure=False,
+    )
+    assert_release_http_contract(
+        profile,
+        inventory,
+        443,
+        work_directory,
+        probe_deadline,
+        insecure=False,
+        redirect_domains=profile.live_redirect_domains,
+    )
+
+
+def probe_live_health(
+    inventory: InventoryContract,
+    profile: StaticProfile,
+    work_directory: Path,
+    max_probe_seconds: int,
+) -> None:
+    required = (
+        next((item for item in inventory.files if item.route == "/"), None),
+        next((item for item in inventory.files if item.file == "404.html"), None),
+        next(
+            (
+                item
+                for item in inventory.files
+                if item.file.endswith(".html") and item.size > 1024
+            ),
+            None,
+        ),
+    )
+    if any(item is None for item in required):
+        fail("persisted route inventory is missing a live health-probe route")
+    selected: list[RouteFile] = []
+    for item in required:
+        assert item is not None
+        if item not in selected:
+            selected.append(item)
+    asset = next(
+        (item for item in inventory.files if item.route.startswith("/assets/")),
+        None,
+    )
+    if asset is not None and asset not in selected:
+        selected.append(asset)
+    health_inventory = dataclasses.replace(
+        inventory,
+        file_count=len(selected),
+        files=tuple(selected),
+    )
+    probe_deadline = time.monotonic() + max_probe_seconds
+    wait_for_probe(
+        profile.canonical_domain,
+        443,
+        work_directory,
+        probe_deadline,
+        insecure=False,
+    )
+    assert_release_http_contract(
+        profile,
+        health_inventory,
+        443,
+        work_directory,
+        probe_deadline,
+        insecure=False,
+        redirect_domains=profile.live_redirect_domains,
+    )
+
+
+def assert_live_caddy_runtime(
+    caddy_image: str,
+    work_directory: Path,
+    *,
+    expected_identifier: str | None = None,
+) -> str:
+    environment = safe_environment(work_directory)
+    containers = run_checked(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "ls",
+            "--no-trunc",
+            "--quiet",
+            "--filter",
+            "label=com.docker.compose.project=vps-public-static-edge",
+            "--filter",
+            "label=com.docker.compose.service=caddy",
+            "--filter",
+            "status=running",
+        ],
+        environment=environment,
+        timeout=30,
+    )
+    identifiers = containers.stdout.splitlines()
+    if (
+        containers.stderr
+        or len(identifiers) != 1
+        or re.fullmatch(r"[0-9a-f]{64}", identifiers[0]) is None
+    ):
+        fail("the live public edge does not have exactly one running Caddy container")
+    if expected_identifier is not None and identifiers[0] != expected_identifier:
+        fail("the live public edge Caddy container changed during deployment")
+    runtime = run_checked(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            "{{.Config.Image}}\t{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+            identifiers[0],
+        ],
+        environment=environment,
+        timeout=30,
+    )
+    if runtime.stderr or runtime.stdout != f"{caddy_image}\thealthy\n":
+        fail("the live public edge is unhealthy or does not use the promoted Caddy image")
+    return identifiers[0]
 
 
 def probe_release(
@@ -5024,6 +6480,10 @@ def probe_release(
             "--rm",
             "--name",
             name,
+            "--label",
+            f"{STATIC_PROBE_LABEL}=true",
+            "--label",
+            f"{STATIC_PROBE_APPLICATION_LABEL}={profile.application}",
             "--read-only",
             "--user",
             "65534:65534",
@@ -5072,6 +6532,10 @@ def probe_release(
             "--detach",
             "--name",
             name,
+            "--label",
+            f"{STATIC_PROBE_LABEL}=true",
+            "--label",
+            f"{STATIC_PROBE_APPLICATION_LABEL}={profile.application}",
             "--pull",
             "never",
             "--read-only",
@@ -5122,62 +6586,14 @@ def probe_release(
             fail("temporary Caddy returned an invalid loopback port")
         port = int(match.group(1))
         wait_for_probe(profile.canonical_domain, port, work_directory, probe_deadline)
-        for item in inventory.files:
-            if item.route.startswith("/assets/"):
-                cache_control = "public, max-age=3600"
-            elif item.route == "/" or item.route.endswith(".html") or item.route.endswith("/"):
-                cache_control = "no-cache"
-            else:
-                cache_control = None
-            assert_probe_response(
-                profile.canonical_domain,
-                port,
-                item.route,
-                work_directory,
-                probe_deadline,
-                expected_status=200,
-                expected_sha256=item.sha256,
-                expected_cache_control=cache_control,
-            )
-        not_found = next((item for item in inventory.files if item.file == "404.html"), None)
-        if not_found is None:
-            fail("route inventory must contain 404.html for production Caddy error handling")
-        assert_probe_response(
-            profile.canonical_domain,
+        assert_release_http_contract(
+            profile,
+            inventory,
             port,
-            f"/.vps-probe-missing-{secrets.token_hex(8)}",
             work_directory,
             probe_deadline,
-            expected_status=404,
-            expected_sha256=not_found.sha256,
-            expected_cache_control="no-cache",
+            insecure=True,
         )
-        html_item = next(
-            (item for item in inventory.files if item.file.endswith(".html") and item.size > 1024),
-            None,
-        )
-        if html_item is None:
-            fail("route inventory must contain an HTML item larger than 1024 bytes")
-        assert_probe_response(
-            profile.canonical_domain,
-            port,
-            html_item.route,
-            work_directory,
-            probe_deadline,
-            expected_status=200,
-            accept_encoding="gzip",
-            expected_content_encoding="gzip",
-        )
-        for redirect_domain in profile.redirect_domains:
-            assert_probe_response(
-                redirect_domain,
-                port,
-                "/probe?value=1",
-                work_directory,
-                probe_deadline,
-                expected_status=308,
-                expected_location=f"https://{profile.canonical_domain}/probe?value=1",
-            )
     except BaseException as exc:
         failure = exc
     finally:
@@ -5306,13 +6722,48 @@ def validate_current_link(
         os.close(app_fd)
 
 
+def get_current_target(
+    current: Path,
+    releases: Path,
+    *,
+    expected_uid: int = 0,
+) -> str | None:
+    app_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        require_safe_directory_fd(
+            app_fd,
+            "application root",
+            expected_uid=expected_uid,
+        )
+        releases_fd = os.open(
+            releases.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=app_fd,
+        )
+        try:
+            require_safe_directory_fd(
+                releases_fd,
+                "release root",
+                expected_uid=expected_uid,
+            )
+            return read_current_target(
+                app_fd,
+                releases_fd,
+                expected_uid=expected_uid,
+            )
+        finally:
+            os.close(releases_fd)
+    finally:
+        os.close(app_fd)
+
+
 def activate_release(
     current: Path,
     release_name: str,
     releases: Path,
     *,
     expected_uid: int = 0,
-) -> None:
+) -> tuple[str | None, bool]:
     app_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary_name = f".current-{secrets.token_hex(8)}"
     rollback_name = f".current-rollback-{secrets.token_hex(8)}"
@@ -5348,7 +6799,7 @@ def activate_release(
             new_target = f"releases/{release_name}"
             if old_target == new_target:
                 os.fsync(app_fd)
-                return
+                return old_target, False
             os.symlink(new_target, temporary_name, dir_fd=app_fd)
             os.fsync(app_fd)
             os.replace(
@@ -5379,6 +6830,7 @@ def activate_release(
                         f"{activation_error}; {rollback_error}"
                     )
                 fail(f"activation fsync failed; previous current was restored: {activation_error}")
+            return old_target, True
         finally:
             os.close(releases_fd)
     finally:
@@ -5386,6 +6838,725 @@ def activate_release(
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(name, dir_fd=app_fd)
         os.close(app_fd)
+
+
+def restore_current_target(
+    current: Path,
+    previous_target: str | None,
+    releases: Path,
+    *,
+    expected_uid: int = 0,
+) -> None:
+    app_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary_name = f".current-restore-{secrets.token_hex(8)}"
+    try:
+        require_safe_directory_fd(
+            app_fd,
+            "application root",
+            expected_uid=expected_uid,
+        )
+        releases_fd = os.open(
+            releases.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=app_fd,
+        )
+        try:
+            require_safe_directory_fd(
+                releases_fd,
+                "release root",
+                expected_uid=expected_uid,
+            )
+            read_current_target(
+                app_fd,
+                releases_fd,
+                expected_uid=expected_uid,
+            )
+            if previous_target is None:
+                try:
+                    os.unlink("current", dir_fd=app_fd)
+                except FileNotFoundError:
+                    pass
+                os.fsync(app_fd)
+                return
+            match = re.fullmatch(r"releases/(sha256-[0-9a-f]{64})", previous_target)
+            if match is None:
+                fail("previous current target is invalid")
+            previous_fd = open_release_directory(
+                releases_fd,
+                match.group(1),
+                expected_uid=expected_uid,
+            )
+            os.close(previous_fd)
+            os.symlink(previous_target, temporary_name, dir_fd=app_fd)
+            os.fsync(app_fd)
+            os.replace(
+                temporary_name,
+                "current",
+                src_dir_fd=app_fd,
+                dst_dir_fd=app_fd,
+            )
+            os.fsync(app_fd)
+        finally:
+            os.close(releases_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=app_fd)
+        os.close(app_fd)
+
+
+def cleanup_static_filesystem_residue(
+    application: str,
+    app_root: Path,
+    releases: Path,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    if application not in PROFILES or app_root != PRODUCTION_ROOT / application:
+        fail("static filesystem cleanup application root is invalid")
+    if releases != app_root / "releases":
+        fail("static filesystem cleanup release root is invalid")
+    if expected_uid < 0 or expected_gid < 0:
+        fail("static filesystem cleanup owner is invalid")
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        fail("static filesystem cleanup requires symlink-safe recursive removal")
+
+    releases_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        releases_metadata = os.fstat(releases_fd)
+        require_safe_directory_fd(
+            releases_fd,
+            "release root",
+            expected_uid=expected_uid,
+        )
+        staging_names = sorted(
+            name
+            for name in os.listdir(releases_fd)
+            if re.fullmatch(r"\.sha256-[0-9a-f]{64}-[0-9a-f]{16}", name)
+        )
+        if len(staging_names) > 16:
+            fail("static filesystem cleanup exceeded its staging-directory limit")
+        for name in staging_names:
+            metadata = os.stat(name, dir_fd=releases_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+                or metadata.st_dev != releases_metadata.st_dev
+                or stat.S_IMODE(metadata.st_mode) not in {0o700, 0o755}
+            ):
+                fail("static staging residue is not one protected directory")
+            shutil.rmtree(name, dir_fd=releases_fd)
+        if staging_names:
+            os.fsync(releases_fd)
+    finally:
+        os.close(releases_fd)
+
+    app_fd = os.open(app_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        require_safe_directory_fd(
+            app_fd,
+            "application root",
+            expected_uid=expected_uid,
+        )
+        temporary_names = sorted(
+            name
+            for name in os.listdir(app_fd)
+            if re.fullmatch(
+                r"\.current-(?:rollback-|restore-)?[0-9a-f]{16}",
+                name,
+            )
+        )
+        if len(temporary_names) > 16:
+            fail("static filesystem cleanup exceeded its temporary-link limit")
+        for name in temporary_names:
+            metadata = os.stat(name, dir_fd=app_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+            ):
+                fail("static current-link residue is not one protected symlink")
+            os.unlink(name, dir_fd=app_fd)
+        if temporary_names:
+            os.fsync(app_fd)
+    finally:
+        os.close(app_fd)
+
+
+def recover_interrupted_deployment(
+    application: str,
+    current: Path,
+    releases: Path,
+) -> None:
+    transaction = read_deployment_transaction(application)
+    if transaction is None:
+        return
+    actual_target = get_current_target(current, releases)
+    active = read_deployment_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        f"{application}.json",
+        "active deployment state",
+    )
+    allowed_targets = {transaction.previous_target, transaction.expected_target}
+    if actual_target not in allowed_targets:
+        fail(
+            "interrupted static deployment found an unexpected current target; "
+            "operator recovery is required"
+        )
+    if active == transaction.candidate:
+        if actual_target != transaction.expected_target:
+            fail(
+                "interrupted static deployment has a committed state but an "
+                "unexpected current target"
+            )
+        validate_persisted_release(transaction.candidate, releases)
+        fsync_static_state_directory(
+            STATIC_ACTIVE_STATE_ROOT,
+            "active deployment state directory",
+        )
+        remove_protected_state_file(
+            STATIC_TRANSACTION_ROOT,
+            f"{application}.json",
+            "deployment transaction",
+        )
+        return
+    if active is not None and active != transaction.previous_state:
+        fail(
+            "interrupted static deployment found an unexpected active state; "
+            "operator recovery is required"
+        )
+
+    if transaction.phase == "probed":
+        if actual_target == transaction.expected_target:
+            validate_persisted_release(transaction.candidate, releases)
+            write_deployment_state_file(
+                STATIC_ACTIVE_STATE_ROOT,
+                f"{application}.json",
+                transaction.candidate,
+                "active deployment state",
+            )
+            remove_protected_state_file(
+                STATIC_TRANSACTION_ROOT,
+                f"{application}.json",
+                "deployment transaction",
+            )
+            print(
+                "completed a probed static deployment after an interrupted commit: "
+                f"{application}",
+                file=sys.stderr,
+            )
+            return
+        if transaction.previous_state is not None:
+            validate_persisted_release(transaction.previous_state, releases)
+        restore_previous_active_state(transaction)
+        remove_protected_state_file(
+            STATIC_TRANSACTION_ROOT,
+            f"{application}.json",
+            "deployment transaction",
+        )
+        print(
+            "preserved the previous static deployment after an interrupted "
+            f"post-probe rollback: {application}",
+            file=sys.stderr,
+        )
+        return
+
+    if transaction.phase == "probe-rejected":
+        rollback_deployment_transaction(
+            transaction,
+            current,
+            releases,
+            quarantine=True,
+        )
+        print(
+            "rolled back an interrupted rejected static deployment and "
+            f"quarantined it conservatively: {application}",
+            file=sys.stderr,
+        )
+        return
+
+    if transaction.phase == "superseded":
+        rollback_deployment_transaction(
+            transaction,
+            current,
+            releases,
+            quarantine=False,
+        )
+        print(
+            "rolled back an interrupted superseded static deployment: "
+            f"{application}",
+            file=sys.stderr,
+        )
+        return
+
+    if transaction.phase == "prepared" and actual_target == transaction.previous_target:
+        if transaction.previous_state is not None:
+            validate_persisted_release(transaction.previous_state, releases)
+        restore_previous_active_state(transaction)
+        remove_protected_state_file(
+            STATIC_TRANSACTION_ROOT,
+            f"{application}.json",
+            "deployment transaction",
+        )
+        print(
+            "removed a prepared static deployment that had not switched live: "
+            f"{application}",
+            file=sys.stderr,
+        )
+        return
+
+    if (
+        transaction.previous_state is None
+        and transaction.previous_target == transaction.expected_target
+        and actual_target == transaction.expected_target
+    ):
+        remove_protected_state_file(
+            STATIC_TRANSACTION_ROOT,
+            f"{application}.json",
+            "deployment transaction",
+        )
+        print(
+            "left an existing untracked static release unchanged after recovery: "
+            f"{application}",
+            file=sys.stderr,
+        )
+        return
+
+    rollback_deployment_transaction(
+        transaction,
+        current,
+        releases,
+        quarantine=True,
+    )
+    print(
+        "recovered an interrupted static deployment and quarantined its candidate: "
+        f"{application}",
+        file=sys.stderr,
+    )
+
+
+def prepare_live_deployment(
+    candidate: DeploymentState,
+    current: Path,
+    releases: Path,
+) -> tuple[bool, DeploymentState | None]:
+    for path, label in (
+        (STATIC_STATE_ROOT, "static deployment state root"),
+        (STATIC_ACTIVE_STATE_ROOT, "active deployment state directory"),
+        (STATIC_INVENTORY_STATE_ROOT, "persisted inventory directory"),
+        (STATIC_QUARANTINE_ROOT, "quarantine directory"),
+        (STATIC_TRANSACTION_ROOT, "transaction directory"),
+    ):
+        descriptor = open_static_state_directory(path, label)
+        os.close(descriptor)
+    recover_interrupted_deployment(candidate.application, current, releases)
+    quarantine = read_deployment_state_file(
+        STATIC_QUARANTINE_ROOT,
+        quarantine_name(candidate),
+        "quarantined deployment state",
+    )
+    if quarantine is not None:
+        if quarantine != candidate:
+            fail("quarantine fingerprint collision or corrupted candidate state")
+        fail("candidate is quarantined after a previous live activation failure")
+    active = read_deployment_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        f"{candidate.application}.json",
+        "active deployment state",
+    )
+    actual_target = get_current_target(current, releases)
+    if active is not None:
+        expected_active_target = release_target_for_state(active)
+        if actual_target != expected_active_target:
+            fail("active deployment state does not match the protected current symlink")
+        if (
+            active.source_revision == candidate.source_revision
+            and (
+                active.site_reference != candidate.site_reference
+                or active.routes_reference != candidate.routes_reference
+            )
+        ):
+            fail("one source revision resolved to different site or route digests")
+    if active == candidate:
+        if actual_target != release_target_for_state(candidate):
+            fail("candidate state is active but its release target is not current")
+        return False, active
+    return True, active
+
+
+def activate_live_release(
+    candidate: DeploymentState,
+    profile: StaticProfile,
+    inventory: InventoryContract,
+    current: Path,
+    releases: Path,
+    release_name: str,
+    work_directory: Path,
+    *,
+    previous_active_state: DeploymentState | None,
+) -> None:
+    if previous_active_state is not None:
+        validate_persisted_release(previous_active_state, releases)
+    caddy_identifier = assert_live_caddy_runtime(
+        candidate.caddy_image,
+        work_directory,
+    )
+    assert_current_source_revision(
+        profile,
+        candidate.source_revision,
+        work_directory,
+    )
+    previous_target = get_current_target(current, releases)
+    transaction = DeploymentTransaction(
+        candidate=candidate,
+        previous_state=previous_active_state,
+        previous_target=previous_target,
+        expected_target=f"releases/{release_name}",
+        phase="prepared",
+    )
+    write_deployment_transaction(transaction)
+    activated_from, changed = activate_release(current, release_name, releases)
+    if activated_from != previous_target:
+        fail("current target changed while the activation lock was held")
+    switched = dataclasses.replace(transaction, phase="switched")
+    try:
+        write_deployment_transaction(switched)
+    except BaseException as phase_error:
+        try:
+            recover_interrupted_deployment(candidate.application, current, releases)
+        except BaseException as recovery_error:
+            raise StaticDeploymentError(
+                "the live release switched but its transaction phase and immediate "
+                f"recovery both failed: {phase_error}; {recovery_error}"
+            ) from recovery_error
+        raise StaticDeploymentError(
+            "the live release switch was recovered after its transaction phase "
+            f"could not be made durable: {phase_error}"
+        ) from phase_error
+    transaction = switched
+    try:
+        probe_live_release(
+            inventory,
+            profile,
+            work_directory,
+            profile.probe_timeout_seconds,
+        )
+    except BaseException as probe_error:
+        if not changed and previous_active_state is None:
+            try:
+                remove_protected_state_file(
+                    STATIC_TRANSACTION_ROOT,
+                    f"{candidate.application}.json",
+                    "deployment transaction",
+                )
+            except BaseException as cleanup_error:
+                raise StaticDeploymentError(
+                    "existing untracked release failed live HTTPS verification and "
+                    f"its transaction could not be cleared: {probe_error}; "
+                    f"{cleanup_error}"
+                ) from cleanup_error
+            raise StaticDeploymentError(
+                "existing untracked release failed live HTTPS verification; "
+                f"the current symlink was left unchanged: {probe_error}"
+            ) from probe_error
+
+        rejected = dataclasses.replace(transaction, phase="probe-rejected")
+        try:
+            write_deployment_transaction(rejected)
+        except BaseException as phase_error:
+            try:
+                rollback_deployment_transaction(
+                    transaction,
+                    current,
+                    releases,
+                    quarantine=False,
+                )
+            except BaseException as rollback_error:
+                raise StaticDeploymentError(
+                    "live HTTPS probe failed and neither its rollback phase nor "
+                    f"rollback could be made durable: {probe_error}; {phase_error}; "
+                    f"{rollback_error}"
+                ) from rollback_error
+            raise StaticDeploymentError(
+                "live HTTPS probe failed; the previous release was restored "
+                "without quarantine because the classification phase failed: "
+                f"{probe_error}; {phase_error}"
+            ) from phase_error
+        try:
+            restore_deployment_transaction(
+                rejected,
+                current,
+                releases,
+            )
+        except BaseException as rollback_error:
+            raise StaticDeploymentError(
+                "live HTTPS probe failed and rollback could not be made "
+                f"durable: {probe_error}; {rollback_error}"
+            ) from rollback_error
+
+        try:
+            assert_live_caddy_runtime(
+                candidate.caddy_image,
+                work_directory,
+                expected_identifier=caddy_identifier,
+            )
+            assert_current_source_revision(
+                profile,
+                candidate.source_revision,
+                work_directory,
+            )
+        except BaseException as prerequisite_error:
+            superseded = dataclasses.replace(rejected, phase="superseded")
+            phase_error: BaseException | None = None
+            try:
+                write_deployment_transaction(superseded)
+            except BaseException as error:
+                phase_error = error
+            if phase_error is not None:
+                raise StaticDeploymentError(
+                    "the public probe failed after a live prerequisite changed; "
+                    "the previous release was restored, but the rejected journal "
+                    "was retained for conservative recovery because superseded "
+                    f"state could not be recorded: {probe_error}; "
+                    f"{prerequisite_error}; {phase_error}"
+                ) from phase_error
+            try:
+                remove_protected_state_file(
+                    STATIC_TRANSACTION_ROOT,
+                    f"{candidate.application}.json",
+                    "deployment transaction",
+                )
+            except BaseException as cleanup_error:
+                raise StaticDeploymentError(
+                    "the previous release was restored after a prerequisite "
+                    "change, but its superseded transaction could not be "
+                    f"cleared: {probe_error}; {prerequisite_error}; "
+                    f"{cleanup_error}"
+                ) from cleanup_error
+            raise StaticDeploymentError(
+                "the public probe failed after a live prerequisite changed; the "
+                "previous release was already restored without quarantine: "
+                f"{probe_error}; {prerequisite_error}"
+            ) from prerequisite_error
+        try:
+            write_deployment_state_file(
+                STATIC_QUARANTINE_ROOT,
+                quarantine_name(candidate),
+                candidate,
+                "quarantined deployment state",
+            )
+        except BaseException as quarantine_error:
+            raise StaticDeploymentError(
+                "live HTTPS probe failed and the previous release was restored, "
+                "but quarantine state could not be made durable: "
+                f"{probe_error}; {quarantine_error}"
+            ) from quarantine_error
+        try:
+            remove_protected_state_file(
+                STATIC_TRANSACTION_ROOT,
+                f"{candidate.application}.json",
+                "deployment transaction",
+            )
+        except BaseException as cleanup_error:
+            raise StaticDeploymentError(
+                "live HTTPS probe failed and the previous release was restored "
+                "and quarantined, but its transaction could not be cleared: "
+                f"{probe_error}; {cleanup_error}"
+            ) from cleanup_error
+        raise StaticDeploymentError(
+            "live HTTPS probe failed; the previous release was restored "
+            f"and the candidate quarantined: {probe_error}"
+        ) from probe_error
+
+    try:
+        write_persisted_inventory(candidate, inventory)
+    except BaseException as inventory_error:
+        try:
+            rollback_deployment_transaction(
+                transaction,
+                current,
+                releases,
+                quarantine=False,
+            )
+        except BaseException as rollback_error:
+            raise StaticDeploymentError(
+                "the live probe passed, but the protected inventory and rollback "
+                f"both failed: {inventory_error}; {rollback_error}"
+            ) from rollback_error
+        raise StaticDeploymentError(
+            "the live probe passed, but its protected inventory could not be "
+            f"persisted; the previous release was restored: {inventory_error}"
+        ) from inventory_error
+
+    try:
+        assert_live_caddy_runtime(
+            candidate.caddy_image,
+            work_directory,
+            expected_identifier=caddy_identifier,
+        )
+        assert_current_source_revision(
+            profile,
+            candidate.source_revision,
+            work_directory,
+        )
+    except BaseException as superseded_error:
+        superseded = dataclasses.replace(transaction, phase="superseded")
+        phase_error: BaseException | None = None
+        try:
+            write_deployment_transaction(superseded)
+        except BaseException as error:
+            phase_error = error
+        try:
+            rollback_deployment_transaction(
+                superseded,
+                current,
+                releases,
+                quarantine=False,
+            )
+        except BaseException as rollback_error:
+            raise StaticDeploymentError(
+                "a live prerequisite changed after the public probe and rollback "
+                f"failed: {superseded_error}; {phase_error}; {rollback_error}"
+            ) from rollback_error
+        raise StaticDeploymentError(
+            "a live prerequisite changed after the public probe; the previous "
+            "release was restored without quarantining the valid candidate: "
+            f"{superseded_error}"
+        ) from superseded_error
+
+    probed = dataclasses.replace(transaction, phase="probed")
+    try:
+        write_deployment_transaction(probed)
+    except BaseException as phase_error:
+        try:
+            persisted_transaction = read_deployment_transaction(candidate.application)
+        except BaseException as read_error:
+            try:
+                actual_target = get_current_target(current, releases)
+                active = read_deployment_state_file(
+                    STATIC_ACTIVE_STATE_ROOT,
+                    f"{candidate.application}.json",
+                    "active deployment state",
+                )
+                if (
+                    actual_target
+                    not in {transaction.previous_target, transaction.expected_target}
+                    or active != transaction.previous_state
+                ):
+                    fail("the in-memory rollback state no longer matches live state")
+                rollback_deployment_transaction(
+                    transaction,
+                    current,
+                    releases,
+                    quarantine=False,
+                )
+            except BaseException as rollback_error:
+                raise StaticDeploymentError(
+                    "the successful live probe phase write failed; neither its "
+                    "durable transaction nor a safe rollback could be completed: "
+                    f"{phase_error}; {read_error}; {rollback_error}"
+                ) from rollback_error
+            raise StaticDeploymentError(
+                "the successful live probe phase could not be read back; the "
+                f"previous release was restored without quarantine: {phase_error}; "
+                f"{read_error}"
+            ) from read_error
+        if persisted_transaction is None:
+            try:
+                rollback_deployment_transaction(
+                    transaction,
+                    current,
+                    releases,
+                    quarantine=False,
+                )
+            except BaseException as rollback_error:
+                raise StaticDeploymentError(
+                    "the successful live probe lost its durable transaction and "
+                    f"rollback failed: {phase_error}; {rollback_error}"
+                ) from rollback_error
+            raise StaticDeploymentError(
+                "the successful live probe lost its durable transaction; the "
+                f"previous release was restored without quarantine: {phase_error}"
+            ) from phase_error
+        if persisted_transaction == transaction:
+            try:
+                rollback_deployment_transaction(
+                    transaction,
+                    current,
+                    releases,
+                    quarantine=False,
+                )
+            except BaseException as rollback_error:
+                raise StaticDeploymentError(
+                    "the successful live probe phase was not durable and rollback "
+                    f"failed: {phase_error}; {rollback_error}"
+                ) from rollback_error
+            raise StaticDeploymentError(
+                "the successful live probe phase was not durable; the previous "
+                f"release was restored without quarantine: {phase_error}"
+            ) from phase_error
+        if persisted_transaction != probed:
+            raise StaticDeploymentError(
+                "the successful live probe phase write left an unexpected durable "
+                f"transaction: {phase_error}"
+            ) from phase_error
+        try:
+            recover_interrupted_deployment(candidate.application, current, releases)
+        except BaseException as recovery_error:
+            raise StaticDeploymentError(
+                "the successful live probe could not be recorded or recovered: "
+                f"{phase_error}; {recovery_error}"
+            ) from recovery_error
+        active = read_deployment_state_file(
+            STATIC_ACTIVE_STATE_ROOT,
+            f"{candidate.application}.json",
+            "active deployment state",
+        )
+        if (
+            active == candidate
+            and get_current_target(current, releases) == probed.expected_target
+        ):
+            return
+        raise StaticDeploymentError(
+            "the successful live probe was not committed because its phase could "
+            f"not be made durable: {phase_error}"
+        ) from phase_error
+
+    try:
+        write_deployment_state_file(
+            STATIC_ACTIVE_STATE_ROOT,
+            f"{candidate.application}.json",
+            candidate,
+            "active deployment state",
+        )
+        remove_protected_state_file(
+            STATIC_TRANSACTION_ROOT,
+            f"{candidate.application}.json",
+            "deployment transaction",
+        )
+    except BaseException as commit_error:
+        try:
+            recover_interrupted_deployment(candidate.application, current, releases)
+        except BaseException as recovery_error:
+            raise StaticDeploymentError(
+                "the probed live release could not finish its active-state commit "
+                f"or immediate recovery: {commit_error}; {recovery_error}"
+            ) from recovery_error
+        active = read_deployment_state_file(
+            STATIC_ACTIVE_STATE_ROOT,
+            f"{candidate.application}.json",
+            "active deployment state",
+        )
+        if (
+            active != candidate
+            or get_current_target(current, releases) != probed.expected_target
+        ):
+            raise StaticDeploymentError(
+                "the probed live release was not active after commit recovery: "
+                f"{commit_error}"
+            ) from commit_error
 
 
 @contextlib.contextmanager
@@ -5408,6 +7579,43 @@ def deployment_lock() -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)
+
+
+def recover_live_deployments(application: str | None = None) -> None:
+    if os.geteuid() != 0 or os.getegid() != 0:
+        fail("live static deployment recovery must run as root")
+    applications = sorted(PROFILES) if application is None else [application]
+    if any(item not in PROFILES for item in applications):
+        fail("live static deployment recovery application is invalid")
+    with deployment_lock():
+        for item in applications:
+            app_root = PRODUCTION_ROOT / item
+            releases = app_root / "releases"
+            for path in (PRODUCTION_ROOT, app_root, releases):
+                metadata = path.lstat()
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != 0
+                    or metadata.st_gid != 0
+                    or metadata.st_mode & 0o022
+                ):
+                    fail(f"static release root {path} is unsafe during recovery")
+            for path, label in (
+                (STATIC_STATE_ROOT, "static deployment state root"),
+                (STATIC_ACTIVE_STATE_ROOT, "active deployment state directory"),
+                (STATIC_INVENTORY_STATE_ROOT, "persisted inventory directory"),
+                (STATIC_QUARANTINE_ROOT, "quarantine directory"),
+                (STATIC_TRANSACTION_ROOT, "transaction directory"),
+            ):
+                descriptor = open_static_state_directory(path, label)
+                os.close(descriptor)
+            cleanup_probe_containers(item)
+            cleanup_static_filesystem_residue(item, app_root, releases)
+            recover_interrupted_deployment(
+                item,
+                app_root / "current",
+                releases,
+            )
 
 
 def refuse_isolated_worker_residue_locked() -> None:
@@ -5483,6 +7691,31 @@ def refuse_isolated_worker_residue_locked() -> None:
         fail("refusing deployment with residual isolated worker runtime state")
 
 
+def deployment_temporary_root(application: str, activate_live: bool) -> Path:
+    configured = os.environ.get(STATIC_RUNTIME_DIRECTORY_ENV)
+    if not activate_live:
+        if configured is not None:
+            fail("static runtime directory is reserved for live activation")
+        return Path("/var/tmp")
+    expected = re.fullmatch(
+        rf"/run/(vps-static-live-{re.escape(application)}-[0-9a-f]{{24}})",
+        configured or "",
+    )
+    if expected is None:
+        fail("live activation requires its exact transient runtime directory")
+    runtime_root = Path(configured)
+    metadata = runtime_root.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail("live activation runtime directory is not protected")
+    return runtime_root
+
+
 def deploy(
     application: str,
     source_revision: str,
@@ -5491,6 +7724,8 @@ def deploy(
     integration_revision: str,
     integration_reference: str,
     caddy_image: str,
+    *,
+    activate_live: bool = False,
 ) -> None:
     profile = PROFILES.get(application)
     if profile is None:
@@ -5508,6 +7743,16 @@ def deploy(
     )
     if not CADDY_IMAGE_RE.fullmatch(caddy_image):
         fail("Caddy image must be an immutable vps-infra/caddy GHCR reference")
+    candidate = DeploymentState(
+        application=application,
+        source_revision=source_revision,
+        site_reference=site_reference,
+        routes_reference=routes_reference,
+        integration_revision=integration_revision,
+        integration_reference=integration_reference,
+        caddy_image=caddy_image,
+    )
+    validate_deployment_state(candidate)
     validate_runtime()
     promoted_caddy_image = read_promoted_caddy_image(
         PLATFORM_ENV_PATH,
@@ -5515,6 +7760,37 @@ def deploy(
     )
     if caddy_image != promoted_caddy_image:
         fail("Caddy image does not match the protected platform promotion point")
+    (
+        promoted_integration_revision,
+        promoted_integration_reference,
+        static_caddy_image,
+        enabled_static_applications,
+    ) = read_static_production_pins(
+        STATIC_PRODUCTION_CONTRACT_PATH,
+        require_root_owner=True,
+    )
+    if (
+        integration_revision != promoted_integration_revision
+        or integration_reference != promoted_integration_reference
+    ):
+        fail("platform integration does not match the static production promotion point")
+    if caddy_image != static_caddy_image:
+        fail("Caddy image does not match the static production promotion point")
+    application_enablement = read_application_production_enablement(
+        APPLICATION_PRODUCTION_CONTRACT_PATH,
+        require_root_owner=True,
+    )
+    active_application_enablement = read_active_application_enablement(
+        APPLICATION_ACTIVE_MANIFEST_PATH,
+        APPLICATION_ACTIVE_STATE_PATH,
+        require_root_owner=True,
+    )
+    assert_static_activation_mode(
+        application,
+        enabled_static_applications,
+        application_enablement,
+        active_application_enablement,
+    )
 
     app_root = PRODUCTION_ROOT / profile.application
     releases = app_root / "releases"
@@ -5526,11 +7802,76 @@ def deploy(
             fail(f"static release root {path} must not be writable by group or others")
 
     with deployment_lock():
+        cleanup_probe_containers(application)
+        cleanup_static_filesystem_residue(application, app_root, releases)
         refuse_isolated_worker_residue_locked()
+        temporary_root = deployment_temporary_root(application, activate_live)
         with tempfile.TemporaryDirectory(
             prefix=f"vps-static-{application}-",
-            dir="/var/tmp",
+            dir=temporary_root,
         ) as temporary_name:
+            temporary_path = Path(temporary_name)
+            if activate_live:
+                assert_current_source_revision(
+                    profile,
+                    source_revision,
+                    temporary_path,
+                )
+                proceed, previous_active_state = prepare_live_deployment(
+                    candidate,
+                    app_root / "current",
+                    releases,
+                )
+                if not proceed:
+                    inventory = read_persisted_inventory(candidate)
+                    release = releases / release_target_for_state(candidate).removeprefix(
+                        "releases/"
+                    )
+                    filesystem_inventory(
+                        release,
+                        inventory,
+                        expected_uid=0,
+                        expected_gid=0,
+                    )
+                    caddy_identifier = assert_live_caddy_runtime(
+                        caddy_image,
+                        temporary_path,
+                    )
+                    assert_current_source_revision(
+                        profile,
+                        source_revision,
+                        temporary_path,
+                    )
+                    probe_live_health(
+                        inventory,
+                        profile,
+                        temporary_path,
+                        min(profile.probe_timeout_seconds, 120),
+                    )
+                    assert_live_caddy_runtime(
+                        caddy_image,
+                        temporary_path,
+                        expected_identifier=caddy_identifier,
+                    )
+                    assert_current_source_revision(
+                        profile,
+                        source_revision,
+                        temporary_path,
+                    )
+                    print(
+                        "static release already active and healthy with the complete "
+                        f"immutable tuple: {application} {source_revision}"
+                    )
+                    return
+                if previous_active_state is not None:
+                    assert_source_revision_descends_from_active(
+                        profile,
+                        previous_active_state.source_revision,
+                        candidate.source_revision,
+                        temporary_path,
+                    )
+            else:
+                previous_active_state = None
             deploy_locked(
                 profile,
                 source_revision,
@@ -5539,9 +7880,12 @@ def deploy(
                 integration_revision,
                 integration_reference,
                 caddy_image,
-                Path(temporary_name),
+                temporary_path,
                 releases,
                 app_root,
+                activate_live=activate_live,
+                candidate=candidate,
+                previous_active_state=previous_active_state,
             )
 
 
@@ -5556,7 +7900,13 @@ def deploy_locked(
     temporary: Path,
     releases: Path,
     app_root: Path,
+    *,
+    activate_live: bool = False,
+    candidate: DeploymentState | None = None,
+    previous_active_state: DeploymentState | None = None,
 ) -> None:
+        if activate_live and candidate is None:
+            fail("live activation requires an exact deployment state")
         application = profile.application
         temporary.chmod(0o755)
         download_root = temporary / "downloads"
@@ -5748,19 +8098,42 @@ def deploy_locked(
                     temporary,
                     profile.probe_timeout_seconds,
                 )
-            activate_release(app_root / "current", release_name, releases)
+            if activate_live:
+                if candidate is None:
+                    fail("live activation lost its exact deployment state")
+                activate_live_release(
+                    candidate,
+                    profile,
+                    inventory,
+                    app_root / "current",
+                    releases,
+                    release_name,
+                    temporary,
+                    previous_active_state=previous_active_state,
+                )
         finally:
             if staging is not None:
                 shutil.rmtree(staging, ignore_errors=True)
-        print(
-            f"static current link updated after local HTTPS probe: {application} "
-            f"{site_layer.manifest_digest} source {source_revision}; "
-            "public TLS was not tested"
-        )
+        if activate_live:
+            print(
+                f"static release activated after strict live HTTPS probe: {application} "
+                f"{site_layer.manifest_digest} source {source_revision}"
+            )
+        else:
+            print(
+                f"static release materialized after local HTTPS probe: {application} "
+                f"{site_layer.manifest_digest} source {source_revision}; "
+                "the current link was left unchanged and public TLS was not tested"
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--activate-live",
+        action="store_true",
+        help="activate through the forced-command live transaction contract",
+    )
     parser.add_argument("application", choices=sorted(PROFILES))
     parser.add_argument("source_revision")
     parser.add_argument("site_reference")
@@ -5774,6 +8147,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     try:
+        if arguments and arguments[0] == "--recover-live":
+            if len(arguments) not in {1, 2}:
+                fail("live recovery received an invalid argument count")
+            application = None if len(arguments) == 1 else arguments[1]
+            recover_live_deployments(application)
+            return 0
         if arguments and arguments[0] == "--extract-worker":
             if len(arguments) != 8:
                 fail("extract worker received an invalid argument count")
@@ -5861,6 +8240,19 @@ def main(argv: list[str] | None = None) -> int:
             _, request, output = arguments
             run_registry_fetch_worker(Path(request), Path(output))
             return 0
+        if arguments and arguments[0] == "--source-ancestry-worker":
+            if len(arguments) != 4:
+                fail("source ancestry worker received an invalid argument count")
+            _, application, active_revision, candidate_revision = arguments
+            profile = PROFILES.get(application)
+            if profile is None:
+                fail("source ancestry worker received an invalid application")
+            run_source_ancestry_worker(
+                profile,
+                active_revision,
+                candidate_revision,
+            )
+            return 0
         args = build_parser().parse_args(arguments)
         deploy(
             args.application,
@@ -5870,6 +8262,7 @@ def main(argv: list[str] | None = None) -> int:
             args.integration_revision,
             args.integration_reference,
             args.caddy_image,
+            activate_live=args.activate_live,
         )
     except (OSError, KeyError, StaticDeploymentError) as exc:
         print(f"static deployment refused: {exc}", file=sys.stderr)

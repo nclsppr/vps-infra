@@ -25,6 +25,10 @@ if [[ -n $platform_integration_revision ]]; then
     }
 fi
 echo "release manifest valid: $REPOSITORY_ROOT/releases/production.yaml"
+"$SCRIPT_DIR/resolve-static-releases" \
+  --contract "$REPOSITORY_ROOT/releases/static-production.json" \
+  --application-contract "$REPOSITORY_ROOT/releases/production.yaml" \
+  --validate-contract
 "$SCRIPT_DIR/verify-github-evidence" \
   "$REPOSITORY_ROOT/releases/production.yaml"
 "$SCRIPT_DIR/check-public-safe" --root "$REPOSITORY_ROOT"
