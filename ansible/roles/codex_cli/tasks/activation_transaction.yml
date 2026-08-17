@@ -111,12 +111,13 @@
     - name: Verify the private Codex App Server before activation commit
       ansible.builtin.include_tasks: verify_app_server.yml
       vars:
-        vps_codex_verify_proxy_smoke: true
-      when: vps_codex_remote_enabled | bool
+        vps_codex_verify_proxy_smoke: >-
+          {{ vps_codex_remote_enabled | bool }}
+      when: vps_codex_app_server_enabled | bool
 
     - name: Verify private Codex App Server disablement before activation commit
       ansible.builtin.include_tasks: verify_app_server_disabled.yml
-      when: not (vps_codex_remote_enabled | bool)
+      when: not (vps_codex_app_server_enabled | bool)
 
   rescue:
     - name: Stop the private Codex App Server after activation failure

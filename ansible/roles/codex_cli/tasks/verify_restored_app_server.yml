@@ -100,7 +100,8 @@
       - >-
         vps_codex_restored_app_server_properties.stdout is search(
         '(?m)^ExecStart=.*/opt/codex/releases/[^ ]+/bin/codex '
-        ~ '.*features\\.code_mode_host=true app-server --listen unix://')
+        ~ '.*features\\.code_mode_host=true app-server'
+        ~ '(?: --remote-control)? --listen unix://')
       - >-
         vps_codex_restored_app_server_properties.stdout is search(
         '(?m)^Environment=.*CODEX_HOME=' ~

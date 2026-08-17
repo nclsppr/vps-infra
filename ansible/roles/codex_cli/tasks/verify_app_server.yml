@@ -80,7 +80,10 @@
       - >-
         vps_codex_app_server_properties.stdout is search(
         '(?m)^ExecStart=.*' ~ (vps_codex_release_path | regex_escape) ~
-        '/bin/codex .*features\\.code_mode_host=true app-server --listen unix://')
+        '/bin/codex .*features\\.code_mode_host=true app-server' ~
+        (' --remote-control' if
+         (vps_codex_remote_control_enabled | bool) else '') ~
+        ' --listen unix://')
       - >-
         vps_codex_app_server_properties.stdout is search(
         '(?m)^Environment=.*CODEX_HOME=' ~

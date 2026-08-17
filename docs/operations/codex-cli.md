@@ -124,6 +124,7 @@ external public-variable file used by convergence:
 vps_codex_remote_enabled: true
 vps_codex_remote_authorized_keys:
   - "ssh-ed25519 AAAA... codex@operator"
+vps_codex_remote_control_enabled: false
 ```
 
 Never place the private key or the concrete production variable file in this
@@ -173,13 +174,57 @@ again. Never retire the proven owner key in the same operation.
 In the Codex desktop app, add an SSH remote connection that uses
 `atlas-codex`. The app starts the bounded App Server command and reaches its
 Unix socket through `codex app-server proxy`. Do not configure a WebSocket URL
-or a public Atlas port. The managed `remote_control` feature remains false.
+or a public Atlas port.
 
-For phone control, keep the signed-in desktop app awake and online, then use
-the same ChatGPT account on the phone. The phone controls the desktop session;
-it does not connect directly to Atlas. If the desktop sleeps, exits, loses its
-network, or loses the SSH key from its agent, the phone cannot start or resume
-the Atlas task.
+## Pair an iPhone directly with Atlas
+
+Direct pairing is an experimental Codex 0.147.0 capability. Public OpenAI
+documentation describes the macOS or Windows desktop relay as the supported
+mobile flow. Atlas uses the pinned Unix implementation without the built-in
+daemon bootstrap or updater.
+
+For a mobile-only Atlas connection, use these external public variables:
+
+```yaml
+vps_codex_remote_enabled: false
+vps_codex_remote_authorized_keys: []
+vps_codex_remote_control_enabled: true
+```
+
+The role keeps the App Server enabled at boot because direct mobile control
+needs it. It does not create the `codex-remote` account, authorize a Codex SSH
+key, or add that account to `AllowUsers`. Set both remote settings to true only
+when both independent paths are required.
+
+First prove that the persistent service is enabled, uses remote control, and
+still has no Internet listener:
+
+```bash
+sudo systemctl is-enabled atlas-codex-app-server.service
+sudo systemctl is-active atlas-codex-app-server.service
+sudo systemctl show atlas-codex-app-server.service --property=ExecStart
+sudo ss -lntup
+```
+
+The first two commands must return `enabled` and `active`. `ExecStart` must
+contain `app-server --remote-control --listen unix://`. The socket listing must
+not contain a Codex TCP or UDP listener.
+
+Generate a short-lived pairing code from the administrator session:
+
+```bash
+sudo /usr/local/sbin/atlas-codex --remote-control-pair
+```
+
+Enter the code immediately in the Remote connection flow on the iPhone while
+the phone uses the same ChatGPT account. Treat the code as a credential. Do
+not put it in Git, an Ansible variable, a pull request, a log, or a chat.
+Successful pairing lets the iPhone reach Atlas through the outbound ChatGPT
+relay. The Mac can be off. The direct path adds no inbound Atlas port.
+
+If the iPhone client does not offer manual-code pairing, stop. Do not publish
+the App Server WebSocket transport. Use the documented desktop relay until a
+compatible mobile client is available.
 
 ## Prepare work
 
@@ -203,7 +248,8 @@ codex
 
 The managed policy permits workspace edits but forbids all approval escalation.
 It also denies command network access, danger-full access, MCP servers, apps,
-plugins, remote control, browser control, and unmanaged hooks.
+plugins, browser control, and unmanaged hooks. Remote control is permitted only
+when the external production variable enables the reviewed outbound relay.
 
 Each supported session receives private `/tmp` and `/var/tmp` tmpfs mounts.
 Each mount has a 512 MiB size ceiling and `nosuid,nodev,noexec`; allocated tmpfs
@@ -227,13 +273,13 @@ the persistent App Server, persistently masks the fixed interactive session,
 and proves both are inactive. It then snapshots every active policy, launcher,
 wrapper, forced-command gate, restricted SSH authorization, service, service
 boot link, sudo gateway, slice, and release selector surface before
-publication. During runtime validation it
-starts the service while the external gateway remains blocked, proves the
-effective unit and socket, and completes a bounded WebSocket upgrade through
-the gate, sudo rule, launcher, and proxy. Only then does it commit and release
-the interlocks. Any failure before commit stops the service and restores the
-exact snapshot. An interrupted published transaction is recovered on the next
-convergence; incomplete recovery remains interlocked.
+publication. During runtime validation it starts the service, proves the
+effective unit and socket, and verifies the configured remote-control startup
+flag. When the desktop gateway is enabled, it also completes a bounded
+WebSocket upgrade through the gate, sudo rule, launcher, and proxy. Only then
+does it commit and release the interlocks. Any failure before commit stops the
+service and restores the exact snapshot. An interrupted published transaction
+is recovered on the next convergence; incomplete recovery remains interlocked.
 
 ## Sensitive state and capacity
 
@@ -282,9 +328,10 @@ make converge-check \
 
 The role proves the version, the loop-backed storage identity and mount
 options, sandbox startup inside the bounded systemd unit, exact primary group,
-the persistent App Server identity and Unix socket, the SSH gateway policy,
-and the inability of the runtime, gateway, and managed command sandbox to read
-or traverse protected host paths. Lease, mask, snapshot, staging, and probe
+and the persistent App Server identity and Unix socket when either remote path
+is enabled. When configured, it separately proves the SSH gateway policy. It
+also proves the inability of the runtime, gateway, and managed command sandbox
+to read or traverse protected host paths. Lease, mask, snapshot, staging, and probe
 operations are temporary safety bookkeeping and do not report durable drift;
 a successful second normal convergence therefore reports `changed=0`. For a
 manual verification, enter through the supported launcher and run:

@@ -26,7 +26,7 @@ ExecCondition=+/usr/local/sbin/atlas-codex --service-admission
 ExecCondition=+/usr/local/sbin/atlas-codex --service-preflight
 ExecCondition=/usr/bin/test -w {{ vps_codex_workspace_root }}
 ExecStartPre=/usr/bin/rm --force {{ vps_codex_app_server_socket }}
-ExecStart={{ vps_codex_release_path }}/bin/codex -c features.code_mode_host=true app-server --listen unix://
+ExecStart={{ vps_codex_release_path }}/bin/codex -c features.code_mode_host=true app-server{% if vps_codex_remote_control_enabled | bool %} --remote-control{% endif %} --listen unix://
 Restart=always
 RestartSec=5s
 KillMode=mixed

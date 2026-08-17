@@ -97,8 +97,9 @@ pas comme un agent permanent privilégié sur le VPS. Il gère au minimum :
 - réseaux Docker externes et unités systemd nécessaires ;
 - outils de récupération d’artefacts, épinglés et vérifiés ;
 - Codex CLI autonome pour les travaux bornés, avec un compte runtime sans
-  sudo, Docker, SSH direct ni accès aux états de production, plus une
-  passerelle SSH distincte vers un App Server sur socket Unix privé ;
+  sudo, Docker, SSH direct ni accès aux états de production, et un App Server
+  sur socket Unix privé pour une passerelle SSH optionnelle ou un relais mobile
+  sortant ;
 - permissions des secrets matérialisés.
 
 Java, Node, Maven, npm, PostgreSQL, Caddy, Prometheus et Grafana ne sont pas

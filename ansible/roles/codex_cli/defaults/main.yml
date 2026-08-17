@@ -4,6 +4,7 @@ vps_codex_group: codex
 vps_codex_remote_user: codex-remote
 vps_codex_remote_group: codex-remote
 vps_codex_remote_enabled: false
+vps_codex_remote_control_enabled: false
 vps_codex_remote_authorized_keys: []
 vps_codex_storage_root: /srv/codex
 vps_codex_storage_image_path: /var/lib/vps-infra/codex-storage.ext4

@@ -51,7 +51,10 @@ Ansible installs the official standalone Codex CLI package with these controls:
    `approval_policy = "never"`, a read-only profile, and one workspace profile.
    A session cannot approve or request escalation. Command network access,
    danger-full access, web search, MCP servers, apps, plugins, browser control,
-   Computer Use, remote control, and unmanaged hooks are disabled.
+   Computer Use, and unmanaged hooks are disabled. Remote control is denied by
+   default and can be permitted only for the reviewed persistent App Server
+   defined by ADR-0006. It does not enable command network access inside a
+   workspace session.
 6. Secret filename globs inside workspaces provide defense in depth only. The
    primary policy is that operators must never place secrets or production
    state in a Codex workspace.
@@ -63,9 +66,10 @@ Ansible installs the official standalone Codex CLI package with these controls:
    sandbox. Private `/tmp` and `/var/tmp` tmpfs mounts are capped at 512 MiB
    each, use `nosuid,nodev,noexec`, and consume memory below `MemoryMax`. Swap
    is disabled for both the session unit and aggregate slice.
-8. Codex remains an interactive operator tool. Ansible installs no persistent
-   daemon, listening port, scheduled job, deployment helper, application
-   toolchain, or source checkout for it.
+8. Codex remains an interactive operator tool. Ansible installs no Codex-owned
+   daemon or updater, public listening port, scheduled job, deployment helper,
+   application toolchain, or source checkout for it. ADR-0006 defines the
+   Ansible-owned private App Server service.
 9. Authentication is a separate manual operation using the official headless
    device flow. Managed policy allows ChatGPT login only and rejects API-key
    login. No OpenAI credential is accepted by Ansible or Git, and convergence

@@ -65,6 +65,15 @@ require_remote_caller() {
   refuse_maintenance
 }
 
+require_admin_caller() {
+  if [ "$(/usr/bin/id --user)" -ne 0 ] || \
+     [ "${SUDO_USER:-}" != "{{ vps_admin_user }}" ]; then
+    printf '%s\n' 'This command is reserved for the Atlas administrator' >&2
+    exit 77
+  fi
+  refuse_maintenance
+}
+
 require_proxy_validation_caller() {
   if [ "$(/usr/bin/id --user)" -ne 0 ] || \
      [ "${SUDO_USER:-}" != "{{ vps_codex_remote_user }}" ] || \
@@ -154,6 +163,19 @@ case "${1:-}" in
     runtime_max=30s
     set -- --pipe \
       {{ vps_codex_release_path }}/bin/codex app-server proxy
+    ;;
+  --remote-control-pair)
+    test "$#" -eq 1
+    require_admin_caller
+    if [ "{{ vps_codex_remote_control_enabled | bool | lower }}" != true ]; then
+      printf '%s\n' 'Atlas direct remote control is disabled' >&2
+      exit 78
+    fi
+    wait_for_app_server
+    session_unit="atlas-codex-pairing-$$"
+    runtime_max=30s
+    set -- --pipe \
+      {{ vps_codex_release_path }}/bin/codex remote-control pair
     ;;
   *)
     printf '%s\n' 'atlas-codex received an unsupported argument' >&2

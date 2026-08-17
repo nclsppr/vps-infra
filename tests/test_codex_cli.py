@@ -530,6 +530,7 @@ sys.stdin.buffer.read()
         defaults = yaml.safe_load(
             (ROLE / "defaults/main.yml").read_text(encoding="utf-8")
         )
+        self.assertIs(defaults["vps_codex_remote_control_enabled"], False)
         self.assertRegex(defaults["vps_codex_version"], r"^\d+\.\d+\.\d+$")
         self.assertEqual(set(defaults["vps_codex_artifacts"]), {"x86_64", "aarch64"})
         self.assertEqual(
@@ -573,9 +574,144 @@ sys.stdin.buffer.read()
             self.assertRegex(artifact["package_sha256"], digest_pattern)
             self.assertRegex(artifact["executable_sha256"], digest_pattern)
 
+    def test_app_server_lifecycle_supports_all_remote_mode_combinations(
+        self,
+    ) -> None:
+        converge_tasks = yaml.safe_load(
+            (ROLE / "tasks/converge.yml").read_text(encoding="utf-8")
+        )
+        converge_by_name = {task["name"]: task for task in converge_tasks}
+        derived_expression = converge_by_name[
+            "Select the pinned Codex artifact for this architecture"
+        ]["ansible.builtin.set_fact"]["vps_codex_app_server_enabled"]
+
+        activate_tasks = yaml.safe_load(
+            (ROLE / "tasks/activate.yml").read_text(encoding="utf-8")
+        )
+        activate_by_name = {task["name"]: task for task in activate_tasks}
+        for task_name in (
+            "Install the private Codex App Server unit",
+            "Enable the private Codex App Server transactionally",
+        ):
+            self.assertEqual(
+                activate_by_name[task_name]["when"],
+                "vps_codex_app_server_enabled | bool",
+            )
+        self.assertEqual(
+            activate_by_name["Validate the private Codex App Server unit"]["when"],
+            ["not ansible_check_mode", "vps_codex_app_server_enabled | bool"],
+        )
+        for task_name in (
+            "Remove the private Codex App Server unit when disabled",
+            "Remove private Codex App Server boot activation when disabled",
+        ):
+            self.assertEqual(
+                activate_by_name[task_name]["when"],
+                "not (vps_codex_app_server_enabled | bool)",
+            )
+
+        gateway_conditions = {
+            "Install the bounded Codex remote SSH command gate": (
+                "vps_codex_remote_enabled | bool"
+            ),
+            "Install restricted Codex remote public keys transactionally": (
+                "vps_codex_remote_enabled | bool"
+            ),
+            "Remove Codex remote SSH authorization transactionally": (
+                "not (vps_codex_remote_enabled | bool)"
+            ),
+            "Remove the Codex remote SSH command gate when disabled": (
+                "not (vps_codex_remote_enabled | bool)"
+            ),
+            "Install the exact Codex remote sudo gateway": (
+                "vps_codex_remote_enabled | bool"
+            ),
+            "Remove the Codex remote sudo gateway when disabled": (
+                "not (vps_codex_remote_enabled | bool)"
+            ),
+        }
+        for task_name, expected_condition in gateway_conditions.items():
+            self.assertEqual(
+                activate_by_name[task_name]["when"], expected_condition
+            )
+
+        activation = yaml.safe_load(
+            (ROLE / "tasks/activation_transaction.yml").read_text(
+                encoding="utf-8"
+            )
+        )[0]
+        activation_by_name = {
+            task["name"]: task for task in activation["block"]
+        }
+        verify = activation_by_name[
+            "Verify the private Codex App Server before activation commit"
+        ]
+        self.assertEqual(verify["when"], "vps_codex_app_server_enabled | bool")
+        self.assertEqual(
+            verify["vars"]["vps_codex_verify_proxy_smoke"],
+            "{{ vps_codex_remote_enabled | bool }}",
+        )
+        self.assertEqual(
+            activation_by_name[
+                "Verify private Codex App Server disablement before activation commit"
+            ]["when"],
+            "not (vps_codex_app_server_enabled | bool)",
+        )
+
+        cases = (
+            (False, False, False),
+            (True, False, True),
+            (False, True, True),
+            (True, True, True),
+        )
+        for ssh_remote, direct_mobile, expected_app_server in cases:
+            variables = {
+                "vps_codex_remote_enabled": ssh_remote,
+                "vps_codex_remote_control_enabled": direct_mobile,
+            }
+            templar = Templar(loader=DataLoader(), variables=variables)
+            observed_app_server = templar.template(
+                trust_as_template(derived_expression)
+            )
+            observed_proxy_smoke = templar.template(
+                trust_as_template(
+                    verify["vars"]["vps_codex_verify_proxy_smoke"]
+                )
+            )
+            with self.subTest(
+                ssh_remote=ssh_remote, direct_mobile=direct_mobile
+            ):
+                self.assertIs(observed_app_server, expected_app_server)
+                self.assertIs(observed_proxy_smoke, ssh_remote)
+
+        locked_tasks = yaml.safe_load(
+            (ROLE / "tasks/locked_convergence.yml").read_text(encoding="utf-8")
+        )[0]["block"]
+        locked_by_name = {task["name"]: task for task in locked_tasks}
+        for task_name in (
+            "Stop transient Codex remote gateway units behind the interlock",
+            "Read transient Codex remote gateway units behind the interlock",
+        ):
+            argv = locked_by_name[task_name]["ansible.builtin.command"]["argv"]
+            self.assertIn("atlas-codex-pairing-*.service", argv)
+            self.assertIn("atlas-codex-proxy-*.service", argv)
+            self.assertIn("atlas-codex-version-*.service", argv)
+
     def test_managed_policy_excludes_privileged_and_extensible_modes(self) -> None:
+        requirements_template = (
+            ROLE / "templates/requirements.toml.j2"
+        ).read_text(encoding="utf-8")
+        policy_variables = {
+            "vps_codex_remote_user": "codex-remote",
+            "vps_codex_remote_control_enabled": False,
+        }
+        rendered_requirements = str(
+            Templar(loader=DataLoader(), variables=policy_variables).template(
+                trust_as_template(requirements_template)
+            )
+        )
         requirements = tomllib.loads(
-            (ROLE / "templates/requirements.toml.j2").read_text(encoding="utf-8")
+            rendered_requirements
         )
         self.assertEqual(requirements["allowed_approval_policies"], ["never"])
         self.assertNotIn("allowed_approvals_reviewers", requirements)
@@ -605,7 +741,7 @@ sys.stdin.buffer.read()
         protected_paths = requirements["permissions"]["filesystem"]["deny_read"]
         for protected_path in (
             "/etc/vps",
-            "/home/{{ vps_codex_remote_user }}",
+            "/home/codex-remote",
             "/srv/codex/home/.codex",
             "/home/vpsadmin",
             "/root",
@@ -624,11 +760,25 @@ sys.stdin.buffer.read()
             "in_app_browser",
             "plugins",
             "recommended_plugins",
-            "remote_control",
             "remote_plugin",
             "skill_mcp_dependency_install",
         ):
             self.assertFalse(requirements["features"][feature])
+        self.assertFalse(requirements["features"]["remote_control"])
+
+        policy_variables["vps_codex_remote_control_enabled"] = True
+        enabled_requirements = tomllib.loads(
+            str(
+                Templar(loader=DataLoader(), variables=policy_variables).template(
+                    trust_as_template(requirements_template)
+                )
+            )
+        )
+        self.assertTrue(enabled_requirements["allow_remote_control"])
+        self.assertFalse(enabled_requirements["features"]["remote_control"])
+        self.assertEqual(
+            enabled_requirements["permissions"], requirements["permissions"]
+        )
 
     def test_user_defaults_forbid_escalation_and_avoid_history(self) -> None:
         config = tomllib.loads(
@@ -1061,7 +1211,7 @@ sys.stdin.buffer.read()
             "User={{ vps_codex_user }}",
             "Group={{ vps_codex_group }}",
             "Slice=atlas-codex.slice",
-            "app-server --listen unix://",
+            " --listen unix://",
             "Restart=always",
             "NoNewPrivileges=yes",
             "CapabilityBoundingSet=",
@@ -1086,8 +1236,16 @@ sys.stdin.buffer.read()
             service,
         )
         self.assertNotIn("RestartPreventExitStatus", service)
-        self.assertNotIn("--remote-control", service)
+        self.assertIn("vps_codex_remote_control_enabled", service)
+        self.assertIn(" --remote-control{% endif %} --listen unix://", service)
         self.assertNotIn("RuntimeMaxSec", service)
+
+        launcher = (ROLE / "templates/atlas-codex.j2").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--remote-control-pair)", launcher)
+        self.assertIn("require_admin_caller", launcher)
+        self.assertIn("codex remote-control pair", launcher)
 
         verification = (
             ROLE / "tasks/verify_app_server.yml"
@@ -1116,6 +1274,7 @@ sys.stdin.buffer.read()
                 "/usr/local/sbin/atlas-codex " + command,
                 sudoers,
             )
+        self.assertNotIn("--remote-control-pair", sudoers)
         self.assertNotIn("ALL=(ALL", sudoers)
 
         activation_tasks = yaml.safe_load(
@@ -1158,6 +1317,12 @@ sys.stdin.buffer.read()
         )
         self.assertIn('"\\\\777" * 8', rendered_gate)
         self.assertIn("invalid Codex desktop marker", rendered_gate)
+        self.assertIn("_APP_SERVER_BOOTSTRAP_0148", rendered_gate)
+        self.assertIn("_MARKED_PROXY_0148", rendered_gate)
+        self.assertIn("forwarded-ssh-agent.sock", rendered_gate)
+        self.assertIn("pkill -9 -U", rendered_gate)
+        self.assertIn("[d]esktop-ssh-websocket-v0.sock", rendered_gate)
+        self.assertNotIn("command.startswith(", rendered_gate)
 
         site = yaml.safe_load(
             (ROOT / "ansible/playbooks/site.yml").read_text(encoding="utf-8")
@@ -1262,6 +1427,18 @@ sys.stdin.buffer.read()
             "/usr/local/sbin/atlas-codex-remote-gate",
         ):
             self.assertIn(remote_surface, predictive_surfaces)
+        self.assertIn(
+            "if (vps_codex_app_server_enabled | bool) else []",
+            predictive_surfaces,
+        )
+        self.assertIn(
+            "if (vps_codex_remote_enabled | bool) else []",
+            predictive_surfaces,
+        )
+        self.assertLess(
+            predictive_surfaces.index("vps_codex_app_server_enabled"),
+            predictive_surfaces.index("vps_codex_remote_enabled"),
+        )
         preflight = by_name[
             "Refuse a predictive check before normal Codex convergence"
         ]
@@ -1654,17 +1831,29 @@ sys.stdin.buffer.read()
             ]["ansible.builtin.include_tasks"],
             "verify_app_server.yml",
         )
-        self.assertIs(
+        self.assertEqual(
             activation_block_by_name[
                 "Verify the private Codex App Server before activation commit"
             ]["vars"]["vps_codex_verify_proxy_smoke"],
-            True,
+            "{{ vps_codex_remote_enabled | bool }}",
+        )
+        self.assertEqual(
+            activation_block_by_name[
+                "Verify the private Codex App Server before activation commit"
+            ]["when"],
+            "vps_codex_app_server_enabled | bool",
         )
         self.assertEqual(
             activation_block_by_name[
                 "Verify private Codex App Server disablement before activation commit"
             ]["ansible.builtin.include_tasks"],
             "verify_app_server_disabled.yml",
+        )
+        self.assertEqual(
+            activation_block_by_name[
+                "Verify private Codex App Server disablement before activation commit"
+            ]["when"],
+            "not (vps_codex_app_server_enabled | bool)",
         )
         self.assertEqual(
             commit["name"], "Record the verified Codex activation commit"
@@ -1783,6 +1972,11 @@ sys.stdin.buffer.read()
         ]["ansible.builtin.file"]
         self.assertEqual(app_server_link["state"], "link")
         self.assertIs(app_server_link["follow"], False)
+
+        restored_verification = (
+            ROLE / "tasks/verify_restored_app_server.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("(?: --remote-control)? --listen unix://", restored_verification)
 
     def test_runtime_probes_use_unique_disposable_directories(self) -> None:
         policy = (
