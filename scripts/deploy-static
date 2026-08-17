@@ -4116,7 +4116,7 @@ def run_registry_fetch_worker(request_path: Path, output_path: Path) -> None:
         or input_root_metadata.st_gid != 0
         or stat.S_IMODE(input_root_metadata.st_mode) != 0o755
         or request_path.parent != input_root
-        or re.fullmatch(r"[0-9]{2}", request_path.name) is None
+        or request_path.name != "02.json"
         or set(input_root.iterdir()) != {request_path}
     ):
         fail("registry fetch worker input root is invalid")

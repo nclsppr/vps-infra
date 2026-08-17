@@ -991,6 +991,71 @@ class StaticBundleContractTests(unittest.TestCase):
                 (uppercase_bundle,),
             )
 
+    def test_registry_worker_accepts_only_its_exact_json_remap(self) -> None:
+        contract = MATERIALIZER.RegistryFetchContract(
+            repository=MATERIALIZER.PROFILES["personal"].site_repository,
+            kind="manifest",
+            digest="sha256:" + "a" * 64,
+            maximum_size=MATERIALIZER.MAX_MANIFEST_BYTES,
+            expected_size=None,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            worker = Path(temporary_directory)
+            worker.chmod(0o700)
+            input_root = worker / ".inputs"
+            input_root.mkdir(mode=0o755)
+            request = input_root / "02"
+            request.touch(mode=0o444)
+            output = worker / "registry-object"
+            metadata = list(input_root.lstat())
+            metadata[4] = 0
+            metadata[5] = 0
+            root_owned_input = os.stat_result(metadata)
+
+            def emulate_fetch(
+                _repository,
+                _digest,
+                destination,
+                _maximum_size,
+                _environment,
+                *,
+                kind,
+                expected_size,
+            ):
+                self.assertEqual(kind, "manifest")
+                self.assertIsNone(expected_size)
+                destination.write_bytes(b"manifest")
+
+            with mock.patch.dict(
+                MATERIALIZER.os.environ,
+                {"HOME": str(worker)},
+                clear=True,
+            ), mock.patch.object(
+                MATERIALIZER.Path,
+                "lstat",
+                return_value=root_owned_input,
+            ), mock.patch.object(
+                MATERIALIZER,
+                "read_registry_fetch_contract",
+                return_value=contract,
+            ) as read_contract, mock.patch.object(
+                MATERIALIZER,
+                "fetch_registry_object",
+                side_effect=emulate_fetch,
+            ) as fetch:
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "input root is invalid",
+                ):
+                    MATERIALIZER.run_registry_fetch_worker(request, output)
+                read_contract.assert_not_called()
+                fetch.assert_not_called()
+
+                request = request.rename(input_root / "02.json")
+                MATERIALIZER.run_registry_fetch_worker(request, output)
+                read_contract.assert_called_once_with(request)
+                fetch.assert_called_once()
+
     def test_global_host_addresses_accept_atlas_iproute2_inventory(self) -> None:
         fixture = [
             {
