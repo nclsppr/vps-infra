@@ -51,8 +51,8 @@ Le premier socle exécutable est livré :
 - manifeste de production, schéma, vérificateur de preuves GitHub et contrôleur
   de déploiement borné ;
 - validations locales et CI, dont détection de secrets pour dépôt public ;
-- workflow de production manuel, désactivé tant que les portes de la plateforme
-  et des releases ne sont pas éprouvées ;
+- a generic manual platform workflow that remains locked, plus a separate
+  scheduled static reconciliation workflow that is active;
 - Caddy multi-architecture workflow with a native PR build and Trivy gate for
   each architecture. A `main` build scans both published child manifests by
   digest before it creates and verifies GitHub provenance.
@@ -62,12 +62,16 @@ Le premier socle exécutable est livré :
 - a fail-closed static release reconciler for Personal, Papers Empire, and
   Parkventory. It selects only the canonical branch HEAD after all observed and
   expected checks are green, resolves the coherent site and route tags to
-  digests, and uses one bounded Atlas command. It stays disabled until the
-  dedicated environment and `VPS_STATIC_DEPLOY_ENABLED=true` are configured.
-- immutable application-release admission plus a root-owned transactional
-  Compose controller for Surplasse and Parkventory. It verifies every component
-  and integration attestation and bundle, but both protected entries remain
-  disabled and no application deployment workflow invokes it.
+  digests, and uses one bounded Atlas command. The dedicated
+  `static-production` environment is configured with
+  `VPS_STATIC_DEPLOY_ENABLED=true`; scheduled operation is proved for all three
+  profiles.
+- immutable application-release admission plus repository-delivered Ansible
+  wiring for a root-owned transactional Compose controller for Surplasse and
+  Parkventory. The controller source verifies every component and integration
+  attestation and bundle. Live convergence of this controller revision on Atlas
+  is not proved. Both protected entries remain disabled and no application
+  deployment workflow invokes it.
 
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
@@ -83,11 +87,27 @@ controlled operator rollout now has this live state:
   PostgreSQL and the metrics endpoints have no host port;
 - the local PostgreSQL backup and isolated restore-rehearsal timers are active.
 
+On 2026-08-18, scheduled runs
+[`32076871842`](https://github.com/nclsppr/vps-infra/actions/runs/32076871842)
+and
+[`32078379931`](https://github.com/nclsppr/vps-infra/actions/runs/32078379931)
+both contained the resolver and all three successful deploy jobs. Atlas
+reported the exact immutable tuples as already active and healthy on the
+repeated run. The complete source revisions, digests, controller boundary, and
+TLS probes are in the
+[rollout evidence](docs/evidence/2026-08-18-static-reconciliation-rollout.md).
+Use the
+[static reconciliation runbook](docs/operations/static-release-reconciliation.md)
+for enablement, suspension, run inspection, rollback, recovery, and key
+rotation. A green workflow conclusion alone is not proof that all three
+profiles were `ready`.
+
 This bounded rollout does not enable the dynamic release manifest or invoke the
-installed Compose application controller. The manifest keeps every dynamic
-application at `enabled: false`; the root controller rejects each one before
-runtime validation or network access, and the runtime doctor reports the
-missing desired and active release records as expected warnings.
+Compose application controller. The manifest keeps every dynamic application
+at `enabled: false`. The controller implementation was merged after the last
+proved Atlas static-controller convergence, so repository availability must not
+be reported as live installation. The runtime doctor reports the missing
+desired and active application release records as expected warnings.
 `parkventory.com` is a static demonstration only. `surplasse.com` keeps its
 previous DNS target and Atlas does not serve a Surplasse application.
 
@@ -122,11 +142,13 @@ checks instead of registry downloads. A transient activation unit and a boot
 oneshot recover unfinished transactions and bounded probe residue before the
 public edge can start.
 Branch protection remains a separate external gate. The generic locked
-controller cannot call `apply-release`, which remains absent. The separate
+controller cannot call `apply-release`, which remains absent. The repository
 application controller has its own exact forced-command gate, shared static
-lock, transaction journal, quarantine, and boot recovery. It remains inert
-until a reviewed application entry is enabled and its database, secrets,
-observability, edge route, and network cutover are prepared.
+lock, transaction journal, quarantine, and boot recovery wiring. It remains
+disabled, and its current repository revision still needs a proved Atlas
+convergence. Activation also requires a reviewed application entry, database,
+secrets, observability, edge route, network cutover, and every blocker in
+ADR-0010.
 
 ## Démarrage local
 
@@ -188,7 +210,7 @@ Cette décision est détaillée dans
 - [Architecture cible](docs/architecture.md)
 - [Automatisation de l’hôte](ansible/README.md)
 - [Pile plateforme](platform/README.md)
-- [Adaptateur Surplasse verrouillé](applications/surplasse/README.md)
+- [Legacy locked Surplasse preparation adapter](applications/surplasse/README.md)
 - [Livraison et mises à jour](docs/deployment.md)
 - [Contrat du contrôleur de release](scripts/README.md)
 - [Reconstruction depuis zéro](docs/rebuild.md)
@@ -196,6 +218,8 @@ Cette décision est détaillée dans
 - [Codex CLI on Atlas](docs/operations/codex-cli.md)
 - [Surplasse SMTP relay preparation](docs/operations/surplasse-smtp.md)
 - [Sauvegarde PostgreSQL et répétition de restauration](docs/operations/postgresql-backup.md)
+- [Static release reconciliation operations](docs/operations/static-release-reconciliation.md)
+- [Static reconciliation rollout evidence, 2026-08-18](docs/evidence/2026-08-18-static-reconciliation-rollout.md)
 - [Contrat des secrets](secrets/README.md)
 - [Sources et preuves d’audit](docs/references.md)
 - [Plan de mise en œuvre](VPS-SETUP.md)

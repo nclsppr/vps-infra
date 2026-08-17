@@ -1,13 +1,16 @@
 # Contrôleur de release
 
-Ces scripts forment le plan de contrôle local du VPS. Ils ne construisent aucune
-image. Les contrôleurs générique et applicatif restent désactivés par leurs
-contrats protégés ; le contrôleur statique possède, lui, un chemin d'activation
-borné et transactionnel.
+These scripts form the local VPS control plane. They do not build an image. The
+static controller is converged and its bounded transactional activation path is
+operational. The generic controller remains locked. The Compose application
+controller source and Ansible wiring are merged, but convergence of that
+revision on Atlas has not been proved and both application contracts remain
+disabled.
 
-## Installation attendue
+## Installation contract
 
-Ansible installe, root-owned et non modifiables par le groupe ou les autres :
+At the converged repository revision, Ansible installs these root-owned paths
+without group or other write permission:
 
 - `/usr/local/libexec/vps/deploy`
 - `/usr/local/libexec/vps/deploy-application`
@@ -246,7 +249,19 @@ and temporary activation symlinks. Git ancestry is checked in a separate
 bounded network `DynamicUser` worker rather than in the root process.
 Release garbage collection remains an operator responsibility.
 
+Use the
+[static reconciliation runbook](../docs/operations/static-release-reconciliation.md)
+to inspect resolver status, Atlas active state, transactions, quarantine,
+recovery, public probes, and key rotation. A green workflow can cover only the
+profiles classified as `ready`.
+
 ## Disabled Compose application controller
+
+This section specifies the controller merged in repository revision
+`0a9a0c1d1c7dd7934876c425cdca64340e10a564`. The last proved Atlas controller
+revision is `27a8064400198611214d18853a87a606f349a2ae`; it predates this
+application controller. The paths below are therefore installable through
+Ansible, but are not proved live on Atlas.
 
 `deploy-application` consumes only the immutable
 `ghcr.io/nclsppr/<application>/application-release@sha256:<digest>` selected by
@@ -277,8 +292,8 @@ deploy-application-live <surplasse|parkventory> <source-sha40> \
 
 `forced-command` sends that canonical line over stdin to the argument-free
 root gate. The gate creates a bounded transient systemd unit whose stop hook
-runs `deploy-application --recover-live`. Boot recovery is also installed as
-`vps-application-recover.service` and must finish before the public edge starts.
+runs `deploy-application --recover-live`. After convergence, Ansible installs
+`vps-application-recover.service`; it must finish before the public edge starts.
 
 Before a dedicated migration can run, Parkventory must no longer have static
 active state. For both applications, the installed public edge route must equal
@@ -292,6 +307,12 @@ Activation journals `prepared`, `migration-running`, `migrated`, `started`,
 the previous Compose runtime and quarantines a candidate that reached a
 potentially mutating phase. SQL migrations themselves are not reversible; they
 must remain compatible with both the current and previous runtime images.
+
+The controller does not yet verify an attested backward-compatibility invariant
+for that post-migration restore. Production enablement must therefore remain
+fail-closed until such evidence is enforced, or recovery is changed to stop for
+explicit forward repair after migration. Neither disabled application may use
+the current restore behavior as production readiness evidence.
 
 ## États séparés
 

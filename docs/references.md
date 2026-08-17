@@ -17,6 +17,32 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
 | Parkventory | `21f711c684d3` | propre |
 | Surplasse | `fab494ad2940` | fichiers d’agents et de critiques non suivis |
 
+This table is the initial architecture audit. It is not the current release
+catalog. Current production evidence is recorded below.
+
+## Production evidence on 2026-08-18
+
+The canonical static source revisions were:
+
+| Profile | Source revision |
+|---|---|
+| Personal | `328b535b934560fcaf6324383440a3c2a60641c4` |
+| Papers Empire | `17db1b57414c3c611ce73637d6864dce76cad55b` |
+| Parkventory static demo | `583e0e2b63701097aa4894ecc4fb3de8ad325346` |
+
+Scheduled runs
+[`32076871842`](https://github.com/nclsppr/vps-infra/actions/runs/32076871842)
+and
+[`32078379931`](https://github.com/nclsppr/vps-infra/actions/runs/32078379931)
+each contained the resolver plus all three successful deploy jobs. The second
+run proved the complete tuples as healthy Atlas no-ops. Strict external TLS
+probes returned HTTP 200 for all apexes and one redirect from each `www` name.
+
+The exact site, route, platform integration, and Caddy digests, Atlas controller
+revision, state-directory result, and TLS observations are in the
+[dated rollout evidence](evidence/2026-08-18-static-reconciliation-rollout.md).
+This dated record is evidence, not a mutable release manifest.
+
 ## Preuves dans les projets
 
 ### Personal
@@ -45,9 +71,9 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
 - `backend/src/main/resources/db/migration/` : Flyway, `btree_gist` et
   contraintes d’exclusion ;
 - `.github/workflows/verify.yml` et `pages.yml` : validation et démo Pages,
-  sans GHCR ni déploiement VPS ;
-- commit `21f711c684d3` observé au dernier contrôle, avec worktree propre ; ce
-  commit reste une démo sans artefact ni cible de production ;
+  as observed during the initial audit, before GHCR and Atlas publication;
+- commit `21f711c684d3` observed during the initial audit. The current static
+  producer and active Atlas release are recorded in the newer evidence above;
 - ADR-0003 : flux OIDC passwordless retenu en production, fournisseur encore à
   sélectionner ; l’adaptateur d’identité local n’est pas le fournisseur de
   production.

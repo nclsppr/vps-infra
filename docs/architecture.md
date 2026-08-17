@@ -2,27 +2,23 @@
 
 ## Objet et niveau de preuve
 
-Ce document décrit la cible proposée après audit des dépôts locaux et de leurs
-workflows le 30 juillet 2026. Il ne décrit pas une production déjà
-provisionnée.
+This document describes both the proved static production boundary and the
+disabled target architecture for Compose applications. Dated facts remain
+historical evidence and must be verified again before an operation.
 
-Les états observés sont historiques et devront être revérifiés au moment de
-l’implémentation :
+The project states consolidated on 2026-08-18 are:
 
-| Projet | État réellement observé | Conséquence VPS |
+| Project | Proved state | VPS consequence |
 |---|---|---|
-| `personal` | Site HTML/CSS/JS sans build runtime, actuellement publié directement par GitHub Pages | Produire une allowlist publique et servir une release statique |
-| `papersempire` | Jeu statique ; Retype et `build-lang-pages.mjs` assemblent le répertoire final `site/` | Publier exactement le résultat de CI, jamais le checkout |
-| `parkventory` | Démo Pages et Compose de développement avec Maven, Vite, Mailpit et PostgreSQL 18.3 ; aucun artefact de production | Projet désactivé dans le manifeste de production jusqu’aux portes dédiées |
-| `surplasse` | Cinq images applicatives GHCR par SHA ; Caddy, PostgreSQL 17.10, Prometheus 3.13.1 et Grafana 13.1.1 encore intégrés à son Compose | Extraire les quatre services communs et conserver seulement les modules applicatifs |
+| `personal` | Immutable site and route artifacts from `328b535b934560fcaf6324383440a3c2a60641c4` are active on Atlas. | Keep the allowlisted static producer and automatic reconciliation. |
+| `papersempire` | The assembled `site/` and route inventory from `17db1b57414c3c611ce73637d6864dce76cad55b` are active on Atlas. | Publish the CI result, never the checkout. |
+| `parkventory` | The static demo from `583e0e2b63701097aa4894ecc4fb3de8ad325346` is active. Backend, frontend, integration, and application-release artifacts exist but are not active. | Keep the Compose application disabled until the explicit ownership handoff and all ADR-0010 blockers pass. |
+| `surplasse` | An immutable application release and integration bundle exist. No Atlas deployment is proved. | Keep the Compose application disabled until all host, database, secret, route, migration, resource, recovery, and public-proof blockers pass. |
 
-Au dernier contrôle du 30 juillet 2026, Parkventory était propre au commit
-`21f711c684d3`. Ce commit décrit toujours une démo sans artefact ni cible de
-production. L’ADR choisit le flux OIDC passwordless pour la production, mais le
-fournisseur reste à sélectionner ; l’adaptateur maison reste un outil local et
-ne devient pas implicitement le fournisseur de production. Le worktree
-Surplasse contient également des fichiers non suivis et son garde-fou actuel
-refuserait un déploiement depuis ce checkout.
+The exact active static tuples and public probes are in the
+[2026-08-18 rollout evidence](evidence/2026-08-18-static-reconciliation-rollout.md).
+The older repository audit in [references](references.md) remains historical
+and is not current production state.
 
 ## Objectifs
 
@@ -59,14 +55,15 @@ flowchart LR
 
     Caddy --> Personal["release personal<br/>fichiers statiques"]
     Caddy --> Papers["release papersempire<br/>fichiers statiques"]
-    Caddy --> Surplasse["modules Surplasse<br/>Backend + frontends"]
-    Caddy --> Parkventory["modules Parkventory<br/>désactivés initialement"]
+    Caddy --> ParkStatic["Parkventory demo<br/>static release"]
+    Caddy -. disabled .-> Surplasse["modules Surplasse<br/>Backend + frontends"]
+    Caddy -. disabled .-> Parkventory["Parkventory React + Java<br/>Compose application"]
 
-    PostgreSQL["PostgreSQL plateforme"] --> Surplasse
-    PostgreSQL --> Parkventory
+    PostgreSQL["PostgreSQL plateforme"] -. disabled .-> Surplasse
+    PostgreSQL -. disabled .-> Parkventory
 
-    Prometheus["Prometheus plateforme"] --> Surplasse
-    Prometheus --> Parkventory
+    Prometheus["Prometheus plateforme"] -. disabled .-> Surplasse
+    Prometheus -. disabled .-> Parkventory
     Prometheus --> Exporters["exporteurs hôte / PostgreSQL / Caddy"]
     Grafana["Grafana plateforme"] --> Prometheus
 ```
@@ -363,8 +360,8 @@ checkout contains files such as `AGENTS.md`, `infos/`, and `.claude/`. These
 files must never enter the web root. The same allowlist generates the route
 inventory. Temporary Caddy probes all EN/FR, Work, CV, Blog, article,
 Dashboard, Claude, `v2022` archive, error-page, and asset file routes. Domain
-redirects are not file routes. They remain part of the future public smoke
-test. This inventory prevents a new file route from being omitted from a
+redirects are not file routes. The live activation and external public probes
+test them separately. This inventory prevents a new file route from being omitted from a
 handwritten smoke test.
 
 Pour `papersempire`, l’artefact est le répertoire `site/` déjà assemblé par le
@@ -402,23 +399,18 @@ avec les images.
 
 ### Parkventory
 
-La production reste désactivée tant que le dépôt ne fournit pas :
+Parkventory now publishes immutable Backend, Frontend, integration, and
+`application-release` artifacts from its canonical branch. This closes the
+producer packaging task. It does not make the application deployable.
 
-- une image Backend construite et durcie, sans `quarkus:dev` ni montage source ;
-- un artefact ou une image Frontend de production ;
-- un Compose de production sans ports hôte ;
-- CORS, cookies, SMTP et Swagger configurés pour la production ;
-- des secrets consommés par fichiers, sans fallback local ;
-- un fournisseur OIDC passwordless sélectionné puis implémenté conformément à
-  l’ADR-0003, l’adaptateur maison restant strictement local ;
-- RLS forcée et tests négatifs d’isolation tenant A/B ;
-- une restauration prouvée sur une base jetable ;
-- Micrometer Prometheus et logs structurés ;
-- une validation complète des migrations ;
-- domaine/DNS, branche protégée, paquet d’intégration et smoke public validés.
-
-Mailpit, Vite et l’image Maven de développement ne rejoignent jamais le VPS de
-production.
+Production remains disabled until the reviewed contract proves the OIDC
+provider, CORS and cookie policy, SMTP and Swagger policy, file-backed secrets,
+forced RLS and negative tenant-isolation tests, exact PostgreSQL compatibility,
+restore evidence, metrics and structured logs, protected branch, resource and
+retention budgets, route handoff, recovery, and strict public probes. The
+static demo must release `parkventory.com` under the shared lock before any
+Compose preflight or migration. Mailpit, Vite development mode, and the Maven
+development image never join the production VPS.
 
 ## Network isolation
 
@@ -604,15 +596,18 @@ vps-infra/
   docs/
 ```
 
-The disabled Compose controller materializes immutable releases below
+The repository-delivered disabled Compose controller is designed to materialize
+immutable releases below
 `/srv/applications/<application>/releases` and keeps root-only active,
 inventory, transaction, and quarantine records below
 `/var/lib/vps-application`. It shares `/run/lock/vps-static.lock` with the
-static controller. The boot recovery unit runs before the public edge. An
+static controller. After convergence, its boot recovery unit runs before the
+public edge. Live convergence of this application controller is not proved. An
 application cannot reach its dedicated migration until its protected contract
 entry is enabled, Parkventory no longer has a static owner, and the immutable
 public edge already contains the exact attested route and application-network
-attachment. Route preparation remains a platform responsibility.
+attachment. Route preparation remains a platform responsibility and precedes
+migration.
 
 Les fichiers SOPS sont chiffrés. La clé age privée est conservée hors du VPS et
 hors de Git, avec au moins une copie de récupération dans un gestionnaire de

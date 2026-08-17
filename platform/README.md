@@ -7,8 +7,9 @@ external network, and immutable image reference.
 ## Public static edge
 
 `public-static-edge/` is an independently deployable Caddy-only unit. It serves
-the already materialized Personal and Papers Empire releases. It does not start
-PostgreSQL, Prometheus, Grafana, either exporter, Surplasse, or Parkventory.
+the already materialized Personal, Papers Empire, and temporary static
+Parkventory releases. It does not start PostgreSQL, Prometheus, Grafana, either
+exporter, Surplasse, or the Parkventory Compose application.
 
 This unit is an ordered deployment step, not a replacement for the shared
 platform. PostgreSQL and the internal observability services remain required
@@ -186,9 +187,11 @@ the raw artifact digest returned by GitHub before it publishes the result.
 
 ## Application state
 
-The production release manifest disables all four applications. Therefore,
-the base platform has no active application route, scrape target, or alert
-rule. Each candidate file has a `.disabled` suffix:
+The generic production release manifest disables all four legacy application
+entries. The separate static production contract enables Personal, Papers
+Empire, and the temporary Parkventory demo through the isolated public edge.
+The base shared-platform bundle still has no active application route, scrape
+target, or alert rule. Each candidate file has a `.disabled` suffix:
 
 ```text
 platform/caddy/routes/
@@ -218,6 +221,12 @@ The base Caddy service does not receive an OVH credential or an application
 network. The Caddy entry point requires the three OVH credential files only
 when `surplasse.caddy` is active. This requirement makes an incomplete
 Surplasse activation fail before Caddy starts.
+
+Operate the live static path with the
+[static reconciliation runbook](../docs/operations/static-release-reconciliation.md).
+The dated
+[rollout evidence](../docs/evidence/2026-08-18-static-reconciliation-rollout.md)
+records the active tuples without making them a mutable configuration source.
 
 ## Network boundaries
 

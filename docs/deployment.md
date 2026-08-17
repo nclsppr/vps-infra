@@ -2,18 +2,16 @@
 
 ## Réponse courte
 
-La bonne séparation n’est pas « GitHub Actions **ou** pull depuis le VPS » :
+GitHub Actions builds, tests, and publishes immutable artifacts. For the three
+static profiles, the central `vps-infra` scheduler automatically selects only
+the current canonical producer HEAD after its checks and artifacts are ready.
+No operator supplies an application SHA or digest to that workflow. Atlas then
+revalidates the exact source and artifacts through a bounded controller.
 
-- **GitHub Actions construit, teste et publie** les artefacts ;
-- une pull request dans `vps-infra` choisit les digests à promouvoir ;
-- après fusion, **un déclenchement manuel contrôlé du workflow `vps-infra`
-  demande d’abord le déploiement** ;
-- le VPS **tire le commit d’infrastructure et les artefacts exacts**, puis
-  exécute un wrapper borné.
-
-Le serveur peut donc faire un `git fetch`, mais uniquement pour récupérer un
-commit explicite du dépôt d’infrastructure. Il ne tire jamais les branches des
-applications et ne compile jamais leurs sources.
+Platform and Compose application promotion remain separate reviewed paths.
+Both Compose application entries are disabled. Atlas can fetch an explicit
+infrastructure commit, but it never checks out an application branch and never
+builds application source.
 
 ## Source de vérité : le manifeste de production
 
@@ -134,8 +132,9 @@ remplacée par une révision séparément auditée, **tout** `enabled: true` éc
 même avec des champs de preuve syntaxiquement complets. Le manifeste commité
 garde donc la plateforme et les quatre applications désactivées. Le marqueur
 hôte et l’applicateur générique `apply-release` restent absents. Le contrôleur
-Compose séparé est installé mais refuse les deux entrées désactivées avant tout
-accès réseau ou runtime.
+Compose séparé est livré dans le dépôt avec son chemin d'installation Ansible,
+mais sa convergence live sur Atlas n'est pas prouvée. Les deux entrées restent
+désactivées avant tout accès réseau ou runtime.
 
 ### Locked platform candidate declaration
 
@@ -322,6 +321,16 @@ checks and the configured expected checks, and resolves the matching site and
 routes tags to digests. A red, incomplete, or newer unpublished HEAD preserves
 the current Atlas release. The workflow never falls back to an older green SHA.
 
+The resolver classifies each profile independently as `ready`, `pending`,
+`blocked`, or `disabled`. Its job can succeed while only a subset enters the
+deploy matrix. An overall green workflow is therefore not proof of a complete
+three-site reconciliation. Require the resolver table, all expected deploy
+jobs, matching Atlas protected state, empty transaction state, and strict public
+probes. The
+[operations runbook](operations/static-release-reconciliation.md) defines the
+exact commands and the 2026-08-18 evidence is
+[recorded separately](evidence/2026-08-18-static-reconciliation-rollout.md).
+
 ```mermaid
 sequenceDiagram
     participant CI as GitHub Actions applicatif
@@ -352,10 +361,11 @@ Il ne possède aucun secret VPS. Il :
    visibilité du dépôt le permettent ;
 8. émet une demande de promotion vers `vps-infra`.
 
-Pour commencer sans jeton inter-dépôts, l’opérateur peut lancer manuellement un
-`workflow_dispatch` dans `vps-infra` avec l’application, le SHA et les digests.
-La phase suivante utilise un GitHub App ou un jeton finement limité au seul
-dépôt d’infrastructure pour ouvrir automatiquement la pull request.
+Static producers stop after publication and attestation. The central workflow
+has no application, SHA, or digest input. A manual dispatch only asks the same
+resolver to evaluate the current canonical heads. It cannot bypass checks or
+select an older candidate. A future Compose promotion request, if added, must
+use a separately reviewed least-privilege cross-repository contract.
 
 The shared Caddy image has an additional fail-closed gate. A pull request builds
 native `linux/amd64` and `linux/arm64` images from the committed Go graph. It
@@ -430,10 +440,11 @@ candidate reaches the Atlas static lock at a time. The environment owns one
 dedicated key and the same strict known-hosts model. It sends only the canonical
 `deploy-static-live` command. Enabling this path does not set
 `VPS_DEPLOY_ENABLED`, create `/etc/vps/production-enabled`, or install
-`apply-release`. The installed application controller additionally shares the
-exact host lock `/run/lock/vps-static.lock` with this path; GitHub concurrency
-alone is not a sufficient exclusion boundary for operator-initiated commands.
-No application workflow invokes it while both application entries are disabled.
+`apply-release`. The repository application controller is designed to share
+the exact host lock `/run/lock/vps-static.lock` with this path; GitHub
+concurrency alone is not a sufficient exclusion boundary for operator-initiated
+commands. Its live convergence is not proved. No application workflow invokes
+it while both application entries are disabled.
 
 Le VPS n’héberge pas de runner GitHub Actions persistant. Un workflow arbitraire
 exécuté directement sur la machine de production aurait accès à ses volumes,
@@ -465,11 +476,13 @@ The delivered `deploy` script accepts only a full Git commit ID. It:
 9. rejects `/etc/vps/production-enabled` while `activation_policy` is locked.
 
 The generic locked controller still does not contain an applicator execution
-path. A separate installed `deploy-application` controller performs immutable
-digest pulls, configuration rendering, dedicated migrations, targeted Compose
-activation, probes, compatible runtime rollback, and durable journaling. It
-re-reads the protected application contract first, so the production marker or
-the presence of the executable cannot enable a disabled application.
+path. A separate repository-delivered `deploy-application` controller defines
+immutable digest pulls, configuration rendering, dedicated migrations,
+targeted Compose activation, probes, compatible runtime rollback, and durable
+journaling. Ansible can install it, but the merged revision is not proved live
+on Atlas. It re-reads the protected application contract first, so the
+production marker or the presence of the executable cannot enable a disabled
+application.
 
 Les projets Compose ont des noms fixes (`vps-platform`, `surplasse` et
 `parkventory`) afin qu’un nouveau chemin de checkout ne crée pas de nouveaux
@@ -550,8 +563,8 @@ future production shape is a React frontend image plus a Java backend image,
 with a dedicated migrator and integration bundle. The static resolver and the
 Atlas gate reject a state where both the demo promotion and the Compose
 application are enabled or where an active dynamic manifest still serves it.
-The installed application applicator enforces the inverse guard against an
-existing static state. A later reviewed cutover must transfer the
+The repository application applicator enforces the inverse guard against an
+existing static state after it is converged. A later reviewed cutover must transfer the
 `parkventory.com` route under one shared deployment lock.
 
 ### Activation
@@ -807,21 +820,28 @@ not encrypted and not off-site. Follow
 [`operations/postgresql-backup.md`](operations/postgresql-backup.md) for the
 commands, guarantees, and remaining disaster-recovery decision.
 
-## Déployer une application Compose
+## Deploy a Compose application
 
-Pour une application donnée :
+Both protected entries are disabled and the current controller revision is not
+proved live on Atlas. A future reviewed enablement must keep this order:
 
-1. rendre ses variables non sensibles depuis le manifeste ;
-2. vérifier que tous les secrets référencés existent et ont des permissions
-   privées ;
-3. tirer les nouveaux digests avec `docker compose pull` ;
-4. effectuer le contrôle pré-migration ;
-5. exécuter la migration sous le rôle migrateur dédié ;
-6. lancer seulement le projet Compose applicatif avec
-   `docker compose up --detach --wait --remove-orphans` ;
-7. sonder les healthchecks internes ;
-8. sonder les routes publiques avec TLS strict ;
-9. conserver le manifeste comme état actif.
+1. render non-secret configuration from the immutable release;
+2. verify every root-owned secret file and exact service allocation;
+3. pull and attest the exact image and integration digests;
+4. prove the database, backup, restore, resource, and migration-compatibility
+   prerequisites;
+5. prepare the immutable public-edge route and attach healthy Caddy to the exact
+   application network;
+6. require that the installed route equals the attested route before any
+   database mutation;
+7. run the dedicated one-shot migration with the migrator role;
+8. start only the application Compose project and wait for health;
+9. run internal probes and strict public TLS probes resolved directly to Atlas;
+10. persist active state only after the complete transaction is `probed`.
+
+The application controller does not rewrite the platform edge. Route and
+network preparation is a separate reviewed platform cutover and must precede
+migration.
 
 Compose recrée seulement les services dont l’image ou la configuration a
 changé. C’est pourquoi les digests Surplasse sont indépendants et pourquoi son
@@ -867,18 +887,23 @@ vers l’avant.
 
 ### Statique
 
-Repositionner `current` vers la release précédente, recharger si nécessaire et
-rejouer les probes. Aucune migration n’existe.
+Create and merge a producer revert as a new descendant commit. Let the normal
+checks publish the matching immutable artifacts, then let the same reconciler
+deploy and probe that new revision. Do not force-push, request an old SHA, move
+an OCI tag, or manually repoint `current`. The ancestry check intentionally
+rejects a history rollback. Follow the
+[static reconciliation runbook](operations/static-release-reconciliation.md).
 
 ### Application
 
-Revenir aux anciens digests dans le manifeste, puis rejouer le même pipeline.
-Le wrapper peut restaurer l’état actif précédent lorsqu’un `up --wait` ou une
-probe échoue **avant migration**, puis place le digest en quarantaine. Après une
-migration, l’auto-rollback est interdit sauf si la compatibilité descendante a
-été explicitement prouvée ; le workflow signale alors une intervention. Dans
-tous les cas, Git reste l’état désiré et doit recevoir un revert ou une PR
-corrective avant une nouvelle réconciliation.
+Use a reviewed release change and the same pipeline. A prepared-only failure can
+restore the previous runtime without a schema transition. After migration, the
+previous runtime may start only when an attested invariant proves compatibility
+with the changed schema. The current controller does not enforce that evidence,
+so both application entries must remain disabled. Before enablement, either add
+that enforced invariant or change recovery to stop for explicit forward repair.
+Git remains desired state and must receive a revert or corrective change before
+another reconciliation.
 
 ### Plateforme
 
@@ -915,55 +940,42 @@ and one runtime login. The runtime role cannot create schema objects. No
 service publishes port 5432. This operation does not start Surplasse, modify
 Caddy or Prometheus, consume OVH credentials, or change DNS.
 
-`make activate-surplasse` remains a fail-closed command. The current adapter
-uses the exact published Backend digest containing the reviewed migration
-command, but still lacks the complete production evidence and integration
-bundle. The controller rejects activation before it changes the application or
-shared platform. A later review must implement the persistent platform
-attachments, run the one-shot migration before the five runtime services, and
-verify strict internal and public probes with rollback.
+`make activate-surplasse` remains a fail-closed legacy-adapter command. The
+canonical producer now publishes an immutable application release and common
+integration bundle, but the legacy adapter does not become an activation path.
+The controller rejects activation before it changes the application or shared
+platform. A later review must prepare the exact route and network before the
+one-shot migration, satisfy every ADR-0010 blocker, start the runtime services,
+and verify strict internal and public probes.
 
-## Modifications nécessaires par dépôt
+## Remaining changes by repository
 
 ### `personal`
 
-- ajouter un workflow de validation et d’assemblage par allowlist ;
-- publier l’artefact statique et son digest ;
-- garder GitHub Pages pendant la période de vérification ;
-- protéger `main` ;
-- corriger les surfaces actuellement publiées par Pages avant ou pendant la
-  migration.
+The allowlisted site build, route inventory, immutable OCI publication,
+attestation, and Atlas deployment are complete. Keep required checks and branch
+protection aligned with the names in `releases/static-production.json`.
 
 ### `papersempire`
 
-- conserver l’assemblage `site/` ;
-- ajouter des smokes réels et corriger la documentation de tests contradictoire ;
-- épingler les Actions ;
-- protéger `master` ou migrer explicitement vers `main` ;
-- publier `site/` comme artefact OCI en plus de Pages.
+The assembled `site/`, route inventory, immutable OCI publication, attestation,
+and Atlas deployment are complete. Keep `master` protected and preserve the
+canonical `papersempire.com` origin for browser state.
 
 ### `parkventory`
 
-- conserver un worktree propre et revérifier le commit canonique avant de
-  figer chaque artefact de production ;
-- choisir et implémenter le fournisseur OIDC de production, l’adaptateur local
-  ne quittant pas le développement ;
-- sécuriser cookies et SMTP ;
-- créer les images et le Compose de production ;
-- tester exactement PostgreSQL 17.10 et 18.3 puis aligner l’ADR ;
-- séparer migration et runtime ;
-- livrer isolation tenant/RLS, restauration et secrets par fichiers ;
-- ajouter métriques, logs et règles ;
-- protéger la branche canonique.
+Static publication and deployment are complete. The repository also publishes
+immutable Backend, Frontend, integration, and application-release artifacts.
+Keep the Compose contract disabled while OIDC, cookies, SMTP, PostgreSQL,
+migration compatibility, RLS isolation, restore, secrets, metrics, logs,
+resource budgets, retention, route handoff, recovery, branch protection, and
+public probes remain unproved.
 
 ### `surplasse`
 
-- extraire `edge`, PostgreSQL, Prometheus et Grafana ;
-- rendre les réseaux et l’hôte PostgreSQL externes ;
-- désactiver Flyway au runtime et fournir un job migrateur dédié ;
-- publier routes Caddy, targets/règles Prometheus, dashboards Grafana,
-  migrations et probes dans le paquet `vps-integration` versionné par digest ;
-- publier seulement les images affectées ;
-- remplacer `IMAGE_TAG` global par des digests par composant ;
-- conserver une révision source distincte par composant inchangé ou reconstruit ;
-- ajouter la demande de promotion vers `vps-infra`.
+The canonical producer publishes independently pinned components, the common
+integration bundle, and one immutable application-release descriptor. Keep the
+Compose contract disabled while external networks, database and roles, secrets,
+SMTP, observability, edge route, migration compatibility, blue/green or
+maintenance cutover, resource budgets, retention, boot recovery, and strict
+public probes remain unproved.
