@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nclsppr/vps-infra/schemas/application-production.schema.json",
+  "title": "Atlas application production admission policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "applications"],
+  "properties": {
+    "schema": { "const": 1 },
+    "applications": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surplasse", "parkventory"],
+      "properties": {
+        "surplasse": { "$ref": "#/$defs/surplasse" },
+        "parkventory": { "$ref": "#/$defs/parkventory" }
+      }
+    }
+  },
+  "$defs": {
+    "baseProperties": {
+      "enabled": { "type": "boolean" },
+      "mode": { "const": "compose" },
+      "source_branch": { "const": "main" }
+    },
+    "surplasse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "mode",
+        "source_repository",
+        "source_branch",
+        "release_repository",
+        "integration_repository",
+        "component_repositories",
+        "required_checks"
+      ],
+      "properties": {
+        "enabled": { "$ref": "#/$defs/baseProperties/enabled" },
+        "mode": { "$ref": "#/$defs/baseProperties/mode" },
+        "source_repository": { "const": "nclsppr/surplasse" },
+        "source_branch": { "$ref": "#/$defs/baseProperties/source_branch" },
+        "release_repository": {
+          "const": "ghcr.io/nclsppr/surplasse/application-release"
+        },
+        "integration_repository": {
+          "const": "ghcr.io/nclsppr/surplasse/vps-integration"
+        },
+        "component_repositories": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["backend", "onboarding", "commande", "dashboard", "docs"],
+          "properties": {
+            "backend": { "const": "ghcr.io/nclsppr/surplasse/backend" },
+            "onboarding": { "const": "ghcr.io/nclsppr/surplasse/onboarding" },
+            "commande": { "const": "ghcr.io/nclsppr/surplasse/commande" },
+            "dashboard": { "const": "ghcr.io/nclsppr/surplasse/dashboard" },
+            "docs": { "const": "ghcr.io/nclsppr/surplasse/docs" }
+          }
+        },
+        "required_checks": {
+          "const": ["Publish immutable application release"]
+        }
+      }
+    },
+    "parkventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "mode",
+        "source_repository",
+        "source_branch",
+        "release_repository",
+        "integration_repository",
+        "component_repositories",
+        "required_checks"
+      ],
+      "properties": {
+        "enabled": { "$ref": "#/$defs/baseProperties/enabled" },
+        "mode": { "$ref": "#/$defs/baseProperties/mode" },
+        "source_repository": { "const": "nclsppr/parkventory" },
+        "source_branch": { "$ref": "#/$defs/baseProperties/source_branch" },
+        "release_repository": {
+          "const": "ghcr.io/nclsppr/parkventory/application-release"
+        },
+        "integration_repository": {
+          "const": "ghcr.io/nclsppr/parkventory/vps-integration"
+        },
+        "component_repositories": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["backend", "frontend"],
+          "properties": {
+            "backend": { "const": "ghcr.io/nclsppr/parkventory/backend" },
+            "frontend": { "const": "ghcr.io/nclsppr/parkventory/frontend" }
+          }
+        },
+        "required_checks": {
+          "const": ["Publish immutable application release", "verify"]
+        }
+      }
+    }
+  }
+}

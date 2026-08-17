@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "applications": {
+    "surplasse": {
+      "enabled": false,
+      "mode": "compose",
+      "source_repository": "nclsppr/surplasse",
+      "source_branch": "main",
+      "release_repository": "ghcr.io/nclsppr/surplasse/application-release",
+      "integration_repository": "ghcr.io/nclsppr/surplasse/vps-integration",
+      "component_repositories": {
+        "backend": "ghcr.io/nclsppr/surplasse/backend",
+        "onboarding": "ghcr.io/nclsppr/surplasse/onboarding",
+        "commande": "ghcr.io/nclsppr/surplasse/commande",
+        "dashboard": "ghcr.io/nclsppr/surplasse/dashboard",
+        "docs": "ghcr.io/nclsppr/surplasse/docs"
+      },
+      "required_checks": [
+        "Publish immutable application release"
+      ]
+    },
+    "parkventory": {
+      "enabled": false,
+      "mode": "compose",
+      "source_repository": "nclsppr/parkventory",
+      "source_branch": "main",
+      "release_repository": "ghcr.io/nclsppr/parkventory/application-release",
+      "integration_repository": "ghcr.io/nclsppr/parkventory/vps-integration",
+      "component_repositories": {
+        "backend": "ghcr.io/nclsppr/parkventory/backend",
+        "frontend": "ghcr.io/nclsppr/parkventory/frontend"
+      },
+      "required_checks": [
+        "Publish immutable application release",
+        "verify"
+      ]
+    }
+  }
+}

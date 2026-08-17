@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nclsppr/vps-infra/schemas/application-release.schema.json",
+  "title": "Immutable application release descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "contract",
+    "application",
+    "source",
+    "components",
+    "integration",
+    "migrations",
+    "probes"
+  ],
+  "properties": {
+    "schema": { "const": 1 },
+    "contract": { "const": "vps-infra.application-release.v1" },
+    "application": { "enum": ["surplasse", "parkventory"] },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "branch", "revision"],
+      "properties": {
+        "repository": { "enum": ["nclsppr/surplasse", "nclsppr/parkventory"] },
+        "branch": { "const": "main" },
+        "revision": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "components": { "type": "object" },
+    "integration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "artifact"],
+      "properties": {
+        "source_revision": { "$ref": "#/$defs/revision" },
+        "artifact": { "$ref": "#/$defs/digestReference" }
+      }
+    },
+    "migrations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy",
+        "runtime_auto_migrate",
+        "inventory_artifact",
+        "inventory_sha256"
+      ],
+      "properties": {
+        "strategy": { "const": "dedicated" },
+        "runtime_auto_migrate": { "const": false },
+        "inventory_artifact": { "$ref": "#/$defs/digestReference" },
+        "inventory_sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inventory_artifact", "inventory_sha256"],
+      "properties": {
+        "inventory_artifact": { "$ref": "#/$defs/digestReference" },
+        "inventory_sha256": { "$ref": "#/$defs/digest" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "application": { "const": "surplasse" } },
+        "required": ["application"]
+      },
+      "then": {
+        "properties": {
+          "source": {
+            "properties": { "repository": { "const": "nclsppr/surplasse" } }
+          },
+          "components": { "$ref": "#/$defs/surplasseComponents" },
+          "integration": {
+            "properties": {
+              "artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/surplasse/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "migrations": {
+            "properties": {
+              "inventory_artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/surplasse/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "probes": {
+            "properties": {
+              "inventory_artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/surplasse/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "source": {
+            "properties": { "repository": { "const": "nclsppr/parkventory" } }
+          },
+          "components": { "$ref": "#/$defs/parkventoryComponents" },
+          "integration": {
+            "properties": {
+              "artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/parkventory/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "migrations": {
+            "properties": {
+              "inventory_artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/parkventory/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "probes": {
+            "properties": {
+              "inventory_artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/parkventory/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "digestReference": {
+      "type": "string",
+      "pattern": "^ghcr\\.io/nclsppr/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_revision", "image"],
+      "properties": {
+        "source_revision": { "$ref": "#/$defs/revision" },
+        "image": { "$ref": "#/$defs/digestReference" }
+      }
+    },
+    "surplasseComponents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend", "onboarding", "commande", "dashboard", "docs"],
+      "properties": {
+        "backend": { "$ref": "#/$defs/component" },
+        "onboarding": { "$ref": "#/$defs/component" },
+        "commande": { "$ref": "#/$defs/component" },
+        "dashboard": { "$ref": "#/$defs/component" },
+        "docs": { "$ref": "#/$defs/component" }
+      }
+    },
+    "parkventoryComponents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend", "frontend"],
+      "properties": {
+        "backend": { "$ref": "#/$defs/component" },
+        "frontend": { "$ref": "#/$defs/component" }
+      }
+    }
+  }
+}
