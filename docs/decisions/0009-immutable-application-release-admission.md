@@ -78,12 +78,13 @@ Parkventory route before it activates Compose.
   inventories.
 - Admission can run in CI without access to Atlas or application secrets.
 - Disabled admission performs no remote discovery.
-- This change does not validate or extract the internal `vps-integration`
-  layers. The future materializer must validate their exact media types,
-  inventories, paths, sizes, modes, and content digests.
-- This change does not verify GitHub artifact attestations. The future
-  materializer must verify the allowlisted producer workflow before it accepts
-  bytes for deployment.
+- This resolver admits the release artifact. It does not validate or extract
+  the internal `vps-integration` layers. Before any activation, the future
+  root-owned applicator must validate their exact media types, inventories,
+  paths, sizes, modes, and content digests.
+- This resolver does not verify GitHub artifact attestations. Before any
+  activation, the future root-owned applicator must verify the allowlisted
+  producer workflow and exact source revision for each admitted artifact.
 
 ## Required follow-up
 

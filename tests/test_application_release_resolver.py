@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import unittest
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+REVISION = "0123456789abcdef0123456789abcdef01234567"
+DIGEST_A = "sha256:" + "a" * 64
+DIGEST_B = "sha256:" + "b" * 64
+DIGEST_C = "sha256:" + "c" * 64
+
+
+def load_module(name: str, path: Path):
+    loader = SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+RESOLVER = load_module(
+    "application_release_resolver",
+    ROOT / "scripts/resolve-application-releases",
+)
+
+
+class FakeClient:
+    def __init__(self, responses=()):
+        self.responses = list(responses)
+        self.requests = []
+
+    def get(self, url, *, headers, max_bytes, attempts=3):
+        self.requests.append((url, headers, max_bytes, attempts))
+        if not self.responses:
+            raise AssertionError(f"unexpected HTTP request: {url}")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def response(body, headers=None):
+    return RESOLVER.HttpResponse(body=body, headers=headers or {})
+
+
+def check_run(name, *, status="completed", conclusion="success", revision=REVISION):
+    return {
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "head_sha": revision,
+    }
+
+
+def check_response(runs):
+    return response(
+        json.dumps({"total_count": len(runs), "check_runs": runs}).encode()
+    )
+
+
+def release_bytes(policy):
+    integration = f"{policy.integration_repository}@{DIGEST_B}"
+    value = {
+        "schema": 1,
+        "contract": RESOLVER.APPLICATION_RELEASE_CONTRACT,
+        "application": policy.name,
+        "source": {
+            "repository": policy.source_repository,
+            "branch": policy.source_branch,
+            "revision": REVISION,
+        },
+        "components": {
+            name: {
+                "source_revision": REVISION,
+                "image": f"{repository}@{DIGEST_A}",
+            }
+            for name, repository in policy.component_repositories.items()
+        },
+        "integration": {
+            "source_revision": REVISION,
+            "artifact": integration,
+        },
+        "migrations": {
+            "strategy": "dedicated",
+            "runtime_auto_migrate": False,
+            "inventory_artifact": integration,
+            "inventory_sha256": DIGEST_C,
+        },
+        "probes": {
+            "inventory_artifact": integration,
+            "inventory_sha256": DIGEST_A,
+        },
+    }
+    return RESOLVER.canonical_json(value)
+
+
+def manifest_bytes(policy, descriptor, *, created="2026-08-17T12:00:00Z"):
+    value = {
+        "schemaVersion": 2,
+        "mediaType": RESOLVER.OCI_MANIFEST_MEDIA_TYPE,
+        "artifactType": RESOLVER.APPLICATION_RELEASE_ARTIFACT_TYPE,
+        "config": RESOLVER.OCI_EMPTY_CONFIG,
+        "layers": [
+            {
+                "mediaType": RESOLVER.APPLICATION_RELEASE_LAYER_MEDIA_TYPE,
+                "digest": RESOLVER.content_digest(descriptor),
+                "size": len(descriptor),
+                "annotations": {
+                    RESOLVER.TITLE_ANNOTATION: RESOLVER.APPLICATION_RELEASE_TITLE
+                },
+            }
+        ],
+        "annotations": {
+            RESOLVER.CREATED_ANNOTATION: created,
+            RESOLVER.SOURCE_ANNOTATION: (
+                f"https://github.com/{policy.source_repository}"
+            ),
+            RESOLVER.REVISION_ANNOTATION: REVISION,
+        },
+    }
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+def manifest_response(raw):
+    return response(
+        raw,
+        {
+            "content-type": RESOLVER.OCI_MANIFEST_MEDIA_TYPE,
+            "docker-content-digest": RESOLVER.content_digest(raw),
+        },
+    )
+
+
+class AdmissionResolverTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.contract = RESOLVER.load_production_contract(
+            ROOT / "releases/application-production.json"
+        )
+        cls.surplasse = cls.contract.applications[0]
+        cls.parkventory = cls.contract.applications[1]
+
+    def enabled(self, application):
+        return RESOLVER.dataclasses.replace(application, enabled=True)
+
+    def release_responses(self, application, second_manifest=None):
+        descriptor = release_bytes(application)
+        first_manifest = manifest_bytes(application, descriptor)
+        return [
+            response(b'{"token":"registry-token"}'),
+            manifest_response(first_manifest),
+            response(descriptor),
+            manifest_response(second_manifest or first_manifest),
+        ]
+
+    def test_disabled_application_performs_zero_network_or_head_resolution(self):
+        client = FakeClient()
+        head = mock.Mock(side_effect=AssertionError("head resolver called"))
+        release = mock.Mock(side_effect=AssertionError("release resolver called"))
+        result = RESOLVER.resolve_application(
+            self.parkventory,
+            client=client,
+            head_resolver=head,
+            release_resolver=release,
+        )
+        self.assertEqual(
+            (result.status, result.reason),
+            ("disabled", "disabled-by-application-production-contract"),
+        )
+        self.assertEqual(client.requests, [])
+        head.assert_not_called()
+        release.assert_not_called()
+
+    def test_all_observed_checks_must_be_complete_green_and_exact_sha(self):
+        application = self.enabled(self.parkventory)
+        cases = (
+            (
+                "red-unrelated",
+                [
+                    check_run("Publish immutable application release"),
+                    check_run("verify"),
+                    check_run("lint", conclusion="failure"),
+                ],
+                RESOLVER.BlockedEvidence,
+                "check-run-not-green",
+            ),
+            (
+                "in-progress",
+                [
+                    check_run("Publish immutable application release"),
+                    check_run("verify", status="in_progress", conclusion=None),
+                ],
+                RESOLVER.PendingEvidence,
+                "check-runs-in-progress",
+            ),
+            (
+                "wrong-sha",
+                [
+                    check_run(
+                        "Publish immutable application release",
+                        revision="f" * 40,
+                    ),
+                    check_run("verify"),
+                ],
+                RESOLVER.BlockedEvidence,
+                "head-sha-does-not-match",
+            ),
+            (
+                "missing-required",
+                [check_run("Publish immutable application release")],
+                RESOLVER.PendingEvidence,
+                "required-checks-missing:verify",
+            ),
+        )
+        for name, runs, error, message in cases:
+            with self.subTest(name=name):
+                client = FakeClient([check_response(runs)])
+                with self.assertRaisesRegex(error, message):
+                    RESOLVER.check_candidate(client, application, REVISION)
+
+    def test_tag_is_read_twice_around_descriptor_validation(self):
+        application = self.enabled(self.surplasse)
+        descriptor_bytes = release_bytes(application)
+        manifest = manifest_bytes(application, descriptor_bytes)
+        client = FakeClient(self.release_responses(application))
+        reference, descriptor = RESOLVER.resolve_release(
+            client, application, REVISION
+        )
+        self.assertEqual(
+            reference,
+            f"{application.release_repository}@{RESOLVER.content_digest(manifest)}",
+        )
+        self.assertEqual(descriptor.source_revision, REVISION)
+        requested = [item[0] for item in client.requests]
+        manifest_requests = [url for url in requested if "/manifests/" in url]
+        self.assertEqual(len(manifest_requests), 2)
+        self.assertEqual(manifest_requests[0], manifest_requests[1])
+        self.assertTrue(manifest_requests[0].endswith(f"/sha-{REVISION}"))
+        self.assertEqual(client.responses, [])
+
+    def test_moving_tag_is_blocked_even_when_both_manifests_are_well_formed(self):
+        application = self.enabled(self.surplasse)
+        descriptor = release_bytes(application)
+        second = manifest_bytes(
+            application, descriptor, created="2026-08-17T12:00:01Z"
+        )
+        client = FakeClient(self.release_responses(application, second))
+        with self.assertRaisesRegex(
+            RESOLVER.BlockedEvidence, "tag-changed-during-resolution"
+        ):
+            RESOLVER.resolve_release(client, application, REVISION)
+
+    def test_manifest_requires_matching_content_digest_header(self):
+        application = self.enabled(self.surplasse)
+        descriptor = release_bytes(application)
+        manifest = manifest_bytes(application, descriptor)
+        client = FakeClient(
+            [
+                response(b'{"token":"registry-token"}'),
+                response(
+                    manifest,
+                    {
+                        "content-type": RESOLVER.OCI_MANIFEST_MEDIA_TYPE,
+                        "docker-content-digest": DIGEST_A,
+                    },
+                ),
+            ]
+        )
+        with self.assertRaisesRegex(
+            RESOLVER.BlockedEvidence, "digest-header-does-not-match"
+        ):
+            RESOLVER.resolve_release(client, application, REVISION)
+
+    def test_ready_requires_checks_release_and_unchanged_exact_head(self):
+        application = self.enabled(self.parkventory)
+        runs = [
+            check_run("Publish immutable application release"),
+            check_run("verify"),
+            check_run("lint", conclusion="neutral"),
+        ]
+        client = FakeClient(
+            [check_response(runs), *self.release_responses(application)]
+        )
+        head = mock.Mock(side_effect=[REVISION, REVISION])
+        result = RESOLVER.resolve_application(
+            application, client=client, head_resolver=head
+        )
+        self.assertEqual((result.status, result.reason), ("ready", "candidate-admitted"))
+        self.assertEqual(result.source_revision, REVISION)
+        self.assertIsNotNone(result.release_reference)
+        self.assertEqual(
+            set(result.descriptor.component_references), {"backend", "frontend"}
+        )
+        self.assertEqual(head.call_count, 2)
+        self.assertEqual(client.responses, [])
+
+    def test_changed_head_after_release_keeps_current_deployment_unchanged(self):
+        application = self.enabled(self.surplasse)
+        runs = [check_run("Publish immutable application release")]
+        client = FakeClient(
+            [check_response(runs), *self.release_responses(application)]
+        )
+        head = mock.Mock(side_effect=[REVISION, "f" * 40])
+        result = RESOLVER.resolve_application(
+            application, client=client, head_resolver=head
+        )
+        self.assertEqual(
+            (result.status, result.reason),
+            ("pending", "canonical-head-changed-during-resolution"),
+        )
+        self.assertIsNone(result.release_reference)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""Resolve immutable Compose application releases without deploying them."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import http.client
+import json
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from lib.application_release import (  # noqa: E402
+    APPLICATION_RELEASE_ARTIFACT_TYPE,
+    APPLICATION_RELEASE_CONTRACT,
+    APPLICATION_RELEASE_LAYER_MEDIA_TYPE,
+    APPLICATION_RELEASE_TITLE,
+    CREATED_ANNOTATION,
+    MAX_RELEASE_BYTES,
+    OCI_EMPTY_CONFIG,
+    OCI_MANIFEST_MEDIA_TYPE,
+    REVISION_ANNOTATION,
+    SOURCE_ANNOTATION,
+    TITLE_ANNOTATION,
+    ApplicationPolicy,
+    ApplicationReleaseError,
+    ProductionContract,
+    ReleaseDescriptor,
+    canonical_json,
+    content_digest,
+    load_production_contract,
+    strict_json_bytes,
+    validate_release_descriptor,
+    validate_release_manifest,
+)
+
+
+MIB = 1024 * 1024
+MAX_CHECK_RUNS_BYTES = 2 * MIB
+MAX_AUTH_RESPONSE_BYTES = 64 * 1024
+MAX_CHECK_RUNS = 100
+CHECK_RUN_ATTEMPTS = 2
+HTTP_TIMEOUT_SECONDS = 20
+HTTP_RETRY_DELAYS = (1.0, 2.0)
+TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+GOOD_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+BEARER_RE = re.compile(r"^[!-~]{1,8192}$")
+
+
+class PendingEvidence(ApplicationReleaseError):
+    """Remote release evidence is incomplete or temporarily unavailable."""
+
+
+class BlockedEvidence(ApplicationReleaseError):
+    """Remote release evidence is complete and prevents admission."""
+
+
+class HttpFailure(ApplicationReleaseError):
+    """A bounded HTTPS request failed."""
+
+    def __init__(self, status: int | None, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclasses.dataclass(frozen=True)
+class HttpResponse:
+    body: bytes
+    headers: Mapping[str, str]
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before an authorization header can leave its endpoint."""
+
+    def redirect_request(self, *_arguments: object, **_keywords: object) -> None:
+        raise HttpFailure(None, "HTTPS redirects are not permitted")
+
+
+@dataclasses.dataclass(frozen=True)
+class Resolution:
+    application: str
+    status: str
+    reason: str
+    source_revision: str | None = None
+    release_reference: str | None = None
+    descriptor: ReleaseDescriptor | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        value: dict[str, object] = {
+            "application": self.application,
+            "reason": self.reason,
+            "status": self.status,
+        }
+        if self.source_revision is not None:
+            value["source_revision"] = self.source_revision
+        if self.release_reference is not None:
+            value["release_reference"] = self.release_reference
+        if self.descriptor is not None:
+            value.update(
+                {
+                    "components": dict(self.descriptor.component_references),
+                    "integration_reference": self.descriptor.integration_reference,
+                    "migration_inventory_digest": (
+                        self.descriptor.migration_inventory_digest
+                    ),
+                    "probe_inventory_digest": self.descriptor.probe_inventory_digest,
+                }
+            )
+        return value
+
+    def matrix_entry(self) -> dict[str, object]:
+        if (
+            self.status != "ready"
+            or self.source_revision is None
+            or self.release_reference is None
+            or self.descriptor is None
+        ):
+            raise ApplicationReleaseError(
+                "only complete ready resolutions can enter the admission matrix"
+            )
+        return {
+            "application": self.application,
+            "components": dict(self.descriptor.component_references),
+            "integration_reference": self.descriptor.integration_reference,
+            "migration_inventory_digest": self.descriptor.migration_inventory_digest,
+            "probe_inventory_digest": self.descriptor.probe_inventory_digest,
+            "release_reference": self.release_reference,
+            "source_revision": self.source_revision,
+        }
+
+
+class BoundedHttpClient:
+    """Perform HTTPS GET requests without proxies, redirects, or unbounded reads."""
+
+    def __init__(
+        self,
+        *,
+        opener: object | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        retry_delays: Sequence[float] = HTTP_RETRY_DELAYS,
+    ) -> None:
+        context = ssl.create_default_context()
+        self._opener = opener or urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            RejectRedirects(),
+            urllib.request.HTTPSHandler(context=context),
+        )
+        self._sleeper = sleeper
+        self._retry_delays = tuple(retry_delays)
+
+    def get(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        max_bytes: int,
+        attempts: int = 3,
+    ) -> HttpResponse:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.fragment:
+            raise ApplicationReleaseError(
+                "HTTP client accepts only absolute HTTPS URLs"
+            )
+        if attempts < 1 or attempts > len(self._retry_delays) + 1:
+            raise ApplicationReleaseError(
+                "HTTP attempt count is outside the retry limit"
+            )
+        if max_bytes < 1 or max_bytes > MAX_CHECK_RUNS_BYTES:
+            raise ApplicationReleaseError(
+                "HTTP response bound is outside the global limit"
+            )
+
+        request_headers = {
+            "Accept-Encoding": "identity",
+            "User-Agent": "vps-infra-application-release-resolver/1",
+            **headers,
+        }
+        last_failure: HttpFailure | None = None
+        for attempt in range(attempts):
+            request = urllib.request.Request(url, headers=request_headers, method="GET")
+            try:
+                response = self._opener.open(request, timeout=HTTP_TIMEOUT_SECONDS)
+                with response:
+                    if response.geturl() != url:
+                        raise HttpFailure(
+                            None, "HTTPS response redirected outside the exact endpoint"
+                        )
+                    status = response.getcode()
+                    if status != 200:
+                        raise HttpFailure(
+                            status, f"HTTPS endpoint returned status {status}"
+                        )
+                    content_length = response.headers.get("Content-Length")
+                    if content_length is not None and (
+                        not content_length.isdecimal()
+                        or int(content_length) > max_bytes
+                    ):
+                        raise HttpFailure(
+                            None, "HTTPS Content-Length exceeds the response bound"
+                        )
+                    content_encoding = response.headers.get("Content-Encoding")
+                    if (
+                        content_encoding is not None
+                        and content_encoding.lower() != "identity"
+                    ):
+                        raise HttpFailure(
+                            None, "HTTPS response uses an unexpected content encoding"
+                        )
+                    body = response.read(max_bytes + 1)
+                    if len(body) > max_bytes:
+                        raise HttpFailure(
+                            None, "HTTPS response exceeds the response bound"
+                        )
+                    normalized_headers = {
+                        key.lower(): value.strip()
+                        for key, value in response.headers.items()
+                    }
+                    return HttpResponse(body=body, headers=normalized_headers)
+            except urllib.error.HTTPError as exc:
+                failure = HttpFailure(
+                    exc.code, f"HTTPS endpoint returned status {exc.code}"
+                )
+                exc.close()
+            except HttpFailure:
+                raise
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,
+                TimeoutError,
+                OSError,
+            ) as exc:
+                failure = HttpFailure(None, f"HTTPS request failed: {exc}")
+
+            last_failure = failure
+            transient = failure.status is None or failure.status in TRANSIENT_HTTP_STATUSES
+            if not transient or attempt + 1 >= attempts:
+                raise failure
+            self._sleeper(self._retry_delays[attempt])
+        if last_failure is None:
+            raise HttpFailure(None, "HTTPS request did not run")
+        raise last_failure
+
+
+def bounded_reason(error: BaseException) -> str:
+    value = "".join(
+        character if 0x20 <= ord(character) <= 0x7E else "?"
+        for character in str(error)
+    )
+    return value if len(value) <= 512 else value[:509] + "..."
+
+
+def resolve_head(application: ApplicationPolicy) -> str:
+    remote = f"https://github.com/{application.source_repository}.git"
+    reference = f"refs/heads/{application.source_branch}"
+    environment = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "GIT_ALLOW_PROTOCOL": "https",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "http.https://github.com/.extraheader=",
+                "ls-remote",
+                "--exit-code",
+                "--refs",
+                remote,
+                reference,
+            ],
+            check=False,
+            capture_output=True,
+            cwd="/",
+            env=environment,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PendingEvidence(f"canonical-head-unavailable: {exc}") from exc
+    if result.returncode != 0:
+        raise PendingEvidence(f"canonical-head-unavailable: git-exit-{result.returncode}")
+    if len(result.stdout) > 1024:
+        raise BlockedEvidence("canonical-head-response-too-large")
+    try:
+        lines = result.stdout.decode("ascii", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise BlockedEvidence("canonical-head-response-is-not-ascii") from exc
+    suffix = f"\t{reference}"
+    if len(lines) != 1 or not lines[0].endswith(suffix):
+        raise BlockedEvidence("canonical-head-response-is-ambiguous")
+    revision = lines[0][: -len(suffix)]
+    if SHA40_RE.fullmatch(revision) is None:
+        raise BlockedEvidence("canonical-head-is-not-a-lowercase-sha")
+    return revision
+
+
+def _api_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def check_candidate(
+    client: BoundedHttpClient,
+    application: ApplicationPolicy,
+    revision: str,
+) -> None:
+    url = (
+        f"https://api.github.com/repos/{application.source_repository}/commits/"
+        f"{revision}/check-runs?filter=latest&per_page={MAX_CHECK_RUNS}"
+    )
+    try:
+        response = client.get(
+            url,
+            headers=_api_headers(),
+            max_bytes=MAX_CHECK_RUNS_BYTES,
+            attempts=CHECK_RUN_ATTEMPTS,
+        )
+    except HttpFailure as exc:
+        if exc.status in TRANSIENT_HTTP_STATUSES | {403, 404} or exc.status is None:
+            raise PendingEvidence("check-runs-temporarily-unavailable") from exc
+        raise BlockedEvidence(f"check-runs-http-{exc.status}") from exc
+
+    value = strict_json_bytes(
+        response.body, "check-runs response", maximum=MAX_CHECK_RUNS_BYTES
+    )
+    if not isinstance(value, dict) or set(value) != {"total_count", "check_runs"}:
+        raise BlockedEvidence("check-runs-response-shape-is-invalid")
+    total_count = value["total_count"]
+    runs = value["check_runs"]
+    if type(total_count) is not int or not 0 <= total_count <= MAX_CHECK_RUNS:
+        raise BlockedEvidence("check-run-count-exceeds-limit")
+    if not isinstance(runs, list) or len(runs) != total_count:
+        raise BlockedEvidence("check-run-count-is-inconsistent")
+
+    observed: set[str] = set()
+    successful: set[str] = set()
+    incomplete = False
+    for run in runs:
+        if not isinstance(run, dict):
+            raise BlockedEvidence("check-run-is-not-an-object")
+        required_fields = {"name", "status", "conclusion", "head_sha"}
+        if not required_fields.issubset(run):
+            raise BlockedEvidence("check-run-is-missing-required-fields")
+        name = run["name"]
+        status = run["status"]
+        conclusion = run["conclusion"]
+        if not isinstance(name, str) or not 1 <= len(name) <= 256:
+            raise BlockedEvidence("check-run-name-is-invalid")
+        if run["head_sha"] != revision:
+            raise BlockedEvidence("check-run-head-sha-does-not-match")
+        observed.add(name)
+        if status != "completed":
+            if status not in {
+                "queued",
+                "in_progress",
+                "pending",
+                "requested",
+                "waiting",
+            }:
+                raise BlockedEvidence("check-run-status-is-invalid")
+            incomplete = True
+            continue
+        if not isinstance(conclusion, str) or conclusion not in GOOD_CONCLUSIONS:
+            raise BlockedEvidence("check-run-not-green")
+        if conclusion == "success":
+            successful.add(name)
+
+    missing = [name for name in application.required_checks if name not in observed]
+    if missing:
+        raise PendingEvidence(f"required-checks-missing:{','.join(missing)}")
+    if incomplete:
+        raise PendingEvidence("check-runs-in-progress")
+    unsuccessful = [name for name in application.required_checks if name not in successful]
+    if unsuccessful:
+        raise BlockedEvidence(
+            f"required-checks-not-successful:{','.join(unsuccessful)}"
+        )
+
+
+def _registry_path(repository: str) -> str:
+    prefix = "ghcr.io/"
+    if not repository.startswith(prefix):
+        raise ApplicationReleaseError("registry repository is outside ghcr.io")
+    path = repository.removeprefix(prefix)
+    pattern = r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+"
+    if re.fullmatch(pattern, path) is None:
+        raise ApplicationReleaseError("registry repository path is invalid")
+    return path
+
+
+def _registry_bearer(client: BoundedHttpClient, repository: str) -> str:
+    repository_path = _registry_path(repository)
+    query = urllib.parse.urlencode(
+        {"service": "ghcr.io", "scope": f"repository:{repository_path}:pull"}
+    )
+    try:
+        response = client.get(
+            f"https://ghcr.io/token?{query}",
+            headers={"Accept": "application/json"},
+            max_bytes=MAX_AUTH_RESPONSE_BYTES,
+            attempts=3,
+        )
+    except HttpFailure as exc:
+        if exc.status == 404 or exc.status in TRANSIENT_HTTP_STATUSES or exc.status is None:
+            raise PendingEvidence("registry-token-temporarily-unavailable") from exc
+        raise BlockedEvidence(f"registry-token-http-{exc.status}") from exc
+    value = strict_json_bytes(
+        response.body, "registry token response", maximum=MAX_AUTH_RESPONSE_BYTES
+    )
+    if not isinstance(value, dict):
+        raise BlockedEvidence("registry-token-response-is-not-an-object")
+    bearer = value.get("token", value.get("access_token"))
+    if not isinstance(bearer, str) or BEARER_RE.fullmatch(bearer) is None:
+        raise BlockedEvidence("registry-token-is-invalid")
+    return bearer
+
+
+def _manifest_response(
+    client: BoundedHttpClient,
+    repository_path: str,
+    tag: str,
+    bearer: str,
+) -> HttpResponse:
+    try:
+        response = client.get(
+            f"https://ghcr.io/v2/{repository_path}/manifests/{tag}",
+            headers={
+                "Accept": OCI_MANIFEST_MEDIA_TYPE,
+                "Authorization": f"Bearer {bearer}",
+            },
+            max_bytes=MAX_RELEASE_BYTES,
+            attempts=3,
+        )
+    except HttpFailure as exc:
+        if exc.status == 404:
+            raise PendingEvidence("application-release-not-published") from exc
+        if exc.status in TRANSIENT_HTTP_STATUSES or exc.status is None:
+            raise PendingEvidence("application-release-temporarily-unavailable") from exc
+        raise BlockedEvidence(f"application-release-http-{exc.status}") from exc
+    content_type = response.headers.get("content-type", "").split(";", maxsplit=1)[0]
+    if content_type != OCI_MANIFEST_MEDIA_TYPE:
+        raise BlockedEvidence("application-release-content-type-is-invalid")
+    calculated = content_digest(response.body)
+    advertised = response.headers.get("docker-content-digest")
+    if advertised is None or advertised != calculated:
+        raise BlockedEvidence("application-release-digest-header-does-not-match")
+    return response
+
+
+def resolve_release(
+    client: BoundedHttpClient,
+    application: ApplicationPolicy,
+    revision: str,
+) -> tuple[str, ReleaseDescriptor]:
+    repository_path = _registry_path(application.release_repository)
+    bearer = _registry_bearer(client, application.release_repository)
+    tag = f"sha-{revision}"
+
+    first = _manifest_response(client, repository_path, tag, bearer)
+    layer = validate_release_manifest(first.body, application, revision)
+    try:
+        blob = client.get(
+            f"https://ghcr.io/v2/{repository_path}/blobs/{layer.digest}",
+            headers={
+                "Accept": "application/octet-stream",
+                "Authorization": f"Bearer {bearer}",
+            },
+            max_bytes=MAX_RELEASE_BYTES,
+            attempts=3,
+        )
+    except HttpFailure as exc:
+        if exc.status == 404:
+            raise PendingEvidence("application-release-descriptor-not-published") from exc
+        if exc.status in TRANSIENT_HTTP_STATUSES or exc.status is None:
+            raise PendingEvidence(
+                "application-release-descriptor-temporarily-unavailable"
+            ) from exc
+        raise BlockedEvidence(f"application-release-descriptor-http-{exc.status}") from exc
+    if len(blob.body) != layer.size:
+        raise BlockedEvidence("application-release-descriptor-size-does-not-match")
+    if content_digest(blob.body) != layer.digest:
+        raise BlockedEvidence("application-release-descriptor-digest-does-not-match")
+    descriptor = validate_release_descriptor(blob.body, application, revision)
+
+    second = _manifest_response(client, repository_path, tag, bearer)
+    second_layer = validate_release_manifest(second.body, application, revision)
+    if second.body != first.body or second_layer != layer:
+        raise BlockedEvidence("application-release-tag-changed-during-resolution")
+
+    manifest_digest = content_digest(first.body)
+    return f"{application.release_repository}@{manifest_digest}", descriptor
+
+
+def resolve_application(
+    application: ApplicationPolicy,
+    *,
+    client: BoundedHttpClient,
+    head_resolver: Callable[[ApplicationPolicy], str] = resolve_head,
+    release_resolver: Callable[
+        [BoundedHttpClient, ApplicationPolicy, str], tuple[str, ReleaseDescriptor]
+    ] = resolve_release,
+) -> Resolution:
+    if not application.enabled:
+        return Resolution(
+            application=application.name,
+            status="disabled",
+            reason="disabled-by-application-production-contract",
+        )
+
+    revision: str | None = None
+    try:
+        revision = head_resolver(application)
+        if SHA40_RE.fullmatch(revision) is None:
+            raise BlockedEvidence("canonical-head-is-not-a-lowercase-sha")
+        check_candidate(client, application, revision)
+        release_reference, descriptor = release_resolver(
+            client, application, revision
+        )
+        if head_resolver(application) != revision:
+            raise PendingEvidence("canonical-head-changed-during-resolution")
+        return Resolution(
+            application=application.name,
+            status="ready",
+            reason="candidate-admitted",
+            source_revision=revision,
+            release_reference=release_reference,
+            descriptor=descriptor,
+        )
+    except PendingEvidence as exc:
+        return Resolution(
+            application=application.name,
+            status="pending",
+            reason=bounded_reason(exc),
+            source_revision=revision,
+        )
+    except (BlockedEvidence, ApplicationReleaseError) as exc:
+        return Resolution(
+            application=application.name,
+            status="blocked",
+            reason=bounded_reason(exc),
+            source_revision=revision,
+        )
+    except Exception as exc:
+        return Resolution(
+            application=application.name,
+            status="blocked",
+            reason=f"resolver-internal-error:{type(exc).__name__}",
+            source_revision=revision,
+        )
+
+
+def resolve_all(
+    contract: ProductionContract,
+    *,
+    client: BoundedHttpClient,
+    head_resolver: Callable[[ApplicationPolicy], str] = resolve_head,
+    release_resolver: Callable[
+        [BoundedHttpClient, ApplicationPolicy, str], tuple[str, ReleaseDescriptor]
+    ] = resolve_release,
+) -> tuple[Resolution, ...]:
+    return tuple(
+        resolve_application(
+            application,
+            client=client,
+            head_resolver=head_resolver,
+            release_resolver=release_resolver,
+        )
+        for application in contract.applications
+    )
+
+
+def _canonical_output(value: object) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def write_result(path: Path, resolutions: Sequence[Resolution]) -> None:
+    value = {
+        "applications": [resolution.as_dict() for resolution in resolutions],
+        "schema": 1,
+    }
+    path.write_text(_canonical_output(value) + "\n", encoding="ascii")
+
+
+def write_github_output(path: Path, resolutions: Sequence[Resolution]) -> None:
+    ready = [
+        resolution.matrix_entry()
+        for resolution in resolutions
+        if resolution.status == "ready"
+    ]
+    counts = {
+        status: sum(resolution.status == status for resolution in resolutions)
+        for status in ("ready", "pending", "blocked", "disabled")
+    }
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(f"matrix={_canonical_output({'include': ready})}\n")
+        for status, count in counts.items():
+            stream.write(f"{status}_count={count}\n")
+
+
+def write_step_summary(path: Path, resolutions: Sequence[Resolution]) -> None:
+    lines = [
+        "## Application release admission",
+        "",
+        "| Application | Status | Canonical revision | Reason |",
+        "| --- | --- | --- | --- |",
+    ]
+    for resolution in resolutions:
+        revision = resolution.source_revision or "not resolved"
+        reason = (
+            resolution.reason.replace("|", "-")
+            .replace("`", "'")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
+        lines.append(
+            f"| `{resolution.application}` | **{resolution.status}** | "
+            f"`{revision}` | `{reason}` |"
+        )
+    lines.append("")
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("\n".join(lines) + "\n")
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--contract",
+        type=Path,
+        default=Path("releases/application-production.json"),
+        help="versioned application production admission contract",
+    )
+    parser.add_argument(
+        "--static-contract",
+        type=Path,
+        help=(
+            "versioned static production contract; defaults to static-production.json "
+            "next to the application contract"
+        ),
+    )
+    parser.add_argument("--output", type=Path, help="write the complete resolution JSON")
+    parser.add_argument(
+        "--github-output", type=Path, help="append the ready admission matrix"
+    )
+    parser.add_argument(
+        "--step-summary", type=Path, help="append a readable admission status table"
+    )
+    parser.add_argument(
+        "--validate-contract",
+        action="store_true",
+        help="validate local contracts without network access",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        static_contract = arguments.static_contract or arguments.contract.with_name(
+            "static-production.json"
+        )
+        contract = load_production_contract(arguments.contract, static_contract)
+        if arguments.validate_contract:
+            print(f"application release contract valid: {arguments.contract}")
+            return 0
+        resolutions = resolve_all(contract, client=BoundedHttpClient())
+        if arguments.output is not None:
+            write_result(arguments.output, resolutions)
+        else:
+            print(
+                _canonical_output(
+                    {
+                        "applications": [item.as_dict() for item in resolutions],
+                        "schema": 1,
+                    }
+                )
+            )
+        if arguments.github_output is not None:
+            write_github_output(arguments.github_output, resolutions)
+        if arguments.step_summary is not None:
+            write_step_summary(arguments.step_summary, resolutions)
+        for resolution in resolutions:
+            if resolution.status not in {"ready", "disabled"}:
+                reason = (
+                    resolution.reason.replace("%", "%25")
+                    .replace("\r", "%0D")
+                    .replace("\n", "%0A")
+                )
+                severity = "warning" if resolution.status == "pending" else "error"
+                print(
+                    f"::{severity} title={resolution.application} application release::"
+                    f"{reason}"
+                )
+        return 0
+    except (OSError, ApplicationReleaseError) as exc:
+        print(f"application release resolution failed: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

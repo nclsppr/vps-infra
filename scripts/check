@@ -29,6 +29,10 @@ echo "release manifest valid: $REPOSITORY_ROOT/releases/production.yaml"
   --contract "$REPOSITORY_ROOT/releases/static-production.json" \
   --application-contract "$REPOSITORY_ROOT/releases/production.yaml" \
   --validate-contract
+"$SCRIPT_DIR/resolve-application-releases" \
+  --contract "$REPOSITORY_ROOT/releases/application-production.json" \
+  --static-contract "$REPOSITORY_ROOT/releases/static-production.json" \
+  --validate-contract
 "$SCRIPT_DIR/verify-github-evidence" \
   "$REPOSITORY_ROOT/releases/production.yaml"
 "$SCRIPT_DIR/check-public-safe" --root "$REPOSITORY_ROOT"
