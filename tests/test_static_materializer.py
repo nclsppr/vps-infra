@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import dataclasses
 import gzip
 import hashlib
@@ -12,6 +13,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -43,6 +45,49 @@ def load_script_module():
 
 
 MATERIALIZER = load_script_module()
+
+
+def deployment_state(
+    application: str = "personal",
+    *,
+    source_revision: str = REVISION,
+    site_digit: str = "1",
+    routes_digit: str = "2",
+) -> object:
+    profile = MATERIALIZER.PROFILES[application]
+    return MATERIALIZER.DeploymentState(
+        application=application,
+        source_revision=source_revision,
+        site_reference=f"{profile.site_repository}@sha256:{site_digit * 64}",
+        routes_reference=f"{profile.routes_repository}@sha256:{routes_digit * 64}",
+        integration_revision=REVISION,
+        integration_reference=(
+            f"{MATERIALIZER.INTEGRATION_REPOSITORY}@sha256:{'3' * 64}"
+        ),
+        caddy_image=(
+            "ghcr.io/nclsppr/vps-infra/caddy@sha256:" + "4" * 64
+        ),
+    )
+
+
+def probe_inventory() -> object:
+    files = (
+        MATERIALIZER.RouteFile("index.html", "/", 2048, "a" * 64),
+        MATERIALIZER.RouteFile("404.html", "/404.html", 512, "b" * 64),
+        MATERIALIZER.RouteFile(
+            "assets/application.css",
+            "/assets/application.css",
+            128,
+            "c" * 64,
+        ),
+    )
+    return MATERIALIZER.InventoryContract(
+        archive_bytes=1024,
+        archive_sha256="d" * 64,
+        file_count=len(files),
+        uncompressed_bytes=sum(item.size for item in files),
+        files=files,
+    )
 
 
 def canonical_json(value: object) -> bytes:
@@ -1753,6 +1798,1229 @@ class StaticBundleContractTests(unittest.TestCase):
                     )
             self.assertEqual(os.readlink(current), f"releases/{old_release.name}")
 
+    def test_deployment_state_is_canonical_protected_and_complete(self) -> None:
+        state = deployment_state()
+        encoded = MATERIALIZER.canonical_deployment_state(state)
+        self.assertEqual(MATERIALIZER.parse_deployment_state(encoded, "state"), state)
+        self.assertEqual(
+            MATERIALIZER.release_target_for_state(state),
+            f"releases/sha256-{'1' * 64}",
+        )
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "not canonical",
+        ):
+            MATERIALIZER.parse_deployment_state(
+                json.dumps(state.as_dict(), indent=2).encode("ascii"),
+                "state",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory) / "active"
+            directory.mkdir(mode=0o700)
+            MATERIALIZER.write_deployment_state_file(
+                directory,
+                "personal.json",
+                state,
+                "active state",
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            path = directory / "personal.json"
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                MATERIALIZER.read_deployment_state_file(
+                    directory,
+                    "personal.json",
+                    "active state",
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                ),
+                state,
+            )
+            path.chmod(0o644)
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "protected state file",
+            ):
+                MATERIALIZER.read_deployment_state_file(
+                    directory,
+                    "personal.json",
+                    "active state",
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                )
+
+    def test_deployment_transaction_binds_previous_and_expected_targets(self) -> None:
+        state = deployment_state()
+        transaction = MATERIALIZER.DeploymentTransaction(
+            candidate=state,
+            previous_state=None,
+            previous_target=f"releases/sha256-{'9' * 64}",
+            expected_target=MATERIALIZER.release_target_for_state(state),
+            phase="prepared",
+        )
+        encoded = MATERIALIZER.canonical_deployment_transaction(transaction)
+        self.assertEqual(
+            MATERIALIZER.parse_deployment_transaction(encoded, "transaction"),
+            transaction,
+        )
+        forged = dataclasses.replace(
+            transaction,
+            expected_target=f"releases/sha256-{'8' * 64}",
+        )
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "does not match",
+        ):
+            MATERIALIZER.canonical_deployment_transaction(forged)
+
+    def test_live_activation_commits_state_only_after_public_probe(self) -> None:
+        state = deployment_state()
+        profile = MATERIALIZER.PROFILES["personal"]
+        inventory = probe_inventory()
+        events: list[str] = []
+
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+            side_effect=lambda *args: events.append("previous-release"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+            side_effect=lambda *args: events.append("head"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+            side_effect=lambda *args, **kwargs: events.append("caddy-runtime"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=f"releases/sha256-{'9' * 64}",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_transaction",
+            side_effect=lambda *args: events.append("transaction"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "activate_release",
+            side_effect=lambda *args: (
+                events.append("activate")
+                or (f"releases/sha256-{'9' * 64}", True)
+            ),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "probe_live_release",
+            side_effect=lambda *args: events.append("public-probe"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_persisted_inventory",
+            side_effect=lambda *args: events.append("persisted-inventory"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_state_file",
+            side_effect=lambda *args: events.append("active-state"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "remove_protected_state_file",
+            side_effect=lambda *args: events.append("transaction-removed"),
+        ):
+            MATERIALIZER.activate_live_release(
+                state,
+                profile,
+                inventory,
+                Path("/srv/www/personal/current"),
+                Path("/srv/www/personal/releases"),
+                f"sha256-{'1' * 64}",
+                Path("/var/tmp/test"),
+                previous_active_state=deployment_state(site_digit="9"),
+            )
+        self.assertEqual(
+            events,
+            [
+                "previous-release",
+                "caddy-runtime",
+                "head",
+                "transaction",
+                "activate",
+                "transaction",
+                "public-probe",
+                "persisted-inventory",
+                "caddy-runtime",
+                "head",
+                "transaction",
+                "active-state",
+                "transaction-removed",
+            ],
+        )
+
+    def test_live_probe_failure_restores_and_quarantines_candidate(self) -> None:
+        state = deployment_state()
+        profile = MATERIALIZER.PROFILES["personal"]
+        inventory = MATERIALIZER.InventoryContract(1, "0" * 64, 0, 0, ())
+        previous = f"releases/sha256-{'9' * 64}"
+        writes: list[tuple[Path, str]] = []
+        events: list[str] = []
+        runtime_calls = 0
+        head_calls = 0
+
+        def check_runtime(*_args, **_kwargs):
+            nonlocal runtime_calls
+            runtime_calls += 1
+            events.append(f"caddy-{runtime_calls}")
+            return "a" * 64
+
+        def check_head(*_args, **_kwargs):
+            nonlocal head_calls
+            head_calls += 1
+            events.append(f"head-{head_calls}")
+
+        def write_state(directory, name, *_args):
+            writes.append((directory, name))
+            events.append(
+                "quarantine"
+                if directory == MATERIALIZER.STATIC_QUARANTINE_ROOT
+                else "active-state"
+            )
+
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+            side_effect=check_head,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+            side_effect=check_runtime,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=previous,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_transaction",
+            side_effect=lambda *args: events.append("transaction"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "activate_release",
+            return_value=(previous, True),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "probe_live_release",
+            side_effect=MATERIALIZER.StaticDeploymentError("bad public response"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "restore_current_target",
+            side_effect=lambda *args: events.append("rollback"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_state_file",
+            side_effect=write_state,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "remove_protected_state_file",
+            side_effect=lambda *args: events.append("transaction-removed"),
+        ):
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "restored and the candidate quarantined",
+            ):
+                MATERIALIZER.activate_live_release(
+                    state,
+                    profile,
+                    inventory,
+                    Path("/srv/www/personal/current"),
+                    Path("/srv/www/personal/releases"),
+                    f"sha256-{'1' * 64}",
+                    Path("/var/tmp/test"),
+                    previous_active_state=deployment_state(site_digit="9"),
+                )
+        self.assertEqual(
+            events,
+            [
+                "caddy-1",
+                "head-1",
+                "transaction",
+                "transaction",
+                "transaction",
+                "rollback",
+                "active-state",
+                "caddy-2",
+                "head-2",
+                "quarantine",
+                "transaction-removed",
+            ],
+        )
+        self.assertEqual(
+            writes,
+            [
+                (MATERIALIZER.STATIC_ACTIVE_STATE_ROOT, "personal.json"),
+                (
+                    MATERIALIZER.STATIC_QUARANTINE_ROOT,
+                    MATERIALIZER.quarantine_name(state),
+                ),
+            ],
+        )
+
+    def test_quarantine_write_failure_keeps_the_rejected_transaction(self) -> None:
+        candidate = deployment_state()
+        previous_state = deployment_state(site_digit="9")
+        previous_target = MATERIALIZER.release_target_for_state(previous_state)
+        transactions: list[object] = []
+
+        def write_state(directory, *_args):
+            if directory == MATERIALIZER.STATIC_QUARANTINE_ROOT:
+                raise MATERIALIZER.StaticDeploymentError("quarantine disk full")
+
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+            return_value="a" * 64,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=previous_target,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_transaction",
+            side_effect=transactions.append,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "activate_release",
+            return_value=(previous_target, True),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "probe_live_release",
+            side_effect=MATERIALIZER.StaticDeploymentError("bad public response"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "restore_deployment_transaction",
+        ) as restore, mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_state_file",
+            side_effect=write_state,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "remove_protected_state_file",
+        ) as remove_transaction:
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "quarantine state could not be made durable",
+            ):
+                MATERIALIZER.activate_live_release(
+                    candidate,
+                    MATERIALIZER.PROFILES["personal"],
+                    probe_inventory(),
+                    Path("/srv/www/personal/current"),
+                    Path("/srv/www/personal/releases"),
+                    f"sha256-{'1' * 64}",
+                    Path("/var/tmp/test"),
+                    previous_active_state=previous_state,
+                )
+        self.assertEqual(transactions[-1].phase, "probe-rejected")
+        restore.assert_called_once()
+        remove_transaction.assert_not_called()
+
+    def test_failed_bootstrap_probe_does_not_quarantine_an_unchanged_link(self) -> None:
+        state = deployment_state()
+        profile = MATERIALIZER.PROFILES["personal"]
+        inventory = MATERIALIZER.InventoryContract(1, "0" * 64, 0, 0, ())
+        expected = MATERIALIZER.release_target_for_state(state)
+        with mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=expected,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_transaction",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "activate_release",
+            return_value=(expected, False),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "probe_live_release",
+            side_effect=MATERIALIZER.StaticDeploymentError("bad public response"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "restore_current_target",
+        ) as restore, mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_state_file",
+        ) as write_state, mock.patch.object(
+            MATERIALIZER,
+            "remove_protected_state_file",
+        ) as remove_transaction:
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "existing untracked release",
+            ):
+                MATERIALIZER.activate_live_release(
+                    state,
+                    profile,
+                    inventory,
+                    Path("/srv/www/personal/current"),
+                    Path("/srv/www/personal/releases"),
+                    f"sha256-{'1' * 64}",
+                    Path("/var/tmp/test"),
+                    previous_active_state=None,
+                )
+        restore.assert_not_called()
+        write_state.assert_not_called()
+        remove_transaction.assert_called_once()
+
+    def test_interrupted_activation_recovers_before_new_candidate(self) -> None:
+        state = deployment_state()
+        previous = f"releases/sha256-{'9' * 64}"
+        transaction = MATERIALIZER.DeploymentTransaction(
+            candidate=state,
+            previous_state=None,
+            previous_target=previous,
+            expected_target=MATERIALIZER.release_target_for_state(state),
+            phase="switched",
+        )
+        events: list[str] = []
+        with mock.patch.object(
+            MATERIALIZER,
+            "read_deployment_transaction",
+            return_value=transaction,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=transaction.expected_target,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "read_deployment_state_file",
+            return_value=None,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "restore_current_target",
+            side_effect=lambda *args: events.append("rollback"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_state_file",
+            side_effect=lambda *args: events.append("quarantine"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "remove_protected_state_file",
+            side_effect=lambda directory, *args: events.append(
+                "active-removed"
+                if directory == MATERIALIZER.STATIC_ACTIVE_STATE_ROOT
+                else "transaction-removed"
+            ),
+        ):
+            MATERIALIZER.recover_interrupted_deployment(
+                "personal",
+                Path("/srv/www/personal/current"),
+                Path("/srv/www/personal/releases"),
+            )
+        self.assertEqual(
+            events,
+            ["rollback", "active-removed", "quarantine", "transaction-removed"],
+        )
+
+    def test_interrupted_activation_recovery_respects_durable_phase(self) -> None:
+        candidate = deployment_state()
+        previous_state = deployment_state(site_digit="9")
+        previous_target = MATERIALIZER.release_target_for_state(previous_state)
+        expected_target = MATERIALIZER.release_target_for_state(candidate)
+        cases = (
+            ("prepared", previous_target, None),
+            ("prepared", expected_target, True),
+            ("switched", expected_target, True),
+            ("probe-rejected", expected_target, True),
+            ("probe-rejected", previous_target, True),
+            ("probe-failed", previous_target, True),
+            ("superseded", expected_target, False),
+        )
+        for phase, actual_target, expected_quarantine in cases:
+            with self.subTest(phase=phase, target=actual_target):
+                encoded_transaction = MATERIALIZER.canonical_deployment_transaction(
+                    MATERIALIZER.DeploymentTransaction(
+                        candidate=candidate,
+                        previous_state=previous_state,
+                        previous_target=previous_target,
+                        expected_target=expected_target,
+                        phase=phase,
+                    )
+                )
+                transaction = MATERIALIZER.parse_deployment_transaction(
+                    encoded_transaction,
+                    "durable recovery transaction",
+                )
+                with mock.patch.object(
+                    MATERIALIZER,
+                    "read_deployment_transaction",
+                    return_value=transaction,
+                ), mock.patch.object(
+                    MATERIALIZER,
+                    "get_current_target",
+                    return_value=actual_target,
+                ), mock.patch.object(
+                    MATERIALIZER,
+                    "read_deployment_state_file",
+                    return_value=previous_state,
+                ), mock.patch.object(
+                    MATERIALIZER,
+                    "validate_persisted_release",
+                ), mock.patch.object(
+                    MATERIALIZER,
+                    "rollback_deployment_transaction",
+                ) as rollback, mock.patch.object(
+                    MATERIALIZER,
+                    "write_deployment_state_file",
+                ) as write_state, mock.patch.object(
+                    MATERIALIZER,
+                    "remove_protected_state_file",
+                ) as remove_state:
+                    MATERIALIZER.recover_interrupted_deployment(
+                        "personal",
+                        Path("/srv/www/personal/current"),
+                        Path("/srv/www/personal/releases"),
+                    )
+                if expected_quarantine is None:
+                    rollback.assert_not_called()
+                    write_state.assert_called_once_with(
+                        MATERIALIZER.STATIC_ACTIVE_STATE_ROOT,
+                        "personal.json",
+                        previous_state,
+                        "active deployment state",
+                    )
+                    remove_state.assert_called_once()
+                else:
+                    rollback.assert_called_once_with(
+                        transaction,
+                        Path("/srv/www/personal/current"),
+                        Path("/srv/www/personal/releases"),
+                        quarantine=expected_quarantine,
+                    )
+
+    def test_interrupted_probed_activation_commits_or_preserves_previous(self) -> None:
+        candidate = deployment_state()
+        previous_state = deployment_state(site_digit="9")
+        transaction = MATERIALIZER.DeploymentTransaction(
+            candidate=candidate,
+            previous_state=previous_state,
+            previous_target=MATERIALIZER.release_target_for_state(previous_state),
+            expected_target=MATERIALIZER.release_target_for_state(candidate),
+            phase="probed",
+        )
+        for actual_target, expected_state in (
+            (transaction.expected_target, candidate),
+            (transaction.previous_target, previous_state),
+        ):
+            with self.subTest(target=actual_target):
+                with mock.patch.object(
+                    MATERIALIZER,
+                    "read_deployment_transaction",
+                    return_value=transaction,
+                ), mock.patch.object(
+                    MATERIALIZER,
+                    "get_current_target",
+                    return_value=actual_target,
+                ), mock.patch.object(
+                    MATERIALIZER,
+                    "read_deployment_state_file",
+                    return_value=previous_state,
+                ), mock.patch.object(
+                    MATERIALIZER,
+                    "validate_persisted_release",
+                    return_value=probe_inventory(),
+                ) as validate_release, mock.patch.object(
+                    MATERIALIZER,
+                    "write_deployment_state_file",
+                ) as write_state, mock.patch.object(
+                    MATERIALIZER,
+                    "remove_protected_state_file",
+                ) as remove_state:
+                    MATERIALIZER.recover_interrupted_deployment(
+                        "personal",
+                        Path("/srv/www/personal/current"),
+                        Path("/srv/www/personal/releases"),
+                    )
+                self.assertEqual(validate_release.call_count, 1)
+                expected_validated_state = (
+                    candidate
+                    if actual_target == transaction.expected_target
+                    else previous_state
+                )
+                validate_release.assert_called_once_with(
+                    expected_validated_state,
+                    Path("/srv/www/personal/releases"),
+                )
+                write_state.assert_called_once_with(
+                    MATERIALIZER.STATIC_ACTIVE_STATE_ROOT,
+                    "personal.json",
+                    expected_state,
+                    "active deployment state",
+                )
+                remove_state.assert_called_once()
+
+    def test_recovery_refuses_to_commit_or_restore_a_corrupted_managed_release(
+        self,
+    ) -> None:
+        candidate = deployment_state()
+        previous_state = deployment_state(site_digit="9")
+        releases = Path("/srv/www/personal/releases")
+        current = Path("/srv/www/personal/current")
+        transaction = MATERIALIZER.DeploymentTransaction(
+            candidate=candidate,
+            previous_state=previous_state,
+            previous_target=MATERIALIZER.release_target_for_state(previous_state),
+            expected_target=MATERIALIZER.release_target_for_state(candidate),
+            phase="probed",
+        )
+        with mock.patch.object(
+            MATERIALIZER,
+            "read_deployment_transaction",
+            return_value=transaction,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=transaction.expected_target,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "read_deployment_state_file",
+            return_value=previous_state,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+            side_effect=MATERIALIZER.StaticDeploymentError("filesystem changed"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_state_file",
+        ) as write_state, mock.patch.object(
+            MATERIALIZER,
+            "remove_protected_state_file",
+        ) as remove_state:
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "filesystem changed",
+            ):
+                MATERIALIZER.recover_interrupted_deployment(
+                    "personal",
+                    current,
+                    releases,
+                )
+        write_state.assert_not_called()
+        remove_state.assert_not_called()
+
+        rollback = dataclasses.replace(transaction, phase="probe-failed")
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+            side_effect=MATERIALIZER.StaticDeploymentError("previous changed"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "restore_current_target",
+        ) as restore:
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "previous changed",
+            ):
+                MATERIALIZER.rollback_deployment_transaction(
+                    rollback,
+                    current,
+                    releases,
+                    quarantine=True,
+                )
+        restore.assert_not_called()
+
+    def test_probed_phase_write_failure_rolls_back_without_quarantine(self) -> None:
+        candidate = deployment_state()
+        previous_state = deployment_state(site_digit="9")
+        profile = MATERIALIZER.PROFILES["personal"]
+        previous_target = MATERIALIZER.release_target_for_state(previous_state)
+        writes: list[object] = []
+
+        def write_transaction(transaction: object) -> None:
+            writes.append(transaction)
+            if getattr(transaction, "phase") == "probed":
+                raise MATERIALIZER.StaticDeploymentError("fsync failed")
+
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=previous_target,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_transaction",
+            side_effect=write_transaction,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "activate_release",
+            return_value=(previous_target, True),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "probe_live_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_persisted_inventory",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "read_deployment_transaction",
+            side_effect=lambda _application: writes[-2],
+        ), mock.patch.object(
+            MATERIALIZER,
+            "rollback_deployment_transaction",
+        ) as rollback:
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "restored without quarantine",
+            ):
+                MATERIALIZER.activate_live_release(
+                    candidate,
+                    profile,
+                    probe_inventory(),
+                    Path("/srv/www/personal/current"),
+                    Path("/srv/www/personal/releases"),
+                    f"sha256-{'1' * 64}",
+                    Path("/var/tmp/test"),
+                    previous_active_state=previous_state,
+                )
+        rollback.assert_called_once()
+        self.assertFalse(rollback.call_args.kwargs["quarantine"])
+
+    def test_failed_live_probe_rolls_back_before_slow_classification(self) -> None:
+        candidate = deployment_state()
+        previous_state = deployment_state(site_digit="9")
+        previous_target = MATERIALIZER.release_target_for_state(previous_state)
+        events: list[str] = []
+        runtime_calls = 0
+
+        def check_runtime(*_args, **_kwargs):
+            nonlocal runtime_calls
+            runtime_calls += 1
+            events.append(f"runtime-{runtime_calls}")
+            if runtime_calls == 2:
+                raise MATERIALIZER.StaticDeploymentError("runtime changed")
+            return "a" * 64
+
+        def fail_probe(*_args, **_kwargs):
+            events.append("probe-failed")
+            raise MATERIALIZER.StaticDeploymentError("bad public response")
+
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+            side_effect=check_runtime,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+            side_effect=lambda *_args: events.append("head"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=previous_target,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_transaction",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "activate_release",
+            return_value=(previous_target, True),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "probe_live_release",
+            side_effect=fail_probe,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "restore_deployment_transaction",
+            side_effect=lambda *_args, **_kwargs: events.append("rollback"),
+        ) as restore, mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_state_file",
+        ) as write_state, mock.patch.object(
+            MATERIALIZER,
+            "remove_protected_state_file",
+            side_effect=lambda *_args: events.append("transaction-removed"),
+        ):
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "already restored without quarantine",
+            ):
+                MATERIALIZER.activate_live_release(
+                    candidate,
+                    MATERIALIZER.PROFILES["personal"],
+                    probe_inventory(),
+                    Path("/srv/www/personal/current"),
+                    Path("/srv/www/personal/releases"),
+                    f"sha256-{'1' * 64}",
+                    Path("/var/tmp/test"),
+                    previous_active_state=previous_state,
+                )
+        self.assertLess(events.index("rollback"), events.index("runtime-2"))
+        self.assertLess(events.index("runtime-2"), events.index("transaction-removed"))
+        restore.assert_called_once()
+        write_state.assert_not_called()
+
+    def test_active_state_commit_failure_is_recovered_as_committed(self) -> None:
+        candidate = deployment_state()
+        previous_state = deployment_state(site_digit="9")
+        previous_target = MATERIALIZER.release_target_for_state(previous_state)
+        expected_target = MATERIALIZER.release_target_for_state(candidate)
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            side_effect=[previous_target, expected_target],
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_transaction",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "activate_release",
+            return_value=(previous_target, True),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "probe_live_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_persisted_inventory",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_state_file",
+            side_effect=MATERIALIZER.StaticDeploymentError("ambiguous fsync"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "recover_interrupted_deployment",
+        ) as recover, mock.patch.object(
+            MATERIALIZER,
+            "read_deployment_state_file",
+            return_value=candidate,
+        ):
+            MATERIALIZER.activate_live_release(
+                candidate,
+                MATERIALIZER.PROFILES["personal"],
+                probe_inventory(),
+                Path("/srv/www/personal/current"),
+                Path("/srv/www/personal/releases"),
+                f"sha256-{'1' * 64}",
+                Path("/var/tmp/test"),
+                previous_active_state=previous_state,
+            )
+        recover.assert_called_once_with(
+            "personal",
+            Path("/srv/www/personal/current"),
+            Path("/srv/www/personal/releases"),
+        )
+
+    def test_inventory_persistence_failure_restores_without_quarantine(self) -> None:
+        candidate = deployment_state()
+        previous_state = deployment_state(site_digit="9")
+        previous_target = MATERIALIZER.release_target_for_state(previous_state)
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_persisted_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "get_current_target",
+            return_value=previous_target,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_deployment_transaction",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "activate_release",
+            return_value=(previous_target, True),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "probe_live_release",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "write_persisted_inventory",
+            side_effect=MATERIALIZER.StaticDeploymentError("state disk full"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "rollback_deployment_transaction",
+        ) as rollback:
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "protected inventory could not be persisted",
+            ):
+                MATERIALIZER.activate_live_release(
+                    candidate,
+                    MATERIALIZER.PROFILES["personal"],
+                    probe_inventory(),
+                    Path("/srv/www/personal/current"),
+                    Path("/srv/www/personal/releases"),
+                    f"sha256-{'1' * 64}",
+                    Path("/var/tmp/test"),
+                    previous_active_state=previous_state,
+                )
+        rollback.assert_called_once()
+        self.assertFalse(rollback.call_args.kwargs["quarantine"])
+
+    def test_persisted_inventory_is_canonical_and_bound_to_source(self) -> None:
+        state = deployment_state()
+        inventory = probe_inventory()
+        profile = MATERIALIZER.PROFILES["personal"]
+        encoded = MATERIALIZER.canonical_route_inventory_bytes(
+            inventory,
+            profile,
+            state.source_revision,
+        )
+        self.assertEqual(
+            MATERIALIZER.persisted_inventory_from_bytes(encoded, state),
+            inventory,
+        )
+        value = json.loads(encoded)
+        value["source"]["revision"] = "f" * 40
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "source revision",
+        ):
+            MATERIALIZER.persisted_inventory_from_bytes(
+                canonical_json(value),
+                state,
+            )
+
+    def test_exact_active_candidate_uses_local_health_path_without_registry(self) -> None:
+        candidate = deployment_state()
+        profile = MATERIALIZER.PROFILES["personal"]
+        inventory = probe_inventory()
+        safe_directory = mock.Mock(
+            st_mode=MATERIALIZER.stat.S_IFDIR | 0o700,
+            st_uid=0,
+            st_gid=0,
+        )
+        pins = (
+            candidate.integration_revision,
+            candidate.integration_reference,
+            candidate.caddy_image,
+            frozenset(MATERIALIZER.PROFILES),
+        )
+        with mock.patch.object(
+            MATERIALIZER,
+            "validate_runtime",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "read_promoted_caddy_image",
+            return_value=candidate.caddy_image,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "read_static_production_pins",
+            return_value=pins,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "read_application_production_enablement",
+            return_value={
+                application: False for application in MATERIALIZER.PROFILES
+            },
+        ) as read_application_enablement, mock.patch.object(
+            MATERIALIZER,
+            "read_active_application_enablement",
+            return_value={
+                application: False for application in MATERIALIZER.PROFILES
+            },
+        ) as read_active_enablement, mock.patch.object(
+            MATERIALIZER.Path,
+            "lstat",
+            return_value=safe_directory,
+        ), mock.patch.object(
+            MATERIALIZER,
+            "deployment_lock",
+            return_value=contextlib.nullcontext(),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "cleanup_probe_containers",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "cleanup_static_filesystem_residue",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "deployment_temporary_root",
+            return_value=Path("/var/tmp"),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "refuse_isolated_worker_residue_locked",
+        ), mock.patch.object(
+            MATERIALIZER,
+            "assert_current_source_revision",
+        ) as check_head, mock.patch.object(
+            MATERIALIZER,
+            "prepare_live_deployment",
+            return_value=(False, candidate),
+        ), mock.patch.object(
+            MATERIALIZER,
+            "read_persisted_inventory",
+            return_value=inventory,
+        ) as read_inventory, mock.patch.object(
+            MATERIALIZER,
+            "filesystem_inventory",
+        ) as check_files, mock.patch.object(
+            MATERIALIZER,
+            "assert_live_caddy_runtime",
+        ) as check_caddy, mock.patch.object(
+            MATERIALIZER,
+            "probe_live_health",
+        ) as check_https, mock.patch.object(
+            MATERIALIZER,
+            "deploy_locked",
+        ) as deploy_locked:
+            MATERIALIZER.deploy(
+                candidate.application,
+                candidate.source_revision,
+                candidate.site_reference,
+                candidate.routes_reference,
+                candidate.integration_revision,
+                candidate.integration_reference,
+                candidate.caddy_image,
+                activate_live=True,
+            )
+        read_inventory.assert_called_once_with(candidate)
+        read_application_enablement.assert_called_once_with(
+            MATERIALIZER.APPLICATION_PRODUCTION_CONTRACT_PATH,
+            require_root_owner=True,
+        )
+        read_active_enablement.assert_called_once_with(
+            MATERIALIZER.APPLICATION_ACTIVE_MANIFEST_PATH,
+            MATERIALIZER.APPLICATION_ACTIVE_STATE_PATH,
+            require_root_owner=True,
+        )
+        check_files.assert_called_once()
+        self.assertEqual(check_caddy.call_count, 2)
+        self.assertEqual(
+            check_caddy.call_args_list[1].kwargs["expected_identifier"],
+            check_caddy.return_value,
+        )
+        check_https.assert_called_once()
+        self.assertEqual(check_head.call_count, 3)
+        deploy_locked.assert_not_called()
+
+    def test_live_caddy_identity_must_stay_stable_through_probe(self) -> None:
+        image = deployment_state().caddy_image
+        first_identifier = "a" * 64
+        second_identifier = "b" * 64
+        responses = (
+            subprocess.CompletedProcess([], 0, f"{first_identifier}\n", ""),
+            subprocess.CompletedProcess([], 0, f"{image}\thealthy\n", ""),
+            subprocess.CompletedProcess([], 0, f"{second_identifier}\n", ""),
+        )
+        with mock.patch.object(
+            MATERIALIZER,
+            "run_checked",
+            side_effect=responses,
+        ):
+            observed = MATERIALIZER.assert_live_caddy_runtime(
+                image,
+                Path("/var/tmp/test"),
+            )
+            self.assertEqual(observed, first_identifier)
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "changed during deployment",
+            ):
+                MATERIALIZER.assert_live_caddy_runtime(
+                    image,
+                    Path("/var/tmp/test"),
+                    expected_identifier=first_identifier,
+                )
+
+    def test_internal_live_recovery_cli_is_exact(self) -> None:
+        with mock.patch.object(MATERIALIZER, "recover_live_deployments") as recover:
+            self.assertEqual(MATERIALIZER.main(["--recover-live", "personal"]), 0)
+        recover.assert_called_once_with("personal")
+        with self.assertRaises(SystemExit):
+            MATERIALIZER.build_parser().parse_args(
+                [
+                    "--acti",
+                    "personal",
+                    REVISION,
+                    "site",
+                    "routes",
+                    REVISION,
+                    "integration",
+                    "caddy",
+                ]
+            )
+
+    def test_canonical_source_head_is_checked_exactly_with_retry(self) -> None:
+        profile = MATERIALIZER.PROFILES["personal"]
+        failure = subprocess.CompletedProcess([], 128, "", "temporary")
+        success = subprocess.CompletedProcess(
+            [],
+            0,
+            f"{REVISION}\t{profile.source_ref}\n",
+            "",
+        )
+        with mock.patch.object(
+            MATERIALIZER.subprocess,
+            "run",
+            side_effect=[failure, success],
+        ) as run, mock.patch.object(MATERIALIZER.time, "sleep") as sleep:
+            MATERIALIZER.assert_current_source_revision(profile, REVISION, Path("/tmp"))
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+        stale = subprocess.CompletedProcess(
+            [],
+            0,
+            f"{'f' * 40}\t{profile.source_ref}\n",
+            "",
+        )
+        with mock.patch.object(MATERIALIZER.subprocess, "run", return_value=stale):
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "exact canonical branch head",
+            ):
+                MATERIALIZER.assert_current_source_revision(
+                    profile,
+                    REVISION,
+                    Path("/tmp"),
+                )
+
+    def test_source_ancestry_accepts_descendants_and_rejects_force_resets(self) -> None:
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("Git is unavailable")
+        profile = MATERIALIZER.PROFILES["personal"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "source"
+            subprocess.run(
+                [git, "init", "--quiet", "--initial-branch=main", repository],
+                check=True,
+            )
+            subprocess.run(
+                [git, "-C", repository, "config", "user.name", "Static Test"],
+                check=True,
+            )
+            subprocess.run(
+                [git, "-C", repository, "config", "user.email", "static@example.test"],
+                check=True,
+            )
+            tracked = repository / "index.html"
+            tracked.write_text("one\n", encoding="utf-8")
+            subprocess.run([git, "-C", repository, "add", "index.html"], check=True)
+            subprocess.run(
+                [git, "-C", repository, "commit", "--quiet", "-m", "one"],
+                check=True,
+            )
+            active = subprocess.run(
+                [git, "-C", repository, "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            tracked.write_text("two\n", encoding="utf-8")
+            subprocess.run([git, "-C", repository, "commit", "--quiet", "-am", "two"], check=True)
+            descendant = subprocess.run(
+                [git, "-C", repository, "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            descendant_work = root / "descendant-work"
+            descendant_work.mkdir(mode=0o700)
+            with mock.patch.object(MATERIALIZER, "GIT_PATH", Path(git)):
+                MATERIALIZER.verify_source_ancestry_repository(
+                    profile,
+                    active,
+                    descendant,
+                    descendant_work,
+                    repository_url=str(repository),
+                    allowed_protocol="file",
+                )
+
+            subprocess.run(
+                [git, "-C", repository, "reset", "--hard", "--quiet", active],
+                check=True,
+            )
+            tracked.write_text("divergent\n", encoding="utf-8")
+            subprocess.run([git, "-C", repository, "commit", "--quiet", "-am", "divergent"], check=True)
+            divergent = subprocess.run(
+                [git, "-C", repository, "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            divergent_work = root / "divergent-work"
+            divergent_work.mkdir(mode=0o700)
+            with mock.patch.object(MATERIALIZER, "GIT_PATH", Path(git)):
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "does not descend",
+                ):
+                    MATERIALIZER.verify_source_ancestry_repository(
+                        profile,
+                        descendant,
+                        divergent,
+                        divergent_work,
+                        repository_url=str(repository),
+                        allowed_protocol="file",
+                    )
+
+    def test_source_ancestry_runs_only_in_a_bounded_network_worker(self) -> None:
+        profile = MATERIALIZER.PROFILES["personal"]
+        state = mock.Mock()
+        with mock.patch.object(
+            MATERIALIZER,
+            "run_isolated_worker",
+            return_value=state,
+        ) as run_worker, mock.patch.object(
+            MATERIALIZER,
+            "cleanup_isolated_worker_state",
+        ) as cleanup:
+            MATERIALIZER.assert_source_revision_descends_from_active(
+                profile,
+                "a" * 40,
+                "b" * 40,
+                Path("/var/tmp/unused-root-work"),
+            )
+        worker_call = run_worker.call_args
+        self.assertEqual(worker_call.args[0], "ancestry")
+        self.assertEqual(
+            worker_call.args[1][-4:],
+            ["--source-ancestry-worker", "personal", "a" * 40, "b" * 40],
+        )
+        self.assertTrue(worker_call.kwargs["network"])
+        self.assertEqual(worker_call.kwargs["runtime_seconds"], 240)
+        self.assertEqual(worker_call.kwargs["memory_max"], "256M")
+        self.assertEqual(worker_call.kwargs["file_size_max"], "128M")
+        cleanup.assert_called_once_with(state)
+
     def test_provenance_fetch_and_offline_verification_are_distinct_units(self) -> None:
         calls: list[tuple[str, list[str], dict[str, object]]] = []
         events: list[str] = []
@@ -2679,6 +3947,177 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(MATERIALIZER.StaticDeploymentError, "duplicates"):
                 MATERIALIZER.read_promoted_caddy_image(path, require_root_owner=False)
 
+    def test_live_integration_and_caddy_are_bound_to_the_reviewed_contract(self) -> None:
+        (
+            revision,
+            integration,
+            caddy,
+            enabled_applications,
+        ) = MATERIALIZER.read_static_production_pins(
+            ROOT / "releases/static-production.json",
+            require_root_owner=False,
+        )
+        value = json.loads(
+            (ROOT / "releases/static-production.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(revision, value["integration"]["source_revision"])
+        self.assertEqual(integration, value["integration"]["artifact"])
+        self.assertEqual(caddy, value["caddy_image"])
+        self.assertEqual(enabled_applications, frozenset(MATERIALIZER.PROFILES))
+        self.assertEqual(
+            caddy,
+            MATERIALIZER.read_promoted_caddy_image(
+                ROOT / "platform/.env.example",
+                require_root_owner=False,
+            ),
+        )
+
+        value["integration"]["artifact"] = "ghcr.io/example/integration@sha256:" + "1" * 64
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "static-production.json"
+            path.write_text(json.dumps(value), encoding="ascii")
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "must use repository",
+            ):
+                MATERIALIZER.read_static_production_pins(
+                    path,
+                    require_root_owner=False,
+                )
+
+    def test_static_and_application_release_modes_are_mutually_exclusive(self) -> None:
+        enablement = MATERIALIZER.read_application_production_enablement(
+            ROOT / "releases/production.yaml",
+            require_root_owner=False,
+        )
+        self.assertEqual(
+            enablement,
+            {application: False for application in MATERIALIZER.PROFILES},
+        )
+        MATERIALIZER.assert_static_activation_mode(
+            "parkventory",
+            frozenset(MATERIALIZER.PROFILES),
+            enablement,
+            enablement,
+        )
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "disabled by its promotion contract",
+        ):
+            MATERIALIZER.assert_static_activation_mode(
+                "parkventory",
+                frozenset({"personal", "papersempire"}),
+                enablement,
+                enablement,
+            )
+        conflicting = dict(enablement)
+        conflicting["parkventory"] = True
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "conflicts with its enabled application release",
+        ):
+            MATERIALIZER.assert_static_activation_mode(
+                "parkventory",
+                frozenset(MATERIALIZER.PROFILES),
+                conflicting,
+                enablement,
+            )
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "conflicts with its active application state",
+        ):
+            MATERIALIZER.assert_static_activation_mode(
+                "parkventory",
+                frozenset(MATERIALIZER.PROFILES),
+                enablement,
+                conflicting,
+            )
+
+    def test_active_application_state_also_blocks_static_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            manifest_path = root / "manifest.json"
+            state_path = root / "state.json"
+            self.assertEqual(
+                MATERIALIZER.read_active_application_enablement(
+                    manifest_path,
+                    state_path,
+                    require_root_owner=False,
+                ),
+                {application: False for application in MATERIALIZER.PROFILES},
+            )
+            manifest_path.write_bytes(b"{}\n")
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "state pair is incomplete",
+            ):
+                MATERIALIZER.read_active_application_enablement(
+                    manifest_path,
+                    state_path,
+                    require_root_owner=False,
+                )
+
+            manifest = json.loads(
+                (ROOT / "releases/production.yaml").read_text(encoding="utf-8")
+            )
+            manifest["applications"]["parkventory"]["enabled"] = True
+            manifest_raw = canonical_json(manifest)
+            manifest_path.write_bytes(manifest_raw)
+            state_path.write_bytes(
+                canonical_json(
+                    {
+                        "commit": "a" * 40,
+                        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+                        "recorded_at": "2026-08-17T18:00:00Z",
+                        "schema": 1,
+                    }
+                )
+            )
+            enablement = MATERIALIZER.read_active_application_enablement(
+                manifest_path,
+                state_path,
+                require_root_owner=False,
+            )
+            self.assertTrue(enablement["parkventory"])
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["manifest_sha256"] = "0" * 64
+            state_path.write_bytes(canonical_json(state))
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "does not match its metadata digest",
+            ):
+                MATERIALIZER.read_active_application_enablement(
+                    manifest_path,
+                    state_path,
+                    require_root_owner=False,
+                )
+
+    def test_static_contract_binds_the_temporary_parkventory_demo_mode(self) -> None:
+        value = json.loads(
+            (ROOT / "releases/static-production.json").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "static-production.json"
+            value["applications"]["parkventory"]["enabled"] = False
+            path.write_text(json.dumps(value), encoding="ascii")
+            *_, enabled_applications = MATERIALIZER.read_static_production_pins(
+                path,
+                require_root_owner=False,
+            )
+            self.assertNotIn("parkventory", enabled_applications)
+
+            value["applications"]["parkventory"]["mode"] = "static-site"
+            path.write_text(json.dumps(value), encoding="ascii")
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "parkventory mode is invalid",
+            ):
+                MATERIALIZER.read_static_production_pins(
+                    path,
+                    require_root_owner=False,
+                )
+
     def test_probe_package_injects_local_certs_once_and_activates_only_requested_route(
         self,
     ) -> None:
@@ -2722,6 +4161,7 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(profile.canonical_domain, "parkventory.com")
         self.assertEqual(profile.redirect_domains, ("www.parkventory.com",))
+        self.assertEqual(profile.live_redirect_domains, ("www.parkventory.com",))
         self.assertEqual(
             profile.site_repository,
             "ghcr.io/nclsppr/parkventory-static-site",
@@ -2736,6 +4176,157 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
         self.assertIn("root * /srv/www/parkventory/current", route)
         self.assertNotIn("reverse_proxy", route)
         self.assertNotIn("/api", route)
+
+    def test_live_redirect_contract_matches_the_public_edge(self) -> None:
+        self.assertEqual(
+            MATERIALIZER.PROFILES["personal"].redirect_domains,
+            ("www.nicolaspieper.com", "nicolas.pieper.fr"),
+        )
+        self.assertEqual(
+            MATERIALIZER.PROFILES["personal"].live_redirect_domains,
+            ("www.nicolaspieper.com",),
+        )
+        self.assertEqual(MATERIALIZER.PROFILES["papersempire"].redirect_domains, ())
+        self.assertEqual(
+            MATERIALIZER.PROFILES["papersempire"].live_redirect_domains,
+            ("www.papersempire.com",),
+        )
+        for application, profile in MATERIALIZER.PROFILES.items():
+            route = (
+                ROOT
+                / "platform/public-static-edge/routes-activate"
+                / f"{application}.caddy"
+            ).read_text(encoding="utf-8")
+            self.assertIn(profile.canonical_domain, route)
+            for domain in profile.live_redirect_domains:
+                self.assertIn(domain, route)
+        self.assertNotIn(
+            "nicolas.pieper.fr",
+            (
+                ROOT
+                / "platform/public-static-edge/routes-activate/personal.caddy"
+            ).read_text(encoding="utf-8"),
+        )
+
+    def test_live_probe_requires_valid_tls_and_the_public_redirect_set(self) -> None:
+        profile = MATERIALIZER.PROFILES["personal"]
+        inventory = MATERIALIZER.InventoryContract(1, "0" * 64, 0, 0, ())
+        with mock.patch.object(MATERIALIZER, "wait_for_probe") as wait, \
+            mock.patch.object(MATERIALIZER, "assert_release_http_contract") as contract:
+            MATERIALIZER.probe_live_release(
+                inventory,
+                profile,
+                Path("/var/tmp/test"),
+                30,
+            )
+        self.assertFalse(wait.call_args.kwargs["insecure"])
+        self.assertFalse(contract.call_args.kwargs["insecure"])
+        self.assertEqual(
+            contract.call_args.kwargs["redirect_domains"],
+            profile.live_redirect_domains,
+        )
+        with mock.patch.object(
+            MATERIALIZER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            MATERIALIZER.wait_for_probe(
+                profile.canonical_domain,
+                443,
+                Path("/var/tmp/test"),
+                MATERIALIZER.time.monotonic() + 5,
+                insecure=False,
+            )
+        self.assertEqual(run.call_args.args[0][1], "--disable")
+
+    def test_live_readiness_rejects_a_self_signed_certificate(self) -> None:
+        openssl = shutil.which("openssl")
+        curl = shutil.which("curl")
+        if openssl is None or curl is None:
+            self.skipTest("OpenSSL or curl is unavailable")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            configuration = root / "certificate.cnf"
+            certificate = root / "certificate.pem"
+            private_key_path = root / "private-key.pem"
+            configuration.write_text(
+                "[req]\n"
+                "distinguished_name=dn\n"
+                "x509_extensions=ext\n"
+                "prompt=no\n"
+                "[dn]\n"
+                "CN=localhost\n"
+                "[ext]\n"
+                "subjectAltName=DNS:localhost\n",
+                encoding="ascii",
+            )
+            generated = subprocess.run(
+                [
+                    openssl,
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-days",
+                    "1",
+                    "-keyout",
+                    private_key_path,
+                    "-out",
+                    certificate,
+                    "-config",
+                    configuration,
+                ],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+            if generated.returncode != 0:
+                self.skipTest("OpenSSL cannot generate a test certificate")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            server = subprocess.Popen(
+                [
+                    openssl,
+                    "s_server",
+                    "-quiet",
+                    "-accept",
+                    str(port),
+                    "-cert",
+                    certificate,
+                    "-key",
+                    private_key_path,
+                    "-www",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                with mock.patch.object(MATERIALIZER, "CURL_PATH", Path(curl)):
+                    MATERIALIZER.wait_for_probe(
+                        "localhost",
+                        port,
+                        root,
+                        MATERIALIZER.time.monotonic() + 5,
+                        insecure=True,
+                    )
+                    with self.assertRaises(MATERIALIZER.StaticDeploymentError):
+                        MATERIALIZER.wait_for_probe(
+                            "localhost",
+                            port,
+                            root,
+                            MATERIALIZER.time.monotonic() + 1,
+                            insecure=False,
+                        )
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=5)
 
     def test_probe_budget_and_bind_permissions_fail_closed(self) -> None:
         with mock.patch.object(MATERIALIZER.time, "monotonic", return_value=10.1):
@@ -2767,6 +4358,7 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
 
     def test_probe_response_files_and_container_are_cleaned(self) -> None:
         body = b"verified body\n"
+        curl_commands: list[list[str]] = []
         headers = (
             "HTTP/2 200\r\n"
             "strict-transport-security: max-age=31536000; includeSubDomains\r\n"
@@ -2779,6 +4371,7 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
         )
 
         def respond(command, *, environment, timeout=120):
+            curl_commands.append(command)
             response_path = Path(command[command.index("--output") + 1])
             header_path = Path(command[command.index("--dump-header") + 1])
             response_path.write_bytes(body)
@@ -2798,7 +4391,21 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
                     expected_sha256=hashlib.sha256(body).hexdigest(),
                     expected_cache_control="no-cache",
                 )
+                MATERIALIZER.assert_probe_response(
+                    "example.com",
+                    443,
+                    "/",
+                    root,
+                    MATERIALIZER.time.monotonic() + 10,
+                    expected_status=200,
+                    expected_sha256=hashlib.sha256(body).hexdigest(),
+                    expected_cache_control="no-cache",
+                    insecure=False,
+                )
             self.assertEqual(list(root.iterdir()), [])
+        self.assertIn("--insecure", curl_commands[0])
+        self.assertNotIn("--insecure", curl_commands[1])
+        self.assertTrue(all(command[1] == "--disable" for command in curl_commands))
 
         calls = 0
 
@@ -2835,6 +4442,139 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
                 "left a container behind",
             ):
                 MATERIALIZER.cleanup_probe_container("probe-test", {})
+
+    def test_residual_probe_cleanup_is_batched_bounded_and_exact(self) -> None:
+        identifier = "a" * 64
+        record = (
+            f"{identifier}\tvps-static-probe-{'b' * 16}\ttrue\tpersonal\n"
+        )
+        listed = subprocess.CompletedProcess([], 0, record, "")
+        empty = subprocess.CompletedProcess([], 0, "", "")
+        removed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(
+            MATERIALIZER,
+            "run_checked",
+            side_effect=[listed, empty],
+        ) as run_checked, mock.patch.object(
+            MATERIALIZER.subprocess,
+            "run",
+            return_value=removed,
+        ) as run:
+            MATERIALIZER.cleanup_probe_containers("personal")
+        self.assertEqual(run_checked.call_count, 2)
+        for call in run_checked.call_args_list:
+            self.assertEqual(
+                call.kwargs["timeout"],
+                MATERIALIZER.PROBE_CONTAINER_LIST_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(call.kwargs["environment"]["HOME"], "/nonexistent")
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(MATERIALIZER.DOCKER_PATH), "rm", "--force", identifier],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            MATERIALIZER.PROBE_CONTAINER_REMOVE_TIMEOUT_SECONDS,
+        )
+
+        malformed = subprocess.CompletedProcess(
+            [],
+            0,
+            f"{identifier}\tother-container\ttrue\tpersonal\n",
+            "",
+        )
+        with mock.patch.object(MATERIALIZER, "run_checked", return_value=malformed):
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "unexpected container identity",
+            ):
+                MATERIALIZER.cleanup_probe_containers("personal")
+
+    def test_static_residue_cleanup_removes_only_exact_protected_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            production_root = Path(temporary_directory)
+            app_root = production_root / "personal"
+            releases = app_root / "releases"
+            releases.mkdir(parents=True, mode=0o755)
+            staging = releases / f".sha256-{'a' * 64}-{'b' * 16}"
+            staging.mkdir(mode=0o700)
+            (staging / "partial").write_text("partial\n", encoding="utf-8")
+            temporary_link = app_root / f".current-{'c' * 16}"
+            temporary_link.symlink_to(f"releases/sha256-{'d' * 64}")
+            with mock.patch.object(
+                MATERIALIZER,
+                "PRODUCTION_ROOT",
+                production_root,
+            ):
+                MATERIALIZER.cleanup_static_filesystem_residue(
+                    "personal",
+                    app_root,
+                    releases,
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                )
+            self.assertFalse(staging.exists())
+            self.assertFalse(temporary_link.is_symlink())
+
+            outside = production_root / "outside"
+            outside.mkdir(mode=0o700)
+            hostile = releases / f".sha256-{'e' * 64}-{'f' * 16}"
+            hostile.symlink_to(outside, target_is_directory=True)
+            with mock.patch.object(
+                MATERIALIZER,
+                "PRODUCTION_ROOT",
+                production_root,
+            ):
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "not one protected directory",
+                ):
+                    MATERIALIZER.cleanup_static_filesystem_residue(
+                        "personal",
+                        app_root,
+                        releases,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                    )
+            self.assertTrue(outside.is_dir())
+
+    def test_live_runtime_directory_contract_is_exact_and_protected(self) -> None:
+        runtime = f"/run/vps-static-live-personal-{'a' * 24}"
+        protected = mock.Mock(
+            st_mode=MATERIALIZER.stat.S_IFDIR | 0o700,
+            st_uid=0,
+            st_gid=0,
+        )
+        with mock.patch.dict(
+            MATERIALIZER.os.environ,
+            {MATERIALIZER.STATIC_RUNTIME_DIRECTORY_ENV: runtime},
+            clear=True,
+        ), mock.patch.object(MATERIALIZER.Path, "lstat", return_value=protected):
+            self.assertEqual(
+                MATERIALIZER.deployment_temporary_root("personal", True),
+                Path(runtime),
+            )
+        with mock.patch.dict(
+            MATERIALIZER.os.environ,
+            {MATERIALIZER.STATIC_RUNTIME_DIRECTORY_ENV: runtime},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "reserved for live activation",
+            ):
+                MATERIALIZER.deployment_temporary_root("personal", False)
+        with mock.patch.dict(
+            MATERIALIZER.os.environ,
+            {MATERIALIZER.STATIC_RUNTIME_DIRECTORY_ENV: runtime + "x"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "exact transient runtime directory",
+            ):
+                MATERIALIZER.deployment_temporary_root("personal", True)
 
     def test_exact_promoted_caddy_serves_the_probe_contract_when_docker_is_available(
         self,
@@ -2922,7 +4662,12 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
         staging_position = source.index("staging = releases")
         self.assertLess(
             source.index("probe_release(", staging_position),
-            source.index("activate_release(app_root / \"current\""),
+            source.index("activate_live_release(", staging_position),
+        )
+        self.assertNotIn('activate_release(app_root / "current"', source)
+        self.assertIn(
+            "the current link was left unchanged and public TLS was not tested",
+            source,
         )
         self.assertIn(
             'release_name = f"sha256-{site_layer.manifest_digest.removeprefix(\'sha256:\')}"',

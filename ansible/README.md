@@ -143,7 +143,8 @@ It drops direct non-DNAT forwarding and all other new public Docker forwarding.
 
 The `deploy` account is locked and is not a member of the `docker` group. It
 has a valid shell because OpenSSH requires one. `ForceCommand` sends every key
-to a parser that accepts only `deploy <full-git-sha>`.
+to a parser that accepts only `deploy <full-git-sha>` or the exact
+`deploy-static-live` tuple for one allowlisted application.
 
 The controller files are installed under `/usr/local/libexec/vps`. The marker
 `/etc/vps/production-enabled` and the executable `apply-release` are absent.
@@ -157,10 +158,24 @@ version. The role then installs
 Current Personal, Papers Empire, and platform integration packages are public,
 so this path does not install a registry credential.
 
-`deploy-static` is not an SSH command and is not allowed by the deploy sudo
-rule. A future reviewed applicator must supply the application, the application
-source revision, the exact site and route references, the platform integration
-revision and reference, and the exact Caddy image. The materializer runs
+The static SSH form does not grant arbitrary `deploy-static` arguments. The
+non-root wrapper sends one bounded canonical record over stdin to a root-owned
+gate with no command-line arguments. That gate independently revalidates the
+application, repositories, SHAs, digests, token count, ASCII encoding, and
+framing before it invokes `deploy-static --activate-live`. This construction is
+compatible with Atlas `sudo-rs` and does not rely on unsupported sudoers
+argument regexes.
+
+The root gate starts each activation in a transient systemd unit. Its stop hook
+recovers any unfinished transaction even if the SSH session disappears. The
+enabled `vps-static-recover.service` also runs before the public edge at boot;
+it orders itself after and requires Docker so it can remove strictly labeled
+orphan probe containers. The edge requires a successful recovery. Root-only active, inventory,
+transaction, and quarantine state lives under `/var/lib/vps-static`.
+
+The caller supplies the application, the application source revision, the
+exact site and route references, the platform integration revision and
+reference, and the exact Caddy image. The materializer runs
 registry fetches, validation, extraction, and GitHub attestation verification
 in short-lived systemd `DynamicUser` units. A dedicated bounded tmpfs stores
 each private runtime directory. One separate network execution uses the pinned
@@ -172,7 +187,9 @@ GitHub verification use other sequential executions of one fixed transient
 unit. The offline verifier receives the copied root through
 `--custom-trusted-root`. This unit name
 serializes worker creation in systemd. Each accepted file is copied into a
-root-owned tree and made durable before activation.
+root-owned tree and made durable before activation. Ansible also creates
+root-only active, inventory, transaction, and quarantine directories under
+`/var/lib/vps-static`.
 
 The deploy role initializes the root-owned mirror at `/srv/vps/repository` from
 the single allowed public origin:

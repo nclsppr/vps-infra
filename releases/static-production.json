@@ -1,0 +1,47 @@
+{
+  "schema": 2,
+  "integration": {
+    "source_revision": "bd919bc6754e3fb1a53a80e45c1925fac495e7f2",
+    "artifact": "ghcr.io/nclsppr/vps-infra/platform-integration@sha256:c32b085bd4ee586d11e759be09b52b6a044cd56411ea6a600e7e0c2021bbb7a3"
+  },
+  "caddy_image": "ghcr.io/nclsppr/vps-infra/caddy:sha-755565642f71918134151921f8eae63935951ad6@sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f",
+  "applications": {
+    "personal": {
+      "enabled": true,
+      "mode": "static-site",
+      "source_repository": "nclsppr/personal",
+      "source_branch": "main",
+      "site_repository": "ghcr.io/nclsppr/personal/site",
+      "routes_repository": "ghcr.io/nclsppr/personal/routes",
+      "required_checks": [
+        "Publish immutable VPS artifacts",
+        "build"
+      ]
+    },
+    "papersempire": {
+      "enabled": true,
+      "mode": "static-site",
+      "source_repository": "nclsppr/papersempire",
+      "source_branch": "master",
+      "site_repository": "ghcr.io/nclsppr/papersempire/site",
+      "routes_repository": "ghcr.io/nclsppr/papersempire/routes",
+      "required_checks": [
+        "Publish immutable VPS artifacts",
+        "build"
+      ]
+    },
+    "parkventory": {
+      "enabled": true,
+      "mode": "temporary-static-demo",
+      "source_repository": "nclsppr/parkventory",
+      "source_branch": "main",
+      "site_repository": "ghcr.io/nclsppr/parkventory-static-site",
+      "routes_repository": "ghcr.io/nclsppr/parkventory-static-routes",
+      "required_checks": [
+        "Publish immutable VPS artifacts",
+        "build",
+        "verify"
+      ]
+    }
+  }
+}

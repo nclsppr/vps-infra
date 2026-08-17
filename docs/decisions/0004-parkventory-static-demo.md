@@ -31,6 +31,11 @@ Atlas serves the Parkventory demo as a third static release:
    API route.
 6. The production release manifest keeps the Parkventory Compose application
    disabled. The static demo does not satisfy any backend readiness gate.
+7. The static promotion contract marks Parkventory as an enabled
+   `temporary-static-demo`. The static resolver and the root activation gate
+   both reject a contradictory state where the Parkventory Compose application
+   is enabled at the same time; the root gate also rejects a persisted active
+   Compose manifest left from an incomplete handoff.
 
 The first cutover uses IPv4 HTTP-01. The operator must publish exact Atlas A
 records and remove old AAAA records before HTTPS activation. The edge receives
@@ -52,6 +57,22 @@ no OVH API credential.
 - The public edge activation now requires DNS readiness for three zones.
 - The shared static controller and its tests must maintain one more bounded
   application profile.
+- The future React frontend and Java backend cannot be activated by merely
+  adding their image digests. Their reviewed Compose release must first disable
+  the temporary static-demo mode and complete an exclusive handoff of the
+  `parkventory.com` route.
+
+## Replacement by the full application
+
+Parkventory's production application is a different release class: a React
+frontend image, a Java backend image, a dedicated migration job, and a platform
+integration bundle. Before that application can be enabled, one reviewed
+`vps-infra` revision must make the static promotion entry inactive and the
+Compose release entry active without ever accepting both. Atlas must drain any
+in-flight static activation, retire or archive the static state, and transfer
+the public route while holding the future shared application-deployment lock.
+The dynamic applicator must refuse to start while the static Parkventory state
+or route still owns the domain.
 
 ## Rollback
 

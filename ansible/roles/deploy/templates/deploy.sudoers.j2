@@ -1,4 +1,6 @@
 Defaults:{{ vps_deploy_user }} env_reset
 Defaults:{{ vps_deploy_user }} secure_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Defaults:{{ vps_deploy_user }} !setenv
-{{ vps_deploy_user }} ALL=(root) NOPASSWD:NOSETENV: {{ vps_deploy_controller_path }}
+Cmnd_Alias VPS_DEPLOY_SHA = {{ vps_deploy_controller_path }}
+Cmnd_Alias VPS_DEPLOY_STATIC_LIVE = {{ vps_deploy_static_gate_path }} ""
+{{ vps_deploy_user }} ALL=(root) NOPASSWD:NOSETENV: VPS_DEPLOY_SHA, VPS_DEPLOY_STATIC_LIVE

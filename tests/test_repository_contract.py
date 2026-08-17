@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from importlib.machinery import SourceFileLoader
+import io
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 from ansible.parsing.dataloader import DataLoader
@@ -803,6 +805,469 @@ class SupplyChainContractTests(unittest.TestCase):
 
 
 class SecurityBoundaryContractTests(unittest.TestCase):
+    def test_forced_static_deployment_contract_is_exact(self) -> None:
+        defaults = yaml.safe_load(
+            (ROOT / "ansible/roles/deploy/defaults/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            defaults["vps_deploy_controller_path"],
+            "/usr/local/libexec/vps/deploy",
+        )
+        self.assertEqual(
+            defaults["vps_deploy_static_path"],
+            "/usr/local/libexec/vps/deploy-static",
+        )
+        self.assertEqual(
+            defaults["vps_deploy_static_gate_path"],
+            "/usr/local/libexec/vps/deploy-static-live-gate",
+        )
+        self.assertEqual(
+            defaults["vps_static_state_dir"],
+            "/var/lib/vps-static",
+        )
+        self.assertEqual(
+            defaults["vps_static_recovery_unit"],
+            "vps-static-recover.service",
+        )
+        self.assertIn(
+            "deploy-static-live-gate",
+            defaults["vps_deploy_executables"],
+        )
+
+        tasks = yaml.safe_load(
+            (ROOT / "ansible/roles/deploy/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        create_directories = next(
+            task
+            for task in tasks
+            if task["name"] == "Create root-owned controller directories"
+        )
+        directory_modes = {
+            entry["path"]: entry["mode"] for entry in create_directories["loop"]
+        }
+        for path in (
+            "{{ vps_static_state_dir }}",
+            "{{ vps_static_state_dir }}/active",
+            "{{ vps_static_state_dir }}/inventories",
+            "{{ vps_static_state_dir }}/quarantine",
+            "{{ vps_static_state_dir }}/transactions",
+        ):
+            self.assertEqual(directory_modes[path], "0700")
+        directory_task = create_directories["ansible.builtin.file"]
+        self.assertEqual(directory_task["owner"], "root")
+        self.assertEqual(directory_task["group"], "root")
+
+        by_name = {task["name"]: task for task in tasks}
+        recovery_install = by_name[
+            "Install the static transaction recovery unit"
+        ]["ansible.builtin.template"]
+        self.assertEqual(
+            recovery_install,
+            {
+                "src": "vps-static-recover.service.j2",
+                "dest": "/etc/systemd/system/{{ vps_static_recovery_unit }}",
+                "owner": "root",
+                "group": "root",
+                "mode": "0644",
+            },
+        )
+        recovery_enable = by_name[
+            "Enable static transaction recovery at boot"
+        ]
+        self.assertEqual(
+            recovery_enable["ansible.builtin.systemd_service"],
+            {
+                "name": "{{ vps_static_recovery_unit }}",
+                "enabled": True,
+                "daemon_reload": True,
+            },
+        )
+        self.assertEqual(recovery_enable["when"], "not ansible_check_mode")
+
+        recovery_unit = (
+            ROOT
+            / "ansible/roles/deploy/templates/vps-static-recover.service.j2"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Type=oneshot", recovery_unit)
+        self.assertIn("User=root", recovery_unit)
+        self.assertIn("Group=root", recovery_unit)
+        self.assertIn(
+            "RequiresMountsFor=/srv/www /var/lib/vps-static",
+            recovery_unit,
+        )
+        self.assertIn("Before=vps-public-static-edge.service", recovery_unit)
+        self.assertIn(
+            "ExecStart={{ vps_deploy_static_path }} --recover-live",
+            recovery_unit,
+        )
+        self.assertIn("TimeoutStartSec=300", recovery_unit)
+        self.assertIn("WantedBy=multi-user.target", recovery_unit)
+        self.assertIn("After=local-fs.target docker.service", recovery_unit)
+        self.assertIn("Requires=docker.service", recovery_unit)
+        self.assertNotIn("RemainAfterExit", recovery_unit)
+
+        parser = (SCRIPTS / "parse-forced-command").read_text(encoding="utf-8")
+        wrapper = (SCRIPTS / "forced-command").read_text(encoding="utf-8")
+        gate_source = (SCRIPTS / "deploy-static-live-gate").read_text(
+            encoding="utf-8"
+        )
+        for repository in (
+            "ghcr.io/nclsppr/personal/site",
+            "ghcr.io/nclsppr/personal/routes",
+            "ghcr.io/nclsppr/papersempire/site",
+            "ghcr.io/nclsppr/papersempire/routes",
+            "ghcr.io/nclsppr/parkventory-static-site",
+            "ghcr.io/nclsppr/parkventory-static-routes",
+            "ghcr.io/nclsppr/vps-infra/platform-integration",
+            "ghcr.io/nclsppr/vps-infra/caddy",
+        ):
+            self.assertIn(repository, parser)
+            self.assertIn(repository, gate_source)
+        self.assertNotIn("eval", wrapper)
+        self.assertIn("set -f", wrapper)
+        self.assertIn("LC_ALL=C", parser)
+        self.assertIn("LC_ALL=C", wrapper)
+        self.assertEqual(wrapper.count("/usr/bin/sudo -n --"), 2)
+        self.assertIn(
+            "exec /usr/bin/sudo -n -- /usr/local/libexec/vps/deploy \"$sha\"",
+            wrapper,
+        )
+        self.assertIn(
+            "printf '%s\\n' \"$original_command\" |",
+            wrapper,
+        )
+        self.assertIn(
+            "/usr/bin/sudo -n -- "
+            "/usr/local/libexec/vps/deploy-static-live-gate",
+            wrapper,
+        )
+        self.assertNotIn("/usr/local/libexec/vps/deploy-static \\", wrapper)
+        self.assertIn("subprocess.run", gate_source)
+        self.assertNotIn("os.execve", gate_source)
+
+        template = (
+            ROOT / "ansible/roles/deploy/templates/deploy.sudoers.j2"
+        ).read_text(encoding="utf-8")
+        rendered = Environment().from_string(template).render(
+            **defaults,
+            vps_deploy_user="deploy",
+        )
+        aliases = [
+            line
+            for line in rendered.splitlines()
+            if line.startswith("Cmnd_Alias ")
+        ]
+        self.assertEqual(len(aliases), 2)
+        self.assertEqual(
+            aliases,
+            [
+                "Cmnd_Alias VPS_DEPLOY_SHA = /usr/local/libexec/vps/deploy",
+                "Cmnd_Alias VPS_DEPLOY_STATIC_LIVE = "
+                "/usr/local/libexec/vps/deploy-static-live-gate \"\"",
+            ],
+        )
+        self.assertNotIn("*", rendered)
+        self.assertNotIn("^", rendered)
+        privilege = rendered.splitlines()[-1]
+        self.assertIn("NOPASSWD:NOSETENV:", privilege)
+        self.assertNotIn("ALL=(ALL", rendered)
+
+        validated_executables = set()
+        for executable_name in ("visudo-rs", "visudo"):
+            visudo = shutil.which(executable_name)
+            if visudo is None:
+                continue
+            resolved_visudo = str(Path(visudo).resolve())
+            if resolved_visudo in validated_executables:
+                continue
+            validated_executables.add(resolved_visudo)
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                sudoers = Path(temporary_directory) / "deploy.sudoers"
+                sudoers.write_text(rendered + "\n", encoding="utf-8")
+                validation = subprocess.run(
+                    [visudo, "-cf", str(sudoers)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(validation.returncode, 0, validation.stderr)
+
+    def test_static_live_gate_revalidates_bounded_canonical_stdin(self) -> None:
+        gate_path = SCRIPTS / "deploy-static-live-gate"
+        self.assertTrue(os.access(gate_path, os.X_OK))
+        gate = load_script_module("deploy_static_live_gate", gate_path)
+        self.assertEqual(gate.MAX_INPUT_BYTES, 1024)
+        self.assertEqual(gate.INPUT_TIMEOUT_SECONDS, 5)
+        self.assertEqual(gate.ACTIVATION_TIMEOUT_SECONDS, 2100)
+        self.assertEqual(gate.RECOVERY_TIMEOUT_SECONDS, 300)
+        self.assertEqual(gate.SYSTEMD_RUN_WAIT_TIMEOUT_SECONDS, 2460)
+        self.assertEqual(gate.SYSTEMD_RUN_PATH, "/usr/bin/systemd-run")
+
+        sha = "a" * 40
+        digest = "b" * 64
+        integration = (
+            "ghcr.io/nclsppr/vps-infra/platform-integration@sha256:" + digest
+        )
+        caddy = (
+            "ghcr.io/nclsppr/vps-infra/caddy:release_1.2-3@sha256:" + digest
+        )
+        repositories = {
+            "personal": (
+                "ghcr.io/nclsppr/personal/site",
+                "ghcr.io/nclsppr/personal/routes",
+            ),
+            "papersempire": (
+                "ghcr.io/nclsppr/papersempire/site",
+                "ghcr.io/nclsppr/papersempire/routes",
+            ),
+            "parkventory": (
+                "ghcr.io/nclsppr/parkventory-static-site",
+                "ghcr.io/nclsppr/parkventory-static-routes",
+            ),
+        }
+        valid_commands = {}
+        for application, (
+            site_repository,
+            routes_repository,
+        ) in repositories.items():
+            command = (
+                f"deploy-static-live {application} {sha} "
+                f"{site_repository}@sha256:{digest} "
+                f"{routes_repository}@sha256:{digest} {sha} {integration} {caddy}"
+            )
+            valid_commands[application] = command
+            self.assertEqual(
+                gate.parse_request((command + "\n").encode("ascii")),
+                command.split(" ")[1:],
+            )
+
+        personal = valid_commands["personal"]
+        invalid_payloads = (
+            b"",
+            personal.encode("ascii"),
+            (personal + "\n\n").encode("ascii"),
+            (personal + "\r\n").encode("ascii"),
+            (personal + " \n").encode("ascii"),
+            (
+                personal.replace(
+                    "deploy-static-live ",
+                    "deploy-static-live  ",
+                )
+                + "\n"
+            ).encode("ascii"),
+            (personal + " extra\n").encode("ascii"),
+            (personal.replace(" personal ", " unknown ") + "\n").encode(
+                "ascii"
+            ),
+            (
+                personal.replace(
+                    "ghcr.io/nclsppr/personal/site",
+                    "ghcr.io/nclsppr/papersempire/site",
+                )
+                + "\n"
+            ).encode("ascii"),
+            (personal[:-1] + "é\n").encode("utf-8"),
+            b"x" * (gate.MAX_INPUT_BYTES + 1),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload[:80]):
+                with self.assertRaises(gate.GateError):
+                    gate.parse_request(payload)
+
+        with mock.patch.object(gate.os, "isatty", return_value=True):
+            with self.assertRaisesRegex(gate.GateError, "terminal"):
+                gate.read_request()
+
+        with mock.patch.object(gate.sys, "argv", [str(gate_path), "extra"]):
+            with mock.patch.object(gate.sys, "stderr"):
+                with self.assertRaisesRegex(SystemExit, "64"):
+                    gate.main()
+
+        with (
+            mock.patch.object(gate.sys, "argv", [str(gate_path)]),
+            mock.patch.object(gate.os, "geteuid", return_value=501),
+            mock.patch.object(gate.sys, "stderr"),
+        ):
+            with self.assertRaisesRegex(SystemExit, "64"):
+                gate.main()
+
+        oversized_stdin = mock.Mock()
+        oversized_stdin.buffer = io.BytesIO(
+            b"x" * (gate.MAX_INPUT_BYTES + 1)
+        )
+        with (
+            mock.patch.object(gate.os, "isatty", return_value=False),
+            mock.patch.object(gate.sys, "stdin", oversized_stdin),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "input limit"):
+                gate.read_request()
+
+        personal_payload = (personal + "\n").encode("ascii")
+        materializer_command = [
+            "/usr/local/libexec/vps/deploy-static",
+            "--activate-live",
+            *personal.split(" ")[1:],
+        ]
+        unit_suffix = "c" * 24
+        activation_command = [
+            "/usr/bin/systemd-run",
+            "--system",
+            "--no-ask-password",
+            f"--unit=vps-static-live-personal-{unit_suffix}.service",
+            "--service-type=exec",
+            "--wait",
+            "--collect",
+            "--quiet",
+            "--expand-environment=no",
+            "--uid=root",
+            "--gid=root",
+            "--working-directory=/",
+        ]
+        for property_value in (
+            "KillMode=control-group",
+            "SendSIGKILL=yes",
+            "FinalKillSignal=SIGKILL",
+            "Restart=no",
+            "UMask=0077",
+            "StandardInput=null",
+            "StandardOutput=journal",
+            "StandardError=journal",
+            "TimeoutStartSec=2100s",
+            "RuntimeMaxSec=2100s",
+            "RuntimeRandomizedExtraSec=0",
+            "RuntimeDirectory=vps-static-live-personal-" + unit_suffix,
+            "RuntimeDirectoryMode=0700",
+            "RuntimeDirectoryPreserve=no",
+            "TimeoutStopSec=300s",
+            (
+                "ExecStopPost=/usr/local/libexec/vps/deploy-static "
+                "--recover-live personal"
+            ),
+            "Environment=HOME=/root",
+            "Environment=LANG=C",
+            "Environment=LC_ALL=C",
+            (
+                "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:"
+                "/usr/bin:/sbin:/bin"
+            ),
+            (
+                "Environment=VPS_STATIC_RUNTIME_DIRECTORY=/run/"
+                "vps-static-live-personal-" + unit_suffix
+            ),
+        ):
+            activation_command.extend(("--property", property_value))
+        activation_command.extend(("--", *materializer_command))
+        with mock.patch.object(
+            gate.secrets,
+            "token_hex",
+            return_value=unit_suffix,
+        ):
+            self.assertEqual(
+                gate.build_activation_command(personal.split(" ")[1:]),
+                activation_command,
+            )
+        with mock.patch.object(
+            gate.secrets,
+            "token_hex",
+            return_value="not-a-token",
+        ):
+            with self.assertRaisesRegex(gate.GateError, "unit name"):
+                gate.build_activation_command(personal.split(" ")[1:])
+        self.assertNotIn("--pipe", activation_command)
+        self.assertNotIn("--pty", activation_command)
+        recovery_command = [
+            "/usr/local/libexec/vps/deploy-static",
+            "--recover-live",
+            "personal",
+        ]
+        expected_subprocess_options = {
+            "check": False,
+            "close_fds": True,
+            "env": {
+                "HOME": "/root",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": (
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                ),
+            },
+            "shell": False,
+            "stdin": gate.subprocess.DEVNULL,
+        }
+
+        inherited_environment = {"ATTACKER_CONTROLLED": "value"}
+        with (
+            mock.patch.object(gate.sys, "argv", [str(gate_path)]),
+            mock.patch.object(gate, "read_request", return_value=personal_payload),
+            mock.patch.object(gate.os, "geteuid", return_value=0),
+            mock.patch.object(gate.os, "environ", inherited_environment),
+            mock.patch.object(gate.os, "umask"),
+            mock.patch.object(
+                gate.secrets,
+                "token_hex",
+                return_value=unit_suffix,
+            ),
+            mock.patch.object(
+                gate.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    activation_command,
+                    0,
+                ),
+            ) as run,
+        ):
+            gate.main()
+        self.assertEqual(inherited_environment, gate.SAFE_ENVIRONMENT)
+        run.assert_called_once_with(
+            activation_command,
+            **expected_subprocess_options,
+            timeout=gate.SYSTEMD_RUN_WAIT_TIMEOUT_SECONDS,
+        )
+
+        failed_environment = {"ATTACKER_CONTROLLED": "value"}
+        with (
+            mock.patch.object(gate.sys, "argv", [str(gate_path)]),
+            mock.patch.object(gate, "read_request", return_value=personal_payload),
+            mock.patch.object(gate.os, "geteuid", return_value=0),
+            mock.patch.object(gate.os, "environ", failed_environment),
+            mock.patch.object(gate.os, "umask"),
+            mock.patch.object(gate.sys, "stderr"),
+            mock.patch.object(
+                gate.secrets,
+                "token_hex",
+                return_value=unit_suffix,
+            ),
+            mock.patch.object(
+                gate.subprocess,
+                "run",
+                side_effect=(
+                    subprocess.CompletedProcess(activation_command, 1),
+                    subprocess.CompletedProcess(recovery_command, 0),
+                ),
+            ) as run,
+        ):
+            with self.assertRaisesRegex(SystemExit, "70"):
+                gate.main()
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(
+                    activation_command,
+                    **expected_subprocess_options,
+                    timeout=gate.SYSTEMD_RUN_WAIT_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    recovery_command,
+                    **expected_subprocess_options,
+                    timeout=gate.RECOVERY_TIMEOUT_SECONDS,
+                ),
+            ],
+        )
+
     def test_shared_platform_images_and_non_root_database_are_exact(self) -> None:
         environment = {}
         for raw_line in (ROOT / "platform/.env.example").read_text(
@@ -1049,6 +1514,16 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("ExecStop=/usr/bin/docker compose", unit)
         self.assertIn(" stop --timeout 30 caddy", unit)
+        self.assertIn(
+            "After=network-online.target docker.service "
+            "vps-docker-ingress-firewall.service vps-static-recover.service",
+            unit,
+        )
+        self.assertIn(
+            "Requires=docker.service vps-docker-ingress-firewall.service "
+            "vps-static-recover.service",
+            unit,
+        )
         self.assertNotIn("--volumes", unit)
 
     def test_internal_platform_controller_is_bounded_and_reversible(self) -> None:

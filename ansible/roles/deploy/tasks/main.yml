@@ -7,11 +7,17 @@
       - vps_deploy_install_root == '/usr/local/libexec/vps'
       - vps_deploy_gate_path == '/usr/local/libexec/vps/forced-command'
       - vps_deploy_controller_path == '/usr/local/libexec/vps/deploy'
+      - vps_deploy_static_path == '/usr/local/libexec/vps/deploy-static'
+      - >-
+        vps_deploy_static_gate_path ==
+        '/usr/local/libexec/vps/deploy-static-live-gate'
       - vps_deploy_schema_root == '/usr/local/share/vps-infra/schemas'
       - vps_deploy_repository_dir == '/srv/vps/repository'
       - vps_deploy_repository_url == 'https://github.com/nclsppr/vps-infra.git'
       - vps_deploy_revision_path == '/usr/local/share/vps-infra/controller-revision'
       - vps_deploy_state_dir == '/var/lib/vps-controller'
+      - vps_static_state_dir == '/var/lib/vps-static'
+      - vps_static_recovery_unit == 'vps-static-recover.service'
       - vps_deploy_production_marker == '/etc/vps/production-enabled'
       - vps_deploy_git_sha_length | int == 40
       - vps_infra_revision is match('^[0-9a-f]{40}$')
@@ -31,10 +37,11 @@
         match('^[0-9a-f]{64}$')
       - >-
         vps_deploy_executables | list | sort ==
-        ['check-public-safe', 'deploy', 'deploy-static', 'doctor',
-         'forced-command', 'parse-forced-command', 'plan-digests',
-         'reconcile', 'validate-compose', 'validate-release',
-         'verify-github-evidence', 'verify-state']
+        ['check-public-safe', 'deploy', 'deploy-static',
+         'deploy-static-live-gate', 'doctor', 'forced-command',
+         'parse-forced-command', 'plan-digests', 'reconcile',
+         'validate-compose', 'validate-release', 'verify-github-evidence',
+         'verify-state']
       - not (vps_live_apply_enabled | bool)
     fail_msg: "Le contrat du compte ou de la commande de déploiement a dérivé."
 
@@ -110,6 +117,16 @@
     - path: "{{ vps_deploy_repository_dir }}"
       mode: "0700"
     - path: "{{ vps_deploy_state_dir }}"
+      mode: "0700"
+    - path: "{{ vps_static_state_dir }}"
+      mode: "0700"
+    - path: "{{ vps_static_state_dir }}/active"
+      mode: "0700"
+    - path: "{{ vps_static_state_dir }}/inventories"
+      mode: "0700"
+    - path: "{{ vps_static_state_dir }}/quarantine"
+      mode: "0700"
+    - path: "{{ vps_static_state_dir }}/transactions"
       mode: "0700"
     - path: "{{ vps_gh_cache_root }}"
       mode: "0755"
@@ -433,7 +450,15 @@
     path: "{{ vps_deploy_production_marker }}"
     state: absent
 
-- name: Allow only the root-owned deployment controller through sudo
+- name: Install the static transaction recovery unit
+  ansible.builtin.template:
+    src: vps-static-recover.service.j2
+    dest: "/etc/systemd/system/{{ vps_static_recovery_unit }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Allow only the bounded root-owned deployment executables through sudo
   ansible.builtin.template:
     src: deploy.sudoers.j2
     dest: "/etc/sudoers.d/91-{{ vps_deploy_user }}-deploy"
@@ -469,6 +494,8 @@
   loop:
     - "{{ vps_deploy_gate_path }}"
     - "{{ vps_deploy_controller_path }}"
+    - "{{ vps_deploy_static_gate_path }}"
+    - "/etc/systemd/system/{{ vps_static_recovery_unit }}"
     - "{{ vps_deploy_install_root }}/lib/release_policy.py"
     - "{{ vps_deploy_install_root }}/lib/platform_proof.py"
     - "{{ vps_deploy_install_root }}/lib/platform_integration.py"
@@ -513,4 +540,11 @@
   loop: "{{ vps_deploy_installed_executables.results }}"
   loop_control:
     label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Enable static transaction recovery at boot
+  ansible.builtin.systemd_service:
+    name: "{{ vps_static_recovery_unit }}"
+    enabled: true
+    daemon_reload: true
   when: not ansible_check_mode

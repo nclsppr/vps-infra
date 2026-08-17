@@ -28,6 +28,11 @@ keeps its application images, but not its copy of Caddy, PostgreSQL,
 Prometheus, or Grafana. One physical PostgreSQL cluster is shared. Each project
 keeps separate databases, roles, secrets, networks, and migrations.
 
+The Parkventory demo is explicitly temporary. Its future React frontend and
+Java backend form one Compose application release and must replace the static
+promotion through an exclusive cross-contract handoff; the two modes may never
+own `parkventory.com` simultaneously.
+
 ## État actuel
 
 Le premier socle exécutable est livré :
@@ -54,6 +59,11 @@ Le premier socle exécutable est livré :
 - deterministic platform integration publication from an exact runtime
   allowlist. The workflow verifies the manifest and both GHCR layer payloads
   before it creates and verifies GitHub provenance.
+- a fail-closed static release reconciler for Personal, Papers Empire, and
+  Parkventory. It selects only the canonical branch HEAD after all observed and
+  expected checks are green, resolves the coherent site and route tags to
+  digests, and uses one bounded Atlas command. It stays disabled until the
+  dedicated environment and `VPS_STATIC_DEPLOY_ENABLED=true` are configured.
 
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
@@ -69,8 +79,8 @@ controlled operator rollout now has this live state:
   PostgreSQL and the metrics endpoints have no host port;
 - the local PostgreSQL backup and isolated restore-rehearsal timers are active.
 
-This bounded rollout does not enable the release manifest or install the live
-release applicator. The manifest keeps every dynamic application at
+This bounded rollout does not enable the dynamic release manifest or install
+its generic live applicator. The manifest keeps every dynamic application at
 `enabled: false`, its root policy rejects activation, and the runtime doctor
 reports the missing desired and active release records as expected warnings.
 `parkventory.com` is a static demonstration only. `surplasse.com` keeps its
@@ -92,14 +102,23 @@ The canonical proof binds the VEX policy digest and its earliest exception
 expiry. Evidence verification rejects the proof after that UTC date, even when
 the GitHub artifact itself is still retained.
 
-The deploy role installs the static materializer as a root-owned primitive. It
+The deploy role installs the static materializer as a root-owned primitive and
+exposes a separate allowlisted `deploy-static-live` forced command. It
 binds each site, route inventory, and platform integration artifact to an exact
 GitHub attestation. It performs bounded unprivileged parsing and verifies the
 exact integration route through temporary HTTPS Caddy before it changes the
-`current` symlink. It makes release and symlink changes durable with ordered
-fsync operations and restores the previous symlink after an activation fsync
-failure. Branch protection remains a separate external gate. The locked
-controller cannot call the primitive because `apply-release` is still absent.
+`current` symlink. The live form journals the transaction, rechecks the
+canonical source HEAD, probes the actual edge with strict public TLS, records
+the complete active tuple, and restores the previous release before it
+classifies a failed probe. It quarantines the candidate only while the same
+source HEAD and Caddy runtime still hold. A bounded unprivileged ancestry check
+also rejects branch-history rollback. Protected inventories make repeated exact candidates local health
+checks instead of registry downloads. A transient activation unit and a boot
+oneshot recover unfinished transactions and bounded probe residue before the
+public edge can start.
+Branch protection remains a separate external gate. The locked
+dynamic controller cannot call an applicator because `apply-release` is still
+absent.
 
 ## Démarrage local
 
@@ -176,6 +195,7 @@ Cette décision est détaillée dans
 - [ADR-0002 — dépôt public](docs/decisions/0002-depot-public-sans-etat-sensible.md)
 - [ADR-0003 — builds hors production](docs/decisions/0003-builds-hors-du-vps-de-production.md)
 - [ADR-0004 - Parkventory static demo](docs/decisions/0004-parkventory-static-demo.md)
+- [ADR-0008 - automatic static release reconciliation](docs/decisions/0008-automatic-static-release-reconciliation.md)
 - [ADR-0005 - dedicated Codex CLI account](docs/decisions/0005-dedicated-codex-cli-account.md)
 - [ADR-0006 - private Codex App Server](docs/decisions/0006-private-codex-app-server.md)
 - [ADR-0007 - managed transactional email relay for Surplasse](docs/decisions/0007-relais-email-transactionnel-surplasse.md)

@@ -2,12 +2,16 @@
 vps_deploy_install_root: /usr/local/libexec/vps
 vps_deploy_gate_path: /usr/local/libexec/vps/forced-command
 vps_deploy_controller_path: /usr/local/libexec/vps/deploy
+vps_deploy_static_path: /usr/local/libexec/vps/deploy-static
+vps_deploy_static_gate_path: /usr/local/libexec/vps/deploy-static-live-gate
 vps_deploy_git_sha_length: 40
 vps_deploy_schema_root: /usr/local/share/vps-infra/schemas
 vps_deploy_repository_dir: /srv/vps/repository
 vps_deploy_repository_url: https://github.com/nclsppr/vps-infra.git
 vps_deploy_revision_path: /usr/local/share/vps-infra/controller-revision
 vps_deploy_state_dir: /var/lib/vps-controller
+vps_static_state_dir: /var/lib/vps-static
+vps_static_recovery_unit: vps-static-recover.service
 vps_deploy_production_marker: /etc/vps/production-enabled
 vps_gh_version: "2.97.0"
 vps_gh_install_path: /usr/local/bin/gh
@@ -25,6 +29,7 @@ vps_deploy_executables:
   - check-public-safe
   - deploy
   - deploy-static
+  - deploy-static-live-gate
   - doctor
   - forced-command
   - parse-forced-command
