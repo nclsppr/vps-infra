@@ -144,17 +144,23 @@ It drops direct non-DNAT forwarding and all other new public Docker forwarding.
 The `deploy` account is locked and is not a member of the `docker` group. It
 has a valid shell because OpenSSH requires one. `ForceCommand` sends every key
 to a parser that accepts only `deploy <full-git-sha>` or the exact
-`deploy-static-live` tuple for one allowlisted application.
+`deploy-static-live` or `deploy-application-live` tuple for one allowlisted
+application.
 
 The controller files are installed under `/usr/local/libexec/vps`. The marker
 `/etc/vps/production-enabled` and the executable `apply-release` are absent.
-The current controller can validate and plan. It cannot activate production.
+The generic controller can validate and plan. Static activation has its own
+reviewed gate. The Compose application gate is installed, but Surplasse and
+Parkventory are both disabled by the protected application contract before any
+runtime validation or network operation.
 
 The deploy role also installs GitHub CLI 2.97.0 from its official release
 archive. It selects `amd64` or `arm64`, verifies the archive SHA-256, verifies
 the extracted executable with a second SHA-256, and confirms the installed
 version. The role then installs
 `/usr/local/libexec/vps/deploy-static` and its platform integration verifier.
+It also installs `/usr/local/libexec/vps/deploy-application`, the strict
+application bundle policy, and the argument-free root application gate.
 Current Personal, Papers Empire, and platform integration packages are public,
 so this path does not install a registry credential.
 
@@ -172,6 +178,24 @@ enabled `vps-static-recover.service` also runs before the public edge at boot;
 it orders itself after and requires Docker so it can remove strictly labeled
 orphan probe containers. The edge requires a successful recovery. Root-only active, inventory,
 transaction, and quarantine state lives under `/var/lib/vps-static`.
+
+The application SSH form follows the same stdin-only forced-command boundary.
+Its exact record contains the application, one full source SHA, and one
+digest-only `application-release` reference. The root controller independently
+verifies release, component, and integration attestations and referenced
+content before activation. It shares `/run/lock/vps-static.lock` with static
+deployments. Root-only application release, active, inventory, transaction, and
+quarantine state lives under `/srv/applications` and
+`/var/lib/vps-application`; runtime configuration lives under the root-only
+`/etc/vps/applications` directory. Secret bytes remain in
+`/etc/vps/secrets/<application>` and are never copied into state.
+
+`vps-application-recover.service` is enabled beside the static recovery unit.
+Both complete before the public edge starts. Application activation also
+requires an exact pre-staged public edge route and application-network
+attachment before it may run the dedicated migrator. The controller does not
+perform that platform cutover itself, and the current contracts keep both
+applications disabled.
 
 The caller supplies the application, the application source revision, the
 exact site and route references, the platform integration revision and

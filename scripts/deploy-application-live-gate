@@ -1,0 +1,222 @@
+#!/usr/bin/python3 -I
+
+"""Root-side gate for one canonical Compose application activation request."""
+
+from __future__ import annotations
+
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+
+
+EXIT_USAGE = 64
+EXIT_RUNTIME = 70
+MAX_INPUT_BYTES = 512
+INPUT_TIMEOUT_SECONDS = 5
+ACTIVATION_TIMEOUT_SECONDS = 2700
+RECOVERY_TIMEOUT_SECONDS = 600
+SYSTEMD_RUN_WAIT_TIMEOUT_SECONDS = (
+    ACTIVATION_TIMEOUT_SECONDS + RECOVERY_TIMEOUT_SECONDS + 60
+)
+DEPLOY_APPLICATION_PATH = "/usr/local/libexec/vps/deploy-application"
+SYSTEMD_RUN_PATH = "/usr/bin/systemd-run"
+SAFE_ENVIRONMENT = {
+    "HOME": "/root",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+}
+RELEASE_REPOSITORIES = {
+    "surplasse": "ghcr.io/nclsppr/surplasse/application-release",
+    "parkventory": "ghcr.io/nclsppr/parkventory/application-release",
+}
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+
+
+class GateError(ValueError):
+    """The activation request is outside the forced-command contract."""
+
+
+def fail(message: str) -> None:
+    print(f"deploy-application-live gate: {message}", file=sys.stderr)
+    raise SystemExit(EXIT_USAGE)
+
+
+def _read_timed_out(_signum: int, _frame: object) -> None:
+    raise GateError("timed out waiting for a complete request")
+
+
+def read_request() -> bytes:
+    if any(os.isatty(descriptor) for descriptor in (0, 1, 2)):
+        raise GateError("terminal input or output is forbidden")
+    previous_handler = signal.signal(signal.SIGALRM, _read_timed_out)
+    signal.alarm(INPUT_TIMEOUT_SECONDS)
+    try:
+        payload = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    except OSError as exc:
+        raise GateError("could not read the request") from exc
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+    if len(payload) > MAX_INPUT_BYTES:
+        raise GateError("request exceeds the input limit")
+    if not payload.endswith(b"\n") or payload.count(b"\n") != 1:
+        raise GateError("request must end at exactly one newline")
+    return payload
+
+
+def _digest_reference(value: str, repository: str) -> bool:
+    prefix = f"{repository}@sha256:"
+    return value.startswith(prefix) and SHA256_RE.fullmatch(
+        value.removeprefix(prefix)
+    ) is not None
+
+
+def parse_request(payload: bytes) -> list[str]:
+    if len(payload) > MAX_INPUT_BYTES:
+        raise GateError("request exceeds the input limit")
+    if not payload.endswith(b"\n") or payload.count(b"\n") != 1:
+        raise GateError("request must end at exactly one newline")
+    command_bytes = payload[:-1]
+    if not command_bytes or any(
+        byte < 0x20 or byte > 0x7E for byte in command_bytes
+    ):
+        raise GateError("request must contain printable ASCII only")
+    command = command_bytes.decode("ascii")
+    fields = command.split(" ")
+    if any(not field for field in fields) or command != " ".join(fields):
+        raise GateError("request spacing is not canonical")
+    if len(fields) != 4 or fields[0] != "deploy-application-live":
+        raise GateError("request shape is invalid")
+    _, application, revision, release_reference = fields
+    repository = RELEASE_REPOSITORIES.get(application)
+    if repository is None:
+        raise GateError("application is outside the allowlist")
+    if SHA40_RE.fullmatch(revision) is None:
+        raise GateError("source revision is invalid")
+    if not _digest_reference(release_reference, repository):
+        raise GateError("application release reference is invalid")
+    return fields[1:]
+
+
+def build_activation_command(arguments: list[str]) -> list[str]:
+    application = arguments[0]
+    random_suffix = secrets.token_hex(12)
+    if re.fullmatch(r"[0-9a-f]{24}", random_suffix, re.ASCII) is None:
+        raise GateError("could not generate a bounded transient unit name")
+    runtime_name = f"vps-application-live-{application}-{random_suffix}"
+    unit_name = f"{runtime_name}.service"
+    properties = [
+        "KillMode=control-group",
+        "SendSIGKILL=yes",
+        "FinalKillSignal=SIGKILL",
+        "Restart=no",
+        "UMask=0077",
+        "StandardInput=null",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        f"TimeoutStartSec={ACTIVATION_TIMEOUT_SECONDS}s",
+        f"RuntimeMaxSec={ACTIVATION_TIMEOUT_SECONDS}s",
+        "RuntimeRandomizedExtraSec=0",
+        f"RuntimeDirectory={runtime_name}",
+        "RuntimeDirectoryMode=0700",
+        "RuntimeDirectoryPreserve=no",
+        f"TimeoutStopSec={RECOVERY_TIMEOUT_SECONDS}s",
+        (
+            f"ExecStopPost={DEPLOY_APPLICATION_PATH} "
+            f"--recover-live {application}"
+        ),
+        "Environment=HOME=/root",
+        "Environment=LANG=C",
+        "Environment=LC_ALL=C",
+        f"Environment=PATH={SAFE_ENVIRONMENT['PATH']}",
+        (
+            "Environment=VPS_APPLICATION_RUNTIME_DIRECTORY="
+            f"/run/{runtime_name}"
+        ),
+    ]
+    command = [
+        SYSTEMD_RUN_PATH,
+        "--system",
+        "--no-ask-password",
+        f"--unit={unit_name}",
+        "--service-type=exec",
+        "--wait",
+        "--collect",
+        "--quiet",
+        "--expand-environment=no",
+        "--uid=root",
+        "--gid=root",
+        "--working-directory=/",
+    ]
+    for property_value in properties:
+        command.extend(("--property", property_value))
+    command.extend(("--", DEPLOY_APPLICATION_PATH, "--activate-live", *arguments))
+    return command
+
+
+def main() -> None:
+    if len(sys.argv) != 1:
+        fail("arguments are forbidden")
+    if os.geteuid() != 0:
+        fail("effective root is required")
+    os.environ.clear()
+    os.environ.update(SAFE_ENVIRONMENT)
+    os.umask(0o077)
+    try:
+        arguments = parse_request(read_request())
+        activation_command = build_activation_command(arguments)
+    except (GateError, OSError) as exc:
+        fail(str(exc))
+
+    application = arguments[0]
+    activation_failed = False
+    try:
+        activation = subprocess.run(
+            activation_command,
+            check=False,
+            close_fds=True,
+            env=SAFE_ENVIRONMENT,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            timeout=SYSTEMD_RUN_WAIT_TIMEOUT_SECONDS,
+        )
+        activation_failed = activation.returncode != 0
+    except (OSError, subprocess.TimeoutExpired):
+        activation_failed = True
+    if not activation_failed:
+        return
+
+    print(
+        "deploy-application-live gate: activation failed; recovering its transaction",
+        file=sys.stderr,
+    )
+    try:
+        recovery = subprocess.run(
+            [DEPLOY_APPLICATION_PATH, "--recover-live", application],
+            check=False,
+            close_fds=True,
+            env=SAFE_ENVIRONMENT,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            timeout=RECOVERY_TIMEOUT_SECONDS,
+        )
+        if recovery.returncode != 0:
+            print(
+                "deploy-application-live gate: immediate transaction recovery failed",
+                file=sys.stderr,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        print(
+            "deploy-application-live gate: immediate transaction recovery failed",
+            file=sys.stderr,
+        )
+    raise SystemExit(EXIT_RUNTIME)
+
+
+if __name__ == "__main__":
+    main()

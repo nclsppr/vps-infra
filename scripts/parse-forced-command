@@ -122,7 +122,35 @@ case "$original_command" in
     [ "$original_command" = "$canonical_command" ] || fail "deploy-static-live command must use one canonical space between arguments"
     printf '%s\n' "$canonical_command"
     ;;
+  "deploy-application-live "*)
+    rest=${original_command#"deploy-application-live "}
+
+    application=${rest%% *}
+    [ "$application" != "$rest" ] || fail "malformed deploy-application-live command"
+    rest=${rest#* }
+    source_sha=${rest%% *}
+    [ "$source_sha" != "$rest" ] || fail "malformed deploy-application-live command"
+    release_reference=${rest#* }
+
+    case "$application" in
+      surplasse)
+        release_repository=ghcr.io/nclsppr/surplasse/application-release
+        ;;
+      parkventory)
+        release_repository=ghcr.io/nclsppr/parkventory/application-release
+        ;;
+      *) fail "application is outside the Compose allowlist" ;;
+    esac
+
+    is_lower_sha40 "$source_sha" || fail "source SHA must be 40 lowercase hexadecimal characters"
+    is_digest_reference "$release_reference" "$release_repository" || \
+      fail "application release reference does not match the allowlist"
+
+    canonical_command="deploy-application-live $application $source_sha $release_reference"
+    [ "$original_command" = "$canonical_command" ] || fail "deploy-application-live command must use one canonical space between arguments"
+    printf '%s\n' "$canonical_command"
+    ;;
   *)
-    fail "only deploy and deploy-static-live commands are accepted"
+    fail "only deploy, deploy-static-live, and deploy-application-live commands are accepted"
     ;;
 esac

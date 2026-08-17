@@ -15,6 +15,8 @@ readonly PARKVENTORY_SITE="ghcr.io/nclsppr/parkventory-static-site@sha256:$VALID
 readonly PARKVENTORY_ROUTES="ghcr.io/nclsppr/parkventory-static-routes@sha256:$VALID_DIGEST"
 readonly PLATFORM_INTEGRATION="ghcr.io/nclsppr/vps-infra/platform-integration@sha256:$VALID_DIGEST"
 readonly CADDY_IMAGE="ghcr.io/nclsppr/vps-infra/caddy:sha-$VALID_SHA@sha256:$VALID_DIGEST"
+readonly SURPLASSE_RELEASE="ghcr.io/nclsppr/surplasse/application-release@sha256:$VALID_DIGEST"
+readonly PARKVENTORY_RELEASE="ghcr.io/nclsppr/parkventory/application-release@sha256:$VALID_DIGEST"
 
 if [[ $EUID -eq 0 ]]; then
   command -v setpriv >/dev/null 2>&1 || {
@@ -81,6 +83,8 @@ python3 "$TESTS_DIR/test_codex_cli.py"
 python3 "$TESTS_DIR/test_repository_contract.py"
 python3 "$TESTS_DIR/test_application_release_policy.py"
 python3 "$TESTS_DIR/test_application_release_resolver.py"
+python3 "$TESTS_DIR/test_application_bundle.py"
+python3 "$TESTS_DIR/test_application_controller.py"
 python3 "$TESTS_DIR/test_static_release_resolver.py"
 python3 "$TESTS_DIR/test_static_materializer.py"
 python3 "$TESTS_DIR/test_surplasse_controller.py"
@@ -91,11 +95,20 @@ parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "deploy $VALID_SHA")
 personal_command="deploy-static-live personal $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE"
 papersempire_command="deploy-static-live papersempire $VALID_SHA $PAPERSEMPIRE_SITE $PAPERSEMPIRE_ROUTES $VALID_SHA $PLATFORM_INTEGRATION ghcr.io/nclsppr/vps-infra/caddy@sha256:$VALID_DIGEST"
 parkventory_command="deploy-static-live parkventory $VALID_SHA $PARKVENTORY_SITE $PARKVENTORY_ROUTES $VALID_SHA $PLATFORM_INTEGRATION ghcr.io/nclsppr/vps-infra/caddy:release_1.2-3@sha256:$VALID_DIGEST"
+surplasse_application_command="deploy-application-live surplasse $VALID_SHA $SURPLASSE_RELEASE"
+parkventory_application_command="deploy-application-live parkventory $VALID_SHA $PARKVENTORY_RELEASE"
 
 for valid in \
   "$personal_command" \
   "$papersempire_command" \
   "$parkventory_command"; do
+  parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "$valid")
+  [[ $parsed == "$valid" ]]
+done
+
+for valid in \
+  "$surplasse_application_command" \
+  "$parkventory_application_command"; do
   parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "$valid")
   [[ $parsed == "$valid" ]]
 done
@@ -114,6 +127,25 @@ for invalid in \
   "doctor"; do
   if "$TESTS_DIR/../scripts/parse-forced-command" "$invalid" >/dev/null 2>&1; then
     echo "parser unexpectedly accepted: $invalid" >&2
+    exit 1
+  fi
+done
+
+for invalid in \
+  "deploy-application-live" \
+  "deploy-application-live  surplasse $VALID_SHA $SURPLASSE_RELEASE" \
+  "${surplasse_application_command} " \
+  "$surplasse_application_command extra" \
+  "deploy-application-live unknown $VALID_SHA $SURPLASSE_RELEASE" \
+  "deploy-application-live surplasse 0123456789ABCDEF0123456789ABCDEF01234567 $SURPLASSE_RELEASE" \
+  "deploy-application-live surplasse $VALID_SHA $PARKVENTORY_RELEASE" \
+  "deploy-application-live surplasse $VALID_SHA ghcr.io/nclsppr/surplasse/application-release:latest@sha256:$VALID_DIGEST" \
+  "deploy-application-live surplasse $VALID_SHA ghcr.io/nclsppr/surplasse/application-release@sha256:${VALID_DIGEST%?}" \
+  "${surplasse_application_command}; id" \
+  "${surplasse_application_command}"$'\n''id' \
+  "${surplasse_application_command}"$'\t'; do
+  if "$TESTS_DIR/../scripts/parse-forced-command" "$invalid" >/dev/null 2>&1; then
+    echo "parser unexpectedly accepted application command: $invalid" >&2
     exit 1
   fi
 done
@@ -146,7 +178,9 @@ for invalid in \
   "doctor" \
   "deploy ${VALID_SHA}; id" \
   "deploy-static-live unknown $VALID_SHA $PERSONAL_SITE $PERSONAL_ROUTES $VALID_SHA $PLATFORM_INTEGRATION $CADDY_IMAGE" \
-  "${personal_command}; id"; do
+  "${personal_command}; id" \
+  "deploy-application-live unknown $VALID_SHA $SURPLASSE_RELEASE" \
+  "${surplasse_application_command}; id"; do
   if SSH_ORIGINAL_COMMAND=$invalid "$TESTS_DIR/../scripts/forced-command" >/dev/null 2>&1; then
     echo "forced-command wrapper unexpectedly accepted: $invalid" >&2
     exit 1

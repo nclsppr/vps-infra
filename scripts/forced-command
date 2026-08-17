@@ -10,7 +10,7 @@ unset CDPATH ENV BASH_ENV DRY_RUN VPS_CONTROLLER_TESTING VPS_REPOSITORY_DIR \
   VPS_STATE_DIR VPS_LOCK_DIR VPS_PRODUCTION_ENABLE_FILE VPS_VALIDATE_RELEASE \
   VPS_RECONCILE VPS_PLAN_DIGEST_READER VPS_APPLY_EXECUTABLE \
   VPS_EXPECTED_ORIGIN VPS_SCHEMA_FILE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 \
-  GIT_CONFIG_VALUE_0
+  GIT_CONFIG_VALUE_0 VPS_APPLICATION_RUNTIME_DIRECTORY
 
 if [ "$#" -ne 0 ]; then
   echo "forced-command wrapper: arguments are forbidden" >&2
@@ -29,6 +29,10 @@ case "$original_command" in
   "deploy-static-live "*)
     printf '%s\n' "$original_command" |
       /usr/bin/sudo -n -- /usr/local/libexec/vps/deploy-static-live-gate
+    ;;
+  "deploy-application-live "*)
+    printf '%s\n' "$original_command" |
+      /usr/bin/sudo -n -- /usr/local/libexec/vps/deploy-application-live-gate
     ;;
   *)
     echo "forced-command wrapper: validated command has no dispatcher" >&2

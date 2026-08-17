@@ -3061,6 +3061,19 @@ class StaticBundleContractTests(unittest.TestCase):
             candidate.caddy_image,
             frozenset(MATERIALIZER.PROFILES),
         )
+        lock_state = {"held": False}
+
+        @contextlib.contextmanager
+        def tracked_deployment_lock():
+            lock_state["held"] = True
+            try:
+                yield
+            finally:
+                lock_state["held"] = False
+
+        def assert_owner_guard_is_locked(_application):
+            self.assertTrue(lock_state["held"])
+
         with mock.patch.object(
             MATERIALIZER,
             "validate_runtime",
@@ -3091,8 +3104,12 @@ class StaticBundleContractTests(unittest.TestCase):
         ), mock.patch.object(
             MATERIALIZER,
             "deployment_lock",
-            return_value=contextlib.nullcontext(),
+            side_effect=tracked_deployment_lock,
         ), mock.patch.object(
+            MATERIALIZER,
+            "refuse_compose_application_owner",
+            side_effect=assert_owner_guard_is_locked,
+        ) as check_compose_owner, mock.patch.object(
             MATERIALIZER,
             "cleanup_probe_containers",
         ), mock.patch.object(
@@ -3140,6 +3157,7 @@ class StaticBundleContractTests(unittest.TestCase):
                 activate_live=True,
             )
         read_inventory.assert_called_once_with(candidate)
+        check_compose_owner.assert_called_once_with(candidate.application)
         read_application_enablement.assert_called_once_with(
             MATERIALIZER.APPLICATION_PRODUCTION_CONTRACT_PATH,
             require_root_owner=True,
@@ -3862,6 +3880,52 @@ class StaticBundleContractTests(unittest.TestCase):
                 )
 
             self.assertEqual(combined.read_bytes(), bundle + b"\n")
+            manifest_value = json.loads(manifest)
+            manifest_value["subject"]["mediaType"] = MATERIALIZER.OCI_INDEX_MEDIA_TYPE
+            manifest = producer_json(manifest_value)
+            manifest_digest = f"sha256:{hashlib.sha256(manifest).hexdigest()}"
+            index_value = json.loads(index)
+            index_value["manifests"][0]["digest"] = manifest_digest
+            index_value["manifests"][0]["size"] = len(manifest)
+            index = producer_json(index_value)
+            index_root = root / "index-subject"
+            index_root.mkdir()
+            with mock.patch.object(
+                MATERIALIZER,
+                "fetch_registry_named_manifest",
+                side_effect=write_index,
+            ), mock.patch.object(
+                MATERIALIZER,
+                "fetch_registry_object",
+                side_effect=write_object,
+            ):
+                index_combined = MATERIALIZER.fetch_attestation_bundles_bounded(
+                    reference,
+                    index_root,
+                    MATERIALIZER.safe_environment(index_root),
+                    subject_media_type=MATERIALIZER.OCI_INDEX_MEDIA_TYPE,
+                )
+            self.assertEqual(index_combined.read_bytes(), bundle + b"\n")
+            mismatch_root = root / "mismatch-subject"
+            mismatch_root.mkdir()
+            with mock.patch.object(
+                MATERIALIZER,
+                "fetch_registry_named_manifest",
+                side_effect=write_index,
+            ), mock.patch.object(
+                MATERIALIZER,
+                "fetch_registry_object",
+                side_effect=write_object,
+            ):
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "subject is invalid",
+                ):
+                    MATERIALIZER.fetch_attestation_bundles_bounded(
+                        reference,
+                        mismatch_root,
+                        MATERIALIZER.safe_environment(mismatch_root),
+                    )
             with self.assertRaisesRegex(
                 MATERIALIZER.StaticDeploymentError,
                 "must be UTF-8 JSON",
@@ -4395,6 +4459,62 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
                 enablement,
                 conflicting,
             )
+
+    def test_parkventory_static_refuses_compose_state_or_current_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            active_root = root / "active"
+            transaction_root = root / "transactions"
+            application_root = root / "applications"
+            active_root.mkdir()
+            transaction_root.mkdir()
+            (application_root / "parkventory").mkdir(parents=True)
+            with (
+                mock.patch.object(
+                    MATERIALIZER,
+                    "COMPOSE_APPLICATION_ACTIVE_ROOT",
+                    active_root,
+                ),
+                mock.patch.object(
+                    MATERIALIZER,
+                    "COMPOSE_APPLICATION_ROOT",
+                    application_root,
+                ),
+                mock.patch.object(
+                    MATERIALIZER,
+                    "COMPOSE_APPLICATION_TRANSACTION_ROOT",
+                    transaction_root,
+                ),
+            ):
+                MATERIALIZER.refuse_compose_application_owner("parkventory")
+                (active_root / "parkventory.json").write_text(
+                    "{}\n",
+                    encoding="ascii",
+                )
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "conflicts with its Compose",
+                ):
+                    MATERIALIZER.refuse_compose_application_owner("parkventory")
+                (active_root / "parkventory.json").unlink()
+                (transaction_root / "parkventory.json").write_text(
+                    "{}\n",
+                    encoding="ascii",
+                )
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "conflicts with its Compose",
+                ):
+                    MATERIALIZER.refuse_compose_application_owner("parkventory")
+                (transaction_root / "parkventory.json").unlink()
+                (application_root / "parkventory/current").symlink_to(
+                    "releases/sha256-" + "a" * 64
+                )
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "conflicts with its Compose",
+                ):
+                    MATERIALIZER.refuse_compose_application_owner("parkventory")
 
     def test_active_application_state_also_blocks_static_activation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

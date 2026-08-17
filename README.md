@@ -64,6 +64,10 @@ Le premier socle exécutable est livré :
   expected checks are green, resolves the coherent site and route tags to
   digests, and uses one bounded Atlas command. It stays disabled until the
   dedicated environment and `VPS_STATIC_DEPLOY_ENABLED=true` are configured.
+- immutable application-release admission plus a root-owned transactional
+  Compose controller for Surplasse and Parkventory. It verifies every component
+  and integration attestation and bundle, but both protected entries remain
+  disabled and no application deployment workflow invokes it.
 
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
@@ -79,10 +83,11 @@ controlled operator rollout now has this live state:
   PostgreSQL and the metrics endpoints have no host port;
 - the local PostgreSQL backup and isolated restore-rehearsal timers are active.
 
-This bounded rollout does not enable the dynamic release manifest or install
-its generic live applicator. The manifest keeps every dynamic application at
-`enabled: false`, its root policy rejects activation, and the runtime doctor
-reports the missing desired and active release records as expected warnings.
+This bounded rollout does not enable the dynamic release manifest or invoke the
+installed Compose application controller. The manifest keeps every dynamic
+application at `enabled: false`; the root controller rejects each one before
+runtime validation or network access, and the runtime doctor reports the
+missing desired and active release records as expected warnings.
 `parkventory.com` is a static demonstration only. `surplasse.com` keeps its
 previous DNS target and Atlas does not serve a Surplasse application.
 
@@ -116,9 +121,12 @@ also rejects branch-history rollback. Protected inventories make repeated exact 
 checks instead of registry downloads. A transient activation unit and a boot
 oneshot recover unfinished transactions and bounded probe residue before the
 public edge can start.
-Branch protection remains a separate external gate. The locked
-dynamic controller cannot call an applicator because `apply-release` is still
-absent.
+Branch protection remains a separate external gate. The generic locked
+controller cannot call `apply-release`, which remains absent. The separate
+application controller has its own exact forced-command gate, shared static
+lock, transaction journal, quarantine, and boot recovery. It remains inert
+until a reviewed application entry is enabled and its database, secrets,
+observability, edge route, and network cutover are prepared.
 
 ## Démarrage local
 
@@ -199,6 +207,8 @@ Cette décision est détaillée dans
 - [ADR-0005 - dedicated Codex CLI account](docs/decisions/0005-dedicated-codex-cli-account.md)
 - [ADR-0006 - private Codex App Server](docs/decisions/0006-private-codex-app-server.md)
 - [ADR-0007 - managed transactional email relay for Surplasse](docs/decisions/0007-relais-email-transactionnel-surplasse.md)
+- [ADR-0009 - immutable application release admission](docs/decisions/0009-immutable-application-release-admission.md)
+- [ADR-0010 - disabled transactional application controller](docs/decisions/0010-disabled-transactional-application-controller.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas

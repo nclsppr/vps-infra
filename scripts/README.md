@@ -1,15 +1,19 @@
 # Contrôleur de release
 
-Ces scripts forment le plan de contrôle local du VPS. Ils valident et planifient
-un état Git immuable ; ils ne construisent aucune image et ne démarrent aucun
-conteneur.
+Ces scripts forment le plan de contrôle local du VPS. Ils ne construisent aucune
+image. Les contrôleurs générique et applicatif restent désactivés par leurs
+contrats protégés ; le contrôleur statique possède, lui, un chemin d'activation
+borné et transactionnel.
 
 ## Installation attendue
 
 Ansible installe, root-owned et non modifiables par le groupe ou les autres :
 
 - `/usr/local/libexec/vps/deploy`
+- `/usr/local/libexec/vps/deploy-application`
+- `/usr/local/libexec/vps/deploy-application-live-gate`
 - `/usr/local/libexec/vps/deploy-static`
+- `/usr/local/libexec/vps/deploy-static-live-gate`
 - `/usr/local/libexec/vps/forced-command`
 - `/usr/local/libexec/vps/parse-forced-command`
 - `/usr/local/libexec/vps/plan-digests`
@@ -19,6 +23,8 @@ Ansible installe, root-owned et non modifiables par le groupe ou les autres :
 - `/usr/local/libexec/vps/verify-github-evidence`
 - `/usr/local/libexec/vps/verify-state`
 - `/usr/local/libexec/vps/lib/release_policy.py`
+- `/usr/local/libexec/vps/lib/application_bundle.py`
+- `/usr/local/libexec/vps/lib/application_release.py`
 - `/usr/local/libexec/vps/lib/platform_integration.py`
 - `/usr/local/libexec/vps/lib/platform_proof.py`
 - `/usr/local/share/vps-infra/schemas/production-release.schema.json`
@@ -239,6 +245,53 @@ bytes and removes bounded labeled probe containers, strict staging directories,
 and temporary activation symlinks. Git ancestry is checked in a separate
 bounded network `DynamicUser` worker rather than in the root process.
 Release garbage collection remains an operator responsibility.
+
+## Disabled Compose application controller
+
+`deploy-application` consumes only the immutable
+`ghcr.io/nclsppr/<application>/application-release@sha256:<digest>` selected by
+the admission resolver. It supports the exact `surplasse` and `parkventory`
+profiles. Both remain `enabled: false` in
+`releases/application-production.json`; that check happens before runtime
+validation or network access.
+
+For a future enabled entry, the controller independently verifies the release,
+every component image index and config, the application integration manifest,
+and all allowlisted GitHub attestations. It validates the common two-layer
+integration bundle, canonical inventories, safe archive metadata, migration and
+probe hashes, rendered Compose policy, and root-owned secret metadata. Secret
+bytes are never copied into a release or state journal.
+
+Materialized releases live under
+`/srv/applications/<application>/releases/sha256-<release-manifest-digest>`.
+Active, inventory, transaction, and quarantine records live under
+`/var/lib/vps-application`. Application and static deployments serialize on
+`/run/lock/vps-static.lock`.
+
+The live SSH record is exact and digest-only:
+
+```text
+deploy-application-live <surplasse|parkventory> <source-sha40> \
+  <application-release@sha256>
+```
+
+`forced-command` sends that canonical line over stdin to the argument-free
+root gate. The gate creates a bounded transient systemd unit whose stop hook
+runs `deploy-application --recover-live`. Boot recovery is also installed as
+`vps-application-recover.service` and must finish before the public edge starts.
+
+Before a dedicated migration can run, Parkventory must no longer have static
+active state. For both applications, the installed public edge route must equal
+the attested bundle route byte for byte and the healthy edge Caddy container
+must already be attached to the exact application network. The controller does
+not mutate the immutable edge release, so this platform cutover remains a
+separate reviewed prerequisite.
+
+Activation journals `prepared`, `migration-running`, `migrated`, `started`,
+`probe-rejected`, and `probed`. Only `probed` can become active. Recovery restores
+the previous Compose runtime and quarantines a candidate that reached a
+potentially mutating phase. SQL migrations themselves are not reversible; they
+must remain compatible with both the current and previous runtime images.
 
 ## États séparés
 

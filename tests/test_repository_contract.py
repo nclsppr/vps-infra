@@ -931,7 +931,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("set -f", wrapper)
         self.assertIn("LC_ALL=C", parser)
         self.assertIn("LC_ALL=C", wrapper)
-        self.assertEqual(wrapper.count("/usr/bin/sudo -n --"), 2)
+        self.assertEqual(wrapper.count("/usr/bin/sudo -n --"), 3)
         self.assertIn(
             "exec /usr/bin/sudo -n -- /usr/local/libexec/vps/deploy \"$sha\"",
             wrapper,
@@ -943,6 +943,11 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn(
             "/usr/bin/sudo -n -- "
             "/usr/local/libexec/vps/deploy-static-live-gate",
+            wrapper,
+        )
+        self.assertIn(
+            "/usr/bin/sudo -n -- "
+            "/usr/local/libexec/vps/deploy-application-live-gate",
             wrapper,
         )
         self.assertNotIn("/usr/local/libexec/vps/deploy-static \\", wrapper)
@@ -961,13 +966,15 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             for line in rendered.splitlines()
             if line.startswith("Cmnd_Alias ")
         ]
-        self.assertEqual(len(aliases), 2)
+        self.assertEqual(len(aliases), 3)
         self.assertEqual(
             aliases,
             [
                 "Cmnd_Alias VPS_DEPLOY_SHA = /usr/local/libexec/vps/deploy",
                 "Cmnd_Alias VPS_DEPLOY_STATIC_LIVE = "
                 "/usr/local/libexec/vps/deploy-static-live-gate \"\"",
+                "Cmnd_Alias VPS_DEPLOY_APPLICATION_LIVE = "
+                "/usr/local/libexec/vps/deploy-application-live-gate \"\"",
             ],
         )
         self.assertNotIn("*", rendered)
@@ -995,6 +1002,143 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual(validation.returncode, 0, validation.stderr)
+
+    def test_disabled_application_controller_is_installed_with_recovery(self) -> None:
+        defaults = yaml.safe_load(
+            (ROOT / "ansible/roles/deploy/defaults/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            defaults["vps_deploy_application_path"],
+            "/usr/local/libexec/vps/deploy-application",
+        )
+        self.assertEqual(
+            defaults["vps_deploy_application_gate_path"],
+            "/usr/local/libexec/vps/deploy-application-live-gate",
+        )
+        self.assertEqual(defaults["vps_application_root"], "/srv/applications")
+        self.assertEqual(
+            defaults["vps_application_config_dir"],
+            "/etc/vps/applications",
+        )
+        self.assertEqual(
+            defaults["vps_application_state_dir"],
+            "/var/lib/vps-application",
+        )
+        self.assertEqual(
+            defaults["vps_application_recovery_unit"],
+            "vps-application-recover.service",
+        )
+        self.assertIn("deploy-application", defaults["vps_deploy_executables"])
+        self.assertIn(
+            "deploy-application-live-gate",
+            defaults["vps_deploy_executables"],
+        )
+
+        tasks = yaml.safe_load(
+            (ROOT / "ansible/roles/deploy/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        by_name = {task["name"]: task for task in tasks}
+        directories = {
+            item["path"]: item["mode"]
+            for item in by_name[
+                "Create root-owned controller directories"
+            ]["loop"]
+        }
+        for path in (
+            "{{ vps_application_config_dir }}",
+            "{{ vps_application_state_dir }}",
+            "{{ vps_application_state_dir }}/active",
+            "{{ vps_application_state_dir }}/inventories",
+            "{{ vps_application_state_dir }}/quarantine",
+            "{{ vps_application_state_dir }}/transactions",
+        ):
+            self.assertEqual(directories[path], "0700")
+        for application in ("surplasse", "parkventory"):
+            self.assertEqual(
+                directories[f"{{{{ vps_application_root }}}}/{application}"],
+                "0755",
+            )
+            self.assertEqual(
+                directories[
+                    f"{{{{ vps_application_root }}}}/{application}/releases"
+                ],
+                "0755",
+            )
+
+        recovery_install = by_name[
+            "Install the application transaction recovery unit"
+        ]["ansible.builtin.template"]
+        self.assertEqual(
+            recovery_install,
+            {
+                "src": "vps-application-recover.service.j2",
+                "dest": (
+                    "/etc/systemd/system/"
+                    "{{ vps_application_recovery_unit }}"
+                ),
+                "owner": "root",
+                "group": "root",
+                "mode": "0644",
+            },
+        )
+        recovery_enable = by_name[
+            "Enable application transaction recovery at boot"
+        ]
+        self.assertEqual(
+            recovery_enable["ansible.builtin.systemd_service"],
+            {
+                "name": "{{ vps_application_recovery_unit }}",
+                "enabled": True,
+                "daemon_reload": True,
+            },
+        )
+        self.assertEqual(recovery_enable["when"], "not ansible_check_mode")
+
+        recovery_unit = (
+            ROOT
+            / "ansible/roles/deploy/templates/vps-application-recover.service.j2"
+        ).read_text(encoding="utf-8")
+        for expected in (
+            "Type=oneshot",
+            "User=root",
+            "Group=root",
+            "After=local-fs.target docker.service",
+            "Before=vps-public-static-edge.service",
+            "Requires=docker.service",
+            "ExecStart={{ vps_deploy_application_path }} --recover-live",
+            "WantedBy=multi-user.target",
+        ):
+            self.assertIn(expected, recovery_unit)
+        self.assertIn(
+            "After=local-fs.target docker.service vps-static-recover.service",
+            recovery_unit,
+        )
+        self.assertIn(
+            "Requires=docker.service vps-static-recover.service",
+            recovery_unit,
+        )
+        self.assertNotIn("RemainAfterExit", recovery_unit)
+
+        parser = (SCRIPTS / "parse-forced-command").read_text(encoding="utf-8")
+        wrapper = (SCRIPTS / "forced-command").read_text(encoding="utf-8")
+        gate = (SCRIPTS / "deploy-application-live-gate").read_text(
+            encoding="utf-8"
+        )
+        for repository in (
+            "ghcr.io/nclsppr/surplasse/application-release",
+            "ghcr.io/nclsppr/parkventory/application-release",
+        ):
+            self.assertIn(repository, parser)
+            self.assertIn(repository, gate)
+        self.assertIn('"deploy-application-live "*', parser)
+        self.assertIn('"deploy-application-live "*', wrapper)
+        self.assertIn("RuntimeDirectoryMode=0700", gate)
+        self.assertIn("ExecStopPost=", gate)
+        self.assertIn("--recover-live", gate)
 
     def test_static_live_gate_revalidates_bounded_canonical_stdin(self) -> None:
         gate_path = SCRIPTS / "deploy-static-live-gate"
@@ -1516,12 +1660,13 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn(" stop --timeout 30 caddy", unit)
         self.assertIn(
             "After=network-online.target docker.service "
-            "vps-docker-ingress-firewall.service vps-static-recover.service",
+            "vps-docker-ingress-firewall.service "
+            "vps-application-recover.service vps-static-recover.service",
             unit,
         )
         self.assertIn(
             "Requires=docker.service vps-docker-ingress-firewall.service "
-            "vps-static-recover.service",
+            "vps-application-recover.service vps-static-recover.service",
             unit,
         )
         self.assertNotIn("--volumes", unit)

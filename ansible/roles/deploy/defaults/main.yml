@@ -4,6 +4,8 @@ vps_deploy_gate_path: /usr/local/libexec/vps/forced-command
 vps_deploy_controller_path: /usr/local/libexec/vps/deploy
 vps_deploy_static_path: /usr/local/libexec/vps/deploy-static
 vps_deploy_static_gate_path: /usr/local/libexec/vps/deploy-static-live-gate
+vps_deploy_application_path: /usr/local/libexec/vps/deploy-application
+vps_deploy_application_gate_path: /usr/local/libexec/vps/deploy-application-live-gate
 vps_deploy_git_sha_length: 40
 vps_deploy_schema_root: /usr/local/share/vps-infra/schemas
 vps_deploy_repository_dir: /srv/vps/repository
@@ -12,6 +14,10 @@ vps_deploy_revision_path: /usr/local/share/vps-infra/controller-revision
 vps_deploy_state_dir: /var/lib/vps-controller
 vps_static_state_dir: /var/lib/vps-static
 vps_static_recovery_unit: vps-static-recover.service
+vps_application_root: /srv/applications
+vps_application_config_dir: /etc/vps/applications
+vps_application_state_dir: /var/lib/vps-application
+vps_application_recovery_unit: vps-application-recover.service
 vps_deploy_production_marker: /etc/vps/production-enabled
 vps_gh_version: "2.97.0"
 vps_gh_install_path: /usr/local/bin/gh
@@ -28,6 +34,8 @@ vps_gh_archives:
 vps_deploy_executables:
   - check-public-safe
   - deploy
+  - deploy-application
+  - deploy-application-live-gate
   - deploy-static
   - deploy-static-live-gate
   - doctor
