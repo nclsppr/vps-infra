@@ -76,7 +76,13 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 	$(MISE_EXEC) ./scripts/validate-release --require-json-schema \
 		releases/production.yaml
 	$(MISE_EXEC) uv run python -m json.tool \
+		releases/application-production.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
 		releases/static-production.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		schemas/application-production.schema.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		schemas/application-release.schema.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
 		platform/observability/grafana/dashboards/platform/overview.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
