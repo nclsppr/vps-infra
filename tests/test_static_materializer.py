@@ -899,6 +899,75 @@ class StaticBundleContractTests(unittest.TestCase):
         )
         self.assertNotIn("--replace", other_command)
 
+    def test_isolated_worker_remaps_protected_runtime_inputs_into_its_home(
+        self,
+    ) -> None:
+        state_name = "2" * 32
+        script_path = Path("/usr/local/libexec/vps/deploy-static")
+        protected_input = Path("/run/root-only/deployment/request.json")
+        inputs = (script_path, protected_input)
+        mapping = MATERIALIZER.isolated_worker_input_mapping(
+            state_name,
+            inputs,
+            (protected_input,),
+        )
+        mapped_input = (
+            MATERIALIZER.SYSTEMD_WORKER_LOGICAL_ROOT
+            / state_name
+            / ".inputs"
+            / "01"
+        )
+        self.assertEqual(mapping, {protected_input: mapped_input})
+
+        properties = MATERIALIZER.isolated_worker_properties(
+            state_name,
+            runtime_seconds=60,
+            memory_max="128M",
+            memory_swap_max="64M",
+            file_size_max="1M",
+            network=False,
+            inputs=inputs,
+            input_mapping=mapping,
+        )
+        self.assertIn(
+            f"BindReadOnlyPaths={protected_input}:{mapped_input}:norbind",
+            properties,
+        )
+        self.assertNotIn(
+            f"BindReadOnlyPaths={protected_input}:{protected_input}:norbind",
+            properties,
+        )
+        resolved = MATERIALIZER.resolved_isolated_worker_command(
+            state_name,
+            [
+                str(MATERIALIZER.PYTHON_PATH),
+                str(script_path),
+                "--registry-fetch-worker",
+                str(protected_input),
+                "{STATE_DIRECTORY}/registry-object",
+            ],
+            mapping,
+        )
+        self.assertEqual(resolved[3], str(mapped_input))
+        self.assertEqual(
+            resolved[4],
+            str(
+                MATERIALIZER.SYSTEMD_WORKER_LOGICAL_ROOT
+                / state_name
+                / "registry-object"
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "undeclared",
+        ):
+            MATERIALIZER.isolated_worker_input_mapping(
+                state_name,
+                inputs,
+                (Path("/run/not-an-input"),),
+            )
+
     def test_global_host_addresses_accept_atlas_iproute2_inventory(self) -> None:
         fixture = [
             {
