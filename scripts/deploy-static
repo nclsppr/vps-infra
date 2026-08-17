@@ -247,6 +247,7 @@ class IsolatedWorkerState:
     physical_root: Path
     uid: int
     gid: int
+    remapped_input_names: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2333,6 +2334,78 @@ def run_trusted_root_fetch_worker(output_path: Path) -> None:
         fail("GitHub trusted root fetch worker left unexpected runtime files")
 
 
+def validate_remapped_worker_inputs(
+    worker_parent_fd: int,
+    worker_parent: os.stat_result,
+    expected_names: tuple[str, ...],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    label: str,
+) -> None:
+    if (
+        not 1 <= len(expected_names) <= 100
+        or len(set(expected_names)) != len(expected_names)
+        or any(re.fullmatch(r"[0-9]{2}", name) is None for name in expected_names)
+    ):
+        fail(f"{label} remapped worker input names are invalid")
+    try:
+        input_root_fd = os.open(
+            ".inputs",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=worker_parent_fd,
+        )
+    except OSError as exc:
+        fail(f"cannot open {label} remapped worker input root: {exc}")
+    try:
+        before = os.fstat(input_root_fd)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_dev != worker_parent.st_dev
+            or before.st_uid != expected_uid
+            or before.st_gid != expected_gid
+            or stat.S_IMODE(before.st_mode) != 0o755
+        ):
+            fail(f"{label} remapped worker input root is unsafe")
+        if set(os.listdir(input_root_fd)) != set(expected_names):
+            fail(f"{label} remapped worker input root has unexpected entries")
+        for name in expected_names:
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=input_root_fd,
+                )
+            except OSError as exc:
+                fail(f"cannot open {label} remapped worker input placeholder: {exc}")
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_dev != worker_parent.st_dev
+                    or metadata.st_uid != expected_uid
+                    or metadata.st_gid != expected_gid
+                    or metadata.st_nlink != 1
+                    or stat.S_IMODE(metadata.st_mode) != 0o644
+                    or metadata.st_size != 0
+                ):
+                    fail(f"{label} remapped worker input placeholder is unsafe")
+            finally:
+                os.close(descriptor)
+        after = os.fstat(input_root_fd)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_mode != before.st_mode
+            or after.st_uid != before.st_uid
+            or after.st_gid != before.st_gid
+            or set(os.listdir(input_root_fd)) != set(expected_names)
+        ):
+            fail(f"{label} remapped worker input root changed during validation")
+    finally:
+        os.close(input_root_fd)
+
+
 def copy_trusted_worker_file(
     source: Path,
     destination: Path,
@@ -2345,6 +2418,7 @@ def copy_trusted_worker_file(
     expected_size: int | None = None,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    expected_remapped_input_names: tuple[str, ...] = (),
 ) -> tuple[str, int]:
     """Copy one exact bounded worker output into a protected root file."""
 
@@ -2380,8 +2454,20 @@ def copy_trusted_worker_file(
             or destination_parent.st_mode & 0o022
         ):
             fail(f"{label} trusted parent is not protected")
-        if set(os.listdir(source_parent_fd)) != {source.name}:
-            fail(f"{label} worker directory does not contain exactly one output")
+        expected_entries = {source.name}
+        if expected_remapped_input_names:
+            expected_entries.add(".inputs")
+        if set(os.listdir(source_parent_fd)) != expected_entries:
+            fail(f"{label} worker directory does not match its declared entries")
+        if expected_remapped_input_names:
+            validate_remapped_worker_inputs(
+                source_parent_fd,
+                source_parent,
+                expected_remapped_input_names,
+                expected_uid=trusted_uid,
+                expected_gid=trusted_gid,
+                label=label,
+            )
         try:
             source_fd = os.open(
                 source.name,
@@ -3512,7 +3598,13 @@ def run_isolated_worker(
             cleanup_isolated_worker_token(unit, state_name)
         raise failure
     try:
-        return open_isolated_worker_state(unit, state_name)
+        state = open_isolated_worker_state(unit, state_name)
+        return dataclasses.replace(
+            state,
+            remapped_input_names=tuple(
+                destination.name for destination in input_mapping.values()
+            ),
+        )
     except BaseException:
         cleanup_isolated_worker_token(unit, state_name)
         raise
@@ -4115,6 +4207,7 @@ def fetch_registry_object_isolated(
                 label=f"registry {contract.kind}",
                 trusted_uid=trusted_uid,
                 trusted_gid=trusted_gid,
+                expected_remapped_input_names=state.remapped_input_names,
             )
         except BaseException as exc:
             failure = exc
