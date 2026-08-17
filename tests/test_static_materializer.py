@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -1521,6 +1522,41 @@ class StaticBundleContractTests(unittest.TestCase):
             trusted = root / "trusted"
             trusted.mkdir(mode=0o700)
 
+            remapped_worker = root / "remapped-worker"
+            remapped_worker.mkdir(mode=0o700)
+            remapped_source = remapped_worker / "result"
+            remapped_source.write_bytes(content)
+            remapped_source.chmod(0o444)
+            input_root = remapped_worker / ".inputs"
+            input_root.mkdir(mode=0o755)
+            (input_root / "02").touch(mode=0o644)
+            with self.assertRaisesRegex(
+                MATERIALIZER.StaticDeploymentError,
+                "declared entries",
+            ):
+                MATERIALIZER.copy_trusted_worker_file(
+                    remapped_source,
+                    trusted / "strict-copy",
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                    maximum_size=len(content),
+                    label="strict cardinality fixture",
+                    trusted_uid=os.geteuid(),
+                    trusted_gid=os.getegid(),
+                )
+            MATERIALIZER.copy_trusted_worker_file(
+                remapped_source,
+                trusted / "remapped-copy",
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+                maximum_size=len(content),
+                label="remapped cardinality fixture",
+                trusted_uid=os.geteuid(),
+                trusted_gid=os.getegid(),
+                expected_remapped_input_names=("02",),
+            )
+            self.assertEqual((trusted / "remapped-copy").read_bytes(), content)
+
             symlink_worker = root / "symlink-worker"
             symlink_worker.mkdir(mode=0o700)
             external = root / "external"
@@ -1595,6 +1631,119 @@ class StaticBundleContractTests(unittest.TestCase):
             finally:
                 os.close(writer)
             self.assertFalse((trusted / "mutation-copy").exists())
+
+    def test_remapped_worker_input_root_rejects_unsafe_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            root.chmod(0o700)
+            external = root / "external"
+            external.write_bytes(b"")
+
+            def validate_fixture(
+                name: str,
+                mutate,
+                *,
+                expected_uid: int | None = None,
+            ) -> None:
+                worker = root / name
+                worker.mkdir(mode=0o700)
+                input_root = worker / ".inputs"
+                input_root.mkdir(mode=0o755)
+                placeholder = input_root / "02"
+                placeholder.touch(mode=0o644)
+                mutate(input_root, placeholder)
+                worker_fd = os.open(
+                    worker,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+                try:
+                    with self.assertRaises(MATERIALIZER.StaticDeploymentError):
+                        MATERIALIZER.validate_remapped_worker_inputs(
+                            worker_fd,
+                            os.fstat(worker_fd),
+                            ("02",),
+                            expected_uid=(
+                                os.geteuid() if expected_uid is None else expected_uid
+                            ),
+                            expected_gid=os.getegid(),
+                            label=f"{name} fixture",
+                        )
+                finally:
+                    os.close(worker_fd)
+
+            validate_fixture(
+                "symlink",
+                lambda _root, placeholder: (
+                    placeholder.unlink(),
+                    placeholder.symlink_to(external),
+                ),
+            )
+            validate_fixture(
+                "writable",
+                lambda _root, placeholder: placeholder.chmod(0o664),
+            )
+            validate_fixture(
+                "wrong-root-owner",
+                lambda _root, _placeholder: None,
+                expected_uid=os.geteuid() + 1,
+            )
+
+            wrong_owner_worker = root / "wrong-placeholder-owner"
+            wrong_owner_worker.mkdir(mode=0o700)
+            wrong_owner_input_root = wrong_owner_worker / ".inputs"
+            wrong_owner_input_root.mkdir(mode=0o755)
+            (wrong_owner_input_root / "02").touch(mode=0o644)
+            wrong_owner_worker_fd = os.open(
+                wrong_owner_worker,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            real_fstat = os.fstat
+
+            def report_wrong_placeholder_owner(descriptor):
+                metadata = real_fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    return metadata
+                values = list(metadata)
+                values[4] = metadata.st_uid + 1
+                return os.stat_result(values)
+
+            try:
+                with mock.patch.object(
+                    MATERIALIZER.os,
+                    "fstat",
+                    side_effect=report_wrong_placeholder_owner,
+                ):
+                    with self.assertRaisesRegex(
+                        MATERIALIZER.StaticDeploymentError,
+                        "placeholder is unsafe",
+                    ):
+                        MATERIALIZER.validate_remapped_worker_inputs(
+                            wrong_owner_worker_fd,
+                            real_fstat(wrong_owner_worker_fd),
+                            ("02",),
+                            expected_uid=os.geteuid(),
+                            expected_gid=os.getegid(),
+                            label="wrong placeholder owner fixture",
+                        )
+            finally:
+                os.close(wrong_owner_worker_fd)
+
+            validate_fixture(
+                "extra",
+                lambda input_root, _placeholder: (input_root / "03").touch(
+                    mode=0o644
+                ),
+            )
+            validate_fixture(
+                "wrong-name",
+                lambda _root, placeholder: placeholder.rename(
+                    placeholder.with_name("03")
+                ),
+            )
+            validate_fixture(
+                "nonzero",
+                lambda _root, placeholder: placeholder.write_bytes(b"x"),
+            )
 
     def test_integration_worker_dispatch_copies_validated_contract_to_trusted_tree(self) -> None:
         integration_created = "2026-08-12T07:00:00Z"
@@ -3726,12 +3875,16 @@ class StaticBundleContractTests(unittest.TestCase):
                 calls.append((phase, command, kwargs))
                 state_root = root / "registry-state"
                 state_root.mkdir(mode=0o700)
+                input_root = state_root / ".inputs"
+                input_root.mkdir(mode=0o755)
+                (input_root / "02").touch()
                 output = state_root / "registry-object"
                 output.write_bytes(content)
                 output.chmod(0o444)
                 request = Path(command[command.index("--registry-fetch-worker") + 1])
                 request_value = json.loads(request.read_text(encoding="ascii"))
                 self.assertEqual(request_value, dataclasses.asdict(contract))
+                self.assertEqual(kwargs["remapped_inputs"], (request,))
                 return MATERIALIZER.IsolatedWorkerState(
                     unit=MATERIALIZER.SYSTEMD_WORKER_UNIT,
                     state_name="5" * 32,
@@ -3739,6 +3892,7 @@ class StaticBundleContractTests(unittest.TestCase):
                     physical_root=state_root,
                     uid=os.geteuid(),
                     gid=os.getegid(),
+                    remapped_input_names=("02",),
                 )
 
             with mock.patch.object(
@@ -3796,6 +3950,9 @@ class StaticBundleContractTests(unittest.TestCase):
 
             def emulate_worker(phase, command, **kwargs):
                 state_root.mkdir(mode=0o700)
+                input_root = state_root / ".inputs"
+                input_root.mkdir(mode=0o755)
+                (input_root / "02").touch()
                 output = state_root / "registry-object"
                 output.write_bytes(b"forged!!\n")
                 output.chmod(0o444)
@@ -3806,6 +3963,7 @@ class StaticBundleContractTests(unittest.TestCase):
                     physical_root=state_root,
                     uid=os.geteuid(),
                     gid=os.getegid(),
+                    remapped_input_names=("02",),
                 )
 
             with mock.patch.object(
