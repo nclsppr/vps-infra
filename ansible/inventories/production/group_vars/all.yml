@@ -17,6 +17,7 @@ vps_ssh_port: 22
 vps_admin_authorized_keys: []
 vps_deploy_authorized_keys: []
 vps_codex_remote_enabled: false
+vps_codex_remote_control_enabled: false
 vps_codex_remote_authorized_keys: []
 vps_live_apply_enabled: false
 # This value must be a full Git SHA that is reachable from origin/main.

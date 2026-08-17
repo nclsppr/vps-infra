@@ -168,11 +168,13 @@ traité comme l’état courant lors d’une mise en œuvre ultérieure.
   local stdio and Unix socket transports, protocol lifecycle, and warning
   against unauthenticated public or shared-network exposure.
 - [OpenAI - Codex remote connections](https://learn.chatgpt.com/docs/remote-connections) :
-  desktop-managed SSH App Server connection and the online desktop requirement
-  for phone control.
+  public desktop-managed SSH App Server and phone relay workflow.
 - [OpenAI Codex CLI 0.147.0](https://github.com/openai/codex/releases/tag/rust-v0.147.0) :
   exact release represented by the pinned package and executable SHA-256
   values.
+- [OpenAI Codex 0.147.0 remote-control CLI](https://github.com/openai/codex/blob/rust-v0.147.0/codex-rs/cli/src/remote_control_cmd.rs) :
+  experimental Unix remote-control and short-lived manual pairing commands
+  represented by the pinned release.
 
 ### Données et observabilité
 

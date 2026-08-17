@@ -1,4 +1,4 @@
-# ADR-0006: Expose Codex App Server only through a bounded SSH gateway
+# ADR-0006: Keep Codex App Server private for bounded remote access
 
 ## Status
 
@@ -22,13 +22,18 @@ bounded workspace.
 The App Server transport is not an Internet service. OpenAI documents the
 stdio and Unix socket transports as local transports and warns against
 exposing the experimental WebSocket transport on a public or shared network.
-The phone workflow still uses the signed-in desktop app as its online bridge.
+Codex 0.147.0 also has an experimental remote-control relay for Unix hosts.
+That relay makes an outbound authenticated WebSocket connection to ChatGPT.
+It does not require an inbound App Server port.
 
 ## Decision
 
-Atlas uses these boundaries when `vps_codex_remote_enabled` is true:
+Atlas derives an internal `vps_codex_app_server_enabled` value. It is true when
+either the desktop SSH gateway or direct mobile control is enabled. The two
+public settings remain independent.
 
-1. Ansible creates `codex-remote` as a separate SSH gateway account. It has a
+1. When `vps_codex_remote_enabled` is true, Ansible creates `codex-remote` as a
+   separate SSH gateway account. It has a
    locked password, one primary group, no Docker access, and no general sudo.
    Its public keys come from the external public-variable file. Each key has
    the OpenSSH `restrict` option. The SSH policy also disables terminals, user
@@ -39,7 +44,8 @@ Atlas uses these boundaries when `vps_codex_remote_enabled` is true:
    root-owned `codex` wrapper through `~/.local/bin`.
 2. The runtime `codex` account remains a system account with no SSH key and no
    direct SSH login. It alone owns the credential, state, and workspaces.
-3. `atlas-codex-app-server.service` runs the exact pinned Codex executable as
+3. When the derived App Server value is true,
+   `atlas-codex-app-server.service` runs the exact pinned Codex executable as
    `codex` below `atlas-codex.slice`. It listens only on the managed Unix socket
    below `/srv/codex/home/.codex/app-server-control`. It is enabled at boot,
    restarts after failure, allows the UDP bind required by the pinned musl DNS
@@ -69,19 +75,31 @@ Atlas uses these boundaries when `vps_codex_remote_enabled` is true:
    the still-inaccessible service, proves its effective systemd properties and
    Unix socket, and opens
    a bounded WebSocket upgrade through the command gate, sudo rule, launcher,
-   and proxy. Failure stops the service and restores the snapshot. Only a
-   verified commit releases the SSH and session interlocks.
-8. Atlas does not enable Codex `remote_control`. Both the managed requirement
-   and feature remain false. The supported route is desktop to SSH gateway to
-   private Unix socket. The desktop must remain awake, online, and signed in
-   for control from the ChatGPT mobile app.
+   and proxy when the desktop gateway is enabled. Mobile-only activation does
+   not create or exercise the SSH gateway. Failure stops the service and
+   restores the snapshot. Only a verified commit releases the session
+   interlock and any configured SSH path.
+8. Atlas enables Codex `remote_control` when
+   `vps_codex_remote_control_enabled` is true, independently of the desktop SSH
+   gateway. The managed requirement then permits remote control, and the
+   reviewed App Server unit passes the hidden `--remote-control` startup flag.
+   The removed compatibility feature remains false because Codex 0.147.0
+   treats it as a no-op.
+   The App Server keeps its private Unix socket and adds only an outbound
+   authenticated WebSocket connection to ChatGPT. It does not add a firewall
+   rule or an inbound listener.
 9. The built-in `codex app-server daemon bootstrap` flow is not used. The
    reviewed Ansible unit owns boot persistence and the pinned update path.
+10. Manual mobile pairing runs through the root-owned launcher. Only the Atlas
+    administrator can request the short-lived pairing code. The launcher runs
+    the exact pinned `codex remote-control pair` command as the `codex` account
+    in a bounded transient unit. The SSH gateway key cannot request a code.
 
-Remote access is disabled by default in the public repository. Enabling it
-requires at least one valid public key in the external variable file. No
-private key, OpenAI credential, hostname inventory, or App Server token enters
-Git.
+Both remote paths are disabled by default in the public repository. Enabling
+the desktop gateway requires at least one valid public key in the external
+variable file. Mobile-only control requires no Codex gateway key. No private
+key, OpenAI credential, hostname inventory, pairing code, or App Server token
+enters Git.
 
 ## Consequences
 
@@ -108,18 +126,30 @@ Git.
 - The three accepted desktop command shapes are a compatibility contract. A
   future desktop release may require a reviewed wrapper update before it can
   connect.
-- Mobile control still depends on the desktop app. Running the App Server on
-  Atlas does not make Atlas a standalone ChatGPT mobile backend.
+- Direct mobile control is an experimental Codex 0.147.0 capability. The
+  public OpenAI remote-connection documentation describes the desktop relay
+  as the supported flow. A mobile product change can therefore require a
+  reviewed Codex upgrade or disable direct pairing.
+- A paired mobile controller can use the authenticated App Server without an
+  SSH key. Treat the pairing code and each paired controller as access to the
+  bounded Codex account. Revoke a lost controller immediately.
 - The runtime may bind a transient UDP client socket for DNS. UFW remains the
   independent inbound boundary for every undeclared port.
 
 ## Rollback
 
-Set `vps_codex_remote_enabled` to false in the external public-variable file
-and converge a reviewed `main` revision. Convergence stops and disables the
-App Server, removes its unit, boot link, forced-command gate, and sudo policy,
-removes the gateway authorized keys, and removes the account from `AllowUsers`.
-It preserves the `codex` credential, sessions, workspaces, and bounded storage.
+Set `vps_codex_remote_control_enabled` to false and converge a reviewed `main`
+revision to stop the direct relay. If the private desktop gateway remains
+enabled, the service restarts without `--remote-control` and the managed policy
+denies future relay activation. In a mobile-only configuration, the service and
+boot link are removed because neither remote path still needs the App Server.
+
+Set `vps_codex_remote_enabled` to false to remove the desktop path. Convergence
+removes the forced-command gate, sudo policy, gateway authorized keys, and the
+account from `AllowUsers`. The App Server remains only if direct mobile control
+is still enabled. Disabling both settings stops and removes its unit and boot
+link. Every case preserves the `codex` credential, sessions, workspaces, and
+bounded storage.
 
 Remove the local `atlas-codex` SSH alias and retire its private key separately
 after the disabled state is verified. Do not remove the administrator key or
@@ -129,4 +159,5 @@ the `/srv/codex` backing file as part of this rollback.
 
 - [OpenAI Codex App Server](https://learn.chatgpt.com/docs/app-server)
 - [OpenAI Codex remote connections](https://learn.chatgpt.com/docs/remote-connections)
+- [Codex 0.147.0 remote-control implementation](https://github.com/openai/codex/blob/rust-v0.147.0/codex-rs/cli/src/remote_control_cmd.rs)
 - [ADR-0005](0005-dedicated-codex-cli-account.md)

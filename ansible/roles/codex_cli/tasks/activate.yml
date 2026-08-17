@@ -170,14 +170,14 @@
     group: root
     mode: "0644"
   notify: Reload systemd for the Codex session boundary
-  when: vps_codex_remote_enabled | bool
+  when: vps_codex_app_server_enabled | bool
 
 - name: Remove the private Codex App Server unit when disabled
   ansible.builtin.file:
     path: /etc/systemd/system/atlas-codex-app-server.service
     state: absent
   notify: Reload systemd for the Codex session boundary
-  when: not (vps_codex_remote_enabled | bool)
+  when: not (vps_codex_app_server_enabled | bool)
 
 - name: Validate the private Codex App Server unit
   ansible.builtin.command:
@@ -188,7 +188,7 @@
   changed_when: false
   when:
     - not ansible_check_mode
-    - vps_codex_remote_enabled | bool
+    - vps_codex_app_server_enabled | bool
 
 - name: Enable the private Codex App Server transactionally
   ansible.builtin.file:
@@ -198,13 +198,13 @@
     owner: root
     group: root
     follow: false
-  when: vps_codex_remote_enabled | bool
+  when: vps_codex_app_server_enabled | bool
 
 - name: Remove private Codex App Server boot activation when disabled
   ansible.builtin.file:
     path: /etc/systemd/system/multi-user.target.wants/atlas-codex-app-server.service
     state: absent
-  when: not (vps_codex_remote_enabled | bool)
+  when: not (vps_codex_app_server_enabled | bool)
 
 - name: Install the exact Codex remote sudo gateway
   ansible.builtin.template:

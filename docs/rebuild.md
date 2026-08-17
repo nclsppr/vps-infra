@@ -153,11 +153,13 @@ CI toolchain; reconstruction does not install it on Atlas.
 Host convergence installs one operator tool outside that CI toolchain: the
 standalone Codex CLI package. It uses no Node.js or npm and runs only as the
 isolated `codex` account through the enforced bounded launcher. When enabled
-by an external public key, a separate unprivileged SSH gateway reaches a
-persistent App Server through a private Unix socket. Its persistent state is
-capped by a dedicated 6 GiB filesystem. Authentication is not part of
-reconstruction. After convergence, an operator may restore access with the
-ChatGPT-only device flow documented in
+for either remote path, a persistent App Server uses a private Unix socket. An
+optional unprivileged SSH gateway requires an external public key. Direct
+mobile control instead uses the App Server's outbound ChatGPT relay and opens
+no inbound port. Persistent state is capped by a dedicated 6 GiB filesystem.
+Authentication and mobile pairing are not part of reconstruction. After
+convergence, an operator may restore access with the ChatGPT-only device flow
+and the manual pairing procedure documented in
 [`operations/codex-cli.md`](operations/codex-cli.md).
 
 Before a static activation, supply the exact application source revision, site

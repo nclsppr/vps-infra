@@ -73,6 +73,7 @@
         argv:
           - /usr/bin/systemctl
           - stop
+          - atlas-codex-pairing-*.service
           - atlas-codex-proxy-*.service
           - atlas-codex-version-*.service
       register: vps_codex_interlocked_remote_units_stop
@@ -88,6 +89,7 @@
           - --state=active
           - --plain
           - --no-legend
+          - atlas-codex-pairing-*.service
           - atlas-codex-proxy-*.service
           - atlas-codex-version-*.service
       register: vps_codex_interlocked_remote_units

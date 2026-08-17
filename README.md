@@ -45,8 +45,8 @@ Le premier socle exécutable est livré :
   static OCI materializer for Personal, Papers Empire, and the Parkventory
   demo;
 - Codex CLI 0.147.0 from the standalone OpenAI package, with an isolated
-  runtime account, a separate bounded SSH gateway, managed permissions, and a
-  private persistent App Server Unix socket;
+  runtime account, managed permissions, and a private persistent App Server
+  Unix socket for an optional bounded SSH gateway or outbound mobile control;
 - PostgreSQL 17, observabilité commune et provisioning Grafana ;
 - manifeste de production, schéma, vérificateur de preuves GitHub et contrôleur
   de déploiement borné ;

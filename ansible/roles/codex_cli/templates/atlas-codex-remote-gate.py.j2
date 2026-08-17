@@ -27,6 +27,46 @@ _APP_SERVER_COMMANDS = {
     "'codex' -c features.code_mode_host=true app-server --listen 'unix://'",
 }
 _PROXY_COMMANDS = {"codex app-server proxy", "'codex' app-server proxy"}
+_APP_SERVER_BOOTSTRAP_LEGACY = (
+    'if [ "${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}" = "true" ]; '
+    'then exit 0; fi; umask 077; mkdir -p -- '
+    '"${CODEX_HOME:-$HOME/.codex}/app-server-control" && '
+    'nohup codex -c features.code_mode_host=true app-server --listen '
+    'unix:// >"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+    'app-server.log" 2>&1 &'
+)
+_APP_SERVER_BOOTSTRAP_0148 = (
+    'if [ "${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}" = "true" ]; '
+    'then exit 0; fi; (umask 077; mkdir -p -- '
+    '"${CODEX_HOME:-$HOME/.codex}/app-server-control" && '
+    '(pkill -9 -U "$(id -u)" -f '
+    "'codex.*[d]esktop-ssh-websocket-v0.sock' || true) && "
+    'if [ -S "${SSH_AUTH_SOCK:-}" ]; then ln -sfn -- "$SSH_AUTH_SOCK" '
+    '"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+    'forwarded-ssh-agent.sock"; elif [ ! -S '
+    '"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+    'forwarded-ssh-agent.sock" ]; then rm -f -- '
+    '"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+    'forwarded-ssh-agent.sock"; fi && '
+    ': >"${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server.log") && '
+    'SSH_AUTH_SOCK="${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+    'forwarded-ssh-agent.sock" nohup codex -c features.code_mode_host=true '
+    'app-server --listen unix:// >"${CODEX_HOME:-$HOME/.codex}/'
+    'app-server-control/app-server.log" 2>&1 &'
+)
+_MARKED_PROXY_LEGACY = (
+    'if [ -S "${SSH_AUTH_SOCK:-}" ]; then true; fi && '
+    'exec codex app-server proxy'
+)
+_MARKED_PROXY_0148 = (
+    'if [ -S "${SSH_AUTH_SOCK:-}" ]; then ln -sfn -- "$SSH_AUTH_SOCK" '
+    '"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+    'forwarded-ssh-agent.sock"; elif [ ! -S '
+    '"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+    'forwarded-ssh-agent.sock" ]; then rm -f -- '
+    '"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
+    'forwarded-ssh-agent.sock"; fi && exec codex app-server proxy'
+)
 
 
 class RejectedCommand(ValueError):
@@ -76,25 +116,10 @@ def _classify(original: str) -> tuple[str, bytes]:
     if normalized == "codex app-server proxy":
         return "proxy", marker
 
-    if (
-        command.startswith(
-            'if [ "${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}" = "true" ]; '
-            'then exit 0; fi; umask 077; mkdir -p -- '
-            '"${CODEX_HOME:-$HOME/.codex}/app-server-control" && '
-        )
-        and " app-server --listen " in command
-        and command.endswith(
-            '>"${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server.log" '
-            "2>&1 &"
-        )
-    ):
+    if command in {_APP_SERVER_BOOTSTRAP_LEGACY, _APP_SERVER_BOOTSTRAP_0148}:
         return "app-server", marker
 
-    if (
-        command.startswith('if [ -S "${SSH_AUTH_SOCK:-}" ]; then ')
-        and (command.endswith("&& exec codex app-server proxy") or
-             command.endswith("&& exec 'codex' app-server proxy"))
-    ):
+    if command in {_MARKED_PROXY_LEGACY, _MARKED_PROXY_0148}:
         return "proxy", marker
 
     raise RejectedCommand("SSH command is not a reviewed Codex desktop action")
@@ -133,18 +158,8 @@ def _self_test() -> None:
     fixtures = {
         "path": "if command -v codex >/dev/null 2>&1; then exit 0; fi; exit 86",
         "version": "codex --version",
-        "app-server": (
-            'if [ "${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}" = "true" ]; '
-            'then exit 0; fi; umask 077; mkdir -p -- '
-            '"${CODEX_HOME:-$HOME/.codex}/app-server-control" && '
-            'nohup codex -c features.code_mode_host=true app-server --listen '
-            'unix:// >"${CODEX_HOME:-$HOME/.codex}/app-server-control/'
-            'app-server.log" 2>&1 &'
-        ),
-        "proxy": (
-            'if [ -S "${SSH_AUTH_SOCK:-}" ]; then true; fi && '
-            "exec codex app-server proxy"
-        ),
+        "app-server": _APP_SERVER_BOOTSTRAP_0148,
+        "proxy": _MARKED_PROXY_0148,
     }
     for expected_action, command in fixtures.items():
         envelope, expected_marker = _marked_envelope(command)
@@ -161,6 +176,20 @@ def _self_test() -> None:
         "invalid marker": shlex.join(
             ["sh", "-c", "desktop-login-shell", "sh", invalid_marker_payload]
         ),
+        "modified bootstrap signal scope": _marked_envelope(
+            _APP_SERVER_BOOTSTRAP_0148.replace("pkill -9 -U", "pkill -9")
+        )[0],
+        "modified bootstrap socket": _marked_envelope(
+            _APP_SERVER_BOOTSTRAP_0148.replace(
+                "forwarded-ssh-agent.sock", "../../tmp/agent.sock", 1
+            )
+        )[0],
+        "modified bootstrap command": _marked_envelope(
+            _APP_SERVER_BOOTSTRAP_0148.replace("nohup codex", "nohup sh")
+        )[0],
+        "bootstrap command suffix": _marked_envelope(
+            _APP_SERVER_BOOTSTRAP_0148 + "; id"
+        )[0],
     }
     for description, original in rejected_commands.items():
         try:
