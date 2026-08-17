@@ -15,7 +15,9 @@ import json
 import os
 import re
 import secrets
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -511,6 +513,22 @@ def validate_recovery_state_runtime() -> None:
         TRANSACTION_ROOT,
         "application transaction directory",
     )
+    require_protected_directory(
+        APPLICATION_ROOT,
+        "application release root",
+        mode=0o755,
+    )
+    for application in sorted(PROFILES):
+        require_protected_directory(
+            APPLICATION_ROOT / application,
+            f"{application} release root",
+            mode=0o755,
+        )
+        require_protected_directory(
+            APPLICATION_ROOT / application / "releases",
+            f"{application} releases",
+            mode=0o755,
+        )
     require_protected_file(
         SCRIPT_DIRECTORY / "deploy-application",
         "application controller",
@@ -887,11 +905,58 @@ def compose_environment(
     bundle: ApplicationBundle,
     state: ApplicationState,
     home: Path,
+    configuration: Mapping[str, str],
 ) -> dict[str, str]:
+    if set(configuration) != set(profile.runtime_configuration_keys):
+        fail("application runtime configuration snapshot differs from its profile")
     result = safe_environment(home)
-    result.update(runtime_configuration(profile))
+    result.update(configuration)
     result.update(image_environment(bundle, state))
     return result
+
+
+def materialized_runtime_configuration(
+    release: Path,
+    profile: BundleProfile,
+) -> dict[str, str]:
+    path = release / "runtime-config.json"
+    require_protected_file(
+        path,
+        "materialized runtime configuration",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    raw = path.read_bytes()
+    value = strict_json(raw, "materialized runtime configuration", maximum=MAX_CONFIG_BYTES)
+    if raw != canonical_json(value) or not isinstance(value, dict):
+        fail("materialized runtime configuration is not canonical")
+    if set(value) != set(profile.runtime_configuration_keys) or any(
+        not isinstance(key, str)
+        or not isinstance(item, str)
+        or CONFIG_KEY_RE.fullmatch(key) is None
+        or CONFIG_VALUE_RE.fullmatch(item) is None
+        for key, item in value.items()
+    ):
+        fail("materialized runtime configuration differs from its profile")
+    result = dict(value)
+    environment_path = release / "runtime.env"
+    require_protected_file(
+        environment_path,
+        "materialized Compose environment",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    if environment_path.read_bytes() != canonical_runtime_environment(result):
+        fail("materialized Compose environment differs from its configuration")
+    return result
+
+
+def canonical_runtime_environment(configuration: Mapping[str, str]) -> bytes:
+    if not configuration:
+        fail("application runtime configuration cannot be empty")
+    return "".join(
+        f"{key}={configuration[key]}\n" for key in sorted(configuration)
+    ).encode("ascii")
 
 
 def compose_prefix(
@@ -908,7 +973,7 @@ def compose_prefix(
         "--project-directory",
         str(release / "integration"),
         "--env-file",
-        str(RUNTIME_CONFIG_ROOT / f"{profile.application}.env"),
+        str(release / "runtime.env"),
         "--file",
         str(release / "integration/compose.yaml"),
     ]
@@ -925,24 +990,81 @@ def _run_bounded_status(
     timeout: int,
     maximum_stdout: int = MAX_RENDERED_COMPOSE_BYTES,
 ) -> subprocess.CompletedProcess[str]:
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+
+    def terminate() -> None:
+        if process is None or process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            with contextlib.suppress(OSError):
+                process.kill()
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
-            check=False,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             env=dict(environment),
             cwd="/",
-            timeout=timeout,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        if process.stdout is None or process.stderr is None:
+            fail(f"command {command[0]} did not expose bounded output pipes")
+        streams = {
+            process.stdout: (bytearray(), maximum_stdout),
+            process.stderr: (bytearray(), 64 * 1024),
+        }
+        for stream in streams:
+            selector.register(stream, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate()
+                fail(f"command {command[0]} failed: timed out after {timeout} seconds")
+            for key, _events in selector.select(timeout=min(remaining, 1.0)):
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                output, maximum = streams[stream]
+                if len(output) + len(chunk) > maximum:
+                    terminate()
+                    fail(f"command {command[0]} output exceeds the limit")
+                output.extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            terminate()
+            fail(f"command {command[0]} failed: timed out after {timeout} seconds")
+        returncode = process.wait(timeout=remaining)
+        try:
+            stdout = streams[process.stdout][0].decode("utf-8", errors="strict")
+            stderr = streams[process.stderr][0].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            fail(f"command {command[0]} returned non-UTF-8 output")
+        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+    except OSError as exc:
+        terminate()
         fail(f"command {command[0]} failed: {exc}")
-    if len(result.stdout.encode("utf-8")) > maximum_stdout or len(
-        result.stderr.encode("utf-8")
-    ) > 64 * 1024:
-        fail(f"command {command[0]} output exceeds the limit")
-    return result
+    except subprocess.TimeoutExpired:
+        terminate()
+        fail(f"command {command[0]} failed: timed out after {timeout} seconds")
+    finally:
+        selector.close()
+        if process is not None:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
 
 
 def _run_bounded(
@@ -1108,8 +1230,15 @@ def render_and_validate_compose(
     profile: BundleProfile,
     bundle: ApplicationBundle,
     state: ApplicationState,
+    configuration: Mapping[str, str],
 ) -> None:
-    environment = compose_environment(profile, bundle, state, staging)
+    environment = compose_environment(
+        profile,
+        bundle,
+        state,
+        staging,
+        configuration,
+    )
     rendered_result = _run_bounded(
         [*compose_prefix(staging, profile), "config", "--format", "json"],
         environment=environment,
@@ -1247,6 +1376,84 @@ def expose_release_directory(path: Path) -> None:
         fail(f"cannot protect materialized application release: {exc}")
 
 
+def cleanup_application_filesystem_residue(
+    application: str,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    if application not in PROFILES or expected_uid < 0 or expected_gid < 0:
+        fail("application filesystem cleanup target is invalid")
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        fail("application filesystem cleanup requires symlink-safe removal")
+    app_root = APPLICATION_ROOT / application
+    releases = app_root / "releases"
+    releases_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent = os.fstat(releases_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or stat.S_IMODE(parent.st_mode) != 0o755
+        ):
+            fail("application releases directory is unsafe during cleanup")
+        names = sorted(
+            name
+            for name in os.listdir(releases_fd)
+            if re.fullmatch(r"\.sha256-[0-9a-f]{64}-[0-9a-f]{16}", name)
+        )
+        if len(names) > 16:
+            fail("application filesystem cleanup exceeded its staging limit")
+        for name in names:
+            metadata = os.stat(name, dir_fd=releases_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+                or metadata.st_dev != parent.st_dev
+                or stat.S_IMODE(metadata.st_mode) not in {0o700, 0o755}
+            ):
+                fail("application staging residue is not one protected directory")
+            shutil.rmtree(name, dir_fd=releases_fd)
+        if names:
+            os.fsync(releases_fd)
+    finally:
+        os.close(releases_fd)
+
+    app_fd = os.open(app_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent = os.fstat(app_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or stat.S_IMODE(parent.st_mode) != 0o755
+        ):
+            fail("application root is unsafe during cleanup")
+        names = sorted(
+            name
+            for name in os.listdir(app_fd)
+            if re.fullmatch(r"\.current-[0-9a-f]{16}", name)
+        )
+        if len(names) > 16:
+            fail("application filesystem cleanup exceeded its link limit")
+        for name in names:
+            metadata = os.stat(name, dir_fd=app_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+            ):
+                fail("application current-link residue is not one protected symlink")
+            os.unlink(name, dir_fd=app_fd)
+        if names:
+            os.fsync(app_fd)
+    finally:
+        os.close(app_fd)
+
+
 def validate_materialized_release(release: Path, state: ApplicationState) -> None:
     require_protected_directory(release, "materialized application release", mode=0o755)
     inventory_path = release / "materialization.json"
@@ -1266,6 +1473,35 @@ def validate_materialized_release(release: Path, state: ApplicationState) -> Non
         fail("materialized application release state differs")
 
 
+def materialization_inventory_name(state: ApplicationState) -> str:
+    return (
+        f"{state.application}-"
+        f"{release_name(state).removeprefix('sha256-')}.json"
+    )
+
+
+def ensure_external_inventory(release: Path, state: ApplicationState) -> None:
+    raw = (release / "materialization.json").read_bytes()
+    name = materialization_inventory_name(state)
+    existing = STATIC.read_protected_state_bytes(
+        INVENTORY_STATE_ROOT,
+        name,
+        "application materialization inventory",
+        maximum_size=MAX_STATE_BYTES,
+    )
+    if existing is not None:
+        if existing != raw:
+            fail("external application inventory differs from its immutable release")
+        return
+    STATIC.write_protected_state_bytes(
+        INVENTORY_STATE_ROOT,
+        name,
+        raw,
+        "application materialization inventory",
+        maximum_size=MAX_STATE_BYTES,
+    )
+
+
 def materialize_candidate(
     state: ApplicationState,
     profile: BundleProfile,
@@ -1277,6 +1513,7 @@ def materialize_candidate(
     final = releases / release_name(state)
     if final.exists() or final.is_symlink():
         validate_materialized_release(final, state)
+        ensure_external_inventory(final, state)
         return final
     staging = releases / f".{release_name(state)}-{secrets.token_hex(8)}"
     if staging.exists() or staging.is_symlink():
@@ -1290,7 +1527,24 @@ def materialize_candidate(
         for name, raw in sorted(evidence.items()):
             write_release_file(evidence_root / name, raw, f"release evidence {name}")
         write_release_file(staging / "state.json", canonical_state(state), "release state")
-        render_and_validate_compose(staging, profile, bundle, state)
+        configuration = runtime_configuration(profile)
+        write_release_file(
+            staging / "runtime-config.json",
+            canonical_json(configuration),
+            "runtime configuration snapshot",
+        )
+        write_release_file(
+            staging / "runtime.env",
+            canonical_runtime_environment(configuration),
+            "Compose environment snapshot",
+        )
+        render_and_validate_compose(
+            staging,
+            profile,
+            bundle,
+            state,
+            configuration,
+        )
         inventory_raw = canonical_json(filesystem_inventory(staging))
         write_release_file(
             staging / "materialization.json",
@@ -1309,14 +1563,7 @@ def materialize_candidate(
         shutil.rmtree(staging, ignore_errors=True)
         raise
     validate_materialized_release(final, state)
-    inventory_name = f"{state.application}-{release_name(state).removeprefix('sha256-')}.json"
-    STATIC.write_protected_state_bytes(
-        INVENTORY_STATE_ROOT,
-        inventory_name,
-        (final / "materialization.json").read_bytes(),
-        "application materialization inventory",
-        maximum_size=MAX_STATE_BYTES,
-    )
+    ensure_external_inventory(final, state)
     return final
 
 
@@ -1496,8 +1743,48 @@ def state_release(state: ApplicationState) -> Path:
 
 def bundle_from_release(release: Path, state: ApplicationState) -> ApplicationBundle:
     profile = PROFILES[state.application]
-    files: dict[str, bytes] = {}
-    for relative in profile.runtime_paths:
+    evidence = release / "evidence"
+
+    def read_evidence(name: str, maximum: int) -> bytes:
+        path = evidence / name
+        require_protected_file(
+            path,
+            f"materialized integration evidence {name}",
+            allowed_modes=frozenset({0o444}),
+            maximum_size=maximum,
+        )
+        return path.read_bytes()
+
+    manifest_raw = read_evidence("integration-manifest.json", MAX_MANIFEST_BYTES)
+    integration = validate_integration_manifest(
+        manifest_raw,
+        profile,
+        state.source_revision,
+        parse_digest_reference(
+            state.integration_reference,
+            profile.integration_repository,
+            "materialized integration reference",
+        ),
+    )
+    archive_raw = read_evidence("integration.tar.gz", MAX_ARCHIVE_BYTES)
+    inventory_raw = read_evidence("inventory.json", MAX_INVENTORY_BYTES)
+    for raw, descriptor, label in (
+        (archive_raw, integration.archive, "archive"),
+        (inventory_raw, integration.inventory, "inventory"),
+    ):
+        if len(raw) != descriptor.size or content_digest(raw) != descriptor.digest:
+            fail(f"materialized integration {label} differs from its manifest")
+    bundle = validate_bundle(
+        archive_raw,
+        inventory_raw,
+        profile=profile,
+        revision=state.source_revision,
+        created=integration.created,
+        component_references=state.component_references,
+        migration_inventory_digest=state.migration_inventory_digest,
+        probe_inventory_digest=state.probe_inventory_digest,
+    )
+    for relative, expected in bundle.files.items():
         path = release / "integration" / PurePosixPath(relative)
         require_protected_file(
             path,
@@ -1505,21 +1792,9 @@ def bundle_from_release(release: Path, state: ApplicationState) -> ApplicationBu
             allowed_modes=frozenset({0o444}),
             maximum_size=5 * 1024 * 1024,
         )
-        files[relative] = path.read_bytes()
-    contract = strict_json(files["contract.json"], "integration contract", maximum=5 * 1024 * 1024)
-    migrations = strict_json(files["migrations.json"], "migration inventory", maximum=5 * 1024 * 1024)
-    probes = strict_json(files["probes.json"], "probe inventory", maximum=5 * 1024 * 1024)
-    if not isinstance(contract, dict) or not isinstance(migrations, dict) or not isinstance(probes, dict):
-        fail("materialized application operational inventories are invalid")
-    return ApplicationBundle(
-        application=state.application,
-        source_revision=state.source_revision,
-        created="1970-01-01T00:00:00Z",
-        files=files,
-        contract=contract,
-        migrations=migrations,
-        probes=probes,
-    )
+        if path.read_bytes() != expected:
+            fail("materialized integration file differs from its admitted archive")
+    return bundle
 
 
 def _read_materialized_policy_file(
@@ -1547,7 +1822,14 @@ def validate_materialized_runtime_policy(
     release = state_release(state)
     validate_materialized_release(release, state)
     bundle = bundle_from_release(release, state)
-    environment = compose_environment(profile, bundle, state, release)
+    configuration = materialized_runtime_configuration(release, profile)
+    environment = compose_environment(
+        profile,
+        bundle,
+        state,
+        release,
+        configuration,
+    )
     rendered_result = _run_bounded(
         [*compose_prefix(release, profile), "config", "--format", "json"],
         environment=environment,
@@ -1625,7 +1907,14 @@ def _compose_for_state(
         profile = PROFILES[state.application]
         validate_materialized_release(release, state)
         bundle = bundle_from_release(release, state)
-        environment = compose_environment(profile, bundle, state, release)
+        configuration = materialized_runtime_configuration(release, profile)
+        environment = compose_environment(
+            profile,
+            bundle,
+            state,
+            release,
+            configuration,
+        )
     return _run_bounded(
         [*compose_prefix(release, profile, precommit=precommit), *arguments],
         environment=environment,
@@ -2036,6 +2325,7 @@ def probe_runtime(state: ApplicationState, work: Path) -> None:
                 else None
             ),
             work=work,
+            resolve_host=host,
         )
 
 
@@ -2244,6 +2534,15 @@ def recover_application(application: str) -> None:
             "application transaction",
         )
         return
+    if transaction.phase == "probed" and not any(
+        active == expected_active and target == expected_target
+        for expected_active, expected_target in (
+            (transaction.previous_state, transaction.previous_target),
+            (transaction.previous_state, transaction.expected_target),
+            (transaction.candidate, transaction.expected_target),
+        )
+    ):
+        fail("probed application transaction found an unexpected active tuple")
     if active == transaction.candidate and target == transaction.expected_target:
         if transaction.phase != "probed":
             fail("unprobed application transaction already owns the active tuple")
@@ -2445,6 +2744,7 @@ def deploy(
         fail("application is disabled by the protected production contract")
     validate_runtime()
     with deployment_lock():
+        cleanup_application_filesystem_residue(application)
         STATIC.refuse_isolated_worker_residue_locked()
         if activate_live:
             assert_exact_source_head(profile, source_revision)
@@ -2482,6 +2782,8 @@ def recover_live(application: str | None) -> None:
     if any(item not in PROFILES for item in applications):
         fail("application recovery target is invalid")
     with deployment_lock():
+        for item in applications:
+            cleanup_application_filesystem_residue(item)
         if not any(read_transaction(item) is not None for item in applications):
             return
         validate_runtime()

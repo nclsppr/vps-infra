@@ -25,6 +25,8 @@ MAX_EXPANDED_BYTES = 32 * MIB
 MAX_FILE_BYTES = 5 * MIB
 MAX_COMPONENT_MANIFEST_BYTES = 4 * MIB
 MAX_IMAGE_CONFIG_BYTES = 2 * MIB
+MAX_RUNTIME_LAYER_COUNT = 64
+MAX_RUNTIME_COMPRESSED_BYTES = 4 * 1024 * MIB
 
 OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
 OCI_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
@@ -1020,14 +1022,27 @@ def validate_runtime_manifest(
         size=_size(config["size"], "runtime image manifest.config.size", MAX_IMAGE_CONFIG_BYTES),
     )
     layers = manifest["layers"]
-    if not isinstance(layers, list) or not layers:
-        _fail("runtime image manifest.layers", "must be non-empty")
+    if (
+        not isinstance(layers, list)
+        or not 1 <= len(layers) <= MAX_RUNTIME_LAYER_COUNT
+    ):
+        _fail("runtime image manifest.layers", "count is outside the limit")
+    total_size = 0
     for index, item in enumerate(layers):
         descriptor = _object(item, f"runtime image manifest.layers[{index}]")
         if not {"mediaType", "digest", "size"}.issubset(descriptor) or set(descriptor) - {"mediaType", "digest", "size", "annotations"}:
             _fail(f"runtime image manifest.layers[{index}]", "fields are invalid")
         _digest(descriptor["digest"], f"runtime image manifest.layers[{index}].digest")
-        _size(descriptor["size"], f"runtime image manifest.layers[{index}].size", 2 * 1024 * MIB)
+        total_size += _size(
+            descriptor["size"],
+            f"runtime image manifest.layers[{index}].size",
+            2 * 1024 * MIB,
+        )
+        if total_size > MAX_RUNTIME_COMPRESSED_BYTES:
+            _fail(
+                "runtime image manifest.layers",
+                "total compressed size is outside the limit",
+            )
     return layer
 
 

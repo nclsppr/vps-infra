@@ -384,6 +384,62 @@ class ApplicationBundleTests(unittest.TestCase):
                 expected_size=len(invalid),
             )
 
+    def test_runtime_manifest_bounds_layer_count_and_compressed_total(self):
+        config = {
+            "digest": "sha256:" + "a" * 64,
+            "mediaType": BUNDLE.OCI_CONFIG_MEDIA_TYPE,
+            "size": 1,
+        }
+
+        def manifest(layers):
+            return json.dumps(
+                {
+                    "config": config,
+                    "layers": layers,
+                    "mediaType": BUNDLE.OCI_MANIFEST_MEDIA_TYPE,
+                    "schemaVersion": 2,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+
+        too_many = manifest(
+            [
+                {
+                    "digest": f"sha256:{index + 1:064x}",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 1,
+                }
+                for index in range(BUNDLE.MAX_RUNTIME_LAYER_COUNT + 1)
+            ]
+        )
+        with self.assertRaisesRegex(BUNDLE.ApplicationBundleError, "count"):
+            BUNDLE.validate_runtime_manifest(
+                too_many,
+                expected_digest=BUNDLE.content_digest(too_many),
+                expected_size=len(too_many),
+            )
+
+        oversized_total = manifest(
+            [
+                {
+                    "digest": f"sha256:{index + 1:064x}",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "size": 2 * 1024 * BUNDLE.MIB,
+                }
+                for index in range(3)
+            ]
+        )
+        with self.assertRaisesRegex(
+            BUNDLE.ApplicationBundleError,
+            "total compressed size",
+        ):
+            BUNDLE.validate_runtime_manifest(
+                oversized_total,
+                expected_digest=BUNDLE.content_digest(oversized_total),
+                expected_size=len(oversized_total),
+            )
+
     def test_materializer_creates_only_allowlisted_read_only_files(self):
         profile = BUNDLE.PROFILES["parkventory"]
         files, component_references = fixture_files(profile)

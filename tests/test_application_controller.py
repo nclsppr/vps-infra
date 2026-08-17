@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -430,6 +431,29 @@ class ApplicationControllerTests(unittest.TestCase):
             "registry blob",
         )
 
+    def test_command_output_is_killed_while_streaming_past_its_bound(self):
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import os,time; "
+                "[(os.write(1,b'x'*4096),time.sleep(0.001)) "
+                "for _ in range(1024)]; time.sleep(30)"
+            ),
+        ]
+        started = time.monotonic()
+        with self.assertRaisesRegex(
+            CONTROLLER.ApplicationDeploymentError,
+            "output exceeds the limit",
+        ):
+            CONTROLLER._run_bounded_status(
+                command,
+                environment={},
+                timeout=10,
+                maximum_stdout=32 * 1024,
+            )
+        self.assertLess(time.monotonic() - started, 3)
+
     def test_release_root_mode_ignores_a_restrictive_outer_umask(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             release = Path(temporary_directory) / "release"
@@ -442,6 +466,91 @@ class ApplicationControllerTests(unittest.TestCase):
                 os.umask(previous_umask)
             self.assertEqual(release.stat().st_mode & 0o777, 0o755)
 
+    def test_recovery_removes_only_exact_protected_filesystem_residue(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            app_root = root / "surplasse"
+            releases = app_root / "releases"
+            releases.mkdir(parents=True)
+            app_root.chmod(0o755)
+            releases.chmod(0o755)
+            staging = releases / f".sha256-{'a' * 64}-{'b' * 16}"
+            staging.mkdir(mode=0o700)
+            (staging / "partial").write_bytes(b"partial")
+            link = app_root / f".current-{'c' * 16}"
+            link.symlink_to(f"releases/sha256-{'d' * 64}")
+            with mock.patch.object(CONTROLLER, "APPLICATION_ROOT", root):
+                CONTROLLER.cleanup_application_filesystem_residue(
+                    "surplasse",
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                )
+            self.assertFalse(staging.exists())
+            self.assertFalse(link.exists())
+            self.assertFalse(link.is_symlink())
+
+    def test_recovery_refuses_a_symlink_disguised_as_staging_residue(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            app_root = root / "surplasse"
+            releases = app_root / "releases"
+            releases.mkdir(parents=True)
+            app_root.chmod(0o755)
+            releases.chmod(0o755)
+            outside = root / "outside"
+            outside.mkdir()
+            staging = releases / f".sha256-{'a' * 64}-{'b' * 16}"
+            staging.symlink_to(outside, target_is_directory=True)
+            with mock.patch.object(CONTROLLER, "APPLICATION_ROOT", root):
+                with self.assertRaisesRegex(
+                    CONTROLLER.ApplicationDeploymentError,
+                    "staging residue is not one protected directory",
+                ):
+                    CONTROLLER.cleanup_application_filesystem_residue(
+                        "surplasse",
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                    )
+            self.assertTrue(staging.is_symlink())
+            self.assertTrue(outside.is_dir())
+
+    def test_existing_release_repairs_only_a_missing_external_inventory(self):
+        candidate = state()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = Path(temporary_directory)
+            raw = b'{"files":[],"schema":1}\n'
+            (release / "materialization.json").write_bytes(raw)
+            with (
+                mock.patch.object(
+                    CONTROLLER.STATIC,
+                    "read_protected_state_bytes",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    CONTROLLER.STATIC,
+                    "write_protected_state_bytes",
+                ) as write,
+            ):
+                CONTROLLER.ensure_external_inventory(release, candidate)
+            self.assertEqual(write.call_args.args[2], raw)
+            with (
+                mock.patch.object(
+                    CONTROLLER.STATIC,
+                    "read_protected_state_bytes",
+                    return_value=b"different\n",
+                ),
+                mock.patch.object(
+                    CONTROLLER.STATIC,
+                    "write_protected_state_bytes",
+                ) as rewrite,
+            ):
+                with self.assertRaisesRegex(
+                    CONTROLLER.ApplicationDeploymentError,
+                    "external application inventory differs",
+                ):
+                    CONTROLLER.ensure_external_inventory(release, candidate)
+            rewrite.assert_not_called()
+
     def test_empty_boot_recovery_does_not_require_attestation_runtime(self):
         with (
             mock.patch.object(CONTROLLER, "validate_recovery_state_runtime"),
@@ -450,6 +559,10 @@ class ApplicationControllerTests(unittest.TestCase):
                 "deployment_lock",
                 return_value=contextlib.nullcontext(),
             ),
+            mock.patch.object(
+                CONTROLLER,
+                "cleanup_application_filesystem_residue",
+            ) as cleanup,
             mock.patch.object(CONTROLLER, "read_transaction", return_value=None),
             mock.patch.object(
                 CONTROLLER,
@@ -461,6 +574,10 @@ class ApplicationControllerTests(unittest.TestCase):
             CONTROLLER.recover_live(None)
         runtime.assert_not_called()
         recover.assert_not_called()
+        self.assertEqual(
+            cleanup.call_args_list,
+            [mock.call("parkventory"), mock.call("surplasse")],
+        )
 
     def test_boot_recovery_with_a_journal_requires_the_full_runtime(self):
         transaction = types.SimpleNamespace()
@@ -471,6 +588,7 @@ class ApplicationControllerTests(unittest.TestCase):
                 "deployment_lock",
                 return_value=contextlib.nullcontext(),
             ),
+            mock.patch.object(CONTROLLER, "cleanup_application_filesystem_residue"),
             mock.patch.object(
                 CONTROLLER,
                 "read_transaction",
@@ -698,6 +816,35 @@ class ApplicationControllerTests(unittest.TestCase):
             str(CONTROLLER.MAX_PROBE_BODY_BYTES),
         )
 
+    def test_public_runtime_probes_are_pinned_to_the_local_edge(self):
+        candidate = state("parkventory")
+        bundle = types.SimpleNamespace(
+            probes={
+                "internal": [],
+                "public": [
+                    {
+                        "host": "parkventory.com",
+                        "path": "/app",
+                        "status": 200,
+                        "body_contains": "Parkventory",
+                    }
+                ],
+            }
+        )
+        with (
+            mock.patch.object(CONTROLLER, "state_release", return_value=Path("/release")),
+            mock.patch.object(CONTROLLER, "bundle_from_release", return_value=bundle),
+            mock.patch.object(CONTROLLER, "_probe_http") as probe,
+        ):
+            CONTROLLER.probe_runtime(candidate, Path("/work"))
+        probe.assert_called_once_with(
+            "https://parkventory.com/app",
+            expected_status=200,
+            expected_body="Parkventory",
+            work=Path("/work"),
+            resolve_host="parkventory.com",
+        )
+
     def test_compose_migrator_and_runtime_auto_migration_are_exact(self):
         profile = CONTROLLER.PROFILES["parkventory"]
         service_credentials = {
@@ -872,6 +1019,97 @@ class ApplicationControllerTests(unittest.TestCase):
         self.assertIs(result, completed)
         validate.assert_called_once_with(candidate)
         self.assertEqual(bounded.call_args.kwargs["environment"], environment)
+
+    def test_materialized_bundle_replays_current_inventory_policy(self):
+        candidate = state("parkventory")
+        archive = b"archive"
+        inventory = b"inventory"
+        manifest = b"manifest"
+        descriptor_archive = types.SimpleNamespace(
+            digest=CONTROLLER.content_digest(archive),
+            size=len(archive),
+        )
+        descriptor_inventory = types.SimpleNamespace(
+            digest=CONTROLLER.content_digest(inventory),
+            size=len(inventory),
+        )
+        integration = types.SimpleNamespace(
+            archive=descriptor_archive,
+            inventory=descriptor_inventory,
+            created="2026-08-17T00:00:00Z",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release = Path(temporary_directory)
+            evidence = release / "evidence"
+            evidence.mkdir()
+            (evidence / "integration-manifest.json").write_bytes(manifest)
+            (evidence / "integration.tar.gz").write_bytes(archive)
+            (evidence / "inventory.json").write_bytes(inventory)
+            with (
+                mock.patch.object(CONTROLLER, "require_protected_file"),
+                mock.patch.object(
+                    CONTROLLER,
+                    "validate_integration_manifest",
+                    return_value=integration,
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "validate_bundle",
+                    side_effect=CONTROLLER.ApplicationBundleError(
+                        "probe inventory violates current profile"
+                    ),
+                ) as validate,
+            ):
+                with self.assertRaisesRegex(
+                    CONTROLLER.ApplicationBundleError,
+                    "violates current profile",
+                ):
+                    CONTROLLER.bundle_from_release(release, candidate)
+        self.assertEqual(validate.call_args.kwargs["revision"], REVISION)
+        self.assertEqual(
+            validate.call_args.kwargs["probe_inventory_digest"],
+            candidate.probe_inventory_digest,
+        )
+
+    def test_compose_environment_uses_the_release_configuration_snapshot(self):
+        candidate = state("parkventory")
+        profile = CONTROLLER.PROFILES["parkventory"]
+        configuration = {
+            key: f"value-{index}"
+            for index, key in enumerate(profile.runtime_configuration_keys)
+        }
+        bundle = types.SimpleNamespace(contract={})
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "runtime_configuration",
+                side_effect=AssertionError("host configuration must not be reread"),
+            ) as host_configuration,
+            mock.patch.object(
+                CONTROLLER,
+                "image_environment",
+                return_value={"PARKVENTORY_BACKEND_IMAGE": "image@sha256"},
+            ),
+        ):
+            environment = CONTROLLER.compose_environment(
+                profile,
+                bundle,
+                candidate,
+                Path("/release"),
+                configuration,
+            )
+        host_configuration.assert_not_called()
+        for key, value in configuration.items():
+            self.assertEqual(environment[key], value)
+        prefix = CONTROLLER.compose_prefix(Path("/release"), profile)
+        self.assertEqual(
+            prefix[prefix.index("--env-file") + 1],
+            "/release/runtime.env",
+        )
+        self.assertNotIn(
+            str(CONTROLLER.RUNTIME_CONFIG_ROOT / "parkventory.env"),
+            prefix,
+        )
 
     def test_migration_has_one_deterministic_container_identity(self):
         candidate = state("parkventory")
@@ -1296,6 +1534,48 @@ class ApplicationControllerTests(unittest.TestCase):
         switch.assert_not_called()
         remove.assert_not_called()
 
+    def test_probed_recovery_refuses_an_unreachable_active_tuple(self):
+        candidate = state()
+        previous = state(revision=PREVIOUS_REVISION, digest=PREVIOUS_DIGEST)
+        unexpected = state(
+            revision="c" * 40,
+            digest="sha256:" + "c" * 64,
+        )
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=previous,
+            previous_target=CONTROLLER.release_target(previous),
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="probed",
+        )
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "read_transaction",
+                return_value=transaction,
+            ),
+            mock.patch.object(CONTROLLER, "remove_migration_container"),
+            mock.patch.object(CONTROLLER, "read_state", return_value=unexpected),
+            mock.patch.object(
+                CONTROLLER,
+                "current_target",
+                return_value=CONTROLLER.release_target(unexpected),
+            ),
+            mock.patch.object(CONTROLLER, "start_runtime") as start,
+            mock.patch.object(CONTROLLER, "switch_current") as switch,
+            mock.patch.object(CONTROLLER, "write_state") as write,
+            mock.patch.object(CONTROLLER, "remove_state") as remove,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "unexpected active tuple",
+            ):
+                CONTROLLER.recover_application("surplasse")
+        start.assert_not_called()
+        switch.assert_not_called()
+        write.assert_not_called()
+        remove.assert_not_called()
+
     def test_recovery_reconciles_an_already_committed_candidate(self):
         candidate = state()
         transaction = CONTROLLER.ApplicationTransaction(
@@ -1543,6 +1823,13 @@ class ApplicationLiveGateTests(unittest.TestCase):
             "--recover-live parkventory",
             command,
         )
+        for resource_bound in (
+            "MemoryMax=1G",
+            "MemorySwapMax=0",
+            "TasksMax=512",
+            "LimitFSIZE=64M",
+        ):
+            self.assertIn(resource_bound, command)
         self.assertEqual(
             command[-6:],
             [

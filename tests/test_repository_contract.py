@@ -1110,6 +1110,10 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "Before=vps-public-static-edge.service",
             "Requires=docker.service",
             "ExecStart={{ vps_deploy_application_path }} --recover-live",
+            "MemoryMax=1G",
+            "MemorySwapMax=0",
+            "TasksMax=512",
+            "LimitFSIZE=64M",
             "WantedBy=multi-user.target",
         ):
             self.assertIn(expected, recovery_unit)
@@ -1137,6 +1141,10 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn('"deploy-application-live "*', parser)
         self.assertIn('"deploy-application-live "*', wrapper)
         self.assertIn("RuntimeDirectoryMode=0700", gate)
+        self.assertIn("MemoryMax=1G", gate)
+        self.assertIn("MemorySwapMax=0", gate)
+        self.assertIn("TasksMax=512", gate)
+        self.assertIn("LimitFSIZE=64M", gate)
         self.assertIn("ExecStopPost=", gate)
         self.assertIn("--recover-live", gate)
 

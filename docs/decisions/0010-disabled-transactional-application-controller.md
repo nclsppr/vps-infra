@@ -45,7 +45,8 @@ and materialization sequence:
 3. verify the release attestation from the allowlisted producer workflow;
 4. fetch every component index, require exactly one `linux/amd64` runtime
    manifest plus its attestation manifest, verify the component attestation,
-   and bind the runtime config labels to the same source revision;
+   bind the runtime config labels to the same source revision, and bound both
+   the count and compressed sum of image layers;
 5. fetch and attest the digest-only `vps-integration` manifest;
 6. require the common artifact type and two ordered archive/inventory layers;
 7. validate the canonical inventory, exact application file allowlist, safe
@@ -55,7 +56,8 @@ and materialization sequence:
 9. render Compose with only the exact root-owned runtime configuration keys and
    image digest variables, apply the repository Compose policy, and inspect
    the exact least-privilege secret allocation without reading or persisting
-   secret bytes;
+   secret bytes; the non-secret configuration values are snapshotted into the
+   immutable release so recovery does not depend on later host-config drift;
 10. materialize the verified bytes and evidence in a digest-named root-owned
     release, then write and fsync a complete filesystem inventory.
 
@@ -70,6 +72,8 @@ equal the attested route byte for byte, and the exact healthy public-edge Caddy
 container must already be attached to the application's external network.
 This controller does not rewrite the immutable platform edge release. Route and
 network preparation remains a separate reviewed platform cutover.
+Post-start public probes resolve every declared public hostname directly to
+Atlas loopback, so a healthy old DNS target cannot prove the local candidate.
 
 Parkventory also refuses activation while any protected static active state,
 static transaction journal, or static `current` link exists. The static
@@ -99,6 +103,9 @@ override. Their normal `unless-stopped` policy is applied only after the
 `probed` journal and active tuple are durable. Boot recovery re-runs Compose and
 waits for health before completing an interrupted forward commit. Docker
 therefore cannot auto-restart an uncommitted candidate ahead of recovery.
+Controller subprocess output is drained with streaming byte limits and the
+activation and recovery units carry explicit memory, task, and file-size
+bounds.
 
 The one-shot migrator has a deterministic name derived from the complete
 release digest. Before rollback, recovery locates only that exact name,
@@ -177,6 +184,12 @@ and output/memory bounds must be dimensioned against the complete worst-case
 Compose path. Migration recovery must gain an attested backward-compatibility
 invariant or stop for operator/forward recovery after migration instead of
 automatically starting the previous runtime against a changed schema.
+The enablement change must additionally add a fail-before-mutation disk budget
+and safe release/image retention, aggregate CPU/memory/pid budgets for overlap,
+latest-desired trigger reconciliation after lock contention, boot health
+reconciliation for an active runtime, exact database/edge/container network
+identity checks, and a route policy that cannot strand rollback behind a newer
+candidate route.
 Surplasse and Parkventory producer branches must publish the common USTAR
 integration format declared by the shared contract.
 
