@@ -916,7 +916,7 @@ class StaticBundleContractTests(unittest.TestCase):
             MATERIALIZER.SYSTEMD_WORKER_LOGICAL_ROOT
             / state_name
             / ".inputs"
-            / "01"
+            / "01.json"
         )
         self.assertEqual(mapping, {protected_input: mapped_input})
 
@@ -968,6 +968,93 @@ class StaticBundleContractTests(unittest.TestCase):
                 inputs,
                 (Path("/run/not-an-input"),),
             )
+
+        attestation_bundle = Path("/run/root-only/deployment/bundle.jsonl")
+        archive = Path("/run/root-only/deployment/site.tar.gz")
+        extension_mapping = MATERIALIZER.isolated_worker_input_mapping(
+            state_name,
+            (script_path, protected_input, attestation_bundle, archive),
+            (protected_input, attestation_bundle, archive),
+        )
+        self.assertEqual(
+            tuple(path.name for path in extension_mapping.values()),
+            ("01.json", "02.jsonl", "03.tar.gz"),
+        )
+        uppercase_bundle = Path("/run/root-only/deployment/bundle.JSONL")
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "suffix is invalid",
+        ):
+            MATERIALIZER.isolated_worker_input_mapping(
+                state_name,
+                (script_path, uppercase_bundle),
+                (uppercase_bundle,),
+            )
+
+    def test_registry_worker_accepts_only_its_exact_json_remap(self) -> None:
+        contract = MATERIALIZER.RegistryFetchContract(
+            repository=MATERIALIZER.PROFILES["personal"].site_repository,
+            kind="manifest",
+            digest="sha256:" + "a" * 64,
+            maximum_size=MATERIALIZER.MAX_MANIFEST_BYTES,
+            expected_size=None,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            worker = Path(temporary_directory)
+            worker.chmod(0o700)
+            input_root = worker / ".inputs"
+            input_root.mkdir(mode=0o755)
+            request = input_root / "02"
+            request.touch(mode=0o444)
+            output = worker / "registry-object"
+            metadata = list(input_root.lstat())
+            metadata[4] = 0
+            metadata[5] = 0
+            root_owned_input = os.stat_result(metadata)
+
+            def emulate_fetch(
+                _repository,
+                _digest,
+                destination,
+                _maximum_size,
+                _environment,
+                *,
+                kind,
+                expected_size,
+            ):
+                self.assertEqual(kind, "manifest")
+                self.assertIsNone(expected_size)
+                destination.write_bytes(b"manifest")
+
+            with mock.patch.dict(
+                MATERIALIZER.os.environ,
+                {"HOME": str(worker)},
+                clear=True,
+            ), mock.patch.object(
+                MATERIALIZER.Path,
+                "lstat",
+                return_value=root_owned_input,
+            ), mock.patch.object(
+                MATERIALIZER,
+                "read_registry_fetch_contract",
+                return_value=contract,
+            ) as read_contract, mock.patch.object(
+                MATERIALIZER,
+                "fetch_registry_object",
+                side_effect=emulate_fetch,
+            ) as fetch:
+                with self.assertRaisesRegex(
+                    MATERIALIZER.StaticDeploymentError,
+                    "input root is invalid",
+                ):
+                    MATERIALIZER.run_registry_fetch_worker(request, output)
+                read_contract.assert_not_called()
+                fetch.assert_not_called()
+
+                request = request.rename(input_root / "02.json")
+                MATERIALIZER.run_registry_fetch_worker(request, output)
+                read_contract.assert_called_once_with(request)
+                fetch.assert_called_once()
 
     def test_global_host_addresses_accept_atlas_iproute2_inventory(self) -> None:
         fixture = [
@@ -3327,6 +3414,29 @@ class StaticBundleContractTests(unittest.TestCase):
             self.assertNotIn("--bundle-from-oci", verify[1])
             self.assertFalse(any("TOKEN" in argument for argument in verify[1]))
             self.assertIn(trusted_root, verify[2]["inputs"])
+            bundle_path = Path(verify[1][verify[1].index("--bundle") + 1])
+            self.assertEqual(
+                verify[2]["remapped_inputs"],
+                (subject_path, bundle_path, trusted_root),
+            )
+            mapping = MATERIALIZER.isolated_worker_input_mapping(
+                "9" * 32,
+                verify[2]["inputs"],
+                verify[2]["remapped_inputs"],
+            )
+            resolved = MATERIALIZER.resolved_isolated_worker_command(
+                "9" * 32,
+                verify[1],
+                mapping,
+            )
+            self.assertEqual(
+                Path(resolved[resolved.index("--bundle") + 1]).suffix,
+                ".jsonl",
+            )
+            self.assertEqual(
+                Path(resolved[resolved.index("--custom-trusted-root") + 1]).suffix,
+                ".jsonl",
+            )
             self.assertEqual(list(root.glob("attestation-*.jsonl")), [])
 
     def test_trusted_root_validation_requires_two_lf_terminated_records(self) -> None:
@@ -3877,7 +3987,7 @@ class StaticBundleContractTests(unittest.TestCase):
                 state_root.mkdir(mode=0o700)
                 input_root = state_root / ".inputs"
                 input_root.mkdir(mode=0o755)
-                (input_root / "02").touch()
+                (input_root / "02.json").touch()
                 output = state_root / "registry-object"
                 output.write_bytes(content)
                 output.chmod(0o444)
@@ -3892,7 +4002,7 @@ class StaticBundleContractTests(unittest.TestCase):
                     physical_root=state_root,
                     uid=os.geteuid(),
                     gid=os.getegid(),
-                    remapped_input_names=("02",),
+                    remapped_input_names=("02.json",),
                 )
 
             with mock.patch.object(
@@ -3952,7 +4062,7 @@ class StaticBundleContractTests(unittest.TestCase):
                 state_root.mkdir(mode=0o700)
                 input_root = state_root / ".inputs"
                 input_root.mkdir(mode=0o755)
-                (input_root / "02").touch()
+                (input_root / "02.json").touch()
                 output = state_root / "registry-object"
                 output.write_bytes(b"forged!!\n")
                 output.chmod(0o444)
@@ -3963,7 +4073,7 @@ class StaticBundleContractTests(unittest.TestCase):
                     physical_root=state_root,
                     uid=os.geteuid(),
                     gid=os.getegid(),
-                    remapped_input_names=("02",),
+                    remapped_input_names=("02.json",),
                 )
 
             with mock.patch.object(
