@@ -14,6 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/deploy-surplasse-public-edge"
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -124,8 +126,8 @@ class ControllerFixture:
         )
         protected_file(self.attested, self.route)
 
-    def create_base(self) -> Path:
-        base = self.paths.base_release_root / f"{REVISION}-prepare"
+    def create_base(self, phase: str = "prepare") -> Path:
+        base = self.paths.base_release_root / f"{REVISION}-{phase}"
         routes = base / "routes"
         routes.mkdir(parents=True)
         for name in CONTROLLER.ROUTE_NAMES:
@@ -134,7 +136,7 @@ class ControllerFixture:
             ("Caddyfile", b"import /etc/caddy/routes/*.caddy\n", 0o444),
             ("compose.yaml", b"name: vps-public-static-edge\n", 0o444),
             ("expected-images.json", b"{}\n", 0o444),
-            ("phase", b"prepare\n", 0o444),
+            ("phase", f"{phase}\n".encode(), 0o444),
             ("source-revision", f"{REVISION}\n".encode(), 0o444),
             ("validate-compose", b"#!/bin/sh\nexit 0\n", 0o555),
         ):
@@ -306,6 +308,14 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
                     modes=frozenset({0o755}),
                     maximum_size=CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES,
                 )
+
+    def test_pre_cutover_is_a_valid_public_edge_base_phase(self) -> None:
+        release = self.fixture.create_base("precutover")
+        revision, phase = CONTROLLER.validate_base_release(
+            release, self.fixture.paths
+        )
+        self.assertEqual(revision, REVISION)
+        self.assertEqual(phase, "precutover")
 
     def test_stage_retains_every_static_route_and_publishes_exact_inputs(self) -> None:
         state = self.fixture.stage()
@@ -687,6 +697,31 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
                 "Refuse an unmanaged base switch over an active Surplasse edge"
             ),
             tasks.index("Create the next public edge release link"),
+        )
+        top_level_tasks = yaml.safe_load(tasks)
+        convergence = next(
+            task
+            for task in top_level_tasks
+            if task.get("name")
+            == "Stage, switch, and verify the isolated public static edge"
+        )
+        convergence_tasks = convergence["block"]
+        preflight = next(
+            task
+            for task in convergence_tasks
+            if task.get("name")
+            == "Refuse an unmanaged base switch over an active Surplasse edge"
+        )
+        self.assertIn("ansible.builtin.command", preflight)
+        transaction = next(
+            task
+            for task in convergence_tasks
+            if task.get("name") == "Switch and reconcile the public static edge"
+        )
+        nested_names = {task.get("name") for task in transaction["block"]}
+        self.assertNotIn(
+            "Refuse an unmanaged base switch over an active Surplasse edge",
+            nested_names,
         )
 
     def test_application_release_contracts_remain_locked(self) -> None:
