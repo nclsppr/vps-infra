@@ -96,6 +96,59 @@ def surplasse_operator_manifest(
     }
 
 
+def surplasse_pilot_service(profile):
+    return {
+        "entrypoint": ["/opt/surplasse/scripts/backend-pilot-bootstrap.sh"],
+        "environment": {
+            "DEPLOYMENT_PROFILE": "production",
+            "JAVA_TOOL_OPTIONS": (
+                "-XX:MaxRAMPercentage=75.0 "
+                "-Djava.util.logging.manager=org.jboss.logmanager.LogManager"
+            ),
+            "PILOT_BOOTSTRAP_MANIFEST_FILE": (
+                "/run/surplasse/pilot-bootstrap.json"
+            ),
+            "QUARKUS_DATASOURCE_JDBC_URL": (
+                "jdbc:postgresql://postgresql:5432/surplasse"
+            ),
+            "QUARKUS_DATASOURCE_PASSWORD_FILE": (
+                "/run/secrets/surplasse_postgres_runtime_password"
+            ),
+            "QUARKUS_DATASOURCE_USERNAME": "surplasse_runtime",
+            "STRIPE_LIVE_MODE": "false",
+            "STRIPE_SECRET_KEY_FILE": (
+                "/run/secrets/surplasse_stripe_secret_key"
+            ),
+            "SURPLASSE_PRODUCTION_RELEASE_MODE": "testers",
+        },
+        "networks": {
+            "app_surplasse": {"gw_priority": 1},
+            "db_surplasse": {},
+        },
+        "profiles": ["pilot-bootstrap"],
+        "restart": "no",
+        "secrets": [
+            {
+                "source": source,
+                "target": f"/run/secrets/{source}",
+            }
+            for source in profile.service_credentials["pilot-bootstrap"]
+        ],
+        "user": "10001:10001",
+        "volumes": [
+            {
+                "bind": {},
+                "read_only": True,
+                "source": (
+                    "/etc/vps/applications/surplasse-pilot-bootstrap.json"
+                ),
+                "target": "/run/surplasse/pilot-bootstrap.json",
+                "type": "bind",
+            }
+        ],
+    }
+
+
 class ApplicationControllerTests(unittest.TestCase):
     def test_state_and_transaction_journals_are_strict_and_canonical(self):
         candidate = state()
@@ -1124,6 +1177,72 @@ class ApplicationControllerTests(unittest.TestCase):
         ):
             CONTROLLER.validate_application_compose_semantics(profile, rendered)
 
+    def test_surplasse_pilot_service_contract_is_exact(self):
+        profile = CONTROLLER.PROFILES["surplasse"]
+        services = {
+            service: {
+                "secrets": [
+                    {
+                        "source": source,
+                        "target": f"/run/secrets/{source}",
+                    }
+                    for source in sources
+                ]
+            }
+            for service, sources in profile.service_credentials.items()
+        }
+        services["backend"]["environment"] = {
+            "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+        }
+        services["backend"]["user"] = "10001:10001"
+        services["migrator"].update(
+            {
+                "entrypoint": [profile.migration_runner],
+                "user": "10001:10001",
+            }
+        )
+        services["pilot-bootstrap"] = surplasse_pilot_service(profile)
+        rendered = {"services": services}
+        CONTROLLER.validate_application_compose_semantics(profile, rendered)
+        mutations = {
+            "live": lambda pilot: pilot["environment"].__setitem__(
+                "STRIPE_LIVE_MODE", "true"
+            ),
+            "database-role": lambda pilot: pilot["environment"].__setitem__(
+                "QUARKUS_DATASOURCE_USERNAME", "surplasse_migrator"
+            ),
+            "network-alias": lambda pilot: pilot["networks"][
+                "app_surplasse"
+            ].__setitem__("aliases", ["backend"]),
+            "manifest-path": lambda pilot: pilot["volumes"][0].__setitem__(
+                "source", "/tmp/pilot.json"
+            ),
+            "profile": lambda pilot: pilot.__setitem__("profiles", ["migration"]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(divergence=label):
+                candidate = copy.deepcopy(rendered)
+                mutate(candidate["services"]["pilot-bootstrap"])
+                with self.assertRaises(CONTROLLER.ApplicationDeploymentError):
+                    CONTROLLER.validate_application_compose_semantics(
+                        profile,
+                        candidate,
+                    )
+
+    def test_surplasse_expected_images_and_compose_profiles_bind_pilot(self):
+        candidate = state("surplasse")
+        expected = CONTROLLER.expected_service_images(candidate)
+        self.assertEqual(
+            expected["pilot-bootstrap"],
+            candidate.component_references["backend"],
+        )
+        prefix = CONTROLLER.compose_prefix(
+            Path("/release"),
+            CONTROLLER.PROFILES["surplasse"],
+        )
+        self.assertIn(["--profile", "migration"], [prefix[index:index + 2] for index in range(len(prefix) - 1)])
+        self.assertIn(["--profile", "pilot-bootstrap"], [prefix[index:index + 2] for index in range(len(prefix) - 1)])
+
     def test_file_secrets_are_host_private_and_container_readable(self):
         profile = CONTROLLER.PROFILES["parkventory"]
         rendered = {
@@ -1489,6 +1608,7 @@ class ApplicationControllerTests(unittest.TestCase):
             migrator = services["migrator"]
             self.assertIsInstance(migrator, dict)
             migrator["entrypoint"] = [profile.migration_runner]
+            services["pilot-bootstrap"] = surplasse_pilot_service(profile)
             return {"name": "surplasse", "services": services}
 
         mutation_names = (

@@ -26,6 +26,12 @@ APPLICATION_COMPONENTS = {
     "surplasse": frozenset({"backend", "onboarding", "commande", "dashboard", "docs"}),
     "parkventory": frozenset({"backend", "frontend"}),
 }
+SURPLASSE_PILOT_SERVICE = "pilot-bootstrap"
+SURPLASSE_PILOT_PROFILE = "pilot-bootstrap"
+SURPLASSE_PILOT_MANIFEST_SOURCE = (
+    "/etc/vps/applications/surplasse-pilot-bootstrap.json"
+)
+SURPLASSE_PILOT_MANIFEST_TARGET = "/run/surplasse/pilot-bootstrap.json"
 PUBLIC_CADDY_PORTS = frozenset({(80, 80, "tcp"), (443, 443, "tcp"), (443, 443, "udp")})
 LOOPBACK_GRAFANA_PORT = (3000, 3000, "tcp")
 DANGEROUS_CAPABILITIES = frozenset({"ALL", "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"})
@@ -386,6 +392,14 @@ def duration_seconds(value: Any, path: str) -> float:
     return total
 
 
+def transient_profile(project: str, service_name: str) -> str | None:
+    if service_name == "migrator" or service_name.endswith("_migrator"):
+        return "migration"
+    if project == "surplasse" and service_name == SURPLASSE_PILOT_SERVICE:
+        return SURPLASSE_PILOT_PROFILE
+    return None
+
+
 def validate_runtime_contract(project: str, service_name: str, service: dict[str, Any]) -> None:
     path = f"services.{service_name}"
     if project == "vps-public-static-edge":
@@ -410,11 +424,14 @@ def validate_runtime_contract(project: str, service_name: str, service: dict[str
     unknown = set(service) - ALLOWED_SERVICE_KEYS
     if unknown:
         fail(f"{path}: unsupported or dangerous keys: {', '.join(sorted(unknown))}")
-    is_migrator = service_name == "migrator" or service_name.endswith("_migrator")
+    expected_profile = transient_profile(project, service_name)
     profiles = service.get("profiles", [])
-    if is_migrator:
-        if profiles != ["migration"]:
-            fail(f"{path}.profiles: migrator requires exactly ['migration']")
+    if expected_profile is not None:
+        if profiles != [expected_profile]:
+            fail(
+                f"{path}.profiles: transient service requires exactly "
+                f"[{expected_profile!r}]"
+            )
     elif profiles not in (None, []):
         fail(f"{path}.profiles: long-running services may not be hidden behind profiles")
 
@@ -504,6 +521,8 @@ def service_networks(project: str, service_name: str, service: dict[str, Any]) -
         db_network = f"db_{project}"
         if service_name == "migrator" or service_name.endswith("_migrator"):
             expected = {db_network}
+        elif project == "surplasse" and service_name == SURPLASSE_PILOT_SERVICE:
+            expected = {app_network, db_network}
         elif service_name == "backend" or service_name.endswith("_backend"):
             expected = {app_network, db_network}
         else:
@@ -516,6 +535,12 @@ def service_networks(project: str, service_name: str, service: dict[str, Any]) -
             fail(f"services.{service_name}.networks.{network_name}: options must be an object")
         if project == "vps-platform" and service_name == "postgresql":
             expected_options = {"aliases": ["postgresql"]}
+        elif (
+            project == "surplasse"
+            and service_name == SURPLASSE_PILOT_SERVICE
+            and network_name == app_network
+        ):
+            expected_options = {"gw_priority": 1}
         elif (
             project not in INFRASTRUCTURE_PROJECTS
             and network_name == f"app_{project}"
@@ -598,8 +623,9 @@ def validate_security(project: str, service_name: str, service: dict[str, Any]) 
     devices = service.get("devices")
     if devices not in (None, False) and devices != []:
         fail(f"{path}.devices: device passthrough is forbidden")
-    is_migrator = service_name == "migrator" or service_name.endswith("_migrator")
-    expected_restart = "no" if is_migrator else "unless-stopped"
+    expected_restart = (
+        "no" if transient_profile(project, service_name) is not None else "unless-stopped"
+    )
     if service.get("restart") != expected_restart:
         fail(f"{path}.restart: expected {expected_restart!r}")
     pids_limit = service.get("pids_limit")
@@ -645,7 +671,25 @@ def validate_volumes(
         if "/var/run/docker.sock" in source or "/run/docker.sock" in source:
             fail(f"{path}: Docker socket mounts are forbidden")
         if project not in INFRASTRUCTURE_PROJECTS:
-            fail(f"{path}: application services may not use host or named-volume mounts")
+            if not (
+                project == "surplasse"
+                and service_name == SURPLASSE_PILOT_SERVICE
+                and volume_type == "bind"
+                and source == SURPLASSE_PILOT_MANIFEST_SOURCE
+                and target == SURPLASSE_PILOT_MANIFEST_TARGET
+                and volume.get("read_only") is True
+                and volume.get("bind", {})
+                in ({}, {"create_host_path": False})
+                and "volume" not in volume
+            ):
+                fail(
+                    f"{path}: application services may not use host or "
+                    "named-volume mounts"
+                )
+            if target in seen_targets:
+                fail(f"{path}: duplicate target {target!r}")
+            seen_targets.add(target)
+            continue
         volume_targets = (
             PLATFORM_VOLUME_TARGETS
             if project == "vps-platform"
@@ -722,6 +766,14 @@ def validate_volumes(
             if extra:
                 details.append(f"unexpected {', '.join(sorted(extra))}")
             fail(f"services.{service_name}.volumes: {'; '.join(details)}")
+    elif project == "surplasse" and service_name == SURPLASSE_PILOT_SERVICE:
+        if seen_targets != {SURPLASSE_PILOT_MANIFEST_TARGET}:
+            fail(
+                f"services.{service_name}.volumes: exact protected manifest bind "
+                "is required"
+            )
+    elif seen_targets:
+        fail(f"services.{service_name}.volumes: application mounts are forbidden")
 
 
 def validate_secrets(project: str, service_name: str, service: dict[str, Any]) -> None:
@@ -803,14 +855,22 @@ def validate_ports(project: str, service_name: str, service: dict[str, Any]) -> 
 
 
 def validate_healthcheck(project: str, service_name: str, service: dict[str, Any]) -> None:
-    is_migrator = service_name == "migrator" or service_name.endswith("_migrator")
-    if is_migrator:
+    expected_profile = transient_profile(project, service_name)
+    if expected_profile is not None:
         profiles = service.get("profiles", [])
-        if not isinstance(profiles, list) or "migration" not in profiles:
-            fail(f"services.{service_name}: migrator must be isolated behind the 'migration' profile")
+        if profiles != [expected_profile]:
+            fail(
+                f"services.{service_name}: transient service must be isolated "
+                f"behind the {expected_profile!r} profile"
+            )
         restart = service.get("restart", "no")
         if restart not in {"no", "none", False}:
-            fail(f"services.{service_name}.restart: migrator must never restart automatically")
+            fail(
+                f"services.{service_name}.restart: transient service must never "
+                "restart automatically"
+            )
+        if service.get("healthcheck") is not None:
+            fail(f"services.{service_name}.healthcheck: transient service forbids a probe")
         return
 
     healthcheck = service.get("healthcheck")
@@ -1043,6 +1103,12 @@ def validate_compose(
                     )
     if project not in INFRASTRUCTURE_PROJECTS:
         expected_services = set(APPLICATION_COMPONENTS[project]) | {"migrator"}
+        if (
+            project == "surplasse"
+            and expected_images is not None
+            and SURPLASSE_PILOT_SERVICE in expected_images
+        ):
+            expected_services.add(SURPLASSE_PILOT_SERVICE)
         if set(services) != expected_services:
             fail(
                 f"services: {project} requires exactly the verified integration services "

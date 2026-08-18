@@ -1,0 +1,456 @@
+#!/usr/bin/python3 -I
+"""Run the admitted Surplasse pilot bootstrap with crash-safe replay refusal."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import importlib.util
+import json
+import os
+import stat
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from typing import Any, Mapping
+
+EX_USAGE = 64
+EX_CONFIG = 78
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+APPLICATION_CONTROLLER_PATH = SCRIPT_DIRECTORY / "deploy-application"
+MANIFEST_HELPER_PATH = SCRIPT_DIRECTORY / "materialize-surplasse-pilot-manifest"
+MANIFEST_PATH = Path("/etc/vps/applications/surplasse-pilot-bootstrap.json")
+STATE_NAME = "surplasse-pilot-bootstrap.json"
+STATE_CONTRACT = "vps-infra.surplasse-pilot-bootstrap"
+EMPTY_CONFIRMATION_SECONDS = 15 * 60
+MAXIMUM_OUTPUT_BYTES = 64 * 1024
+PHASES = frozenset(
+    {
+        "empty-confirmed",
+        "applying",
+        "applied-unverified",
+        "verified",
+        "ambiguous-empty",
+    }
+)
+
+
+def load_application_controller() -> Any:
+    loader = SourceFileLoader("vps_application_pilot_runtime", str(APPLICATION_CONTROLLER_PATH))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the application controller")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+APP = load_application_controller()
+
+
+class PilotError(RuntimeError):
+    """The bounded pilot operation cannot proceed safely."""
+
+
+class UsageParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(EX_USAGE)
+
+
+def fail(message: str) -> None:
+    raise PilotError(message)
+
+
+def content_digest(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def canonical_json(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+    except (UnicodeEncodeError, ValueError, TypeError, RecursionError) as exc:
+        raise PilotError("pilot journal contains invalid JSON values") from exc
+
+
+def identity(active: Any, manifest_digest: str) -> dict[str, str]:
+    return {
+        "active_state_sha256": content_digest(APP.canonical_state(active)),
+        "backend_reference": active.component_references["backend"],
+        "manifest_sha256": manifest_digest,
+        "release_reference": active.release_reference,
+    }
+
+
+def state_value(
+    active: Any,
+    manifest_digest: str,
+    phase: str,
+    *,
+    confirmed_until: int | None,
+) -> dict[str, object]:
+    if phase not in PHASES:
+        fail("pilot journal phase is invalid")
+    return {
+        "confirmed_until": confirmed_until,
+        "contract": STATE_CONTRACT,
+        **identity(active, manifest_digest),
+        "phase": phase,
+        "schema": 1,
+    }
+
+
+def parse_state(raw: bytes, label: str = "pilot journal") -> dict[str, object]:
+    try:
+        value = json.loads(raw)
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise PilotError(f"{label} is not strict JSON") from exc
+    expected = {
+        "active_state_sha256",
+        "backend_reference",
+        "confirmed_until",
+        "contract",
+        "manifest_sha256",
+        "phase",
+        "release_reference",
+        "schema",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        fail(f"{label} shape is invalid")
+    if raw != canonical_json(value):
+        fail(f"{label} is not canonical JSON")
+    if (
+        value["contract"] != STATE_CONTRACT
+        or value["schema"] != 1
+        or isinstance(value["schema"], bool)
+        or not isinstance(value["phase"], str)
+        or value["phase"] not in PHASES
+    ):
+        fail(f"{label} policy is invalid")
+    for key in (
+        "active_state_sha256",
+        "backend_reference",
+        "manifest_sha256",
+        "release_reference",
+    ):
+        if not isinstance(value[key], str):
+            fail(f"{label} identity is invalid")
+    confirmed_until = value["confirmed_until"]
+    if confirmed_until is not None and (
+        not isinstance(confirmed_until, int) or isinstance(confirmed_until, bool)
+    ):
+        fail(f"{label} confirmation is invalid")
+    if value["phase"] == "empty-confirmed" and confirmed_until is None:
+        fail(f"{label} empty confirmation is missing")
+    if value["phase"] != "empty-confirmed" and confirmed_until is not None:
+        fail(f"{label} has an unexpected confirmation")
+    return value
+
+
+def read_pilot_state() -> dict[str, object] | None:
+    raw = APP.STATIC.read_protected_state_bytes(
+        APP.APPLICATION_STATE_ROOT,
+        STATE_NAME,
+        "pilot journal",
+        maximum_size=APP.MAX_STATE_BYTES,
+    )
+    return None if raw is None else parse_state(raw)
+
+
+def write_pilot_state(value: Mapping[str, object]) -> None:
+    raw = canonical_json(dict(value))
+    parse_state(raw)
+    APP.STATIC.write_protected_state_bytes(
+        APP.APPLICATION_STATE_ROOT,
+        STATE_NAME,
+        raw,
+        "pilot journal",
+        maximum_size=APP.MAX_STATE_BYTES,
+    )
+
+
+def run_silent(
+    command: list[str],
+    *,
+    environment: Mapping[str, str],
+    timeout: int,
+) -> int:
+    result = APP._run_bounded_status(
+        command,
+        environment=environment,
+        timeout=timeout,
+        maximum_stdout=MAXIMUM_OUTPUT_BYTES,
+    )
+    # Deliberately discard both streams. They are not part of the operator API
+    # and may never enter Ansible output, journald, or an exception.
+    return result.returncode
+
+
+def validate_helper() -> None:
+    APP.require_protected_file(
+        MANIFEST_HELPER_PATH,
+        "pilot manifest helper",
+        allowed_modes=frozenset({0o500}),
+        maximum_size=2 * 1024 * 1024,
+    )
+    code = run_silent(
+        [str(MANIFEST_HELPER_PATH), "--check"],
+        environment=APP.safe_environment(APP.RUNTIME_CONFIG_ROOT),
+        timeout=45,
+    )
+    if code != 0:
+        fail("protected pilot manifest validation failed")
+
+
+def read_manifest_digest() -> str:
+    metadata = APP.require_protected_file(
+        MANIFEST_PATH,
+        "pilot manifest",
+        allowed_modes=frozenset({0o440}),
+        maximum_size=16 * 1024,
+        expected_gid=10001,
+    )
+    try:
+        raw = MANIFEST_PATH.read_bytes()
+    except OSError as exc:
+        raise PilotError("cannot read the protected pilot manifest") from exc
+    if len(raw) != metadata.st_size:
+        fail("protected pilot manifest changed while being read")
+    return content_digest(raw)
+
+
+def active_release() -> tuple[Any, Any, Mapping[str, str], str]:
+    active = APP.read_state(
+        APP.ACTIVE_STATE_ROOT,
+        "surplasse.json",
+        "active Surplasse state",
+    )
+    if active is None or active.application != "surplasse":
+        fail("there is no admitted active Surplasse release")
+    if APP.read_transaction("surplasse") is not None:
+        fail("a Surplasse deployment transaction is in progress")
+    releases = APP.APPLICATION_ROOT / "surplasse" / "releases"
+    target = APP.current_target(APP.APPLICATION_ROOT / "surplasse" / "current", releases)
+    if target != APP.release_target(active):
+        fail("the active Surplasse state and release switch differ")
+    profile, _bundle, environment = APP.validate_materialized_runtime_policy(active)
+    if profile.application != "surplasse":
+        fail("the active application profile is not Surplasse")
+    return active, profile, environment, read_manifest_digest()
+
+
+def container_name(active: Any) -> str:
+    digest = APP.parse_digest_reference(
+        active.release_reference,
+        "ghcr.io/nclsppr/surplasse/application-release",
+        "active Surplasse release reference",
+    ).removeprefix("sha256:")
+    return f"vps-application-surplasse-pilot-bootstrap-{digest}"
+
+
+def container_id(active: Any) -> str | None:
+    name = container_name(active)
+    result = APP._run_bounded_status(
+        [
+            str(APP.DOCKER_PATH),
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            f"name=^/{name}$",
+        ],
+        environment=APP.safe_environment(APP.state_release(active)),
+        timeout=30,
+        maximum_stdout=256,
+    )
+    if result.returncode != 0 or result.stderr:
+        fail("cannot establish the dedicated pilot container set")
+    identifiers = result.stdout.splitlines()
+    if not identifiers:
+        return None
+    if len(identifiers) != 1 or APP.CONTAINER_ID_RE.fullmatch(identifiers[0]) is None:
+        fail("dedicated pilot container identity is ambiguous")
+    return identifiers[0]
+
+
+def validate_container(active: Any, identifier: str) -> bool:
+    if APP.CONTAINER_ID_RE.fullmatch(identifier) is None:
+        fail("dedicated pilot container identifier is invalid")
+    inspected = APP._run_bounded_status(
+        [
+            str(APP.DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            (
+                "{{.Name}}\t{{.Id}}\t{{.Config.Image}}\t"
+                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+                "{{index .Config.Labels \"com.docker.compose.service\"}}\t"
+                "{{index .Config.Labels \"com.docker.compose.oneoff\"}}\t"
+                "{{json .Config.Cmd}}"
+            ),
+            identifier,
+        ],
+        environment=APP.safe_environment(APP.state_release(active)),
+        timeout=30,
+        maximum_stdout=2048,
+    )
+    if inspected.returncode != 0:
+        if container_id(active) is None:
+            return False
+        fail("cannot inspect the dedicated pilot container exactly")
+    prefix = (
+        f"/{container_name(active)}\t{identifier}\t"
+        f"{active.component_references['backend']}\tsurplasse\t"
+        "pilot-bootstrap\tTrue\t"
+    )
+    if inspected.stderr or not inspected.stdout.startswith(prefix):
+        fail("dedicated pilot container identity differs from policy")
+    command = inspected.stdout.removeprefix(prefix)
+    if command not in {'["apply"]\n', '["status"]\n'}:
+        fail("dedicated pilot container command differs from policy")
+    return True
+
+
+def remove_residue(active: Any) -> None:
+    consecutive_absent = 0
+    for _attempt in range(8):
+        identifier = container_id(active)
+        if identifier is None:
+            consecutive_absent += 1
+            if consecutive_absent == 2:
+                return
+            time.sleep(0.2)
+            continue
+        consecutive_absent = 0
+        if not validate_container(active, identifier):
+            time.sleep(0.2)
+            continue
+        result = APP._run_bounded_status(
+            [str(APP.DOCKER_PATH), "container", "rm", "--force", "--volumes", identifier],
+            environment=APP.safe_environment(APP.state_release(active)),
+            timeout=60,
+            maximum_stdout=256,
+        )
+        if result.returncode != 0 or result.stderr or result.stdout != f"{identifier}\n":
+            fail("cannot remove the dedicated pilot container exactly")
+    fail("dedicated pilot container did not reach absence")
+
+
+def invoke(active: Any, profile: Any, environment: Mapping[str, str], operation: str) -> int:
+    return run_silent(
+        [
+            *APP.compose_prefix(APP.state_release(active), profile),
+            "run",
+            "--rm",
+            "--name",
+            container_name(active),
+            "--no-deps",
+            "--pull",
+            "never",
+            "pilot-bootstrap",
+            operation,
+        ],
+        environment=environment,
+        timeout=900,
+    )
+
+
+def status(active: Any, profile: Any, environment: Mapping[str, str], digest: str) -> int:
+    previous = read_pilot_state()
+    remove_residue(active)
+    code = invoke(active, profile, environment, "status")
+    remove_residue(active)
+    if code == 0:
+        write_pilot_state(state_value(active, digest, "verified", confirmed_until=None))
+        print("Surplasse pilot status: exact tester graph verified.")
+        return 0
+    if code == 3:
+        phase = (
+            "empty-confirmed"
+            if previous is None or previous.get("phase") == "empty-confirmed"
+            else "ambiguous-empty"
+        )
+        expiration = int(time.time()) + EMPTY_CONFIRMATION_SECONDS if phase == "empty-confirmed" else None
+        write_pilot_state(state_value(active, digest, phase, confirmed_until=expiration))
+        if phase == "ambiguous-empty":
+            fail("pilot apply outcome remains ambiguous; replay is refused")
+        print("Surplasse pilot status: exact Flyway V14 database is empty.")
+        return 3
+    fail("pilot status returned an unapproved result")
+
+
+def apply(active: Any, profile: Any, environment: Mapping[str, str], digest: str) -> int:
+    journal = read_pilot_state()
+    expected_identity = identity(active, digest)
+    if journal is None or any(journal.get(key) != value for key, value in expected_identity.items()):
+        fail("pilot apply lacks a status confirmation for the active release and manifest")
+    if journal.get("phase") != "empty-confirmed":
+        fail("pilot apply is not replayable; run status for recovery")
+    confirmed_until = journal.get("confirmed_until")
+    if not isinstance(confirmed_until, int) or int(time.time()) > confirmed_until:
+        fail("pilot empty status confirmation expired")
+    if container_id(active) is not None:
+        fail("dedicated pilot container residue requires status recovery")
+    write_pilot_state(state_value(active, digest, "applying", confirmed_until=None))
+    code = invoke(active, profile, environment, "apply")
+    if code != 0:
+        fail("pilot apply returned an unapproved result; run status for recovery")
+    remove_residue(active)
+    write_pilot_state(
+        state_value(active, digest, "applied-unverified", confirmed_until=None)
+    )
+    print("Surplasse pilot apply completed; separate status verification is required.")
+    return 0
+
+
+def build_parser() -> UsageParser:
+    parser = UsageParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("operation", choices=("status", "apply"))
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        arguments = build_parser().parse_args(argv)
+        if os.geteuid() != 0 or os.getegid() != 0:
+            fail("pilot controller requires root")
+        APP.require_protected_file(
+            Path(__file__).resolve(),
+            "pilot controller",
+            allowed_modes=frozenset({0o500}),
+            maximum_size=2 * 1024 * 1024,
+        )
+        validate_helper()
+        with APP.deployment_lock():
+            APP.validate_runtime()
+            active, profile, environment, digest = active_release()
+            if arguments.operation == "status":
+                return status(active, profile, environment, digest)
+            return apply(active, profile, environment, digest)
+    except PilotError as exc:
+        print(f"Surplasse pilot operation refused: {exc}", file=sys.stderr)
+        return EX_CONFIG
+    except Exception:
+        print(
+            "Surplasse pilot operation refused: protected dependency failed",
+            file=sys.stderr,
+        )
+        return EX_CONFIG
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

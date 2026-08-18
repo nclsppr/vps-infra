@@ -1,0 +1,196 @@
+#!/usr/bin/python3 -I
+"""Copy one private pilot manifest into the isolated convergence home."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+EX_USAGE = 64
+EX_CONFIG = 78
+MAXIMUM_BYTES = 16 * 1024
+DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | os.O_DIRECTORY
+    | os.O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+)
+SOURCE_FLAGS = (
+    os.O_RDONLY
+    | os.O_NOFOLLOW
+    | os.O_NONBLOCK
+    | getattr(os, "O_CLOEXEC", 0)
+)
+DESTINATION_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | os.O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+class StagingError(RuntimeError):
+    """The local private-file staging boundary differs from policy."""
+
+
+def identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def open_directory(path: Path, *, protected: bool) -> int:
+    descriptor = os.open(path, DIRECTORY_FLAGS)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(descriptor)
+        raise StagingError("local staging directory is invalid")
+    if protected and (
+        metadata.st_uid != os.geteuid()
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise StagingError("isolated staging directory is not protected")
+    return descriptor
+
+
+def copy_exact(source: int, destination: int, size: int) -> None:
+    remaining = size
+    while remaining:
+        chunk = os.read(source, min(remaining, 64 * 1024))
+        if not chunk:
+            raise StagingError("local manifest changed during staging")
+        remaining -= len(chunk)
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination, view)
+            if written <= 0:
+                raise StagingError("local manifest staging write failed")
+            view = view[written:]
+    if os.read(source, 1):
+        raise StagingError("local manifest changed during staging")
+
+
+def stage(source: Path, destination: Path) -> None:
+    if (
+        not source.is_absolute()
+        or not destination.is_absolute()
+        or source.name in {"", ".", ".."}
+        or destination.name in {"", ".", ".."}
+    ):
+        raise StagingError("local manifest paths are invalid")
+
+    source_directory = open_directory(source.parent, protected=False)
+    try:
+        destination_directory = open_directory(destination.parent, protected=True)
+    except (OSError, StagingError):
+        os.close(source_directory)
+        raise
+    source_descriptor: int | None = None
+    destination_descriptor: int | None = None
+    created_identity: tuple[int, int] | None = None
+    completed = False
+    try:
+        source_descriptor = os.open(
+            source.name,
+            SOURCE_FLAGS,
+            dir_fd=source_directory,
+        )
+        before = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) not in {0o400, 0o600}
+            or not 1 <= before.st_size <= MAXIMUM_BYTES
+        ):
+            raise StagingError("local manifest metadata is invalid")
+
+        destination_descriptor = os.open(
+            destination.name,
+            DESTINATION_FLAGS,
+            0o600,
+            dir_fd=destination_directory,
+        )
+        created = os.fstat(destination_descriptor)
+        created_identity = (created.st_dev, created.st_ino)
+        copy_exact(source_descriptor, destination_descriptor, before.st_size)
+
+        after = os.fstat(source_descriptor)
+        visible_source = os.stat(
+            source.name,
+            dir_fd=source_directory,
+            follow_symlinks=False,
+        )
+        if identity(before) != identity(after) or identity(after) != identity(
+            visible_source
+        ):
+            raise StagingError("local manifest changed during staging")
+
+        os.fchmod(destination_descriptor, 0o600)
+        os.fsync(destination_descriptor)
+        installed = os.fstat(destination_descriptor)
+        visible_destination = os.stat(
+            destination.name,
+            dir_fd=destination_directory,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(installed.st_mode)
+            or installed.st_uid != os.geteuid()
+            or installed.st_gid != os.getegid()
+            or installed.st_nlink != 1
+            or stat.S_IMODE(installed.st_mode) != 0o600
+            or installed.st_size != before.st_size
+            or identity(installed) != identity(visible_destination)
+        ):
+            raise StagingError("isolated manifest staging metadata is invalid")
+        os.fsync(destination_directory)
+        completed = True
+    finally:
+        if source_descriptor is not None:
+            os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        if not completed and created_identity is not None:
+            with contextlib.suppress(OSError):
+                visible = os.stat(
+                    destination.name,
+                    dir_fd=destination_directory,
+                    follow_symlinks=False,
+                )
+                if (visible.st_dev, visible.st_ino) == created_identity:
+                    os.unlink(destination.name, dir_fd=destination_directory)
+                    os.fsync(destination_directory)
+        os.close(source_directory)
+        os.close(destination_directory)
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if len(arguments) != 2:
+        print("pilot manifest local staging refused: expected source and destination", file=sys.stderr)
+        return EX_USAGE
+    try:
+        stage(Path(arguments[0]), Path(arguments[1]))
+    except (OSError, StagingError):
+        print("pilot manifest local staging refused: protected copy failed", file=sys.stderr)
+        return EX_CONFIG
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -919,6 +919,8 @@ def fetch_and_validate_candidate(
 def expected_service_images(state: ApplicationState) -> dict[str, str]:
     result = dict(state.component_references)
     result["migrator"] = result["backend"]
+    if state.application == "surplasse":
+        result["pilot-bootstrap"] = result["backend"]
     return result
 
 
@@ -1019,6 +1021,8 @@ def compose_prefix(
     if precommit:
         command.extend(("--file", str(release / "precommit-compose.json")))
     command.extend(("--profile", "migration"))
+    if profile.application == "surplasse":
+        command.extend(("--profile", "pilot-bootstrap"))
     return command
 
 
@@ -1324,10 +1328,10 @@ def validate_application_compose_semantics(
         "PARKVENTORY_MIGRATION_ONLY"
     ) != "false":
         fail("rendered Parkventory backend can enter migration-only mode")
-    if set(profile.service_credentials) != {
-        *profile.component_repositories,
-        "migrator",
-    }:
+    expected_services = {*profile.component_repositories, "migrator"}
+    if profile.application == "surplasse":
+        expected_services.add("pilot-bootstrap")
+    if set(profile.service_credentials) != expected_services:
         fail("application service credential profile is incomplete")
     for service_name, expected_sources in profile.service_credentials.items():
         service = services.get(service_name)
@@ -1355,6 +1359,67 @@ def validate_application_compose_semantics(
                 f"rendered Compose service {service_name} user cannot read its "
                 "file-backed secrets"
             )
+    if profile.application == "surplasse":
+        validate_surplasse_pilot_compose(rendered)
+
+
+def validate_surplasse_pilot_compose(rendered: Mapping[str, object]) -> None:
+    services = rendered.get("services")
+    pilot = services.get("pilot-bootstrap") if isinstance(services, dict) else None
+    if not isinstance(pilot, dict):
+        fail("rendered Surplasse pilot bootstrap service is invalid")
+    if pilot.get("profiles") != ["pilot-bootstrap"]:
+        fail("rendered Surplasse pilot bootstrap profile is invalid")
+    if pilot.get("entrypoint") != [
+        "/opt/surplasse/scripts/backend-pilot-bootstrap.sh"
+    ]:
+        fail("rendered Surplasse pilot bootstrap entrypoint is invalid")
+    if pilot.get("restart") != "no" or pilot.get("user") != "10001:10001":
+        fail("rendered Surplasse pilot bootstrap execution identity is invalid")
+    expected_environment = {
+        "DEPLOYMENT_PROFILE": "production",
+        "JAVA_TOOL_OPTIONS": (
+            "-XX:MaxRAMPercentage=75.0 "
+            "-Djava.util.logging.manager=org.jboss.logmanager.LogManager"
+        ),
+        "PILOT_BOOTSTRAP_MANIFEST_FILE": "/run/surplasse/pilot-bootstrap.json",
+        "QUARKUS_DATASOURCE_JDBC_URL": (
+            "jdbc:postgresql://postgresql:5432/surplasse"
+        ),
+        "QUARKUS_DATASOURCE_PASSWORD_FILE": (
+            "/run/secrets/surplasse_postgres_runtime_password"
+        ),
+        "QUARKUS_DATASOURCE_USERNAME": "surplasse_runtime",
+        "STRIPE_LIVE_MODE": "false",
+        "STRIPE_SECRET_KEY_FILE": "/run/secrets/surplasse_stripe_secret_key",
+        "SURPLASSE_PRODUCTION_RELEASE_MODE": "testers",
+    }
+    if pilot.get("environment") != expected_environment:
+        fail("rendered Surplasse pilot bootstrap environment is invalid")
+    expected_networks = {
+        "app_surplasse": {"gw_priority": 1},
+        "db_surplasse": {},
+    }
+    if pilot.get("networks") != expected_networks:
+        fail("rendered Surplasse pilot bootstrap networks are invalid")
+    volumes = pilot.get("volumes")
+    if not isinstance(volumes, list) or len(volumes) != 1:
+        fail("rendered Surplasse pilot bootstrap manifest bind is invalid")
+    volume = volumes[0]
+    if not isinstance(volume, dict):
+        fail("rendered Surplasse pilot bootstrap manifest bind is invalid")
+    portable_volume = {
+        "type": "bind",
+        "source": "/etc/vps/applications/surplasse-pilot-bootstrap.json",
+        "target": "/run/surplasse/pilot-bootstrap.json",
+        "read_only": True,
+    }
+    if any(volume.get(key) != value for key, value in portable_volume.items()):
+        fail("rendered Surplasse pilot bootstrap manifest bind is invalid")
+    if set(volume) - {*portable_volume, "bind"}:
+        fail("rendered Surplasse pilot bootstrap manifest bind is invalid")
+    if volume.get("bind", {}) not in ({}, {"create_host_path": False}):
+        fail("rendered Surplasse pilot bootstrap manifest bind is invalid")
 
 
 def candidate_restart_override(profile: BundleProfile) -> dict[str, object]:

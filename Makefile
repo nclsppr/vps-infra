@@ -6,6 +6,7 @@ ANSIBLE_EXTRA_VARS ?=
 PLATFORM_ENV ?= platform/.env.example
 CADDY_BUILD_ENV ?= platform/caddy/build.env
 POSTGRES_BUILD_ENV ?= platform/postgres/build.env
+SURPLASSE_PILOT_MANIFEST ?=
 MISE_EXEC := mise exec --
 COMPOSE := $(MISE_EXEC) docker-compose
 
@@ -13,6 +14,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	check-controller check-public-safe check-platform check-platform-config \
 	check-public-static-edge check-surplasse-public-edge-candidate \
 	check-surplasse-public-edge-controller check-surplasse-dns-cutover-controller \
+	check-surplasse-pilot-controller \
 	check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
@@ -22,6 +24,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	install-postgres-backup stop-postgres-backup-schedule \
 	backup-postgres-now rehearse-postgres-restore \
 	prepare-surplasse activate-surplasse stop-surplasse \
+	materialize-surplasse-pilot status-surplasse-pilot apply-surplasse-pilot \
 	doctor-local
 
 help: ## Show the available commands.
@@ -64,6 +67,9 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/surplasse.yml
+	cd ansible && ../.venv/bin/ansible-playbook \
+		--inventory inventories/production/hosts.example.yml \
+		--syntax-check playbooks/surplasse-pilot.yml
 
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
@@ -148,6 +154,14 @@ check-surplasse-public-edge-controller: ## Test the crash-safe Surplasse edge tr
 check-surplasse-dns-cutover-controller: ## Test the inactive Surplasse DNS cutover controller.
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		tests/test_surplasse_dns_cutover.py
+
+check-surplasse-pilot-controller: ## Test the private one-shot Surplasse pilot boundary.
+	PYTHONDONTWRITEBYTECODE=1 $(MISE_EXEC) python \
+		tests/test_surplasse_pilot_local_staging.py
+	PYTHONDONTWRITEBYTECODE=1 $(MISE_EXEC) python \
+		tests/test_surplasse_pilot_manifest.py
+	PYTHONDONTWRITEBYTECODE=1 $(MISE_EXEC) python \
+		tests/test_surplasse_pilot_controller.py
 
 check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 	@set -Eeuo pipefail; \
@@ -312,6 +326,22 @@ stop-surplasse: ## Stop only Surplasse application containers and preserve state
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --stop-surplasse
+
+materialize-surplasse-pilot: ## Validate and atomically install the private pilot manifest.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+	SURPLASSE_PILOT_MANIFEST="$(SURPLASSE_PILOT_MANIFEST)" \
+		./scripts/converge --materialize-surplasse-pilot
+
+status-surplasse-pilot: ## Read the admitted pilot graph without mutation.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --status-surplasse-pilot
+
+apply-surplasse-pilot: ## Apply once after a fresh empty status confirmation.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --apply-surplasse-pilot
 
 doctor-local: ## Audit the local checkout without contact with the VPS.
 	./scripts/doctor --local

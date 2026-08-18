@@ -1,0 +1,122 @@
+---
+- name: Validate the bounded Surplasse pilot operator contract
+  ansible.builtin.assert:
+    that:
+      - vps_surplasse_pilot_state in ['materialize', 'status', 'apply']
+      - >-
+        vps_surplasse_pilot_materializer ==
+        '/usr/local/libexec/vps/materialize-surplasse-pilot-manifest'
+      - >-
+        vps_surplasse_pilot_controller ==
+        '/usr/local/libexec/vps/surplasse-pilot-bootstrap'
+      - >-
+        vps_surplasse_pilot_manifest ==
+        '/etc/vps/applications/surplasse-pilot-bootstrap.json'
+    fail_msg: The Surplasse pilot operator paths differ from policy.
+
+- name: Materialize the private Surplasse pilot manifest
+  when:
+    - vps_surplasse_pilot_state == 'materialize'
+    - not ansible_check_mode
+  no_log: true
+  block:
+    - name: Resolve the isolated local pilot manifest input
+      ansible.builtin.set_fact:
+        vps_surplasse_pilot_local_manifest: >-
+          {{ lookup('ansible.builtin.env',
+                    'VPS_SURPLASSE_PILOT_MANIFEST_FILE') }}
+
+    - name: Inspect the isolated local pilot manifest input
+      ansible.builtin.stat:
+        path: "{{ vps_surplasse_pilot_local_manifest }}"
+        follow: false
+      delegate_to: localhost
+      become: false
+      register: vps_surplasse_pilot_local_manifest_stat
+
+    - name: Prove the isolated local pilot manifest input
+      ansible.builtin.assert:
+        that:
+          - vps_surplasse_pilot_local_manifest is match('^/')
+          - vps_surplasse_pilot_local_manifest_stat.stat.exists
+          - vps_surplasse_pilot_local_manifest_stat.stat.isreg
+          - not vps_surplasse_pilot_local_manifest_stat.stat.islnk
+          - vps_surplasse_pilot_local_manifest_stat.stat.nlink == 1
+          - >-
+            vps_surplasse_pilot_local_manifest_stat.stat.mode in ['0400', '0600']
+          - vps_surplasse_pilot_local_manifest_stat.stat.size | int > 0
+          - vps_surplasse_pilot_local_manifest_stat.stat.size | int <= 16384
+
+    - name: Create a protected remote pilot staging directory
+      ansible.builtin.tempfile:
+        state: directory
+        path: /run
+        prefix: vps-surplasse-pilot.
+      register: vps_surplasse_pilot_remote_staging
+
+    - name: Protect the remote pilot staging directory
+      ansible.builtin.file:
+        path: "{{ vps_surplasse_pilot_remote_staging.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Copy the pilot manifest through the protected staging path
+      ansible.builtin.copy:
+        src: "{{ vps_surplasse_pilot_local_manifest }}"
+        dest: "{{ vps_surplasse_pilot_remote_staging.path }}/manifest.json"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Atomically materialize the validated pilot manifest
+      ansible.builtin.command:
+        argv:
+          - "{{ vps_surplasse_pilot_materializer }}"
+          - --install-from
+          - "{{ vps_surplasse_pilot_remote_staging.path }}/manifest.json"
+      changed_when: true
+  always:
+    - name: Remove the protected remote pilot staging directory
+      ansible.builtin.file:
+        path: >-
+          {{ vps_surplasse_pilot_remote_staging.path |
+             default('/run/vps-surplasse-pilot.absent') }}
+        state: absent
+      when: not ansible_check_mode
+      no_log: true
+
+- name: Read the admitted Surplasse pilot status
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_surplasse_pilot_controller }}"
+      - status
+  register: vps_surplasse_pilot_status
+  changed_when: false
+  failed_when: vps_surplasse_pilot_status.rc not in [0, 3]
+  no_log: true
+  when:
+    - vps_surplasse_pilot_state == 'status'
+    - not ansible_check_mode
+
+- name: Derive the safe Surplasse pilot status result
+  ansible.builtin.set_fact:
+    vps_surplasse_pilot_safe_status: >-
+      {{ 'verified'
+         if vps_surplasse_pilot_status.rc == 0
+         else 'empty-confirmed' }}
+  when:
+    - vps_surplasse_pilot_state == 'status'
+    - not ansible_check_mode
+
+- name: Apply the status-confirmed Surplasse pilot once
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_surplasse_pilot_controller }}"
+      - apply
+  changed_when: true
+  no_log: true
+  when:
+    - vps_surplasse_pilot_state == 'apply'
+    - not ansible_check_mode
