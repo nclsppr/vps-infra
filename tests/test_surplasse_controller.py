@@ -60,6 +60,16 @@ MATERIALIZER = load_script(
 )
 
 
+def stripe_restricted_test_key(label: str) -> bytes:
+    payload = hashlib.sha256(label.encode("ascii")).hexdigest().encode("ascii")
+    return b"rk_test_" + payload + b"\n"
+
+
+def stripe_webhook_secret(label: str) -> bytes:
+    payload = hashlib.sha256(label.encode("ascii")).hexdigest().encode("ascii")
+    return b"whsec_" + payload + b"\n"
+
+
 class SurplasseControllerTests(unittest.TestCase):
     def write_operator_bundle(self, root: Path) -> dict[str, bytes]:
         root.mkdir(mode=0o700)
@@ -120,9 +130,15 @@ class SurplasseControllerTests(unittest.TestCase):
             "surplasse-smtp-host": b"smtp.example.invalid\n",
             "surplasse-smtp-password": b"smtp-password-for-test-only\n",
             "surplasse-smtp-username": b"surplasse-test\n",
-            "surplasse-stripe-account-webhook-secret": b"whsec_" + b"A" * 32 + b"\n",
-            "surplasse-stripe-payment-webhook-secret": b"whsec_" + b"B" * 32 + b"\n",
-            "surplasse-stripe-secret-key": b"rk_" + b"live_" + b"C" * 32 + b"\n",
+            "surplasse-stripe-account-webhook-secret": stripe_webhook_secret(
+                "account-webhook"
+            ),
+            "surplasse-stripe-payment-webhook-secret": stripe_webhook_secret(
+                "payment-webhook"
+            ),
+            "surplasse-stripe-secret-key": stripe_restricted_test_key(
+                "default-operator-bundle"
+            ),
         }
         for name, value in values.items():
             path = root / name
@@ -290,7 +306,8 @@ class SurplasseControllerTests(unittest.TestCase):
             manifest_path = protected_root / OPERATOR_MANIFEST
             manifest = json.loads(manifest_path.read_text(encoding="ascii"))
             self.assertEqual(manifest["contract"], "surplasse-operator-bundle")
-            self.assertEqual(manifest["version"], 2)
+            self.assertEqual(manifest["payment_mode"], "test")
+            self.assertEqual(manifest["version"], 3)
             self.assertEqual(
                 manifest["sha256"],
                 {
@@ -365,9 +382,11 @@ class SurplasseControllerTests(unittest.TestCase):
             }
             environment = os.environ.copy()
             environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
-            for invalid_value in (
-                b"rk_test_" + b"X" * 32 + b"\n",
-                b"sk_live_" + b"Y" * 32 + b"\n",
+            for invalid_value, expected_message in (
+                (b"rk_live_" + b"X7" * 16 + b"\n", "stripe-secret-key format"),
+                (b"sk_test_" + b"Y8" * 16 + b"\n", "stripe-secret-key format"),
+                (b"rk_test_replace_me_with_real_key\n", "placeholder-like"),
+                (b"rk_test_" + b"Z" * 32 + b"\n", "placeholder-like"),
             ):
                 with self.subTest(prefix=invalid_value[:8]):
                     invalid.write_bytes(invalid_value)
@@ -386,7 +405,7 @@ class SurplasseControllerTests(unittest.TestCase):
                         env=environment,
                     )
                     self.assertEqual(result.returncode, 78)
-                    self.assertIn("stripe-secret-key format", result.stderr)
+                    self.assertIn(expected_message, result.stderr)
                     self.assertEqual(
                         before,
                         {
@@ -444,6 +463,38 @@ class SurplasseControllerTests(unittest.TestCase):
             )
             for name, value in legacy.items():
                 self.assertEqual((protected_root / name).read_bytes(), value)
+
+    def test_operator_bundle_rejects_equal_or_placeholder_webhook_secrets(
+        self,
+    ) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        cases = (
+            ("equal", stripe_webhook_secret("payment-webhook"), "must be distinct"),
+            ("placeholder", b"whsec_" + b"A" * 32 + b"\n", "placeholder-like"),
+            ("documented-marker", b"whsec_replace_with_real_secret\n", "placeholder-like"),
+        )
+        for label, invalid_value, expected_message in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                protected_root = root / "target"
+                protected_root.mkdir(mode=0o700)
+                source = root / "source"
+                self.write_operator_bundle(source)
+                webhook = source / "surplasse-stripe-account-webhook-secret"
+                webhook.write_bytes(invalid_value)
+                webhook.chmod(0o600)
+
+                result = self.run_secret_helper(
+                    protected_root, "--install-operator-from", str(source)
+                )
+
+                self.assertEqual(result.returncode, 78)
+                self.assertIn(expected_message, result.stderr)
+                self.assertEqual(
+                    {path.name for path in protected_root.iterdir()},
+                    {OPERATOR_LOCK},
+                )
 
     def test_uppercase_smtp_host_is_rejected_before_runtime_publication(self) -> None:
         if os.geteuid() == 0:
@@ -542,7 +593,9 @@ class SurplasseControllerTests(unittest.TestCase):
             values_b = self.write_operator_bundle(source_b)
             changes = {
                 "surplasse-smtp-password": b"rotated-smtp-password\n",
-                "surplasse-stripe-secret-key": b"rk_live_" + b"G" * 32 + b"\n",
+                "surplasse-stripe-secret-key": stripe_restricted_test_key(
+                    "rotated-operator-bundle"
+                ),
                 "surplasse-smtp-host": b"relay.example.invalid\n",
             }
             values_b.update(changes)
@@ -582,7 +635,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 protected_root
                 / ".surplasse-stripe-secret-key.ffffffffffffffffffffffff.pending"
             )
-            orphan.write_bytes(b"rk_live_" + b"Z" * 32 + b"\n")
+            orphan.write_bytes(stripe_restricted_test_key("orphaned-copy"))
             orphan.chmod(0o440)
             runtime_orphan = (
                 root
@@ -877,10 +930,12 @@ class SurplasseControllerTests(unittest.TestCase):
             values_b = self.write_operator_bundle(source_b)
             changes = {
                 "surplasse-smtp-password": b"concurrent-smtp-password\n",
-                "surplasse-stripe-account-webhook-secret": b"whsec_"
-                + b"J" * 32
-                + b"\n",
-                "surplasse-stripe-secret-key": b"rk_live_" + b"K" * 32 + b"\n",
+                "surplasse-stripe-account-webhook-secret": stripe_webhook_secret(
+                    "concurrent-account-webhook"
+                ),
+                "surplasse-stripe-secret-key": stripe_restricted_test_key(
+                    "concurrent-operator-bundle"
+                ),
                 "surplasse-smtp-host": b"smtp-b.example.invalid\n",
             }
             values_b.update(changes)

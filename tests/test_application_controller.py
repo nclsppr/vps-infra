@@ -73,6 +73,29 @@ def state(
     return value
 
 
+def surplasse_operator_manifest(
+    *,
+    payment_mode: str = "test",
+    version: int = 3,
+    digests: dict[str, str] | None = None,
+) -> dict[str, object]:
+    return {
+        "contract": "surplasse-operator-bundle",
+        "payment_mode": payment_mode,
+        "sha256": (
+            {
+                name: f"{index + 1:064x}"
+                for index, name in enumerate(
+                    sorted(CONTROLLER.SURPLASSE_OPERATOR_INPUT_NAMES)
+                )
+            }
+            if digests is None
+            else digests
+        ),
+        "version": version,
+    }
+
+
 class ApplicationControllerTests(unittest.TestCase):
     def test_state_and_transaction_journals_are_strict_and_canonical(self):
         candidate = state()
@@ -1318,8 +1341,13 @@ class ApplicationControllerTests(unittest.TestCase):
                 "_run_bounded",
                 return_value=completed,
             ) as bounded,
+            mock.patch.object(
+                CONTROLLER,
+                "_protected_json",
+                return_value=surplasse_operator_manifest(),
+            ) as protected_json,
         ):
-            CONTROLLER.validate_surplasse_input_commit()
+            self.assertEqual(CONTROLLER.validate_surplasse_input_commit(), "test")
         self.assertEqual(
             protected.call_args.args[:2],
             (
@@ -1335,6 +1363,275 @@ class ApplicationControllerTests(unittest.TestCase):
                 "--operator-only",
             ],
         )
+        protected_json.assert_called_once_with(
+            CONTROLLER.SURPLASSE_OPERATOR_MANIFEST_PATH,
+            "Surplasse operator bundle manifest",
+            allowed_modes=frozenset({0o400}),
+            maximum_size=64 * 1024,
+        )
+
+    def test_surplasse_input_commit_rejects_manifest_policy_and_digest_drift(self):
+        invalid_manifests = {
+            "live": surplasse_operator_manifest(payment_mode="live"),
+            "old-version": surplasse_operator_manifest(version=2),
+            "missing-field": {
+                key: value
+                for key, value in surplasse_operator_manifest().items()
+                if key != "payment_mode"
+            },
+            "missing-digest": surplasse_operator_manifest(
+                digests={
+                    name: "a" * 64
+                    for name in sorted(CONTROLLER.SURPLASSE_OPERATOR_INPUT_NAMES)[1:]
+                }
+            ),
+            "malformed-digest": surplasse_operator_manifest(
+                digests={
+                    name: ("not-a-digest" if index == 0 else "a" * 64)
+                    for index, name in enumerate(
+                        sorted(CONTROLLER.SURPLASSE_OPERATOR_INPUT_NAMES)
+                    )
+                }
+            ),
+        }
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        for label, manifest in invalid_manifests.items():
+            with (
+                self.subTest(divergence=label),
+                mock.patch.object(CONTROLLER, "require_protected_file"),
+                mock.patch.object(
+                    CONTROLLER,
+                    "_run_bounded",
+                    return_value=completed,
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "_protected_json",
+                    return_value=manifest,
+                ),
+                self.assertRaises(CONTROLLER.ApplicationDeploymentError),
+            ):
+                CONTROLLER.validate_surplasse_input_commit()
+
+    def test_surplasse_payment_divergence_refuses_activation_before_mutation(self):
+        profile = CONTROLLER.PROFILES["surplasse"]
+        candidate = state()
+        tester_payment = dict(CONTROLLER.SURPLASSE_PAYMENT_PROFILE)
+        live_payment = {**tester_payment, "mode": "live"}
+        cases = {
+            "adapter-live": {
+                "adapter": live_payment,
+                "bundle": tester_payment,
+                "compose": "false",
+                "manifest": surplasse_operator_manifest(),
+                "error": "adapter payment profile",
+            },
+            "bundle-live": {
+                "adapter": tester_payment,
+                "bundle": live_payment,
+                "compose": "false",
+                "manifest": surplasse_operator_manifest(),
+                "error": "bundle payment profile",
+            },
+            "compose-live": {
+                "adapter": tester_payment,
+                "bundle": tester_payment,
+                "compose": "true",
+                "manifest": surplasse_operator_manifest(),
+                "error": "Stripe mode",
+            },
+            "compose-missing": {
+                "adapter": tester_payment,
+                "bundle": tester_payment,
+                "compose": None,
+                "manifest": surplasse_operator_manifest(),
+                "error": "Stripe mode",
+            },
+            "manifest-live": {
+                "adapter": tester_payment,
+                "bundle": tester_payment,
+                "compose": "false",
+                "manifest": surplasse_operator_manifest(payment_mode="live"),
+                "error": "manifest policy",
+            },
+            "manifest-v2": {
+                "adapter": tester_payment,
+                "bundle": tester_payment,
+                "compose": "false",
+                "manifest": surplasse_operator_manifest(version=2),
+                "error": "manifest policy",
+            },
+        }
+
+        def rendered_document(stripe_live_mode):
+            services: dict[str, object] = {}
+            for service, sources in profile.service_credentials.items():
+                value: dict[str, object] = {
+                    "secrets": [
+                        {
+                            "source": source,
+                            "target": f"/run/secrets/{source}",
+                        }
+                        for source in sources
+                    ]
+                }
+                if sources:
+                    value["user"] = f"{profile.credential_gid}:{profile.credential_gid}"
+                services[service] = value
+            backend = services["backend"]
+            self.assertIsInstance(backend, dict)
+            backend_environment = {
+                "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+            }
+            if stripe_live_mode is not None:
+                backend_environment["STRIPE_LIVE_MODE"] = stripe_live_mode
+            backend["environment"] = backend_environment
+            migrator = services["migrator"]
+            self.assertIsInstance(migrator, dict)
+            migrator["entrypoint"] = [profile.migration_runner]
+            return {"name": "surplasse", "services": services}
+
+        mutation_names = (
+            "prepare_transaction",
+            "write_transaction",
+            "pull_and_verify_images",
+            "validate_public_edge_cutover",
+            "run_migration",
+            "start_runtime",
+            "commit_probed_candidate",
+        )
+        for label, divergence in cases.items():
+            with self.subTest(divergence=label), tempfile.TemporaryDirectory() as root:
+                temporary = Path(root)
+                adapter_path = temporary / "adapter.json"
+                adapter_path.write_bytes(
+                    CONTROLLER.canonical_json({"payment": divergence["adapter"]})
+                )
+                adapter_path.chmod(0o644)
+                manifest_path = temporary / "operator-manifest.json"
+                manifest_path.write_bytes(
+                    CONTROLLER.canonical_json(divergence["manifest"])
+                )
+                manifest_path.chmod(0o400)
+                rendered = rendered_document(divergence["compose"])
+                bundle = types.SimpleNamespace(
+                    contract={"payment": divergence["bundle"]}
+                )
+
+                def bounded(command, **_kwargs):
+                    if command[0] == str(CONTROLLER.DOCKER_PATH):
+                        return subprocess.CompletedProcess(
+                            command,
+                            0,
+                            CONTROLLER.canonical_json(rendered).decode("utf-8"),
+                            "",
+                        )
+                    if command[0] in {
+                        str(CONTROLLER.VALIDATE_COMPOSE_PATH),
+                        str(CONTROLLER.SURPLASSE_INPUT_VALIDATOR_PATH),
+                    }:
+                        return subprocess.CompletedProcess(command, 0, "", "")
+                    self.fail(f"unexpected command: {command}")
+
+                def materialized_file(path, _label, **_kwargs):
+                    if path.name == "compose.json":
+                        return CONTROLLER.canonical_json(rendered)
+                    if path.name == "expected-images.json":
+                        return CONTROLLER.canonical_json(
+                            CONTROLLER.expected_service_images(candidate)
+                        )
+                    self.fail(f"unexpected materialized policy file: {path}")
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "SURPLASSE_ADAPTER_PATH",
+                            adapter_path,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "SURPLASSE_OPERATOR_MANIFEST_PATH",
+                            manifest_path,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "require_protected_file",
+                            side_effect=lambda path, *_args, **_kwargs: path.stat(),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "state_release",
+                            return_value=Path("/release"),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "validate_materialized_release",
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "bundle_from_release",
+                            return_value=bundle,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "materialized_runtime_configuration",
+                            return_value={
+                                "SURPLASSE_AUTH_JWT_KEY_ID": "atlas-2026-08",
+                                "SURPLASSE_SMTP_HOST": "smtp.example.invalid",
+                            },
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "validate_runtime_configuration_snapshot",
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "compose_environment",
+                            return_value={"PATH": "/usr/bin"},
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "_run_bounded",
+                            side_effect=bounded,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            CONTROLLER,
+                            "_read_materialized_policy_file",
+                            side_effect=materialized_file,
+                        )
+                    )
+                    mutations = {
+                        name: stack.enter_context(mock.patch.object(CONTROLLER, name))
+                        for name in mutation_names
+                    }
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        divergence["error"],
+                    ):
+                        CONTROLLER.activate_candidate(candidate, Path("/work"))
+                for mutation in mutations.values():
+                    mutation.assert_not_called()
 
     def test_migration_has_one_deterministic_container_identity(self):
         candidate = state("parkventory")

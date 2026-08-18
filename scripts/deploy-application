@@ -40,6 +40,7 @@ from application_bundle import (  # noqa: E402
     MAX_INVENTORY_BYTES,
     MAX_MANIFEST_BYTES,
     PROFILES,
+    SURPLASSE_PAYMENT_PROFILE,
     ApplicationBundle,
     ApplicationBundleError,
     BundleProfile,
@@ -111,6 +112,27 @@ RUNTIME_DIRECTORY_ENV = "VPS_APPLICATION_RUNTIME_DIRECTORY"
 VALIDATE_COMPOSE_PATH = SCRIPT_DIRECTORY / "validate-compose"
 SURPLASSE_INPUT_VALIDATOR_PATH = (
     SCRIPT_DIRECTORY / "materialize-surplasse-secrets"
+)
+SURPLASSE_ADAPTER_PATH = Path(
+    "/srv/vps/repository/applications/surplasse/adapter.json"
+)
+SURPLASSE_OPERATOR_MANIFEST_PATH = (
+    CREDENTIAL_ROOT
+    / "surplasse"
+    / "surplasse-operator-bundle-manifest.json"
+)
+SURPLASSE_OPERATOR_INPUT_NAMES = frozenset(
+    {
+        "surplasse-jwt-jwks",
+        "surplasse-jwt-private-key",
+        "surplasse-jwt-key-id",
+        "surplasse-smtp-host",
+        "surplasse-smtp-password",
+        "surplasse-smtp-username",
+        "surplasse-stripe-account-webhook-secret",
+        "surplasse-stripe-payment-webhook-secret",
+        "surplasse-stripe-secret-key",
+    }
 )
 DOCKER_PATH = Path("/usr/bin/docker")
 GIT_PATH = Path("/usr/bin/git")
@@ -1103,7 +1125,47 @@ def _run_bounded(
     return result
 
 
-def validate_surplasse_input_commit() -> None:
+def _protected_json(
+    path: Path,
+    label: str,
+    *,
+    allowed_modes: frozenset[int],
+    maximum_size: int,
+) -> object:
+    metadata = require_protected_file(
+        path,
+        label,
+        allowed_modes=allowed_modes,
+        maximum_size=maximum_size,
+    )
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read {label}: {exc}")
+    if len(raw) != metadata.st_size:
+        fail(f"{label} changed while it was read")
+    return strict_json(raw, label, maximum=maximum_size)
+
+
+def surplasse_adapter_payment_profile() -> dict[str, object]:
+    value = _protected_json(
+        SURPLASSE_ADAPTER_PATH,
+        "Surplasse versioned adapter",
+        allowed_modes=frozenset({0o444, 0o644}),
+        maximum_size=64 * 1024,
+    )
+    if not isinstance(value, dict):
+        fail("Surplasse versioned adapter is not an object")
+    payment = value.get("payment")
+    if (
+        not isinstance(payment, dict)
+        or canonical_json(payment) != canonical_json(SURPLASSE_PAYMENT_PROFILE)
+    ):
+        fail("Surplasse adapter payment profile differs from the tester policy")
+    return dict(SURPLASSE_PAYMENT_PROFILE)
+
+
+def validate_surplasse_input_commit() -> str:
     require_protected_file(
         SURPLASSE_INPUT_VALIDATOR_PATH,
         "Surplasse input validator",
@@ -1118,6 +1180,71 @@ def validate_surplasse_input_commit() -> None:
     )
     if result.stdout or result.stderr:
         fail("Surplasse input validation returned unexpected output")
+    value = _protected_json(
+        SURPLASSE_OPERATOR_MANIFEST_PATH,
+        "Surplasse operator bundle manifest",
+        allowed_modes=frozenset({0o400}),
+        maximum_size=64 * 1024,
+    )
+    if not isinstance(value, dict) or set(value) != {
+        "contract",
+        "payment_mode",
+        "sha256",
+        "version",
+    }:
+        fail("Surplasse operator bundle manifest has an invalid shape")
+    if (
+        value["contract"] != "surplasse-operator-bundle"
+        or value["version"] != 3
+        or isinstance(value["version"], bool)
+        or value["payment_mode"] != "test"
+    ):
+        fail("Surplasse operator bundle manifest policy is invalid")
+    digests = value["sha256"]
+    if (
+        not isinstance(digests, dict)
+        or set(digests) != SURPLASSE_OPERATOR_INPUT_NAMES
+        or any(
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in digests.values()
+        )
+    ):
+        fail("Surplasse operator bundle manifest digests are invalid")
+    return value["payment_mode"]
+
+
+def validate_surplasse_payment_binding(
+    profile: BundleProfile,
+    bundle: ApplicationBundle,
+    rendered: object,
+) -> None:
+    if profile.application != "surplasse":
+        return
+    adapter_payment = surplasse_adapter_payment_profile()
+    bundle_payment = bundle.contract.get("payment")
+    if (
+        not isinstance(bundle_payment, dict)
+        or canonical_json(bundle_payment) != canonical_json(adapter_payment)
+    ):
+        fail("Surplasse bundle payment profile differs from the versioned adapter")
+    if not isinstance(rendered, dict):
+        fail("rendered Surplasse Compose document is not an object")
+    services = rendered.get("services")
+    backend = services.get("backend") if isinstance(services, dict) else None
+    environment = backend.get("environment") if isinstance(backend, dict) else None
+    if not isinstance(environment, dict):
+        fail("rendered Surplasse backend environment is invalid")
+    expected_live_mode = {"test": "false", "live": "true"}.get(
+        adapter_payment["mode"]
+    )
+    if (
+        expected_live_mode is None
+        or environment.get("STRIPE_LIVE_MODE") != expected_live_mode
+    ):
+        fail("rendered Surplasse Stripe mode differs from the payment profile")
+    if validate_surplasse_input_commit() != adapter_payment["mode"]:
+        fail("Surplasse operator payment mode differs from the payment profile")
 
 
 def write_release_file(path: Path, raw: bytes, label: str) -> None:
@@ -1304,6 +1431,7 @@ def render_and_validate_compose(
         timeout=60,
     )
     validate_application_compose_semantics(profile, rendered)
+    validate_surplasse_payment_binding(profile, bundle, rendered)
     validate_secret_metadata(profile, rendered)
     write_release_file(
         staging / "precommit-compose.json",
@@ -1900,6 +2028,7 @@ def validate_materialized_runtime_policy(
         timeout=60,
     )
     validate_application_compose_semantics(profile, rendered)
+    validate_surplasse_payment_binding(profile, bundle, rendered)
     validate_secret_metadata(profile, rendered)
     override_path = release / "precommit-compose.json"
     if _read_materialized_policy_file(

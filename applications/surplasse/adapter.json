@@ -31,6 +31,11 @@
     "role": "surplasse_migrator",
     "runtime_auto_migrate": false
   },
+  "payment": {
+    "audience": "testers",
+    "mode": "test",
+    "schema": 1
+  },
   "runtime_services": [
     "backend",
     "commande",

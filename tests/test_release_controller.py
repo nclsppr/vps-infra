@@ -666,7 +666,7 @@ def surplasse_adapter_document() -> dict:
         "STRIPE_ACCOUNT_WEBHOOK_SECRET_FILE": (
             "/run/secrets/surplasse_stripe_account_webhook_secret"
         ),
-        "STRIPE_LIVE_MODE": "true",
+        "STRIPE_LIVE_MODE": "false",
         "STRIPE_PAYMENT_WEBHOOK_SECRET_FILE": (
             "/run/secrets/surplasse_stripe_payment_webhook_secret"
         ),
@@ -1118,6 +1118,13 @@ class ComposePolicyTests(unittest.TestCase):
                 "SMTP_HOST",
             ),
             (
+                "stripe-live-mode",
+                lambda value: value["services"]["backend"]["environment"].update(
+                    STRIPE_LIVE_MODE="true"
+                ),
+                "STRIPE_LIVE_MODE",
+            ),
+            (
                 "smtp-extra-option",
                 lambda value: value["services"]["backend"]["environment"].update(
                     SMTP_LOGIN="DISABLED"
@@ -1208,6 +1215,16 @@ class ComposePolicyTests(unittest.TestCase):
         SURPLASSE_ADAPTER.validate_metadata(
             ROOT, adapter, migrations, expected_images
         )
+
+        changed_adapter = copy.deepcopy(adapter)
+        changed_adapter["payment"]["mode"] = "live"
+        with self.assertRaisesRegex(
+            SURPLASSE_ADAPTER.AdapterError,
+            "versioned tester payment profile",
+        ):
+            SURPLASSE_ADAPTER.validate_metadata(
+                ROOT, changed_adapter, migrations, expected_images
+            )
 
     def test_surplasse_adapter_revision_is_bound_to_every_image_tag(self) -> None:
         application = ROOT / "applications/surplasse"

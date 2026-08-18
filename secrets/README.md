@@ -78,7 +78,8 @@ rules are in
 
 The helper refuses legacy OVH files in the application directory. The adapter
 remains locked. A locally valid OVH token shape does not prove its IAM scope.
-The Stripe input accepts only a dedicated live restricted key, but its prefix
-does not prove its permissions, account, Atlas network restriction, or the
-reviewed Connect release gate. Do not activate from the presence of files
-alone.
+The Stripe input accepts only a dedicated restricted test key with the
+`rk_test_` prefix. It rejects live, unrestricted, and placeholder-like keys.
+Its prefix does not prove its permissions, account, Atlas network restriction,
+or the reviewed Connect release gate. Do not activate from the presence of
+files alone.

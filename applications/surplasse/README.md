@@ -3,9 +3,10 @@
 This directory is a legacy, locked preparation adapter. It remains useful for
 local policy tests and the bounded database-preparation command. It is not the
 canonical application-release producer and it is not a production activation
-path. Surplasse now publishes an immutable `application-release` descriptor and
-common integration bundle for the shared admission contract. The protected
-entry remains disabled.
+path. The canonical controller reads only its exact `payment` projection as an
+independent versioned Atlas policy input. Surplasse publishes an immutable
+`application-release` descriptor and common integration bundle for the shared
+admission contract. The protected entry remains disabled.
 
 Atlas converged the shared transactional application controller from
 `vps-infra` revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b` on 2026-08-18.
@@ -75,6 +76,46 @@ platform/observability/prometheus/targets/surplasse.yml.disabled
 platform/observability/prometheus/rules/surplasse.yml.disabled
 ```
 
+## Tester payment profile
+
+The versioned `adapter.json` file fixes the payment profile to schema `1`,
+audience `testers`, and mode `test`. The runtime deployment profile remains
+`production`, because Atlas uses production URLs and production operational
+controls. The Backend receives `STRIPE_LIVE_MODE=false`. Test orders can create
+Stripe sandbox objects, but they cannot debit a real payment method.
+
+This profile does not enable Surplasse. It does not install a key, create a
+webhook endpoint, change DNS, or prove a connected account capability. A public
+URL is discoverable even when only invited testers know it. Do not treat a low
+visitor count as access control.
+
+The materializer records payment mode `test` in operator manifest version `3`.
+It accepts only a dedicated restricted test key with the `rk_test_` prefix. It
+rejects live keys, unrestricted keys, and placeholder-like values. Offline
+format validation cannot prove that Stripe issued the key, that it belongs to
+the correct account, or that it has the reviewed least-privilege permissions.
+Activation evidence must prove those properties through Stripe without logging
+the key.
+
+The immutable integration `contract.json` repeats the exact tester payment
+profile. During materialization, the canonical `deploy-application` controller
+requires that contract to equal the versioned adapter, requires the rendered
+Backend environment to contain `STRIPE_LIVE_MODE=false`, and explicitly parses
+the protected operator manifest as version `3` with `payment_mode=test` and the
+exact nine input digests. It repeats the complete binding from the materialized
+release before `prepare_transaction`. A divergence therefore stops before an
+image pull, public-edge preflight, migration, container start, or transaction
+journal write. `validate-surplasse-adapter` is still useful locally, but it is
+not the activation proof.
+
+Before a later public launch with real payments, replace this complete profile
+atomically. The application release must publish the matching live public key,
+Atlas must receive a dedicated `rk_live_` key and two new live webhook signing
+secrets, and the Backend must receive `STRIPE_LIVE_MODE=true`. Do not combine a
+test key, a live key, test webhooks, live webhooks, or a public key from another
+mode. This tester tranche does not implement that live credential rotation or
+the controlled service recreation needed after file-secret replacement.
+
 ## Database boundary
 
 The Backend always receives `QUARKUS_FLYWAY_MIGRATE_AT_START=false`. It uses
@@ -108,18 +149,17 @@ surplasse-stripe-secret-key
 ```
 
 Every single-line input must end with one newline. The Stripe key must be a
-dedicated live restricted key with the `rk_live_` prefix. The helper rejects an
-unrestricted `sk_live_` key. Start with no permissions in a Stripe sandbox.
-Exercise the complete pilot flow and use the Stripe request log to grant only
-Accounts v2 read, connected-account Payment Intents write, and
+dedicated restricted test key with the `rk_test_` prefix. The helper rejects an
+unrestricted `sk_test_` key and every live key. Start with no permissions in a
+Stripe sandbox. Exercise the complete pilot flow and use the Stripe request log
+to grant only Accounts v2 read, connected-account Payment Intents write, and
 connected-account Refunds write. Add another permission only when a reviewed
-request receives an explicit permission error. Reproduce the tested permission
-set in live mode and restrict the key to the Atlas IPv4 address when Stripe
-supports the policy. Both webhook values must have the Stripe signing-secret
-prefix, and the two values must be distinct. The secret materializer accepts a
-bounded DNS name as operator input. Prefix validation does not prove the key,
-its permissions, its account, or its network policy. It is not Stripe or SMTP
-readiness evidence.
+request receives an explicit permission error. Restrict the test key to the
+Atlas IPv4 address when Stripe supports the policy. Both webhook values must
+have the Stripe signing-secret prefix, and the two values must be distinct.
+The secret materializer accepts a bounded DNS name as operator input. Prefix
+validation does not prove the key, its permissions, its account, or its network
+policy. It is not Stripe or SMTP readiness evidence.
 
 The rendered adapter requires a lowercase DNS name and the constant port `587`,
 `SMTP_START_TLS=REQUIRED`, `SMTP_TLS=false`,
@@ -174,10 +214,11 @@ lock. This order excludes a secret or runtime change while the application
 controller owns the deployment lock. `--operator-only` takes only the bundle
 lock, so the controller can call it while it owns the deployment lock. The
 helper replaces the supplied application files, then the runtime file, and
-publishes manifest version 2 as the final commit marker. The manifest binds the
-contract version and SHA-256 value of all nine supplied application files. It
-contains no secret value. A crash before the final manifest rename leaves an
-absent or stale marker. Validation then fails even if both the supplied files
+publishes manifest version 3 as the final commit marker. The manifest binds the
+contract version, payment mode `test`, and SHA-256 value of all nine supplied
+application files. It contains no secret value. A crash before the final
+manifest rename leaves an absent or stale marker. Validation then fails even
+if both the supplied files
 and runtime file contain the new generation. A missing, stale, malformed, or
 mismatched manifest makes validation fail. The helper removes bounded orphan
 staging files during the next mutating operation under both locks.

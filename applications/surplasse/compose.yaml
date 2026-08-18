@@ -46,7 +46,7 @@ services:
       SMTP_USERNAME_FILE: /run/secrets/surplasse_smtp_username
       STRIPE_ACCOUNT_WEBHOOK_SECRET_FILE: >-
         /run/secrets/surplasse_stripe_account_webhook_secret
-      STRIPE_LIVE_MODE: "true"
+      STRIPE_LIVE_MODE: "false"
       STRIPE_PAYMENT_WEBHOOK_SECRET_FILE: >-
         /run/secrets/surplasse_stripe_payment_webhook_secret
       STRIPE_SECRET_KEY_FILE: /run/secrets/surplasse_stripe_secret_key
