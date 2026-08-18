@@ -50,14 +50,26 @@ state, proves the `current` link and complete materialized policy, and uses a
 deterministic one-off container name bound to the active application release.
 Child stdout and stderr are bounded and discarded.
 
-An empty `status` creates a 15-minute durable confirmation bound to the full
-active-state digest, Backend reference, application release reference, and
-installed manifest digest. `apply` writes `applying` before container mutation
-and then `applied-unverified` after a zero result and exact container cleanup.
-A separate `status` is required to write `verified`. Any interrupted or
-uncertain apply remains non-replayable. A later empty result after any verified
-or applying history becomes `ambiguous-empty`; it never authorizes an implicit
-rebootstrap.
+Before any container inspection, cleanup, or invocation, `status` replaces the
+previous journal with a durable non-applicable checking phase. `checking-empty`
+preserves only a new or previously confirmed empty lineage.
+`checking-ambiguous` preserves every applying, applied, verified, or ambiguous
+lineage. An interrupted status therefore closes the apply gate without losing
+the evidence needed to classify a later empty result.
+
+This recovery model depends on the admitted producer `status` operation being
+strictly read-only. The immutable application release and consumer policy pin
+that operation before Atlas can invoke it. A producer change that can write
+during status requires a new reviewed contract.
+
+An empty `status` from the empty lineage creates a 15-minute durable
+confirmation bound to the full active-state digest, Backend reference,
+application release reference, and installed manifest digest. `apply` writes
+`applying` before container mutation and then `applied-unverified` after a zero
+result and exact container cleanup. A separate `status` is required to write
+`verified`. Any interrupted or uncertain apply remains non-replayable. A later
+empty result from the ambiguous lineage becomes `ambiguous-empty`; it never
+authorizes an implicit rebootstrap.
 
 Ansible installs both helpers as `root:root 0500`. Manifest transfer and every
 pilot command use `no_log: true` and `argv`. The local wrapper copies the

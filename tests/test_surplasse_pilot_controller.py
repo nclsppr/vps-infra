@@ -77,6 +77,21 @@ class PilotControllerTests(unittest.TestCase):
                 with self.assertRaises(PILOT.PilotError):
                     PILOT.parse_state(raw)
 
+    def test_checking_phase_never_accepts_an_empty_confirmation(self) -> None:
+        for phase in ("checking-empty", "checking-ambiguous"):
+            value = PILOT.state_value(
+                active_state(),
+                "sha256:" + "b" * 64,
+                phase,
+                confirmed_until=None,
+            )
+            value["confirmed_until"] = 2000
+            with self.subTest(phase=phase), self.assertRaisesRegex(
+                PILOT.PilotError,
+                "unexpected confirmation",
+            ):
+                PILOT.parse_state(PILOT.canonical_json(value))
+
     def test_cli_accepts_only_one_bounded_operation_and_no_target(self) -> None:
         parser = PILOT.build_parser()
         self.assertEqual(parser.parse_args(["status"]).operation, "status")
@@ -144,14 +159,186 @@ class PilotControllerTests(unittest.TestCase):
             {"HOME": "/release"},
             "status",
         )
-        self.assertEqual(written[0]["phase"], "empty-confirmed")
         self.assertEqual(
-            written[0]["confirmed_until"],
+            [value["phase"] for value in written],
+            ["checking-empty", "empty-confirmed"],
+        )
+        self.assertIsNone(written[0]["confirmed_until"])
+        self.assertEqual(
+            written[-1]["confirmed_until"],
             1000 + PILOT.EMPTY_CONFIRMATION_SECONDS,
         )
-        self.assertEqual(written[0]["release_reference"], active.release_reference)
-        self.assertEqual(written[0]["backend_reference"], active.component_references["backend"])
-        self.assertEqual(written[0]["manifest_sha256"], "sha256:" + "b" * 64)
+        self.assertEqual(written[-1]["release_reference"], active.release_reference)
+        self.assertEqual(written[-1]["backend_reference"], active.component_references["backend"])
+        self.assertEqual(written[-1]["manifest_sha256"], "sha256:" + "b" * 64)
+
+    def test_status_journals_checking_before_every_child_operation(self) -> None:
+        active = active_state()
+        events: list[str] = []
+
+        def write(value):
+            events.append(f"write:{value['phase']}")
+
+        def remove(_active):
+            events.append("remove")
+
+        def invoke(*_arguments):
+            events.append("invoke")
+            return 0
+
+        with (
+            mock.patch.object(PILOT, "read_pilot_state", return_value=None),
+            mock.patch.object(PILOT, "write_pilot_state", side_effect=write),
+            mock.patch.object(PILOT, "remove_residue", side_effect=remove),
+            mock.patch.object(PILOT, "invoke", side_effect=invoke),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                PILOT.status(
+                    active,
+                    PILOT.APP.PROFILES["surplasse"],
+                    {},
+                    "sha256:" + "b" * 64,
+                ),
+                0,
+            )
+        self.assertEqual(
+            events,
+            [
+                "write:checking-empty",
+                "remove",
+                "invoke",
+                "remove",
+                "write:verified",
+            ],
+        )
+
+    def test_status_checking_write_failure_starts_no_child_probe(self) -> None:
+        active = active_state()
+        with (
+            mock.patch.object(PILOT, "read_pilot_state", return_value=None),
+            mock.patch.object(
+                PILOT,
+                "write_pilot_state",
+                side_effect=PILOT.PilotError("cannot persist checking phase"),
+            ),
+            mock.patch.object(PILOT, "remove_residue") as remove,
+            mock.patch.object(PILOT, "invoke") as invoke,
+        ):
+            with self.assertRaisesRegex(PILOT.PilotError, "persist checking"):
+                PILOT.status(
+                    active,
+                    PILOT.APP.PROFILES["surplasse"],
+                    {},
+                    "sha256:" + "b" * 64,
+                )
+        remove.assert_not_called()
+        invoke.assert_not_called()
+
+    def test_status_invoke_exception_leaves_checking_ambiguous(self) -> None:
+        active = active_state()
+        digest = "sha256:" + "b" * 64
+        previous = PILOT.state_value(
+            active,
+            digest,
+            "applied-unverified",
+            confirmed_until=None,
+        )
+        written: list[dict[str, object]] = []
+        with (
+            mock.patch.object(PILOT, "read_pilot_state", return_value=previous),
+            mock.patch.object(PILOT, "remove_residue"),
+            mock.patch.object(
+                PILOT,
+                "invoke",
+                side_effect=PILOT.PilotError("status child failed"),
+            ),
+            mock.patch.object(PILOT, "write_pilot_state", side_effect=written.append),
+        ):
+            with self.assertRaisesRegex(PILOT.PilotError, "status child failed"):
+                PILOT.status(active, PILOT.APP.PROFILES["surplasse"], {}, digest)
+        self.assertEqual([value["phase"] for value in written], ["checking-ambiguous"])
+
+    def test_status_failures_leave_only_the_non_applicable_checking_phase(self) -> None:
+        active = active_state()
+        digest = "sha256:" + "b" * 64
+        verified = PILOT.state_value(
+            active,
+            digest,
+            "verified",
+            confirmed_until=None,
+        )
+        cases = {
+            "initial-cleanup": (None, PILOT.PilotError("cleanup failed"), 0, False),
+            "final-cleanup": (
+                None,
+                [None, PILOT.PilotError("cleanup failed")],
+                0,
+                True,
+            ),
+            "unapproved-result": (verified, None, 70, True),
+        }
+        for label, (previous, cleanup_effect, result, invoked) in cases.items():
+            written: list[dict[str, object]] = []
+            with (
+                self.subTest(failure=label),
+                mock.patch.object(PILOT, "read_pilot_state", return_value=previous),
+                mock.patch.object(PILOT, "write_pilot_state", side_effect=written.append),
+                mock.patch.object(PILOT, "remove_residue", side_effect=cleanup_effect),
+                mock.patch.object(PILOT, "invoke", return_value=result) as invoke,
+            ):
+                with self.assertRaises(PILOT.PilotError):
+                    PILOT.status(
+                        active,
+                        PILOT.APP.PROFILES["surplasse"],
+                        {},
+                        digest,
+                    )
+            self.assertEqual(len(written), 1)
+            expected = "checking-ambiguous" if label == "unapproved-result" else "checking-empty"
+            self.assertEqual(written[0]["phase"], expected)
+            self.assertIsNone(written[0]["confirmed_until"])
+            if invoked:
+                invoke.assert_called_once()
+            else:
+                invoke.assert_not_called()
+
+    def test_status_retry_preserves_the_checking_lineage(self) -> None:
+        active = active_state()
+        digest = "sha256:" + "b" * 64
+        cases = {
+            "checking-empty": ("empty-confirmed", False),
+            "checking-ambiguous": ("ambiguous-empty", True),
+        }
+        for previous_phase, (final_phase, refused) in cases.items():
+            previous = PILOT.state_value(
+                active,
+                digest,
+                previous_phase,
+                confirmed_until=None,
+            )
+            written: list[dict[str, object]] = []
+            with (
+                self.subTest(previous=previous_phase),
+                mock.patch.object(PILOT, "read_pilot_state", return_value=previous),
+                mock.patch.object(PILOT, "remove_residue"),
+                mock.patch.object(PILOT, "invoke", return_value=3),
+                mock.patch.object(PILOT, "write_pilot_state", side_effect=written.append),
+                mock.patch.object(PILOT.time, "time", return_value=1000),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                if refused:
+                    with self.assertRaisesRegex(PILOT.PilotError, "replay is refused"):
+                        PILOT.status(active, PILOT.APP.PROFILES["surplasse"], {}, digest)
+                else:
+                    self.assertEqual(
+                        PILOT.status(active, PILOT.APP.PROFILES["surplasse"], {}, digest),
+                        3,
+                    )
+            self.assertEqual(
+                [value["phase"] for value in written],
+                [previous_phase, final_phase],
+            )
 
     def test_apply_journals_before_mutation_and_requires_separate_status(self) -> None:
         active = active_state()
@@ -229,6 +416,32 @@ class PilotControllerTests(unittest.TestCase):
                     manifest_digest,
                 )
 
+    def test_apply_refuses_both_interrupted_status_lineages(self) -> None:
+        active = active_state()
+        manifest_digest = "sha256:" + "b" * 64
+        for phase in ("checking-empty", "checking-ambiguous"):
+            journal = PILOT.state_value(
+                active,
+                manifest_digest,
+                phase,
+                confirmed_until=None,
+            )
+            with (
+                self.subTest(phase=phase),
+                mock.patch.object(PILOT, "read_pilot_state", return_value=journal),
+                mock.patch.object(PILOT, "container_id") as container,
+                mock.patch.object(PILOT, "invoke") as invoke,
+            ):
+                with self.assertRaisesRegex(PILOT.PilotError, "not replayable"):
+                    PILOT.apply(
+                        active,
+                        PILOT.APP.PROFILES["surplasse"],
+                        {},
+                        manifest_digest,
+                    )
+                container.assert_not_called()
+                invoke.assert_not_called()
+
     def test_status_resolves_ambiguous_apply_only_on_exact_readback(self) -> None:
         active = active_state()
         manifest_digest = "sha256:" + "b" * 64
@@ -255,7 +468,10 @@ class PilotControllerTests(unittest.TestCase):
                 ),
                 0,
             )
-        self.assertEqual(written[-1]["phase"], "verified")
+        self.assertEqual(
+            [value["phase"] for value in written],
+            ["checking-ambiguous", "verified"],
+        )
 
         written.clear()
         with (
@@ -271,7 +487,10 @@ class PilotControllerTests(unittest.TestCase):
                     {},
                     manifest_digest,
                 )
-        self.assertEqual(written[-1]["phase"], "ambiguous-empty")
+        self.assertEqual(
+            [value["phase"] for value in written],
+            ["checking-ambiguous", "ambiguous-empty"],
+        )
 
     def test_verified_history_then_empty_refuses_implicit_rebootstrap(self) -> None:
         active = active_state()
@@ -296,7 +515,10 @@ class PilotControllerTests(unittest.TestCase):
                     {},
                     manifest_digest,
                 )
-        self.assertEqual(written[-1]["phase"], "ambiguous-empty")
+        self.assertEqual(
+            [value["phase"] for value in written],
+            ["checking-ambiguous", "ambiguous-empty"],
+        )
         self.assertIsNone(written[-1]["confirmed_until"])
 
     def test_identity_manifest_or_expiration_drift_refuses_apply(self) -> None:

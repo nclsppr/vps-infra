@@ -29,6 +29,8 @@ MAXIMUM_OUTPUT_BYTES = 64 * 1024
 PHASES = frozenset(
     {
         "empty-confirmed",
+        "checking-empty",
+        "checking-ambiguous",
         "applying",
         "applied-unverified",
         "verified",
@@ -371,6 +373,15 @@ def invoke(active: Any, profile: Any, environment: Mapping[str, str], operation:
 
 def status(active: Any, profile: Any, environment: Mapping[str, str], digest: str) -> int:
     previous = read_pilot_state()
+    checking_phase = (
+        "checking-empty"
+        if previous is None
+        or previous.get("phase") in {"empty-confirmed", "checking-empty"}
+        else "checking-ambiguous"
+    )
+    write_pilot_state(
+        state_value(active, digest, checking_phase, confirmed_until=None)
+    )
     remove_residue(active)
     code = invoke(active, profile, environment, "status")
     remove_residue(active)
@@ -381,7 +392,7 @@ def status(active: Any, profile: Any, environment: Mapping[str, str], digest: st
     if code == 3:
         phase = (
             "empty-confirmed"
-            if previous is None or previous.get("phase") == "empty-confirmed"
+            if checking_phase == "checking-empty"
             else "ambiguous-empty"
         )
         expiration = int(time.time()) + EMPTY_CONFIRMATION_SECONDS if phase == "empty-confirmed" else None

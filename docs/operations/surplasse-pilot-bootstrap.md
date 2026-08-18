@@ -47,6 +47,17 @@ confirmation expires after 15 minutes. Apply never accepts the release or
 Backend digest from the command line. It leaves `applied-unverified` until the
 last status proves the exact tester graph with order intake paused.
 
+Each status first writes a durable non-applicable checking journal before it
+inspects or removes a previous pilot container. `checking-empty` preserves a
+new or previously confirmed empty lineage. `checking-ambiguous` preserves all
+applying, applied, verified, and ambiguous history. A failed or interrupted
+status leaves one of these phases, and apply refuses both. Run status again.
+An exact graph can still move either phase to `verified`. An empty graph can
+restore `empty-confirmed` only from `checking-empty`; from
+`checking-ambiguous`, it becomes `ambiguous-empty` and refuses replay.
+The admitted producer status operation is read-only. Do not substitute another
+image, command, or manual database probe for this recovery step.
+
 The status command reports only `empty-confirmed` or `verified`. Ansible derives
 that result from the controller return code. It does not display controller
 stdout, stderr, or manifest data. Apply reports only generic completion and
