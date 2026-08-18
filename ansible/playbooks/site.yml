@@ -18,9 +18,82 @@
           - vps_ssh_port | int == 22
           - ansible_port | int == vps_ssh_port | int
           - vps_admin_authorized_keys | length > 0
+          - vps_deploy_authorized_keys is sequence
+          - vps_deploy_authorized_keys is not string
+          - vps_deploy_authorized_keys is not mapping
+          - vps_deploy_authorized_keys | length > 0
+          - vps_deploy_authorized_keys | length <= 4
+          - >-
+            vps_deploy_authorized_keys | unique | length ==
+            vps_deploy_authorized_keys | length
         fail_msg: >-
           Refus du durcissement : site.yml doit déjà être connecté avec le
-          compte administrateur et le port SSH définitif sur un Ubuntu validé.
+          compte administrateur et le port SSH définitif sur un Ubuntu validé,
+          avec un ensemble borné et non vide de clés deploy.
+
+    - name: Validate deployment public key syntax before any role
+      ansible.builtin.assert:
+        that:
+          - >-
+            item is match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
+          - "'\n' not in item"
+          - "'\r' not in item"
+        fail_msg: >-
+          Refus de la convergence : clé publique deploy invalide ou contenant
+          déjà des options SSH.
+      loop: "{{ vps_deploy_authorized_keys }}"
+      loop_control:
+        label: "clé deploy déclarée"
+
+    - name: Normalize desired deployment key identities before any role
+      ansible.builtin.set_fact:
+        site_deploy_key_identities: >-
+          {{
+            vps_deploy_authorized_keys | map('trim') |
+            map('regex_replace', '^([^ ]+ [^ ]+)(?: .*)?$', '\\1') | list
+          }}
+
+    - name: Refuse duplicate deployment key identities before any role
+      ansible.builtin.assert:
+        that:
+          - >-
+            site_deploy_key_identities | unique | length ==
+            site_deploy_key_identities | length
+        fail_msg: >-
+          Refus de converger deux déclarations de la même clé deploy avec des
+          commentaires différents.
+
+    - name: Cryptographically parse deployment public keys before any role
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/ssh-keygen
+          - -l
+          - -E
+          - sha256
+          - -f
+          - /dev/stdin
+        stdin: "{{ item }}\n"
+        stdin_add_newline: false
+      check_mode: false
+      changed_when: false
+      loop: "{{ vps_deploy_authorized_keys }}"
+      loop_control:
+        label: "clé deploy déclarée"
+
+    - name: Validate the one-use deployment key recovery nonce contract
+      ansible.builtin.assert:
+        that:
+          - vps_deploy_key_recovery_nonce is string
+          - >-
+            vps_deploy_key_recovery_nonce == '' or
+            vps_deploy_key_recovery_nonce is match('^[0-9a-f]{64}$')
+          - >-
+            vps_deploy_key_recovery_nonce == '' or
+            vps_deploy_authorized_keys | length == 1
+        fail_msg: >-
+          Le nonce de récupération deploy doit rester vide en fonctionnement
+          normal ou contenir exactement 64 caractères hexadécimaux minuscules.
+      no_log: true
 
     - name: Confirm the current connection is still responsive
       ansible.builtin.wait_for_connection:

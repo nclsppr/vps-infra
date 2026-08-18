@@ -1,11 +1,17 @@
-# ADR-0010: Install a disabled transactional Compose application controller
+# ADR-0010: Provide a disabled transactional Compose application controller
 
 ## Status
 
-Accepted on 17 August 2026. The controller is installed but both Surplasse and
-Parkventory remain disabled in the protected production contract. This change
-does not activate an application, create a database, provision a secret,
-change an edge route, or run a migration on Atlas.
+Accepted on 17 August 2026. Atlas proved installation on 18 August 2026 by
+converging `vps-infra` revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root-owned
+`deploy-application` controller and argument-free gate are installed, and
+`vps-application-recover.service` is loaded and inactive after a successful run
+(`Result=success`, `ExecMainStatus=0`). Both Surplasse and Parkventory remain
+`enabled: false` in the protected production contract, and no application
+deployment workflow invokes the gate. Installation did not activate an
+application, create a database, provision a secret, change an edge route, or run
+a migration on Atlas.
 
 ## Context
 
@@ -27,10 +33,11 @@ take the same public identity while static state still owns it.
 
 ## Decision
 
-Install `deploy-application` and `deploy-application-live-gate` beside the
-static controller. They reuse the static controller's registry download,
-GitHub trusted-root, attestation, isolated-worker, protected-state, and residue
-checks. Both controllers acquire the exact lock `/run/lock/vps-static.lock`.
+Provide `deploy-application` and `deploy-application-live-gate` through the
+deploy Ansible role beside the static controller. The proved convergence has
+installed them. They reuse the static controller's registry download, GitHub
+trusted-root, attestation, isolated-worker, protected-state, and residue checks.
+Both controllers acquire the exact lock `/run/lock/vps-static.lock`.
 
 The root application controller re-reads the protected application and static
 production contracts before it validates the runtime or performs network I/O.
@@ -41,7 +48,9 @@ For an enabled future entry, the controller performs the following admission
 and materialization sequence:
 
 1. require the supplied source revision to be the exact canonical `main` HEAD;
-2. fetch the supplied `application-release@sha256` manifest and descriptor;
+2. fetch the supplied `application-release@sha256` manifest and descriptor,
+   require every runtime reference to be digest-only, and bind every component
+   and integration source revision to the same exact release source SHA;
 3. verify the release attestation from the allowlisted producer workflow;
 4. fetch every component index, require exactly one `linux/amd64` runtime
    manifest plus its attestation manifest, verify the component attestation,
@@ -94,9 +103,13 @@ transaction with these phases:
 
 Only a `probed` candidate can become the atomic `current` link and active state.
 A candidate source must descend from the active source before activation.
-Failure after migration starts restores the previous Compose runtime and
-quarantines the complete immutable candidate fingerprint. A prepared-only
-failure is retryable and is not quarantined.
+The delivered recovery code can restore the previous Compose runtime and
+quarantine the complete immutable candidate fingerprint after migration starts.
+This path is not authorized for production while migration compatibility is
+only an assertion. Before either entry can be enabled, an attested invariant
+must prove that the previous runtime is compatible with the changed schema, or
+the controller must stop after migration for explicit forward recovery. A
+prepared-only failure is retryable and is not quarantined.
 
 Candidate services are created with a generated, immutable `restart: no`
 override. Their normal `unless-stopped` policy is applied only after the
@@ -141,9 +154,11 @@ deploy-application-live <surplasse|parkventory> <source-sha40> \
 The unprivileged parser validates it, then passes one newline-terminated record
 over stdin to a root-owned gate with no arguments. The gate independently
 revalidates the record and creates a bounded transient systemd unit. Its
-`ExecStopPost` invokes recovery. The enabled
-`vps-application-recover.service` is ordered after static recovery and before
-the public-edge systemd unit. Docker can nevertheless restart the existing
+`ExecStopPost` invokes recovery. Ansible installs
+`vps-application-recover.service` after static recovery and before the
+public-edge systemd unit. Its proved idle state on 2026-08-18 was loaded,
+inactive, `Result=success`, and `ExecMainStatus=0`. Docker can nevertheless
+restart the existing
 `unless-stopped` Caddy container as soon as the daemon starts. This tranche
 therefore does not claim that boot recovery withholds public traffic; closing
 that daemon-level bypass remains an activation blocker.
@@ -152,7 +167,6 @@ that daemon-level bypass remains an activation blocker.
 
 - A disabled application performs no source, registry, attestation, Docker, or
   probe network operation.
-- Every consumed runtime reference is digest-only and bound to one source SHA.
 - Release state contains image and artifact references, inventories, and public
   evidence, but no secret value.
 - Static and Compose changes cannot run concurrently, and Parkventory ownership
@@ -160,8 +174,9 @@ that daemon-level bypass remains an activation blocker.
 - A crash after a completed probe can finish the atomic commit; an earlier crash
   restores the previous runtime and conservatively quarantines a mutating
   candidate.
-- Installation and recovery wiring do not make either application deployable
-  while its reviewed contract entry remains disabled.
+- Proved host installation and healthy idle recovery do not make either
+  application deployable while its reviewed contract entry remains disabled;
+  there is no application deployment workflow or active runtime.
 - The active state transition is atomic, but the current fixed Compose project
   and network aliases make runtime replacement rolling rather than blue/green:
   Caddy can observe candidate containers before the final public probes. The
@@ -182,16 +197,21 @@ The public edge must also be made recovery-gated at the Docker/firewall
 boundary, rather than relying only on systemd unit ordering. Recovery timeouts
 and output/memory bounds must be dimensioned against the complete worst-case
 Compose path. Migration recovery must gain an attested backward-compatibility
-invariant or stop for operator/forward recovery after migration instead of
-automatically starting the previous runtime against a changed schema.
+invariant or stop for operator and forward recovery after migration instead of
+automatically starting the previous runtime against a changed schema. This is a
+fail-closed activation condition, not a task that can be deferred until after
+enablement.
 The enablement change must additionally add a fail-before-mutation disk budget
 and safe release/image retention, aggregate CPU/memory/pid budgets for overlap,
 latest-desired trigger reconciliation after lock contention, boot health
 reconciliation for an active runtime, exact database/edge/container network
 identity checks, and a route policy that cannot strand rollback behind a newer
 candidate route.
-Surplasse and Parkventory producer branches must publish the common USTAR
-integration format declared by the shared contract.
+Surplasse and Parkventory now publish the common USTAR integration format and
+immutable `application-release` descriptors. Publication satisfies the producer
+format prerequisite only. It does not close any host, database, secret,
+network, route, migration-compatibility, resource-budget, recovery, or public
+probe blocker above.
 
 ## Alternatives
 

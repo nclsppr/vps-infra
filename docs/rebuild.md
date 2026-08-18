@@ -29,13 +29,14 @@ déjà à rendre la configuration du système reproductible après l’accès SS
 | Élément | Emplacement de récupération |
 |---|---|
 | playbooks, Compose, Caddy, Prometheus, dashboards et runbooks | dépôt public `vps-infra`, sans donnée sensible |
-| versions actives | `releases/production.yaml` dans Git |
-| images et artefacts statiques | GHCR, référencés par digest |
+| static promotion policy | `releases/static-production.json` in Git |
+| last observed static active tuples | dated evidence in Git; verify against current producer HEAD and GHCR before recovery |
+| images et artefacts statiques | GHCR, referenced by immutable digest |
 | clé SSH administrateur | Termius ou poste de confiance, avec copie de récupération |
 | clé age permettant SOPS | gestionnaire de secrets et copie hors ligne |
 | jeton GHCR en lecture | gestionnaire de secrets ou procédure de régénération |
 | accès Git en lecture à `vps-infra` | HTTPS public ; deploy key seulement si la visibilité devient privée |
-| clé du déclencheur SSH de production | secret de l’environnement GitHub `production`, révocable séparément |
+| static SSH trigger key | secret of the GitHub `static-production` environment, separately revocable |
 | secrets DNS, JWT, Stripe, SMTP, Grafana et bases | fichiers SOPS chiffrés et clé age externe |
 | sauvegardes métier | étape locale testée sur Atlas ; cible chiffrée hors VPS encore à sélectionner |
 | inventaire DNS, MX, SPF, DKIM et DMARC | export versionné sans secrets et copie opérateur |
@@ -69,9 +70,13 @@ Run `converge-check` only after a successful normal convergence. It predicts
 drift from the same isolated `origin/main` snapshot and rejects every
 command-line option except the exact `--check --diff` pair.
 
-Le contrôleur `scripts/deploy <sha40>` sait valider et planifier un état désiré,
-mais reste en dry-run. L’activation live exige encore l’applicateur root-owned,
-les secrets, les artefacts applicatifs et une répétition sur hôte jetable.
+The generic `scripts/deploy <sha40>` controller validates and plans desired
+state but remains dry-run. Static activation uses the separate operational
+controller documented in
+[`operations/static-release-reconciliation.md`](operations/static-release-reconciliation.md).
+Atlas has converged the Compose application controller and root gate from
+revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`; both application entries
+remain `enabled: false`, and no application workflow or active release exists.
 
 ## Phase 0 — préparer sans toucher au trafic
 
@@ -136,9 +141,9 @@ Le playbook `site.yml` :
 The current tranche delivers points 1 to 8 and 11 to 13. It uses the public
 HTTPS repository and installs a trigger key only when the operator supplies
 one. GitHub CLI 2.97.0 is pinned by release archive and executable checksums.
-Personal, Papers Empire, and platform integration are public GHCR packages.
-Their materializer uses anonymous bounded registry downloads in short-lived
-systemd `DynamicUser` executions. One execution fetches each attestation bundle
+Personal, Papers Empire, the Parkventory static demo, and platform integration
+are public GHCR packages. Their materializer uses anonymous bounded registry
+downloads in short-lived systemd `DynamicUser` executions. One execution fetches each attestation bundle
 set. A separate network execution uses the pinned GitHub CLI and its embedded
 TUF bootstrap roots to obtain one current trusted root per deployment. The root
 orchestrator also requires its versioned SHA-256. A trust-root rotation fails
@@ -152,22 +157,24 @@ CI toolchain; reconstruction does not install it on Atlas.
 
 Host convergence installs one operator tool outside that CI toolchain: the
 standalone Codex CLI package. It uses no Node.js or npm and runs only as the
-isolated `codex` account through the enforced bounded launcher. When enabled
-for either remote path, a persistent App Server uses a private Unix socket. An
-optional unprivileged SSH gateway requires an external public key. Direct
-mobile control instead uses the App Server's outbound ChatGPT relay and opens
-no inbound port. Persistent state is capped by a dedicated 6 GiB filesystem.
-Authentication and mobile pairing are not part of reconstruction. After
-convergence, an operator may restore access with the ChatGPT-only device flow
-and the manual pairing procedure documented in
+isolated `codex` account through the enforced bounded launcher. On the proved
+2026-08-18 Atlas convergence, `atlas-codex-app-server.service` was active and
+running on its managed private Unix socket. An optional unprivileged SSH gateway
+requires an external public key. Direct mobile control instead uses the App
+Server's outbound ChatGPT relay and opens no inbound port. Persistent state is
+capped by a dedicated 6 GiB filesystem. Authentication and mobile pairing are
+not part of reconstruction. After convergence, an operator may restore access
+with the ChatGPT-only device flow and the manual pairing procedure documented in
 [`operations/codex-cli.md`](operations/codex-cli.md).
 
-Before a static activation, supply the exact application source revision, site
-digest, route digest, platform integration revision, integration digest, and
-Caddy image digest. The integration package and the protected infrastructure
-mirror must name the same Caddy image. An attestation proves the exact source
-ref and workflow. It does not prove branch protection. Restore the repository
-rulesets as a separate reconstruction step before production activation.
+The input-free static reconciliation workflow resolves the exact application
+source revision, site digest, route digest, platform integration revision,
+integration digest, and Caddy image digest. An operator does not supply or
+override these values. The integration package and the protected
+infrastructure mirror must name the same Caddy image. An attestation proves the
+exact source ref and workflow. It does not prove branch protection. Restore the
+repository rulesets as a separate reconstruction step before production
+activation.
 
 The role creates the private secret root but does not materialize a secret. A
 GHCR credential for private application images, decrypted secrets, the live
@@ -219,22 +226,29 @@ reconstruction réelle doit conserver cet ordre :
 Personal, Papers Empire, and the Parkventory demo have no server state. Browser
 `localStorage` remains on the client while its origin and schema stay stable.
 
-## Phase 5 — réconcilier les applications
+## Phase 5 - reconcile releases
 
-`reconcile RELEASE=production` :
+For static recovery:
 
-1. lit le manifeste au commit d’infrastructure choisi ;
-2. refuse Parkventory tant que `enabled: false` ;
-3. retrieve and activate the three static releases;
-4. tire les images Surplasse ;
-5. exécute les migrations contrôlées ;
-6. démarre les Compose applicatifs avec `--wait` ;
-7. vérifie les cibles Prometheus et les dashboards provisionnés ;
-8. enregistre l’état actif.
+1. converge the reviewed static controller revision and public edge;
+2. install the dedicated deploy public key and independently verified host key;
+3. configure the `static-production` environment while deployment is suspended;
+4. confirm that the current canonical producer heads have only complete,
+   non-failing observed checks, successful configured required checks, and
+   immutable artifacts;
+5. enable reconciliation and dispatch the input-free workflow;
+6. require all three deploy jobs, protected active tuples, empty transactions,
+   and strict public probes.
 
-Le manifeste doit permettre de restaurer une release historique, pas seulement
-la plus récente. Les digests garantissent que les octets récupérés ne changent
-pas derrière un tag.
+Do not manually request the old tuple recorded in dated evidence. Normal
+reconstruction selects the current eligible canonical heads. If the current
+producer content must be reverted, merge a new descendant revert first.
+
+For a future Compose application, prepare the exact edge route and application
+network before migration. Do not run a migration until every ADR-0010 blocker,
+including post-migration compatibility or explicit forward-recovery behavior,
+is enforced. Current reconstruction leaves Surplasse and dynamic Parkventory
+disabled.
 
 ## Phase 6 — valider avant le DNS
 

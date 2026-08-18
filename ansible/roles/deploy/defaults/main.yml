@@ -12,6 +12,7 @@ vps_deploy_repository_dir: /srv/vps/repository
 vps_deploy_repository_url: https://github.com/nclsppr/vps-infra.git
 vps_deploy_revision_path: /usr/local/share/vps-infra/controller-revision
 vps_deploy_state_dir: /var/lib/vps-controller
+vps_deploy_key_recovery_marker_dir: /var/lib/vps-controller/deploy-key-recovery-nonces
 vps_static_state_dir: /var/lib/vps-static
 vps_static_recovery_unit: vps-static-recover.service
 vps_application_root: /srv/applications

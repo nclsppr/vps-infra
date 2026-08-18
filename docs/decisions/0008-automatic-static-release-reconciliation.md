@@ -2,9 +2,12 @@
 
 ## Status
 
-Accepted on 17 August 2026. The implementation remains fail-closed until the
-`static-production` environment has its dedicated Atlas identity and the
-environment variable `VPS_STATIC_DEPLOY_ENABLED` is explicitly set to `true`.
+Accepted on 17 August 2026. Operational on 18 August 2026 for Personal, Papers
+Empire, and the temporary static Parkventory demo. The `static-production`
+environment has a dedicated Atlas identity and
+`VPS_STATIC_DEPLOY_ENABLED=true`. Two scheduled runs processed all three
+profiles and Atlas proved the repeated immutable tuples as healthy no-ops. See
+the [rollout evidence](../evidence/2026-08-18-static-reconciliation-rollout.md).
 This decision does not unlock the dynamic application controller.
 
 ## Context
@@ -28,8 +31,9 @@ boundary.
 ## Decision
 
 `vps-infra` owns one scheduled and manually dispatchable reconciliation
-workflow. Every ten minutes it performs these operations independently for the
-three allowlisted applications:
+workflow. Its best-effort GitHub cron requests a run every ten minutes; GitHub
+may delay an individual run. Each invocation performs these operations
+independently for the three allowlisted applications:
 
 1. resolve the exact HEAD of the canonical branch with Git smart HTTP;
 2. read the check runs for that exact SHA;
@@ -51,6 +55,13 @@ Every static application also has an explicit Boolean promotion switch and a
 reviewed mode. Personal and Papers Empire are `static-site`; Parkventory is a
 `temporary-static-demo`. Disabled entries remain visible in reconciliation
 evidence but never enter the deployment matrix.
+
+Resolution is independent per profile. A successful workflow conclusion does
+not prove that all three profiles were ready or contacted Atlas. Operators must
+inspect the resolver status table, the expected deploy jobs, Atlas protected
+state, and public probes. The
+[static reconciliation runbook](../operations/static-release-reconciliation.md)
+defines this complete check.
 
 Atlas accepts only allowlisted repositories and exact digest syntax through
 the forced-command parser and a second root-owned, no-argument stdin gate.
@@ -94,7 +105,10 @@ classification completes, recovery quarantines the rejected tuple
 conservatively so it cannot cause a repeated availability window. A quarantined tuple cannot
 be retried until an operator removes its record after investigation. An interrupted transaction
 is recovered before a new candidate is considered, by the root gate after a
-failed attempt and by a boot oneshot before the public edge. Each activation
+failed attempt and by a boot oneshot ordered before the systemd-managed public
+edge. Docker can still restart the existing `unless-stopped` Caddy container
+when the daemon starts before that unit ordering; closing this bypass remains a
+platform hardening task. Each activation
 runs in a transient systemd unit whose stop hook invokes the same recovery, so
 an SSH disconnect does not abandon an uncommitted switch. Recovery revalidates
 the protected inventory and release filesystem before it serves or commits a
@@ -132,8 +146,8 @@ an older newly selected candidate.
 
 ## Consequences
 
-- Normal propagation is eventual: ten minutes plus any GitHub schedule delay
-  and deployment duration.
+- Normal propagation is eventual: the next best-effort scheduled run, any
+  GitHub delay, and deployment duration.
 - A transient GitHub API or GHCR failure cannot mutate Atlas; a later run
   retries discovery.
 - All production SSH material remains in one environment of `vps-infra`.
@@ -162,5 +176,7 @@ part of this fully automatic environment.
 
 To stop automatic requests, set that variable to `false`; do not enable an
 Atlas polling timer. To roll back content, revert the producer change with a
-new descendant commit. A quarantined tuple must be
-investigated before its root-owned record is removed on Atlas.
+new descendant commit. Do not force-push, request an old source SHA, move an OCI
+tag, or manually repoint `current`. A quarantined tuple must be investigated
+before its root-owned record is removed on Atlas. Follow the operational
+runbook for suspension, dispatch, inspection, recovery, and key rotation.

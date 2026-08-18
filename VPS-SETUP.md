@@ -4,8 +4,13 @@
 > locked.** Atlas passed bootstrap, repeated convergence, predictive check
 > mode, and a complete reboot. The three approved static sites use the Atlas
 > IPv4 address and HTTPS. The private PostgreSQL and observability platform is
-> active. No dynamic application or live release applicator is active. Do not
-> use the archived runbook.
+> active. Automatic static reconciliation is enabled and proved by two complete
+> scheduled runs and the final central run `32086151183`. No dynamic application
+> is active. Atlas has converged the disabled Compose application controller at
+> `da04a09bfa9788ae8127b63f9f3a6692bef2551b`; installation is not activation.
+> Do not use the archived runbook. Use the
+> [static operations runbook](docs/operations/static-release-reconciliation.md)
+> and [dated rollout evidence](docs/evidence/2026-08-18-static-reconciliation-rollout.md).
 
 ## Décision recommandée
 
@@ -130,8 +135,8 @@ Critères :
 - [x] aucune toolchain applicative sur l’hôte ;
 - [x] Codex CLI autonome installé sous un compte dédié sans sudo, Docker,
       SSH direct ni accès aux secrets et releases de production ;
-- [ ] App Server Codex persistant sur socket Unix privé, accessible par une
-      passerelle SSH distincte et sans port public ;
+- [x] App Server Codex persistant `atlas-codex-app-server.service` actif sur son
+      socket Unix privé, sans port public ;
 - [x] logs bornés, redémarrage et reboot vérifiés ;
 - [x] second passage Ansible sans changement ;
 - [x] bounded `--check --diff` invocation covered by CI and executed on the
@@ -145,7 +150,19 @@ reported `changed=0`. This evidence predates the bounded static-edge and
 internal-platform rollout recorded in Phase 7. A full disposable-host platform
 rehearsal remains in Phase 6.
 
+A read-only check after the final convergence on 2026-08-18 found
+`atlas-codex-app-server.service` active and running on its managed private Unix
+socket under the isolated `codex` account. This proves the private service
+boundary, not a current Desktop or mobile authentication and pairing session;
+those remain operator-controlled procedures.
+
 ## Phase 3 — extraire la plateforme commune
+
+This checklist preserves the original extraction acceptance plan. It is not a
+standalone live-status page: checked items have repository or rollout evidence,
+while unchecked items remain future application requirements even when a
+related shared service already exists. Use the README and dated evidence for
+the current Atlas state.
 
 Créer :
 
@@ -165,12 +182,12 @@ platform/
 - [x] reject every HIGH or CRITICAL finding on native `amd64` and `arm64` pull
       request builds, then scan both published child manifests by digest before
       GitHub provenance;
-- [ ] publish and promote the first Caddy digest that passes the complete gate;
-- [ ] importer un fragment de routes par projet ;
-- [ ] servir les releases statiques depuis `/srv/www:ro` ;
+- [x] publish and promote the first Caddy digest that passes the complete gate;
+- [x] importer un fragment de routes par projet statique ;
+- [x] servir les releases statiques depuis `/srv/www:ro` ;
 - [ ] préserver wildcard, CORS, SSE et fermeture des métriques Surplasse ;
-- [ ] valider avant tout reload ;
-- [ ] publier uniquement 80/443.
+- [x] valider avant tout reload ;
+- [x] publier uniquement 80/443.
 - [x] add a deterministic, secret-free OCI publisher for the exact shared
       platform runtime configuration. It verifies both GHCR layers before
       GitHub provenance and does not activate the platform.
@@ -204,32 +221,32 @@ platform/
 
 ### Personal
 
-- [ ] ajouter une CI de validation ;
-- [ ] assembler `site/` par allowlist ;
-- [ ] prouver qu’aucun fichier interne ou d’outillage n’est publié ;
-- [ ] publier l’archive comme artefact OCI GHCR ;
-- [ ] generate and probe the complete EN/FR, Work, CV, Blog, article,
+- [x] ajouter une CI de validation ;
+- [x] assembler `site/` par allowlist ;
+- [x] prouver qu’aucun fichier interne ou d’outillage n’est publié ;
+- [x] publier l’archive comme artefact OCI GHCR ;
+- [x] generate and probe the complete EN/FR, Work, CV, Blog, article,
       Dashboard, Claude, archive, error-page, and asset inventory;
-- [ ] probe domain redirects separately;
-- [ ] conserver Pages jusqu’à la bascule DNS validée.
+- [x] probe domain redirects separately;
+- [x] conserver Pages jusqu’à la bascule DNS validée.
 
 ### Papers Empire
 
-- [ ] corriger la documentation de tests contradictoire ;
-- [ ] épingler les Actions par SHA ;
-- [ ] conserver le build Retype et `build-lang-pages.mjs` ;
-- [ ] sonder jeu, langues, Dashboard et documentation ;
-- [ ] publier le répertoire `site/` comme artefact OCI ;
-- [ ] préserver exactement l’origine `https://papersempire.com`.
+- [x] corriger la documentation de tests contradictoire ;
+- [x] épingler les Actions par SHA ;
+- [x] conserver le build Retype et `build-lang-pages.mjs` ;
+- [x] sonder jeu, langues, Dashboard et documentation ;
+- [x] publier le répertoire `site/` comme artefact OCI ;
+- [x] préserver exactement l’origine `https://papersempire.com`.
 
 ### Parkventory
 
 - [x] build the explicitly labeled static demo for the root path;
 - [x] package deterministic static site and route inventory OCI payloads;
 - [x] add the bounded static materializer profile and shared Caddy route;
-- [ ] publish and attest the exact static artifacts from protected `main`;
-- [ ] deploy the static release, cut over DNS, and run strict public probes;
-- [ ] keep the backend application disabled during the static demo release;
+- [x] publish and attest the exact static artifacts from protected `main`;
+- [x] deploy the static release, cut over DNS, and run strict public probes;
+- [x] keep the backend application disabled during the static demo release;
 - [x] repartir d’un commit propre : vérifié sur `21f711c684d3` ;
 - [ ] refaire ce contrôle et revoir tout changement de worktree avant de figer
       chaque artefact de production ;
@@ -237,8 +254,8 @@ platform/
       fournisseur OIDC passwordless compatible avec le flux déjà choisi ;
 - [ ] conserver l’adaptateur d’identité maison uniquement pour le développement ;
 - [ ] sécuriser cookies, CORS, SMTP et Swagger ;
-- [ ] produire Backend et Frontend immuables ;
-- [ ] publier le paquet d’intégration VPS par digest ;
+- [x] produire Backend et Frontend immuables ;
+- [x] publier le paquet d’intégration VPS par digest ;
 - [ ] supprimer ports et montages de développement ;
 - [ ] ajouter durcissement, limites et healthchecks ;
 - [ ] ajouter Micrometer Prometheus et logs JSON ;
@@ -255,17 +272,18 @@ platform/
 
 ### Surplasse
 
-- [ ] retirer `edge`, `postgresql`, `prometheus` et `grafana` de la pile
-      applicative ;
-- [ ] externaliser réseaux et URL JDBC ;
-- [ ] adapter le wrapper ou remplacer son contrat par le manifeste VPS ;
-- [ ] transformer routes Caddy, targets/règles Prometheus, dashboards Grafana,
+- [x] publish a production application-only Compose contract without owning the
+      shared Caddy, PostgreSQL, Prometheus, or Grafana services;
+- [x] externaliser réseaux et URL JDBC dans le bundle de production ;
+- [x] remplacer le contrat de publication par le manifeste applicatif VPS ;
+- [x] transformer routes Caddy, targets/règles Prometheus, dashboards Grafana,
       migrations et probes en paquet d’intégration OCI ;
-- [ ] remplacer le `IMAGE_TAG` global par un digest par image ;
-- [ ] enregistrer une révision source par composant, y compris pour les images
+- [x] remplacer le `IMAGE_TAG` global par un digest par image ;
+- [x] enregistrer une révision source par composant, y compris pour les images
       inchangées ;
-- [ ] ne publier que les composants affectés ;
-- [ ] garder SBOM, provenance, attestations et Trivy ;
+- [x] publish the fixed five-image matrix on every canonical `main` push, with
+      every component bound to the same source SHA and referenced by digest;
+- [x] garder SBOM, provenance, attestations et Trivy ;
 - [ ] select a managed transactional email relay and accept its DPA, limits,
       support terms, and costs;
 - [ ] preserve the OVH MX records and publish one reviewed SPF record, the
@@ -274,7 +292,12 @@ platform/
       STARTTLS, then prove delivery, bounce handling, and operator alerting;
 - [ ] inspect the exact Backend image and the started process to prove the
       effective SMTP and TLS configuration, not only the Compose declaration;
-- [ ] ajouter la promotion vers `vps-infra`.
+- [x] publish one immutable `application-release` descriptor consumable by
+      `vps-infra` admission.
+
+These completed producer tasks do not authorize deployment. The protected
+Surplasse entry remains disabled until the host, database, secret, SMTP,
+network, route, migration, resource, recovery, and public-proof blockers pass.
 
 ## Phase 5 — livrer le contrôleur de releases
 
@@ -293,17 +316,17 @@ systemd/
 
 Critères :
 
-- [ ] aucun tag mutable accepté ;
-- [ ] origine, SHA et digest cohérents ;
-- [ ] paquets d’intégration validés, rendus et rollbackés avec leur digest ;
-- [ ] activation Parkventory refusée sans toutes les preuves de readiness ;
-- [ ] verrou global empêchant deux déploiements simultanés ;
-- [ ] compte SSH à shell système valide, sans accès interactif et sans groupe
+- [x] aucun tag mutable accepté ;
+- [x] origine, SHA et digest cohérents ;
+- [x] paquets d’intégration validés, rendus et liés à leur digest ;
+- [x] activation Parkventory refusée sans toutes les preuves de readiness ;
+- [x] verrou global empêchant deux déploiements simultanés ;
+- [x] compte SSH à shell système valide, sans accès interactif et sans groupe
       Docker ;
-- [ ] commande forcée bornée et règle `sudoers` root-owned sans `SETENV` ;
-- [ ] empreinte d’hôte préenregistrée ;
-- [ ] commit d’infrastructure complet et présent sur `main` ;
-- [ ] pull avant activation ;
+- [x] commande forcée bornée et règle `sudoers` root-owned sans `SETENV` ;
+- [x] empreinte d’hôte préenregistrée ;
+- [x] commit d’infrastructure complet et présent sur `main` ;
+- [x] pull avant activation ;
 - [x] install GitHub CLI 2.97.0 from checksum-locked `amd64` and `arm64`
       archives;
 - [x] validate the Personal and Papers Empire OCI envelopes, profile limits,
@@ -320,27 +343,35 @@ Critères :
       files into root-owned trees, and validate the exact Caddy configuration
       before an HTTPS `local_certs` probe of every route through the exact Caddy
       image;
-- [ ] `compose up --wait` ciblé ;
+- [x] implement targeted Compose start and health waits in the disabled
+      application controller; live use remains blocked;
 - [x] fsync static release files and directories bottom-up before the durable
       digest-named rename;
 - [x] replace the static `current` symlink atomically and restore the previous
       target if the post-replacement fsync fails;
 - [ ] retain a bounded set of previous static and application states for
       operator rollback;
-- [x] implement static rollback after strict live TLS failure; dynamic
-      pre-migration rollback remains pending;
-- [x] persist exact failed static tuples in quarantine until explicit operator
-      action; dynamic digest quarantine remains pending;
-- [x] add a durable prepared transaction and complete active tuple for static
-      deployments; the generic controller journal remains pending;
+- [x] implement static rollback after strict live TLS failure and application
+      transaction recovery; post-migration compatibility remains an activation
+      blocker;
+- [x] persist exact failed static and application tuples in quarantine until
+      explicit operator action;
+- [x] add durable prepared transactions and complete active tuples for static
+      and application deployments;
 - [x] connect the static materializer to the separately bounded ADR-0008 gate,
       with public TLS rollback and transaction recovery;
-- [ ] converge the reviewed static gate on Atlas, provision its dedicated
+- [x] converge the reviewed static gate on Atlas, provision its dedicated
       GitHub environment identity, and set `VPS_STATIC_DEPLOY_ENABLED=true`;
 - [ ] retain old static releases with a reviewed garbage-collection policy;
-- [x] référence d’environnement GitHub, matrice séquentielle et concurrence
-      globale codées dans le workflow ; l’environnement réel, son identité et
-      l’interrupteur de production restent à provisionner en phase 6.
+- [x] configure the real `static-production` environment, serialized matrix,
+      global concurrency, dedicated identity, and production switch.
+
+Atlas has converged the Compose application controller from revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root controller and gate are
+installed; `vps-application-recover.service` is loaded, inactive after its
+successful run (`Result=success`, `ExecMainStatus=0`). Both protected
+application entries remain `enabled: false`; no application workflow or live
+application activation exists.
 
 ## Phase 6 — répétition générale
 

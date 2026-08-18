@@ -9,6 +9,36 @@ hébergeant :
 - the static Parkventory demo (`parkventory.com`), separate from its disabled
   backend application.
 
+## Déployer un site statique
+
+Pour livrer un changement de contenu sur Atlas, modifier le dépôt du site, pas
+`vps-infra` :
+
+1. ouvrir une PR vers `main` pour
+   [Personal](https://github.com/nclsppr/personal#comment-déployer-sur-atlas) ou
+   [Parkventory](https://github.com/nclsppr/parkventory), et vers `master` pour
+   [Papers Empire](https://github.com/nclsppr/papersempire#deploy-to-atlas) ;
+2. attendre le check PR `Validate VPS release`, puis fusionner ;
+3. vérifier que le workflow producteur `VPS release` du SHA fusionné publie les
+   artefacts immuables avec succès ;
+4. laisser la réconciliation centrale planifiée les activer sur Atlas, ou la
+   déclencher immédiatement sans choisir de digest :
+
+```bash
+gh workflow run deploy-static-releases.yml \
+  --repo nclsppr/vps-infra \
+  --ref main
+```
+
+La planification GitHub Actions est configurée toutes les dix minutes mais
+reste best-effort et peut être retardée. Une modification de `vps-infra` n'est
+nécessaire que pour changer le contrat de déploiement lui-même : profil,
+branche ou checks requis, routage Caddy, activation, contrôleur ou politique de
+sécurité. Le
+[runbook de réconciliation](docs/operations/static-release-reconciliation.md)
+explique comment inspecter un run, prouver l'état Atlas, suspendre, récupérer ou
+faire un rollback.
+
 ## Architecture retenue
 
 Le socle reste volontairement simple :
@@ -51,8 +81,8 @@ Le premier socle exécutable est livré :
 - manifeste de production, schéma, vérificateur de preuves GitHub et contrôleur
   de déploiement borné ;
 - validations locales et CI, dont détection de secrets pour dépôt public ;
-- workflow de production manuel, désactivé tant que les portes de la plateforme
-  et des releases ne sont pas éprouvées ;
+- a generic manual platform workflow that remains locked, plus a separate
+  scheduled static reconciliation workflow that is active;
 - Caddy multi-architecture workflow with a native PR build and Trivy gate for
   each architecture. A `main` build scans both published child manifests by
   digest before it creates and verifies GitHub provenance.
@@ -60,14 +90,22 @@ Le premier socle exécutable est livré :
   allowlist. The workflow verifies the manifest and both GHCR layer payloads
   before it creates and verifies GitHub provenance.
 - a fail-closed static release reconciler for Personal, Papers Empire, and
-  Parkventory. It selects only the canonical branch HEAD after all observed and
-  expected checks are green, resolves the coherent site and route tags to
-  digests, and uses one bounded Atlas command. It stays disabled until the
-  dedicated environment and `VPS_STATIC_DEPLOY_ENABLED=true` are configured.
-- immutable application-release admission plus a root-owned transactional
-  Compose controller for Surplasse and Parkventory. It verifies every component
-  and integration attestation and bundle, but both protected entries remain
-  disabled and no application deployment workflow invokes it.
+  Parkventory. It selects only the canonical branch HEAD after every observed
+  check is complete and non-failing and every configured required check is a
+  success, resolves the coherent site and route tags to
+  digests, and uses one bounded Atlas command. The dedicated
+  `static-production` environment is configured with
+  `VPS_STATIC_DEPLOY_ENABLED=true`; scheduled operation is proved for all three
+  profiles.
+- immutable application-release admission plus repository-delivered Ansible
+  wiring for a root-owned transactional Compose controller for Surplasse and
+  Parkventory. The controller source verifies every component and integration
+  attestation and bundle. Atlas has converged revision
+  `da04a09bfa9788ae8127b63f9f3a6692bef2551b`: the root-owned
+  `deploy-application` controller and its argument-free gate are installed, and
+  `vps-application-recover.service` is loaded, inactive after a successful
+  recovery (`Result=success`, `ExecMainStatus=0`). Both protected entries remain
+  `enabled: false`; no application deployment workflow invokes the controller.
 
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
@@ -81,13 +119,31 @@ controlled operator rollout now has this live state:
   the private internal platform;
 - only SSH, HTTP, and HTTPS use public host ports. Grafana binds to loopback.
   PostgreSQL and the metrics endpoints have no host port;
-- the local PostgreSQL backup and isolated restore-rehearsal timers are active.
+- the local PostgreSQL backup and isolated restore-rehearsal timers are active;
+- `atlas-codex-app-server.service` is active and running as the isolated `codex`
+  account on its managed private Unix socket, with no public listener.
+
+On 2026-08-18, central reconciliation run
+[`32086151183`](https://github.com/nclsppr/vps-infra/actions/runs/32086151183)
+contained the resolver and all three successful deploy jobs after the final
+controller convergence. Atlas reported the exact immutable tuples for Personal
+(`163b9c9643dd9c54e9b1bb5d558d34a670e28e52`), Papers Empire
+(`b95f9bdde468aac9d03bd0548c7aa42969e52df7`), and Parkventory
+(`db9571cc59d0fcc31c6554af259eda4c29988a6a`) as active and healthy. The
+complete site and route digests, controller boundary, and TLS probes are in the
+[rollout evidence](docs/evidence/2026-08-18-static-reconciliation-rollout.md).
+Use the
+[static reconciliation runbook](docs/operations/static-release-reconciliation.md)
+for enablement, suspension, run inspection, rollback, recovery, and key
+rotation. A green workflow conclusion alone is not proof that all three
+profiles were `ready`.
 
 This bounded rollout does not enable the dynamic release manifest or invoke the
-installed Compose application controller. The manifest keeps every dynamic
-application at `enabled: false`; the root controller rejects each one before
-runtime validation or network access, and the runtime doctor reports the
-missing desired and active release records as expected warnings.
+Compose application controller. The manifest keeps every dynamic application
+at `enabled: false`. The application controller is installed, but no application
+workflow invokes it and no desired or active application release exists. The
+runtime doctor reports the missing desired and active application release
+records as expected warnings.
 `parkventory.com` is a static demonstration only. `surplasse.com` keeps its
 previous DNS target and Atlas does not serve a Surplasse application.
 
@@ -117,16 +173,22 @@ canonical source HEAD, probes the actual edge with strict public TLS, records
 the complete active tuple, and restores the previous release before it
 classifies a failed probe. It quarantines the candidate only while the same
 source HEAD and Caddy runtime still hold. A bounded unprivileged ancestry check
-also rejects branch-history rollback. Protected inventories make repeated exact candidates local health
-checks instead of registry downloads. A transient activation unit and a boot
-oneshot recover unfinished transactions and bounded probe residue before the
-public edge can start.
+also rejects branch-history rollback. Protected inventories make repeated exact
+candidates local health checks instead of registry downloads. A transient
+activation unit and a boot oneshot recover unfinished transactions and bounded
+probe residue before the systemd-managed public-edge start. Docker's
+`restart: unless-stopped` can still restart the existing Caddy container when
+the daemon starts, before that ordering is applied. Closing this daemon-level
+recovery bypass remains an explicit platform hardening task.
 Branch protection remains a separate external gate. The generic locked
-controller cannot call `apply-release`, which remains absent. The separate
+controller cannot call `apply-release`, which remains absent. The repository
 application controller has its own exact forced-command gate, shared static
-lock, transaction journal, quarantine, and boot recovery. It remains inert
-until a reviewed application entry is enabled and its database, secrets,
-observability, edge route, and network cutover are prepared.
+lock, transaction journal, quarantine, and boot recovery wiring. Revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b` and its recovery unit are installed
+and proved healthy while idle, but both application entries remain disabled and
+no application release is active. Activation still requires a reviewed
+application entry, database, secrets, observability, edge route, network
+cutover, a dedicated workflow, and every blocker in ADR-0010.
 
 ## Démarrage local
 
@@ -174,11 +236,13 @@ minutes CI, mais mêlerait code non fiable, daemon Docker, CPU, disque et secret
 de production. Une image seulement locale disparaîtrait aussi avec le VPS.
 
 Les dépôts concernés étant publics aujourd’hui, les runners standards GitHub
-Actions ne consomment pas de quota de minutes facturables. La stratégie retenue
-est donc de ne reconstruire que les composants modifiés, publier leurs digests
-dans GHCR, puis exécuter un déploiement VPS très court. Si cette tarification
-change, le repli prévu est un builder éphémère séparé du VPS, jamais un runner
-persistant dans la production.
+Actions ne consomment pas de quota de minutes facturables. Les producteurs
+statiques reconstruisent leur paquet complet. Surplasse reconstruit et publie
+actuellement sa matrice fixe de cinq images à chaque push sur `main`; chaque
+référence reste indépendante, liée au SHA global et résolue par digest. Une
+optimisation future pourrait sélectionner les composants affectés sans changer
+ce contrat. Si la tarification change, le repli prévu est un builder éphémère
+séparé du VPS, jamais un runner persistant dans la production.
 
 Cette décision est détaillée dans
 [l’ADR-0003](docs/decisions/0003-builds-hors-du-vps-de-production.md).
@@ -188,7 +252,7 @@ Cette décision est détaillée dans
 - [Architecture cible](docs/architecture.md)
 - [Automatisation de l’hôte](ansible/README.md)
 - [Pile plateforme](platform/README.md)
-- [Adaptateur Surplasse verrouillé](applications/surplasse/README.md)
+- [Legacy locked Surplasse preparation adapter](applications/surplasse/README.md)
 - [Livraison et mises à jour](docs/deployment.md)
 - [Contrat du contrôleur de release](scripts/README.md)
 - [Reconstruction depuis zéro](docs/rebuild.md)
@@ -196,6 +260,8 @@ Cette décision est détaillée dans
 - [Codex CLI on Atlas](docs/operations/codex-cli.md)
 - [Surplasse SMTP relay preparation](docs/operations/surplasse-smtp.md)
 - [Sauvegarde PostgreSQL et répétition de restauration](docs/operations/postgresql-backup.md)
+- [Static release reconciliation operations](docs/operations/static-release-reconciliation.md)
+- [Static reconciliation rollout evidence, 2026-08-18](docs/evidence/2026-08-18-static-reconciliation-rollout.md)
 - [Contrat des secrets](secrets/README.md)
 - [Sources et preuves d’audit](docs/references.md)
 - [Plan de mise en œuvre](VPS-SETUP.md)

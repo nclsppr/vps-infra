@@ -2414,6 +2414,240 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("difference", drift_contract)
         self.assertIn("separate explicit operation", drift_contract)
 
+    def test_deployment_key_rotation_is_fail_closed_at_every_boundary(self) -> None:
+        tasks = yaml.safe_load(
+            (ROOT / "ansible/roles/deploy/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        def task_named(name: str) -> tuple[int, dict[str, object]]:
+            return next(
+                (index, task)
+                for index, task in enumerate(tasks)
+                if task["name"] == name
+            )
+
+        refusal_index, refusal = next(
+            (index, task)
+            for index, task in enumerate(tasks)
+            if task["name"]
+            == "Refuse convergence without a bounded deployment key set"
+        )
+        syntax_index, syntax = task_named("Validate deployment public key syntax")
+        parse_index, parse = task_named(
+            "Cryptographically parse deployment public keys"
+        )
+        overlap_index, overlap = task_named(
+            "Measure overlap with a currently installed deployment key"
+        )
+        rotation_index, rotation = task_named(
+            "Authorize only first install overlap or explicit unused recovery"
+        )
+        consume_index, consume = task_named(
+            "Consume the exceptional deployment key recovery nonce"
+        )
+        raced_index, raced = task_named(
+            "Refuse a raced or reused deployment key recovery nonce"
+        )
+        install_index, install = task_named("Install forced-command deployment keys")
+        assertions = refusal["ansible.builtin.assert"]
+        contract = json.dumps(assertions, sort_keys=True)
+
+        self.assertIn("vps_deploy_authorized_keys is sequence", contract)
+        self.assertIn("vps_deploy_authorized_keys is not string", contract)
+        self.assertIn("vps_deploy_authorized_keys | length > 0", contract)
+        self.assertIn("vps_deploy_authorized_keys | length <= 4", contract)
+        self.assertIn("vps_deploy_authorized_keys | unique | length", contract)
+        self.assertIn("Refus de vider les clés", assertions["fail_msg"])
+        self.assertNotIn("when", refusal)
+        self.assertNotIn("ignore_errors", refusal)
+
+        parse_command = parse["ansible.builtin.command"]
+        self.assertEqual(
+            parse_command["argv"],
+            ["/usr/bin/ssh-keygen", "-l", "-E", "sha256", "-f", "/dev/stdin"],
+        )
+        self.assertIs(parse["check_mode"], False)
+        self.assertIs(parse["changed_when"], False)
+        self.assertIs(parse_command["stdin_add_newline"], False)
+
+        overlap_contract = json.dumps(overlap, sort_keys=True)
+        rotation_contract = json.dumps(rotation, sort_keys=True)
+        self.assertIn("intersect", overlap_contract)
+        self.assertIn("deploy_first_key_install", rotation_contract)
+        self.assertIn("deploy_key_overlap_count", rotation_contract)
+        self.assertIn("vps_deploy_key_recovery_nonce", rotation_contract)
+        self.assertIn("vps_deploy_authorized_keys | length == 1", rotation_contract)
+        self.assertEqual(rotation["register"], "deploy_key_rotation_guard")
+        self.assertNotIn("ignore_errors", rotation)
+
+        consume_command = consume["ansible.builtin.command"]
+        self.assertEqual(consume_command["argv"][0:2], ["/usr/bin/python3", "-c"])
+        self.assertIn("os.O_EXCL", consume_command["argv"][2])
+        self.assertIn("os.fsync", consume_command["argv"][2])
+        self.assertIn("os.O_DIRECTORY", consume_command["argv"][2])
+        self.assertLess(
+            consume_command["argv"][2].index("os.fsync(marker.fileno())"),
+            consume_command["argv"][2].index("os.O_DIRECTORY"),
+        )
+        self.assertLess(
+            consume_command["argv"][2].index("os.O_DIRECTORY"),
+            consume_command["argv"][2].index("os.fsync(directory)"),
+        )
+        self.assertIn("installed=", consume_command["argv"][4])
+        self.assertIn("desired=", consume_command["argv"][4])
+        with tempfile.TemporaryDirectory() as marker_directory:
+            marker_path = Path(marker_directory) / "one-use"
+            marker_argv = [
+                *consume_command["argv"][0:3],
+                str(marker_path),
+                "revision=test\ninstalled=old\ndesired=new\n",
+            ]
+            first_consumption = subprocess.run(
+                marker_argv,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            second_consumption = subprocess.run(
+                marker_argv,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.assertEqual(first_consumption.returncode, 0)
+            self.assertNotEqual(second_consumption.returncode, 0)
+            self.assertEqual(
+                marker_path.read_text(encoding="utf-8"),
+                "revision=test\ninstalled=old\ndesired=new\n",
+            )
+        self.assertIs(consume["changed_when"], True)
+        self.assertIn("not ansible_check_mode", consume["when"])
+        self.assertIn(
+            "ansible_check_mode or",
+            json.dumps(raced["ansible.builtin.assert"], sort_keys=True),
+        )
+        self.assertLess(refusal_index, syntax_index)
+        self.assertLess(syntax_index, parse_index)
+        self.assertLess(parse_index, overlap_index)
+        self.assertLess(overlap_index, rotation_index)
+        self.assertLess(rotation_index, consume_index)
+        self.assertLess(consume_index, raced_index)
+        self.assertLess(raced_index, install_index)
+
+        install_template = install["ansible.builtin.template"]
+        validate = install_template["validate"]
+        self.assertEqual(validate.count("%s"), 1)
+        self.assertTrue(validate.endswith("vps-deploy-authorized-keys-validator %s"))
+        self.assertIn("/bin/sh -c 'set -eu;", validate)
+        self.assertIn("restrict,command=", validate)
+        self.assertIn("ssh-keygen -l -E sha256", validate)
+        self.assertIn("[ \"$count\" -ge 1 ]", validate)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            key_path = temporary_root / "deploy-test"
+            subprocess.run(
+                [
+                    "/usr/bin/ssh-keygen",
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-f",
+                    str(key_path),
+                ],
+                check=True,
+            )
+            public_key = key_path.with_suffix(".pub").read_text(
+                encoding="utf-8"
+            ).strip()
+            prefix = (
+                'restrict,command="/usr/local/libexec/vps/forced-command" '
+            )
+            candidates = {
+                "valid": (f"{prefix}{public_key}\n", 0),
+                "empty": ("", 1),
+                "mixed-invalid": (
+                    f"not-a-key\n{prefix}{public_key}\n",
+                    1,
+                ),
+                "wrong-prefix": (f"command=\"/bin/sh\" {public_key}\n", 1),
+            }
+            for name, (content, expected_success) in candidates.items():
+                candidate = temporary_root / name
+                candidate.write_text(content, encoding="utf-8")
+                validation = subprocess.run(
+                    shlex.split(validate.replace("%s", str(candidate))),
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.assertEqual(
+                    validation.returncode == 0,
+                    expected_success == 0,
+                    name,
+                )
+
+        template = (
+            ROOT / "ansible/roles/deploy/templates/authorized_keys.j2"
+        ).read_text(encoding="utf-8")
+        self.assertIn("deploy_key_rotation_guard is defined", template)
+        self.assertIn("deploy_key_recovery_marker_creation is defined", template)
+        self.assertIn("ansible_check_mode | default(false) | bool", template)
+        self.assertIn("vps-deploy-authorized-keys-render-refused", template)
+
+        playbook = yaml.safe_load(
+            (ROOT / "ansible/playbooks/site.yml").read_text(encoding="utf-8")
+        )
+        pre_tasks = playbook[0]["pre_tasks"]
+        preflight = pre_tasks[0]["ansible.builtin.assert"]
+        preflight_contract = json.dumps(preflight, sort_keys=True)
+        self.assertIn("vps_deploy_authorized_keys | length > 0", preflight_contract)
+        self.assertIn("vps_deploy_authorized_keys | length <= 4", preflight_contract)
+        self.assertIn(
+            "vps_deploy_authorized_keys | unique | length", preflight_contract
+        )
+
+        preflight_parse = next(
+            task
+            for task in pre_tasks
+            if task["name"]
+            == "Cryptographically parse deployment public keys before any role"
+        )
+        self.assertIs(preflight_parse["check_mode"], False)
+        self.assertIs(preflight_parse["changed_when"], False)
+        self.assertNotIn("delegate_to", preflight_parse)
+        self.assertEqual(
+            preflight_parse["ansible.builtin.command"]["argv"],
+            ["/usr/bin/ssh-keygen", "-l", "-E", "sha256", "-f", "/dev/stdin"],
+        )
+
+    def test_total_loss_recovery_uses_one_nonce_and_a_negative_auth_probe(
+        self,
+    ) -> None:
+        runbook = (
+            ROOT / "docs/operations/static-release-reconciliation.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("vps_deploy_key_recovery_nonce", runbook)
+        self.assertIn("openssl rand -hex 32", runbook)
+        self.assertIn("The same\nnonce cannot be reused", runbook)
+        self.assertIn("vps_deploy_key_recovery_nonce: \"\"", runbook)
+        self.assertIn("neither consumes the nonce nor\nreplaces", runbook)
+        self.assertIn("point-of-mutation template validator", runbook)
+        self.assertIn("-o IdentityAgent=none", runbook)
+        self.assertIn("-o ControlMaster=no", runbook)
+        self.assertIn("'deploy auth-proof'", runbook)
+        self.assertIn("proof_status\" -eq 255", runbook)
+        self.assertIn("proof_status\" -ne 64", runbook)
+        self.assertIn(
+            "forced-command parser: malformed deploy command",
+            runbook,
+        )
+
     def test_root_test_mode_stops_before_controller_paths_are_selected(self) -> None:
         controller = (SCRIPTS / "deploy").read_text(encoding="utf-8")
         guard = controller.index("root cannot use controller test mode")
@@ -2623,6 +2857,19 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             ("deploy", "Read deployment account groups"): [
                 "/usr/bin/id",
                 "-nG",
+                "{{ vps_deploy_user }}",
+            ],
+            ("deploy", "Cryptographically parse deployment public keys"): [
+                "/usr/bin/ssh-keygen",
+                "-l",
+                "-E",
+                "sha256",
+                "-f",
+                "/dev/stdin",
+            ],
+            ("deploy", "Inspect whether the deployment account already exists"): [
+                "/usr/bin/getent",
+                "passwd",
                 "{{ vps_deploy_user }}",
             ],
             ("docker", "Read the Docker key fingerprints"): [

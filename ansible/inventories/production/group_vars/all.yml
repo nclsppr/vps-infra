@@ -16,6 +16,9 @@ vps_ssh_port: 22
 # key is not a secret. The automation must not create one.
 vps_admin_authorized_keys: []
 vps_deploy_authorized_keys: []
+# Break-glass only. A non-empty 64-character nonce authorizes one replacement
+# without overlap and is consumed on Atlas. Normal convergence keeps this empty.
+vps_deploy_key_recovery_nonce: ""
 vps_codex_remote_enabled: false
 vps_codex_remote_control_enabled: false
 vps_codex_remote_authorized_keys: []

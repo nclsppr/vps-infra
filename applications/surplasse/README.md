@@ -1,8 +1,22 @@
-# Locked Surplasse Atlas adapter
+# Legacy locked Surplasse Atlas adapter
 
-This directory defines the reviewed application boundary for Surplasse. It does
-not define Caddy, PostgreSQL, Prometheus, Grafana, or an exporter. The shared
-platform owns those services.
+This directory is a legacy, locked preparation adapter. It remains useful for
+local policy tests and the bounded database-preparation command. It is not the
+canonical application-release producer and it is not a production activation
+path. Surplasse now publishes an immutable `application-release` descriptor and
+common integration bundle for the shared admission contract. The protected
+entry remains disabled.
+
+Atlas converged the shared transactional application controller from
+`vps-infra` revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b` on 2026-08-18.
+The root controller and gate are installed, and
+`vps-application-recover.service` is loaded and inactive after a successful run
+(`Result=success`, `ExecMainStatus=0`). This legacy adapter does not invoke that
+gate: Surplasse remains `enabled: false`, with no application deployment
+workflow and no live Atlas application release.
+
+The adapter does not define Caddy, PostgreSQL, Prometheus, Grafana, or an
+exporter. The shared platform owns those services.
 
 The Compose candidate has five long-running services:
 
@@ -48,8 +62,9 @@ The adapter also stays locked for these integration reasons:
 - no managed transactional email provider is selected or provisioned;
 - SPF, DKIM, DMARC, STARTTLS from Atlas, final delivery, bounce handling, and
   operator alerting do not have reviewed evidence;
-- the source branch, image provenance, Stripe Connect production adapter, and
-  Surplasse integration bundle do not have complete release evidence.
+- immutable producer images, integration bundle, and `application-release`
+  publication do not prove the remaining host, branch-protection, Stripe
+  Connect, secret, route, database, migration, or live-activation gates.
 
 The existing disabled candidates are contract inputs. This adapter does not
 duplicate them:
@@ -198,12 +213,15 @@ must use this order:
 1. verify the exact Backend image and its migration command;
 2. prove a restorable PostgreSQL backup;
 3. provision the database and the three roles;
-4. run the transient migration job and require a successful exit;
-5. start the five long-running services without host ports;
-6. activate the Caddy route and Prometheus configuration with the required
+4. install and verify every exact root-owned secret and runtime configuration;
+5. prepare the immutable Caddy route, Prometheus configuration, and required
    platform network attachments;
-7. complete strict internal and public probes;
-8. change DNS only after the direct Atlas probe succeeds.
+6. require the active edge route to equal the attested bundle and require
+   healthy Caddy on the exact application network before schema migration;
+7. run the transient migration job and require a successful exit;
+8. start the five long-running services without host ports;
+9. complete strict internal and public probes;
+10. change DNS only after the direct Atlas probe succeeds.
 
 The verified Backend digest satisfies the migration-entrypoint image gate. The
 adapter remains locked by the other release, integration, secret, restore, and
@@ -235,12 +253,14 @@ application container. It does not change the persistent platform network
 membership, public Caddy, Prometheus, DNS, or operator-supplied application
 secrets.
 
-`make activate-surplasse` is an intentional refusal while `adapter.json` is
+`make activate-surplasse` is an intentional legacy-adapter refusal while
+`adapter.json` is
 locked. The refusal occurs before a database, application, shared platform, or
 public edge mutation. The next release slice must complete image provenance,
-persistent platform attachments, operator secrets, migration-first
-orchestration, rollback, and public proof, then change the adapter through
-review before activation code can be enabled.
+persistent platform attachments, operator secrets, route-before-migration
+orchestration, compatible recovery, and public proof. Production activation
+must use the immutable application-release controller after every ADR-0010
+blocker passes; it must not unlock this legacy adapter as an alternate path.
 
 The files under `integration/` are inactive attachment candidates. They show
 the bounded target memberships: PostgreSQL joins only `db_surplasse`,
