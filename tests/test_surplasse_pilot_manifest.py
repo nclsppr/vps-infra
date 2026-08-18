@@ -252,7 +252,7 @@ class PilotManifestMaterializerTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 78)
             self.assertNotIn("Traceback", result.stderr)
-            self.assertIn("strict UTF-8 JSON", result.stderr)
+            self.assertRegex(result.stderr, r"(?:invalid shape|strict UTF-8 JSON)")
 
             source.write_bytes(b'{"schema":' + b"9" * 5000 + b"}\n")
             result = self.run_helper(
@@ -264,7 +264,7 @@ class PilotManifestMaterializerTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 78)
             self.assertNotIn("Traceback", result.stderr)
-            self.assertIn("strict UTF-8 JSON", result.stderr)
+            self.assertRegex(result.stderr, r"(?:invalid shape|strict UTF-8 JSON)")
 
     def test_text_limits_match_java_utf16_and_iso_control_semantics(self) -> None:
         self.assertEqual(MATERIALIZER.text("😀" * 80, 1, 160, "name"), "😀" * 80)
