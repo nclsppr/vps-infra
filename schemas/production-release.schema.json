@@ -27,7 +27,7 @@
           "$ref": "#/$defs/staticApplication",
           "properties": {
             "source_repository": { "const": "nclsppr/papersempire" },
-            "source_branch": { "const": "master" }
+            "source_branch": { "const": "main" }
           }
         },
         "surplasse": {

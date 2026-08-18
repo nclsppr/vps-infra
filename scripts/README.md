@@ -122,8 +122,8 @@ Before it downloads a payload layer, the materializer verifies GitHub artifact
 attestations for the site manifest, route manifest, and integration manifest.
 Each verification binds the subject to its exact repository, full source
 revision, canonical source ref, and signer workflow. It rejects a self-hosted
-runner as the signer. The Personal source ref is `refs/heads/main`. The Papers
-Empire source ref is `refs/heads/master`. The integration source ref is
+runner as the signer. The Personal and Papers Empire source refs are
+`refs/heads/main`. The integration source ref is
 `refs/heads/main` in `nclsppr/vps-infra`.
 
 A network-enabled systemd `DynamicUser` execution downloads the bounded

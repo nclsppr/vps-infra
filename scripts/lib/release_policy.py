@@ -28,7 +28,7 @@ PLATFORM_PROOF_BASELINE_GATES = frozenset(
 
 EXPECTED_APPLICATIONS = {
     "personal": ("static", "nclsppr/personal", "main", None),
-    "papersempire": ("static", "nclsppr/papersempire", "master", None),
+    "papersempire": ("static", "nclsppr/papersempire", "main", None),
     "surplasse": ("compose", "nclsppr/surplasse", "main", "surplasse"),
     "parkventory": ("compose", "nclsppr/parkventory", "main", "parkventory"),
 }

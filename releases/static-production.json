@@ -22,7 +22,7 @@
       "enabled": true,
       "mode": "static-site",
       "source_repository": "nclsppr/papersempire",
-      "source_branch": "master",
+      "source_branch": "main",
       "site_repository": "ghcr.io/nclsppr/papersempire/site",
       "routes_repository": "ghcr.io/nclsppr/papersempire/routes",
       "required_checks": [

@@ -340,8 +340,8 @@ class ReleasePolicyTests(unittest.TestCase):
 
     def test_wrong_canonical_branch_is_rejected(self) -> None:
         manifest = sample_manifest()
-        manifest["applications"]["papersempire"]["source_branch"] = "main"
-        with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "must equal 'master'"):
+        manifest["applications"]["papersempire"]["source_branch"] = "master"
+        with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "must equal 'main'"):
             RELEASE_POLICY.validate_manifest(manifest)
 
     def test_postgres_pgdata_must_match_the_volume_contract(self) -> None:
