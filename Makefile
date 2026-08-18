@@ -12,6 +12,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
 	check-public-static-edge check-surplasse-public-edge-candidate \
+	check-surplasse-public-edge-controller \
 	check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
@@ -136,6 +137,10 @@ check-surplasse-public-edge-candidate: check-public-static-edge ## Validate the 
 	image="$$(jq -r .caddy platform/public-static-edge/expected-images.json)"; \
 	./scripts/verify-surplasse-public-edge-caddy \
 		"$$image" platform/caddy/routes/surplasse.caddy.disabled
+
+check-surplasse-public-edge-controller: ## Test the crash-safe Surplasse edge transition controller.
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		tests/test_surplasse_public_edge_controller.py
 
 check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 	@set -Eeuo pipefail; \

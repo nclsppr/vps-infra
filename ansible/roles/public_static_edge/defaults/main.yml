@@ -5,6 +5,15 @@ vps_public_static_edge_release_root: /srv/vps/releases/public-static-edge
 vps_public_static_edge_runtime_dir: /srv/vps/runtime/public-static-edge
 vps_public_static_edge_unit: vps-public-static-edge.service
 vps_public_static_edge_container: vps-public-static-edge-caddy-1
+vps_public_static_edge_surplasse_controller: >-
+  /usr/local/libexec/vps/deploy-surplasse-public-edge
+vps_public_static_edge_surplasse_release_root: >-
+  /srv/vps/releases/public-static-edge-surplasse
+vps_public_static_edge_surplasse_state_root: /var/lib/vps-public-edge-surplasse
+vps_public_static_edge_surplasse_recovery_unit: >-
+  vps-public-edge-surplasse-recover.service
+vps_public_static_edge_surplasse_dns_materializer: >-
+  /usr/local/libexec/vps/materialize-surplasse-dns-secrets
 vps_public_static_edge_network: edge
 vps_public_static_edge_network_subnet: 172.30.32.0/24
 vps_public_static_edge_image: >-

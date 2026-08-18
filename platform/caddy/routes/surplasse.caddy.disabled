@@ -97,7 +97,7 @@ https://{$SURPLASSE_DOMAIN:surplasse.com}, https://*.{$SURPLASSE_DOMAIN:surplass
 		respond "This path is not exposed by the Surplasse Onboarding.\n" 404
 	}
 
-	@reserved host app.{$SURPLASSE_DOMAIN:surplasse.com} admin.{$SURPLASSE_DOMAIN:surplasse.com} local.{$SURPLASSE_DOMAIN:surplasse.com} mail.{$SURPLASSE_DOMAIN:surplasse.com} reports.{$SURPLASSE_DOMAIN:surplasse.com} grafana.{$SURPLASSE_DOMAIN:surplasse.com}
+	@reserved host app.{$SURPLASSE_DOMAIN:surplasse.com} admin.{$SURPLASSE_DOMAIN:surplasse.com} local.{$SURPLASSE_DOMAIN:surplasse.com} mail.{$SURPLASSE_DOMAIN:surplasse.com} autoconfig.{$SURPLASSE_DOMAIN:surplasse.com} autodiscover.{$SURPLASSE_DOMAIN:surplasse.com} mta-sts.{$SURPLASSE_DOMAIN:surplasse.com} smtp.{$SURPLASSE_DOMAIN:surplasse.com} imap.{$SURPLASSE_DOMAIN:surplasse.com} pop.{$SURPLASSE_DOMAIN:surplasse.com} pop3.{$SURPLASSE_DOMAIN:surplasse.com} webmail.{$SURPLASSE_DOMAIN:surplasse.com} status.{$SURPLASSE_DOMAIN:surplasse.com} reports.{$SURPLASSE_DOMAIN:surplasse.com} grafana.{$SURPLASSE_DOMAIN:surplasse.com}
 	handle @reserved {
 		respond "This Surplasse subdomain is reserved but has no service in this deployment.\n" 503
 	}
