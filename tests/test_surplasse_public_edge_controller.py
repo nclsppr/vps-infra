@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,23 @@ def protected_file(path: Path, content: bytes, mode: int = 0o444) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     path.chmod(mode)
+
+
+def changed_metadata(metadata, **changes):
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_gid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    values = {field: getattr(metadata, field) for field in fields}
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 class ControllerFixture:
@@ -155,6 +173,139 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_docker_executable_larger_than_16_mib_needs_no_content_read(
+        self,
+    ) -> None:
+        incident_size = 45_570_321
+        with self.fixture.paths.docker.open("r+b") as stream:
+            stream.truncate(incident_size)
+        self.assertGreater(incident_size, 16 * 1024 * 1024)
+        self.assertEqual(
+            CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES, 128 * 1024 * 1024
+        )
+        self.assertEqual(
+            CONTROLLER.MAX_CONTROL_EXECUTABLE_BYTES, 16 * 1024 * 1024
+        )
+        with mock.patch.object(
+            CONTROLLER.os,
+            "read",
+            side_effect=AssertionError("executable content was read"),
+        ) as read:
+            CONTROLLER.validate_protected_executable(
+                self.fixture.paths.docker,
+                "Docker executable",
+                self.fixture.paths,
+                modes=frozenset({0o755}),
+                maximum_size=CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES,
+            )
+        read.assert_not_called()
+
+    def test_executable_validation_refuses_oversize_symlink_mode_and_nlink(
+        self,
+    ) -> None:
+        docker = self.fixture.paths.docker
+        cases = ("oversize", "symlink", "mode", "nlink")
+        for case in cases:
+            with self.subTest(case=case):
+                candidate = docker
+                linked = docker.with_name(f"docker-{case}")
+                try:
+                    if case == "oversize":
+                        with docker.open("r+b") as stream:
+                            stream.truncate(
+                                CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES + 1
+                            )
+                    elif case == "symlink":
+                        linked.symlink_to(docker)
+                        candidate = linked
+                    elif case == "mode":
+                        docker.chmod(0o775)
+                    else:
+                        os.link(docker, linked)
+                    with self.assertRaises(CONTROLLER.EdgeDeploymentError):
+                        CONTROLLER.validate_protected_executable(
+                            candidate,
+                            "Docker executable",
+                            self.fixture.paths,
+                            modes=frozenset({0o755}),
+                            maximum_size=CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES,
+                        )
+                finally:
+                    if linked.exists() or linked.is_symlink():
+                        linked.unlink()
+                    protected_file(docker, b"docker\n", 0o755)
+
+    def test_executable_validation_refuses_an_untrusted_uid(self) -> None:
+        metadata = self.fixture.paths.docker.lstat()
+        untrusted = changed_metadata(
+            metadata, st_uid=self.fixture.paths.expected_uid + 1
+        )
+        with mock.patch.object(CONTROLLER.os, "fstat", return_value=untrusted):
+            with self.assertRaisesRegex(
+                CONTROLLER.EdgeDeploymentError, "not one protected executable"
+            ):
+                CONTROLLER.validate_protected_executable(
+                    self.fixture.paths.docker,
+                    "Docker executable",
+                    self.fixture.paths,
+                    modes=frozenset({0o755}),
+                    maximum_size=CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES,
+                )
+
+    def test_executable_validation_refuses_descriptor_metadata_change(
+        self,
+    ) -> None:
+        metadata = self.fixture.paths.docker.lstat()
+        changed = changed_metadata(
+            metadata, st_mtime_ns=metadata.st_mtime_ns + 1
+        )
+        with mock.patch.object(
+            CONTROLLER.os, "fstat", side_effect=(metadata, changed)
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.EdgeDeploymentError, "changed while it was validated"
+            ):
+                CONTROLLER.validate_protected_executable(
+                    self.fixture.paths.docker,
+                    "Docker executable",
+                    self.fixture.paths,
+                    modes=frozenset({0o755}),
+                    maximum_size=CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES,
+                )
+
+    def test_executable_validation_refuses_path_replacement_during_check(
+        self,
+    ) -> None:
+        docker = self.fixture.paths.docker
+        metadata = docker.lstat()
+        replacement = changed_metadata(metadata, st_ino=metadata.st_ino + 1)
+        original_lstat = CONTROLLER.Path.lstat
+        target_calls = 0
+
+        def changing_lstat(candidate):
+            nonlocal target_calls
+            if candidate == docker:
+                target_calls += 1
+                return metadata if target_calls == 1 else replacement
+            return original_lstat(candidate)
+
+        with mock.patch.object(
+            CONTROLLER.Path,
+            "lstat",
+            autospec=True,
+            side_effect=changing_lstat,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.EdgeDeploymentError, "changed while it was validated"
+            ):
+                CONTROLLER.validate_protected_executable(
+                    docker,
+                    "Docker executable",
+                    self.fixture.paths,
+                    modes=frozenset({0o755}),
+                    maximum_size=CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES,
+                )
 
     def test_stage_retains_every_static_route_and_publishes_exact_inputs(self) -> None:
         state = self.fixture.stage()
