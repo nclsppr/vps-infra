@@ -104,8 +104,9 @@ Le premier socle exécutable est livré :
   `da04a09bfa9788ae8127b63f9f3a6692bef2551b` and proved that the root-owned
   `deploy-application` controller and its argument-free gate are installed, and
   `vps-application-recover.service` is loaded, inactive after a successful
-  recovery (`Result=success`, `ExecMainStatus=0`). Both protected entries remain
-  `enabled: false`; no application deployment workflow invokes the controller.
+  recovery (`Result=success`, `ExecMainStatus=0`). ADR-0013 now enables only the
+  canonical Surplasse tester admission entry. Parkventory remains disabled and
+  no application deployment workflow invokes the controller.
 
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
@@ -138,12 +139,12 @@ for enablement, suspension, run inspection, rollback, recovery, and key
 rotation. A green workflow conclusion alone is not proof that all three
 profiles were `ready`.
 
-This bounded rollout does not enable the dynamic release manifest or invoke the
-Compose application controller. The manifest keeps every dynamic application
-at `enabled: false`. The application controller is installed, but no application
-workflow invokes it and no desired or active application release exists. The
-runtime doctor reports the missing desired and active application release
-records as expected warnings.
+This bounded rollout did not enable the legacy dynamic release manifest or
+invoke the Compose application controller. `releases/production.yaml` still
+keeps every dynamic application at `enabled: false`. The separate canonical
+contract now admits the Surplasse tester release, but no application workflow
+invokes it and repository admission alone creates no desired or active
+application release.
 `parkventory.com` is a static demonstration only. `surplasse.com` keeps its
 previous DNS target and Atlas does not serve a Surplasse application.
 
@@ -185,11 +186,11 @@ controller cannot call `apply-release`, which remains absent. The repository
 application controller has its own exact forced-command gate, shared static
 lock, transaction journal, quarantine, and boot recovery wiring. Revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b` and its recovery unit were installed
-and proved healthy while idle during the dated rollout. Both application
-entries remain disabled and no application release is active. Activation still
-requires a reviewed
-application entry, database, secrets, observability, edge route, network
-cutover, a dedicated workflow, and every blocker in ADR-0010.
+and proved healthy while idle during the dated rollout. Canonical Surplasse
+tester admission is enabled, Parkventory remains disabled, and no application
+release is active. Surplasse activation still requires a deliberate operator
+command, database, secrets, observability, edge route, network cutover, and
+every retained runtime gate in ADR-0010.
 
 ## Démarrage local
 
@@ -278,6 +279,7 @@ Cette décision est détaillée dans
 - [ADR-0010 - disabled transactional application controller](docs/decisions/0010-disabled-transactional-application-controller.md)
 - [ADR-0011 - Stripe test mode for the Surplasse tester production](docs/decisions/0011-surplasse-tester-stripe-mode.md)
 - [ADR-0012 - locked Surplasse DNS cutover controller](docs/decisions/0012-locked-surplasse-dns-cutover-controller.md)
+- [ADR-0013 - canonical Surplasse tester application admission](docs/decisions/0013-surplasse-tester-application-admission.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas

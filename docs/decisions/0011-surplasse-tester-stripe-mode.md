@@ -3,9 +3,9 @@
 ## Status
 
 Accepted on 18 August 2026. The product owner authorizes production URLs and
-test orders before the public launch. This decision does not modify
-`releases/application-production.json`, enable Surplasse, install a credential,
-change DNS, start a container, or run a migration.
+test orders before the public launch. ADR-0013 later enables the separate
+canonical Surplasse admission entry. This payment decision does not install a
+credential, change DNS, start a container, or run a migration.
 
 ## Context
 
@@ -94,8 +94,8 @@ mounts.
   objects.
 - No real card payment can be collected through this profile.
 - A valid-looking key is not activation evidence. Stripe must authenticate it.
-- This decision keeps the application release disabled until the separate
-  activation contract and real operator inputs are ready.
+- ADR-0013 enables canonical release admission while the real operator inputs
+  and every runtime activation check remain mandatory.
 - The existing same-VPS backup is accepted for this tester MVP. Loss or
   compromise of Atlas can also remove that backup.
 

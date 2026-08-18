@@ -29,10 +29,10 @@ APPLICATION_COMPONENTS = {
 PUBLIC_CADDY_PORTS = frozenset({(80, 80, "tcp"), (443, 443, "tcp"), (443, 443, "udp")})
 LOOPBACK_GRAFANA_PORT = (3000, 3000, "tcp")
 DANGEROUS_CAPABILITIES = frozenset({"ALL", "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"})
-PLATFORM_NETWORKS = frozenset({"ops", "db_monitoring"})
+PLATFORM_NETWORKS = frozenset({"ops", "db_monitoring", "db_surplasse"})
 PLATFORM_SERVICE_NETWORKS = {
     "caddy": frozenset({"ops"}),
-    "postgresql": frozenset({"db_monitoring"}),
+    "postgresql": frozenset({"db_monitoring", "db_surplasse"}),
     "prometheus": frozenset({"ops"}),
     "grafana": frozenset({"ops"}),
     "node-exporter": frozenset({"ops"}),

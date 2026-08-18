@@ -7,6 +7,10 @@ decision adds admission only. It does not install an application, run a
 migration, change a secret, open the dynamic controller, or send a command to
 Atlas.
 
+ADR-0013 later enables only the canonical Surplasse tester admission entry.
+Parkventory and the legacy Surplasse adapter remain disabled, and admission
+still does not perform a live operation.
+
 ## Context
 
 Surplasse and Parkventory use a Java backend and separate frontend images.

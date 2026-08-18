@@ -6,6 +6,9 @@ Accepted on 14 August 2026 for the target architecture. No provider is
 selected. This decision does not authorize a purchase, a DNS change, a secret
 change, or production activation.
 
+ADR-0013 later enables repository admission for the Surplasse tester release.
+It does not supersede the SMTP evidence gates or authorize runtime activation.
+
 ## Context
 
 Surplasse sends authentication magic links by email. An SMTP relay can accept a
@@ -62,8 +65,9 @@ delivery events. Atlas does not expose another inbound port.
    `smtp-atlas-connectivity`, `smtp-effective-runtime-configuration`, and
    `email-delivery-observability`.
 7. Generic GitHub Actions evidence cannot satisfy an external evidence gate.
-   Surplasse stays disabled until reviewed evidence formats bind each result to
-   the provider contract, Backend digest, collection time, and Atlas identity.
+   Surplasse runtime activation stays blocked until reviewed evidence formats
+   bind each result to the provider contract, Backend digest, collection time,
+   and Atlas identity.
 
 ## Consequences
 
@@ -87,10 +91,10 @@ delivery events. Atlas does not expose another inbound port.
 ## Rollback
 
 Before an authorized DNS change, export the complete zone and record each TTL.
-If validation fails, keep Surplasse disabled and revoke the dedicated SMTP
-identity. Restore the previous SPF, DKIM, and DMARC records exactly. Do not
-change the OVH MX records. A provider change requires a new review. Do not use a
-silent SMTP fallback.
+If validation fails, keep the Surplasse runtime inactive and revoke the
+dedicated SMTP identity. Restore the previous SPF, DKIM, and DMARC records
+exactly. Do not change the OVH MX records. A provider change requires a new
+review. Do not use a silent SMTP fallback.
 
 ## Verification
 

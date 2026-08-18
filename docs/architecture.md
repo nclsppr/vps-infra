@@ -3,8 +3,8 @@
 ## Objet et niveau de preuve
 
 This document describes both the proved static production boundary and the
-disabled target architecture for Compose applications. Dated facts remain
-historical evidence and must be verified again before an operation.
+not-yet-activated target architecture for Compose applications. Dated facts
+remain historical evidence and must be verified again before an operation.
 
 The project states consolidated on 2026-08-18 are:
 
@@ -13,7 +13,7 @@ The project states consolidated on 2026-08-18 are:
 | `personal` | Immutable site and route artifacts from `163b9c9643dd9c54e9b1bb5d558d34a670e28e52` are active on Atlas. | Keep the allowlisted static producer and automatic reconciliation. |
 | `papersempire` | The assembled `site/` and route inventory from `b95f9bdde468aac9d03bd0548c7aa42969e52df7` are active on Atlas. | Publish the CI result, never the checkout. |
 | `parkventory` | The static demo from `db9571cc59d0fcc31c6554af259eda4c29988a6a` is active. Backend, frontend, integration, and application-release artifacts exist but are not active. | Keep the Compose application disabled until the explicit ownership handoff and all ADR-0010 blockers pass. |
-| `surplasse` | An immutable application release and integration bundle exist. No Atlas application activation is proved. | Keep the Compose application disabled until all host, database, secret, route, migration, resource, recovery, and public-proof blockers pass. |
+| `surplasse` | An immutable tester release and integration bundle exist. Canonical admission is enabled, but no Atlas application activation is proved. | Keep the legacy adapter locked and require every canonical secret, edge, migration, recovery, and public-probe check before activation. |
 
 The exact active static tuples and public probes are in the
 [2026-08-18 rollout evidence](evidence/2026-08-18-static-reconciliation-rollout.md).
@@ -426,7 +426,7 @@ the locked complete platform definition use these memberships:
 
 ```text
 app_surplasse       empty
-db_surplasse        empty
+db_surplasse        PostgreSQL
 app_parkventory     empty
 db_parkventory      empty
 edge                isolated public static edge Caddy
@@ -439,11 +439,11 @@ The isolated public static edge has no `ops` attachment. The host layout owns
 and runtime inspection require this one-network membership.
 
 A reviewed integration package attaches a platform service or an application
-service only to the required application network. PostgreSQL and PostgreSQL
-Exporter share the internal `db_monitoring` network. Only the exporter also
-joins `ops`. Caddy, Grafana, and Prometheus have no direct TCP path to
-PostgreSQL. The exporter role has only `pg_monitor` and `pg_hba.conf` limits it
-to the `db_monitoring` subnet.
+service only to the required application network. PostgreSQL joins
+`db_monitoring` and `db_surplasse`. PostgreSQL Exporter joins `db_monitoring`
+and `ops`. Caddy, Grafana, and Prometheus have no direct TCP path to PostgreSQL.
+The exporter role has only `pg_monitor` and `pg_hba.conf` limits it to the
+`db_monitoring` subnet.
 
 Aucun service applicatif ne publie de port. Grafana peut écouter sur
 `127.0.0.1` seulement et s’ouvrir par tunnel SSH. Les endpoints de métriques,
@@ -618,7 +618,8 @@ reach its dedicated migration until its protected contract entry is enabled,
 Parkventory no longer has a static owner, and the immutable public edge already
 contains the exact attested route and application-network attachment. Route
 preparation remains a platform responsibility and precedes migration. Both
-entries remain `enabled: false`, with no application workflow or active runtime.
+legacy entries remain `enabled: false`. The canonical Surplasse tester entry is
+enabled, but no application workflow or active runtime follows from admission.
 
 Les fichiers SOPS sont chiffrés. La clé age privée est conservée hors du VPS et
 hors de Git, avec au moins une copie de récupération dans un gestionnaire de

@@ -13,6 +13,11 @@ deployment workflow invokes the gate. Installation did not activate an
 application, create a database, provision a secret, change an edge route, or run
 a migration on Atlas.
 
+ADR-0013 later enables only the canonical Surplasse admission entry. It keeps
+the controller, migration, recovery, secret, edge, SMTP, Stripe test, and public
+probe boundaries from this decision. Parkventory and the legacy Surplasse
+adapter remain disabled.
+
 ## Context
 
 ADR-0009 defines one immutable `application-release` signal for every complete

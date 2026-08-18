@@ -6,15 +6,16 @@ canonical application-release producer and it is not a production activation
 path. The canonical controller reads only its exact `payment` projection as an
 independent versioned Atlas policy input. Surplasse publishes an immutable
 `application-release` descriptor and common integration bundle for the shared
-admission contract. The protected entry remains disabled.
+admission contract. The canonical protected entry is enabled for the tester
+profile by ADR-0013. The legacy adapter remains locked.
 
 Atlas converged the shared transactional application controller from
 `vps-infra` revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b` on 2026-08-18.
 The root controller and gate are installed, and
 `vps-application-recover.service` is loaded and inactive after a successful run
 (`Result=success`, `ExecMainStatus=0`). This legacy adapter does not invoke that
-gate: Surplasse remains `enabled: false`, with no application deployment
-workflow and no live Atlas application release.
+gate. No application deployment workflow invokes it, and repository admission
+does not prove a live Atlas application release.
 
 The adapter does not define Caddy, PostgreSQL, Prometheus, Grafana, or an
 exporter. The shared platform owns those services.
@@ -48,11 +49,10 @@ The adapter also stays locked for these integration reasons:
 
 - the platform Caddy service does not join `app_surplasse` at the fixed trusted
   proxy address `172.30.10.254`;
-- the platform PostgreSQL service does not join `db_surplasse`;
 - the preparation controller can create the `surplasse` database, its
   `NOLOGIN` owner, the `surplasse_migrator` role, and the
-  `surplasse_runtime` role, but the platform attachment needed at runtime is
-  still inactive;
+  `surplasse_runtime` role, but creation does not prove the live database and
+  role state;
 - the platform Prometheus service does not join `app_surplasse` and has no
   active Surplasse scrape job;
 - the Caddy route and the Prometheus target and rules still have the
@@ -84,10 +84,11 @@ audience `testers`, and mode `test`. The runtime deployment profile remains
 controls. The Backend receives `STRIPE_LIVE_MODE=false`. Test orders can create
 Stripe sandbox objects, but they cannot debit a real payment method.
 
-This profile does not enable Surplasse. It does not install a key, create a
-webhook endpoint, change DNS, or prove a connected account capability. A public
-URL is discoverable even when only invited testers know it. Do not treat a low
-visitor count as access control.
+ADR-0013 enables the separate canonical admission entry for this profile. That
+change does not install a key, create a webhook endpoint, change DNS, activate a
+release, or prove a connected account capability. A public URL is discoverable
+even when only invited testers know it. Do not treat a low visitor count as
+access control.
 
 The materializer records payment mode `test` in operator manifest version `3`.
 It accepts only a dedicated restricted test key with the `rk_test_` prefix. It
@@ -296,11 +297,15 @@ command, disabled integration candidates, and locked blockers.
 
 ## Activation sequence
 
-A later reviewed slice must remove every blocker atomically. The applicator
-must use this order:
+For the first tester activation authorized by ADR-0013, a local PostgreSQL
+backup and successful restore rehearsal are strongly recommended. Their absence
+is an explicitly accepted, non-blocking risk for that first activation only.
+They become mandatory before the real public launch and before any later
+schema-changing migration. The applicator must use this order:
 
 1. verify the exact Backend image and its migration command;
-2. prove a restorable PostgreSQL backup;
+2. run the local backup and restore rehearsal when available, or record the
+   accepted first-activation risk when they are absent;
 3. provision the database and the three roles;
 4. install and verify every exact root-owned secret and runtime configuration;
 5. stage and activate the exact Caddy route, TLS snippet, and platform network
@@ -314,8 +319,8 @@ must use this order:
    DNS, certificates, and public probes.
 
 The verified Backend digest satisfies the migration-entrypoint image gate. The
-adapter remains locked by the other release, integration, secret, restore, and
-public-proof gates.
+legacy adapter remains locked by the other release, integration, secret,
+route, and public-proof gates.
 
 ## Fail-closed Atlas preparation
 
@@ -329,10 +334,11 @@ make prepare-surplasse \
 ```
 
 Preparation validates and stages the exact adapter first. It then creates only
-the two missing random database passwords as `root:10001` with mode `0440`. It
-temporarily attaches the healthy shared PostgreSQL container to
-`db_surplasse`, provisions the `surplasse` database and these roles, and removes
-the temporary attachment:
+the two missing random database passwords as `root:10001` with mode `0440`. The
+internal platform now keeps the healthy shared PostgreSQL container on
+`db_surplasse`. Preparation preserves that membership, provisions the
+`surplasse` database and these roles, and uses a temporary attachment only when
+it operates against an older platform revision:
 
 - `surplasse_owner`: `NOLOGIN` database owner;
 - `surplasse_migrator`: login role that defaults to the owner role;
@@ -346,14 +352,14 @@ secrets.
 `make activate-surplasse` is an intentional legacy-adapter refusal while
 `adapter.json` is
 locked. The refusal occurs before a database, application, shared platform, or
-public edge mutation. The next release slice must complete image provenance,
-persistent platform attachments, operator secrets, route-before-migration
-orchestration, compatible recovery, and public proof. Production activation
-must use the immutable application-release controller after every ADR-0010
-blocker passes; it must not unlock this legacy adapter as an alternate path.
+public edge mutation. Canonical production activation must use the immutable
+application-release controller after its existing operator-input,
+route-before-migration, recovery, and public-proof checks pass. It must not
+unlock this legacy adapter as an alternate path.
 
-The files under `integration/` are inactive attachment candidates. They show
-the bounded target memberships: PostgreSQL joins only `db_surplasse`,
-Prometheus joins only `ops` and `app_surplasse`, and public Caddy keeps `edge`
-plus the fixed `172.30.10.254` address on `app_surplasse`. The preparation
-controller stages these candidates but never applies them.
+The files under `integration/` are inactive attachment candidates. PostgreSQL
+is absent because the base internal platform now owns its durable
+`db_surplasse` membership. The remaining candidates show that Prometheus joins
+only `ops` and `app_surplasse`, and public Caddy keeps `edge` plus the fixed
+`172.30.10.254` address on `app_surplasse`. The preparation controller stages
+these candidates but never applies them.

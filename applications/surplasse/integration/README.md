@@ -4,7 +4,8 @@
 `vps-public-static-edge` Compose project. The root-only
 `deploy-surplasse-public-edge` controller can stage and apply the reviewed
 composition. No Ansible state or release contract activates it automatically.
-Surplasse remains disabled and its adapter remains locked.
+Canonical Surplasse admission is enabled, but this edge extension still needs a
+separate deliberate activation. The legacy adapter remains locked.
 
 The candidate adds only these resources to the current public edge:
 

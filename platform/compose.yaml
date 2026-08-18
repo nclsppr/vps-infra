@@ -106,6 +106,9 @@ services:
       db_monitoring:
         aliases:
           - postgresql
+      db_surplasse:
+        aliases:
+          - postgresql
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -330,6 +333,9 @@ networks:
   db_monitoring:
     external: true
     name: ${POSTGRES_MONITORING_NETWORK_NAME:-db_monitoring}
+  db_surplasse:
+    external: true
+    name: db_surplasse
 
 volumes:
   caddy_data:

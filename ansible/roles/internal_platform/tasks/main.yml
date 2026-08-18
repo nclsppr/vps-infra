@@ -20,7 +20,8 @@
          'postgresql', 'prometheus']
       - >-
         vps_internal_platform_network_contract ==
-        {'postgresql': ['db_monitoring'], 'prometheus': ['ops'],
+        {'postgresql': ['db_monitoring', 'db_surplasse'],
+         'prometheus': ['ops'],
          'grafana': ['ops'], 'node-exporter': ['ops'],
          'postgres-exporter': ['db_monitoring', 'ops']}
       - >-
@@ -157,6 +158,7 @@
       loop:
         - ops
         - db_monitoring
+        - db_surplasse
 
     - name: Require the managed internal Docker networks
       ansible.builtin.assert:
@@ -178,6 +180,11 @@
             (((item.stdout | from_json) | first).Internal | bool and
              ((item.stdout | from_json) | first).IPAM.Config |
              map(attribute='Subnet') | list == ['172.30.31.0/24'])
+          - >-
+            item.item != 'db_surplasse' or
+            (((item.stdout | from_json) | first).Internal | bool and
+             ((item.stdout | from_json) | first).IPAM.Config |
+             map(attribute='Subnet') | list == ['172.30.11.0/24'])
         fail_msg: A required internal Docker network differs from the host contract.
       loop: "{{ vps_internal_platform_network_inspections.results }}"
       loop_control:

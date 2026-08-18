@@ -1,14 +1,5 @@
 ---
 services:
-  postgresql:
-    networks:
-      db_monitoring:
-        aliases:
-          - postgresql
-      db_surplasse:
-        aliases:
-          - postgresql
-
   prometheus:
     volumes:
       - type: bind
@@ -34,9 +25,6 @@ services:
       app_surplasse: {}
 
 networks:
-  db_surplasse:
-    external: true
-    name: db_surplasse
   app_surplasse:
     external: true
     name: app_surplasse

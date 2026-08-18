@@ -724,12 +724,12 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
             nested_names,
         )
 
-    def test_application_release_contracts_remain_locked(self) -> None:
+    def test_canonical_admission_is_enabled_but_legacy_adapter_remains_locked(self) -> None:
         application = json.loads(
             (ROOT / "releases/application-production.json").read_text()
         )
         adapter = json.loads((ROOT / "applications/surplasse/adapter.json").read_text())
-        self.assertFalse(application["applications"]["surplasse"]["enabled"])
+        self.assertTrue(application["applications"]["surplasse"]["enabled"])
         self.assertEqual(adapter["activation_policy"], "locked")
 
 

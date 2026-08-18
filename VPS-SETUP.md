@@ -369,9 +369,10 @@ Critères :
 Atlas has converged the Compose application controller from revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root controller and gate are
 installed; `vps-application-recover.service` is loaded, inactive after its
-successful run (`Result=success`, `ExecMainStatus=0`). Both protected
-application entries remain `enabled: false`; no application workflow or live
-application activation exists.
+successful run (`Result=success`, `ExecMainStatus=0`). The two legacy entries in
+`releases/production.yaml` remain `enabled: false`; the separate canonical
+application contract admits Surplasse and keeps Parkventory disabled. No
+application workflow or live application activation exists.
 
 ## Phase 6 — répétition générale
 

@@ -107,13 +107,13 @@ class ProductionContractTests(unittest.TestCase):
         self.contract_path = ROOT / "releases/application-production.json"
         self.static_path = ROOT / "releases/static-production.json"
 
-    def test_repository_contract_is_exact_and_both_apps_are_disabled(self):
+    def test_repository_contract_enables_only_surplasse(self):
         contract = POLICY.load_production_contract(
             self.contract_path, self.static_path
         )
         self.assertEqual(
             [(application.name, application.enabled) for application in contract.applications],
-            [("surplasse", False), ("parkventory", False)],
+            [("surplasse", True), ("parkventory", False)],
         )
         self.assertEqual(
             contract.applications[1].required_checks,
