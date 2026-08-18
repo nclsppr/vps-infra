@@ -122,7 +122,7 @@ class SurplasseControllerTests(unittest.TestCase):
             "surplasse-smtp-username": b"surplasse-test\n",
             "surplasse-stripe-account-webhook-secret": b"whsec_" + b"A" * 32 + b"\n",
             "surplasse-stripe-payment-webhook-secret": b"whsec_" + b"B" * 32 + b"\n",
-            "surplasse-stripe-secret-key": b"sk_" + b"live_" + b"C" * 32 + b"\n",
+            "surplasse-stripe-secret-key": b"rk_" + b"live_" + b"C" * 32 + b"\n",
         }
         for name, value in values.items():
             path = root / name
@@ -356,8 +356,6 @@ class SurplasseControllerTests(unittest.TestCase):
             source = root / "source"
             self.write_operator_bundle(source)
             invalid = source / "surplasse-stripe-secret-key"
-            invalid.write_bytes(b"sk_" + b"test_" + b"X" * 32 + b"\n")
-            invalid.chmod(0o600)
             sentinel = protected_root / "surplasse-smtp-host"
             sentinel.write_bytes(b"existing.example.invalid\n")
             sentinel.chmod(0o400)
@@ -367,29 +365,36 @@ class SurplasseControllerTests(unittest.TestCase):
             }
             environment = os.environ.copy()
             environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
-            result = subprocess.run(
-                [
-                    str(SCRIPTS / "materialize-surplasse-secrets"),
-                    "--install-operator-from",
-                    str(source),
-                    "--test-root",
-                    str(protected_root),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=environment,
-            )
-            self.assertEqual(result.returncode, 78)
-            self.assertIn("stripe-secret-key format", result.stderr)
-            self.assertEqual(
-                before,
-                {
-                    path.name: (path.read_bytes(), path.stat().st_ino)
-                    for path in protected_root.iterdir()
-                    if path.name != OPERATOR_LOCK
-                },
-            )
+            for invalid_value in (
+                b"rk_test_" + b"X" * 32 + b"\n",
+                b"sk_live_" + b"Y" * 32 + b"\n",
+            ):
+                with self.subTest(prefix=invalid_value[:8]):
+                    invalid.write_bytes(invalid_value)
+                    invalid.chmod(0o600)
+                    result = subprocess.run(
+                        [
+                            str(SCRIPTS / "materialize-surplasse-secrets"),
+                            "--install-operator-from",
+                            str(source),
+                            "--test-root",
+                            str(protected_root),
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                    )
+                    self.assertEqual(result.returncode, 78)
+                    self.assertIn("stripe-secret-key format", result.stderr)
+                    self.assertEqual(
+                        before,
+                        {
+                            path.name: (path.read_bytes(), path.stat().st_ino)
+                            for path in protected_root.iterdir()
+                            if path.name != OPERATOR_LOCK
+                        },
+                    )
 
     def test_legacy_dns_and_port_files_fail_closed_without_migration(self) -> None:
         if os.geteuid() == 0:
@@ -537,7 +542,7 @@ class SurplasseControllerTests(unittest.TestCase):
             values_b = self.write_operator_bundle(source_b)
             changes = {
                 "surplasse-smtp-password": b"rotated-smtp-password\n",
-                "surplasse-stripe-secret-key": b"sk_live_" + b"G" * 32 + b"\n",
+                "surplasse-stripe-secret-key": b"rk_live_" + b"G" * 32 + b"\n",
                 "surplasse-smtp-host": b"relay.example.invalid\n",
             }
             values_b.update(changes)
@@ -577,7 +582,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 protected_root
                 / ".surplasse-stripe-secret-key.ffffffffffffffffffffffff.pending"
             )
-            orphan.write_bytes(b"sk_live_" + b"Z" * 32 + b"\n")
+            orphan.write_bytes(b"rk_live_" + b"Z" * 32 + b"\n")
             orphan.chmod(0o440)
             runtime_orphan = (
                 root
@@ -875,7 +880,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 "surplasse-stripe-account-webhook-secret": b"whsec_"
                 + b"J" * 32
                 + b"\n",
-                "surplasse-stripe-secret-key": b"sk_live_" + b"K" * 32 + b"\n",
+                "surplasse-stripe-secret-key": b"rk_live_" + b"K" * 32 + b"\n",
                 "surplasse-smtp-host": b"smtp-b.example.invalid\n",
             }
             values_b.update(changes)

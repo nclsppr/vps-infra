@@ -108,10 +108,18 @@ surplasse-stripe-secret-key
 ```
 
 Every single-line input must end with one newline. The Stripe key must be a
-live secret key. Both webhook values must have the Stripe signing-secret
+dedicated live restricted key with the `rk_live_` prefix. The helper rejects an
+unrestricted `sk_live_` key. Start with no permissions in a Stripe sandbox.
+Exercise the complete pilot flow and use the Stripe request log to grant only
+Accounts v2 read, connected-account Payment Intents write, and
+connected-account Refunds write. Add another permission only when a reviewed
+request receives an explicit permission error. Reproduce the tested permission
+set in live mode and restrict the key to the Atlas IPv4 address when Stripe
+supports the policy. Both webhook values must have the Stripe signing-secret
 prefix, and the two values must be distinct. The secret materializer accepts a
-bounded DNS name as operator input. This input validation is not SMTP readiness
-evidence.
+bounded DNS name as operator input. Prefix validation does not prove the key,
+its permissions, its account, or its network policy. It is not Stripe or SMTP
+readiness evidence.
 
 The rendered adapter requires a lowercase DNS name and the constant port `587`,
 `SMTP_START_TLS=REQUIRED`, `SMTP_TLS=false`,
