@@ -1535,22 +1535,34 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             (edge_root / "expected-images.json").read_text(encoding="utf-8")
         )
         self.assertEqual(expected_images, {"caddy": caddy["image"]})
+        caddy_verifier = (ROOT / "scripts/verify-caddy-image").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "for route_set in routes-prepare routes-precutover routes-activate",
+            caddy_verifier,
+        )
         self.assertEqual(
             {
                 path.name
                 for path in edge_root.iterdir()
                 if path.is_dir() and path.name.startswith("routes-")
             },
-            {"routes-prepare", "routes-activate"},
+            {"routes-prepare", "routes-precutover", "routes-activate"},
         )
-        for route_directory in ("routes-prepare", "routes-activate"):
+        route_directories = (
+            "routes-prepare",
+            "routes-precutover",
+            "routes-activate",
+        )
+        for route_directory in route_directories:
             self.assertEqual(
                 {path.name for path in (edge_root / route_directory).iterdir()},
                 {"personal.caddy", "papersempire.caddy", "parkventory.caddy"},
             )
         route_text = "\n".join(
             path.read_text(encoding="utf-8")
-            for route_directory in ("routes-prepare", "routes-activate")
+            for route_directory in route_directories
             for path in sorted((edge_root / route_directory).iterdir())
         )
         self.assertIn("nicolaspieper.com", route_text)
@@ -1558,7 +1570,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("parkventory.com", route_text)
         self.assertNotIn("surplasse", route_text.lower())
         self.assertNotIn("grafana", route_text.lower())
-        self.assertNotIn("nicolas.pieper.fr", route_text)
+        self.assertIn("nicolas.pieper.fr", route_text)
         prepare_routes = "\n".join(
             path.read_text(encoding="utf-8")
             for path in sorted((edge_root / "routes-prepare").iterdir())
@@ -1567,9 +1579,17 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             path.read_text(encoding="utf-8")
             for path in sorted((edge_root / "routes-activate").iterdir())
         )
+        precutover_routes = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((edge_root / "routes-precutover").iterdir())
+        )
         for domain in (
             "nicolaspieper.com",
             "www.nicolaspieper.com",
+            "pieper.fr",
+            "www.pieper.fr",
+            "nicolas.pieper.fr",
+            "www.nicolas.pieper.fr",
             "papersempire.com",
             "www.papersempire.com",
             "parkventory.com",
@@ -1579,10 +1599,102 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertNotIn("http://nicolaspieper.com", activate_routes)
         self.assertNotIn("http://papersempire.com", activate_routes)
         self.assertNotIn("http://parkventory.com", activate_routes)
+        self.assertNotIn("http://nicolaspieper.com", precutover_routes)
+        self.assertNotIn("http://papersempire.com", precutover_routes)
+        self.assertNotIn("http://parkventory.com", precutover_routes)
+        self.assertEqual(
+            (edge_root / "routes-precutover/papersempire.caddy").read_bytes(),
+            (edge_root / "routes-activate/papersempire.caddy").read_bytes(),
+        )
+        self.assertEqual(
+            (edge_root / "routes-precutover/parkventory.caddy").read_bytes(),
+            (edge_root / "routes-activate/parkventory.caddy").read_bytes(),
+        )
+        personal_activate_route = (
+            edge_root / "routes-activate/personal.caddy"
+        ).read_text(encoding="utf-8")
+        for domain in (
+            "www.nicolaspieper.com",
+            "pieper.fr",
+            "www.pieper.fr",
+            "nicolas.pieper.fr",
+            "www.nicolas.pieper.fr",
+        ):
+            self.assertIn(f"http://{domain}", personal_activate_route)
+        self.assertIn(
+            "redir https://nicolaspieper.com{uri} 308",
+            personal_activate_route,
+        )
         caddyfile = (edge_root / "Caddyfile").read_text(encoding="utf-8")
         self.assertIn("metrics /metrics", caddyfile)
         self.assertIn('respond "Not found.\\n" 404', caddyfile)
         self.assertIn("http:// {", caddyfile)
+        redirect_headers = caddyfile.split("(redirect_security_headers)", 1)[1]
+        redirect_headers = redirect_headers.split("(static_site)", 1)[0]
+        self.assertNotIn("Strict-Transport-Security", redirect_headers)
+        self.assertIn("-Server", redirect_headers)
+        self.assertIn('X-Content-Type-Options "nosniff"', redirect_headers)
+        self.assertIn(
+            'Referrer-Policy "strict-origin-when-cross-origin"',
+            redirect_headers,
+        )
+        self.assertEqual(
+            personal_activate_route.count("import redirect_security_headers"),
+            2,
+        )
+        personal_precutover_route = (
+            edge_root / "routes-precutover/personal.caddy"
+        ).read_text(encoding="utf-8")
+        precutover_site_labels = {
+            label
+            for line in personal_precutover_route.splitlines()
+            if line and not line[0].isspace() and line.endswith(" {")
+            for label in line.removesuffix(" {").split(", ")
+        }
+        self.assertIn("nicolaspieper.com", precutover_site_labels)
+        self.assertIn("www.nicolaspieper.com", precutover_site_labels)
+        for domain in (
+            "pieper.fr",
+            "www.pieper.fr",
+            "nicolas.pieper.fr",
+            "www.nicolas.pieper.fr",
+        ):
+            self.assertIn(f"http://{domain}", precutover_site_labels)
+            self.assertNotIn(domain, precutover_site_labels)
+        self.assertEqual(
+            personal_precutover_route.count("import redirect_security_headers"),
+            2,
+        )
+        edge_defaults = yaml.safe_load(
+            (
+                ROOT
+                / "ansible/roles/public_static_edge/defaults/main.yml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            edge_defaults["vps_public_static_edge_route_sources"],
+            {
+                "prepare": "routes-prepare",
+                "precutover": "routes-precutover",
+                "activate": "routes-activate",
+            },
+        )
+        self.assertEqual(
+            edge_defaults["vps_public_static_edge_direct_http_redirects"],
+            [
+                {
+                    "source": "www.nicolaspieper.com",
+                    "target": "nicolaspieper.com",
+                },
+                {"source": "pieper.fr", "target": "nicolaspieper.com"},
+                {"source": "www.pieper.fr", "target": "nicolaspieper.com"},
+                {"source": "nicolas.pieper.fr", "target": "nicolaspieper.com"},
+                {
+                    "source": "www.nicolas.pieper.fr",
+                    "target": "nicolaspieper.com",
+                },
+            ],
+        )
 
         playbook = yaml.safe_load(
             (ROOT / "ansible/playbooks/public-static-edge.yml").read_text(
@@ -1652,6 +1764,35 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("delegate_to: localhost", runtime_verification)
         self.assertIn("validate_certs: true", runtime_verification)
         self.assertIn("http://{{ ansible_default_ipv4.address }}/", runtime_verification)
+        self.assertIn(
+            "Probe pending one-hop HTTP redirects directly on Atlas before DNS cutover",
+            runtime_verification,
+        )
+        self.assertIn(
+            "vps_public_static_edge_state == 'precutover'",
+            runtime_verification,
+        )
+        self.assertIn("source=atlas-precutover", runtime_verification)
+        self.assertIn(
+            "pre_cutover_http_redirect_probe.server is not defined",
+            runtime_verification,
+        )
+        self.assertIn(
+            "external_http_redirect_probe.server is not defined",
+            runtime_verification,
+        )
+        self.assertIn(
+            "external_https_redirect_probe.server is not defined",
+            runtime_verification,
+        )
+        self.assertGreaterEqual(
+            runtime_verification.count("strict_transport_security"),
+            2,
+        )
+        self.assertGreaterEqual(
+            runtime_verification.count("x_content_type_options"),
+            2,
+        )
         self.assertIn("Refuse an unconfigured HTTP host", runtime_verification)
         self.assertIn("Host: unconfigured.invalid", runtime_verification)
         self.assertIn("status_code: 404", runtime_verification)
@@ -3531,6 +3672,7 @@ fi
 
             for mode, state in (
                 ("--prepare-public-static-edge", "prepare"),
+                ("--precutover-public-static-edge", "precutover"),
                 ("--activate-public-static-edge", "activate"),
                 ("--stop-public-static-edge", "stopped"),
             ):

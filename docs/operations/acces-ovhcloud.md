@@ -124,7 +124,8 @@ Pour chaque zone :
 - CAA ;
 - TTL actuels ;
 - délégation et serveurs autoritatifs ;
-- redirections historiques, notamment `nicolas.pieper.fr` ;
+- redirections historiques, notamment `pieper.fr`, `www.pieper.fr`,
+  `nicolas.pieper.fr` et `www.nicolas.pieper.fr` ;
 - origine canonique exacte `https://papersempire.com`.
 - Parkventory apex origin `https://parkventory.com` and its `www` redirect.
 
@@ -141,6 +142,24 @@ remain unchanged. `surplasse.com` still points to its previous host.
 The captured tables support rollback, but they do not replace a reusable API
 export of A, AAAA, CNAME, MX, SPF, DKIM, DMARC, CAA, wildcard, redirect, and TTL
 state.
+
+The `pieper.fr` web cutover changes only the A and AAAA records for the apex,
+`www`, `nicolas`, and `www.nicolas` names. Each A answer must contain only the
+Atlas IPv4 address and each AAAA answer must be empty before HTTPS activation.
+Preserve the zone delegation, DNSSEC, MX, TXT, DKIM, DMARC, CAA, and every other
+record. Do not replace the apex with a CNAME and do not change mail records as
+part of the web cutover.
+
+Treat TTL preparation as a separate web-only change. Lower the TTL for those
+four names without changing a target, confirm the lower value at every
+authoritative server, and then wait at least the previously published TTL before
+installing the pre-cutover edge state or changing A and AAAA answers. Keep both
+the previous targets and TTLs in the out-of-Git export. A rollback restores only
+those exact web records; it never synthesizes a new zone or rewrites protected
+mail and DNSSEC state. Before declaring success, compare the exact MX, TXT, NS,
+DS, and DNSKEY answers with that export and complete an iCloud send and receive
+test. The web edge emits no HSTS on these aliases, which keeps DNS rollback
+available during the propagation window.
 
 ## Activation GitHub
 

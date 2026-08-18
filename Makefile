@@ -16,7 +16,8 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
-	activate-public-static-edge stop-public-static-edge \
+	precutover-public-static-edge activate-public-static-edge \
+	stop-public-static-edge \
 	start-internal-platform stop-internal-platform \
 	install-postgres-backup stop-postgres-backup-schedule \
 	backup-postgres-now rehearse-postgres-restore \
@@ -251,6 +252,11 @@ prepare-public-static-edge: ## Start the static edge in HTTP-only preflight mode
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --prepare-public-static-edge
+
+precutover-public-static-edge: ## Add pending HTTP aliases without changing live HTTPS sites.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --precutover-public-static-edge
 
 activate-public-static-edge: ## Activate HTTPS only after the exact DNS cutover.
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \

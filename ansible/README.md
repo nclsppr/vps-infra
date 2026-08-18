@@ -258,17 +258,20 @@ or enable the Surplasse public edge.
 
 `playbooks/public-static-edge.yml` is the only current live service path. The
 local `converge` wrapper accepts `--prepare-public-static-edge`,
-`--activate-public-static-edge`, and `--stop-public-static-edge` as exact
-single-argument modes. All three modes execute from an isolated archive of
-`origin/main`.
+`--precutover-public-static-edge`, `--activate-public-static-edge`, and
+`--stop-public-static-edge` as exact single-argument modes. All four modes
+execute from an isolated archive of `origin/main`.
 
 The preparation mode installs one root-owned Compose project, binds it to the
-exact promoted Caddy image, and serves the four hosts over HTTP without asking
-for a certificate. The activation mode first requires every authoritative and
-recursive A answer to contain only Atlas and every AAAA answer to be empty. It
-then switches atomically to the HTTPS release and runs strict certificate
-probes. Each phase uses an immutable revision directory and the matching
-Compose validator from that same checkout. The stop mode stops every container
+exact promoted Caddy image, and serves the reviewed domains over HTTP without
+asking for a certificate. The pre-cutover mode preserves every established
+HTTPS route while exposing pending aliases over HTTP only; it is safe to switch
+over an already active edge after the documented TTL wait. The activation mode
+first requires every authoritative and recursive A answer to contain only Atlas
+and every AAAA answer to be empty. It then switches atomically to the HTTPS
+release and runs strict certificate probes. Each phase uses an immutable
+revision directory and the matching Compose validator from that same checkout.
+The stop mode stops every container
 owned by this Compose project even if the unit is absent or inactive. It
 preserves the ACME volumes and static releases. None of these modes creates
 `apply-release`, writes the production marker, changes DNS, reads an OVH

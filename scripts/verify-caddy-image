@@ -85,7 +85,7 @@ done
   "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
   || fail "inactive Caddy configuration is invalid"
 
-for route_set in routes-prepare routes-activate; do
+for route_set in routes-prepare routes-precutover routes-activate; do
   "${docker_run[@]}" \
     --volume "$repository_root/platform/public-static-edge/Caddyfile:/etc/caddy/Caddyfile:ro" \
     --volume "$repository_root/platform/public-static-edge/$route_set:/etc/caddy/routes:ro" \
