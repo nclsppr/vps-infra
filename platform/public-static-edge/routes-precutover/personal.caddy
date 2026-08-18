@@ -11,7 +11,7 @@ nicolaspieper.com {
 	}
 }
 
-http://www.nicolaspieper.com, http://pieper.fr, http://nicolas.pieper.fr {
+http://www.nicolaspieper.com, http://pieper.fr, http://www.pieper.fr, http://nicolas.pieper.fr {
 	import redirect_security_headers
 	redir https://nicolaspieper.com{uri} 308
 }

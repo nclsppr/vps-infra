@@ -1,4 +1,4 @@
-http://nicolaspieper.com, http://www.nicolaspieper.com, http://pieper.fr, http://nicolas.pieper.fr {
+http://nicolaspieper.com, http://www.nicolaspieper.com, http://pieper.fr, http://www.pieper.fr, http://nicolas.pieper.fr {
 	log
 	root * /srv/www/personal/current
 	import static_site

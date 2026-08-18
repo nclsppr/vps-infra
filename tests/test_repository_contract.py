@@ -1571,7 +1571,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertNotIn("surplasse", route_text.lower())
         self.assertNotIn("grafana", route_text.lower())
         self.assertIn("nicolas.pieper.fr", route_text)
-        self.assertNotIn("www.pieper.fr", route_text)
         self.assertNotIn("www.nicolas.pieper.fr", route_text)
         prepare_routes = "\n".join(
             path.read_text(encoding="utf-8")
@@ -1589,6 +1588,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "nicolaspieper.com",
             "www.nicolaspieper.com",
             "pieper.fr",
+            "www.pieper.fr",
             "nicolas.pieper.fr",
             "papersempire.com",
             "www.papersempire.com",
@@ -1616,6 +1616,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         for domain in (
             "www.nicolaspieper.com",
             "pieper.fr",
+            "www.pieper.fr",
             "nicolas.pieper.fr",
         ):
             self.assertIn(f"http://{domain}", personal_activate_route)
@@ -1653,6 +1654,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("www.nicolaspieper.com", precutover_site_labels)
         for domain in (
             "pieper.fr",
+            "www.pieper.fr",
             "nicolas.pieper.fr",
         ):
             self.assertIn(f"http://{domain}", precutover_site_labels)
@@ -1683,6 +1685,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                     "target": "nicolaspieper.com",
                 },
                 {"source": "pieper.fr", "target": "nicolaspieper.com"},
+                {"source": "www.pieper.fr", "target": "nicolaspieper.com"},
                 {"source": "nicolas.pieper.fr", "target": "nicolaspieper.com"},
             ],
         )
