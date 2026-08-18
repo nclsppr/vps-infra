@@ -279,6 +279,14 @@ preserves the ACME volumes and static releases. None of these modes creates
 credential, or starts PostgreSQL, Grafana, Prometheus, exporters, Surplasse, or
 Parkventory.
 
+The role records the previous immutable release before each link switch. It
+recreates Caddy when that release changes or when the device and inode of its
+effective bind mounts do not match the new immutable release. This direct mount
+identity check also repairs an interrupted switch on the next run. An
+idempotent rerun with matching bind mounts does not recreate the container. A
+rollback also recreates Caddy after it restores the previous release, so its
+bind mounts cannot retain the failed release.
+
 The project joins only the managed `edge` bridge on `172.30.32.0/24`. The
 playbook rejects a missing or incompatible bridge and verifies that the live
 Caddy container has no attachment to `ops`.
