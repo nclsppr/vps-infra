@@ -742,6 +742,11 @@
         vps_public_static_edge_previous_release: >-
           {{ vps_public_static_edge_runtime_link.stat.lnk_source |
              default('') }}
+        vps_public_static_edge_release_changed: >-
+          {{ (vps_public_static_edge_runtime_link.stat.lnk_source |
+              default('') | length > 0) and
+             (vps_public_static_edge_runtime_link.stat.lnk_source |
+              default('') != vps_public_static_edge_release_dir) }}
 
     - name: Refuse an unmanaged base switch over an active Surplasse edge
       ansible.builtin.command:
@@ -778,6 +783,48 @@
             state: restarted
             daemon_reload: true
 
+        - name: Inspect Caddy after unit reconciliation
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - inspect
+              - "{{ vps_public_static_edge_container }}"
+          register: vps_public_static_edge_reconciled_inspect
+          changed_when: false
+
+        - name: Compare reconciled Caddy bind identities
+          ansible.builtin.include_tasks: inspect-bind-identities.yml
+          vars:
+            vps_public_static_edge_bind_inspect_stdout: >-
+              {{ vps_public_static_edge_reconciled_inspect.stdout }}
+            vps_public_static_edge_bind_release_dir: >-
+              {{ vps_public_static_edge_release_dir }}
+
+        - name: Detect a switched or stale public edge release
+          ansible.builtin.set_fact:
+            vps_public_static_edge_requires_recreate: >-
+              {{ vps_public_static_edge_release_changed or
+                 not (vps_public_static_edge_bind_identities_match | bool) }}
+
+        - name: Force Caddy recreation for a switched or stale release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - compose
+              - --project-directory
+              - "{{ vps_public_static_edge_runtime_dir }}"
+              - --file
+              - "{{ vps_public_static_edge_runtime_dir }}/compose.yaml"
+              - up
+              - --detach
+              - --wait
+              - --no-build
+              - --force-recreate
+              - --remove-orphans
+              - caddy
+          changed_when: true
+          when: vps_public_static_edge_requires_recreate
+
         - name: Verify the switched public static edge from host and operator networks
           ansible.builtin.include_tasks: verify-runtime.yml
 
@@ -803,11 +850,62 @@
           changed_when: true
           when: vps_public_static_edge_previous_release | length > 0
 
-        - name: Reconcile the restored public static edge
+        - name: Force Caddy recreation after restoring the previous release
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - compose
+              - --project-directory
+              - "{{ vps_public_static_edge_runtime_dir }}"
+              - --file
+              - "{{ vps_public_static_edge_runtime_dir }}/compose.yaml"
+              - up
+              - --detach
+              - --wait
+              - --no-build
+              - --force-recreate
+              - --remove-orphans
+              - caddy
+          changed_when: true
+          when: vps_public_static_edge_previous_release | length > 0
+
+        - name: Inspect Caddy after forced rollback recreation
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - inspect
+              - "{{ vps_public_static_edge_container }}"
+          register: vps_public_static_edge_rollback_inspect
+          changed_when: false
+          when: vps_public_static_edge_previous_release | length > 0
+
+        - name: Compare restored Caddy bind identities
+          ansible.builtin.include_tasks: inspect-bind-identities.yml
+          vars:
+            vps_public_static_edge_bind_inspect_stdout: >-
+              {{ vps_public_static_edge_rollback_inspect.stdout }}
+            vps_public_static_edge_bind_release_dir: >-
+              {{ vps_public_static_edge_previous_release }}
+          when: vps_public_static_edge_previous_release | length > 0
+
+        - name: Require healthy Caddy with restored bind identities
+          ansible.builtin.assert:
+            that:
+              - >-
+                ((vps_public_static_edge_rollback_inspect.stdout |
+                  from_json) | first).State.Status == 'running'
+              - >-
+                ((vps_public_static_edge_rollback_inspect.stdout |
+                  from_json) | first).State.Health.Status == 'healthy'
+              - vps_public_static_edge_bind_identities_match | bool
+            fail_msg: Caddy did not return to the restored immutable release.
+          when: vps_public_static_edge_previous_release | length > 0
+
+        - name: Re-register the restored public edge with systemd
           ansible.builtin.systemd_service:
             name: "{{ vps_public_static_edge_unit }}"
             enabled: true
-            state: restarted
+            state: started
             daemon_reload: true
           when: vps_public_static_edge_previous_release | length > 0
 

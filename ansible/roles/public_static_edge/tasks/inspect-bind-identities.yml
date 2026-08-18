@@ -1,0 +1,64 @@
+---
+- name: Require one running Caddy container for bind inspection
+  ansible.builtin.assert:
+    that:
+      - (vps_public_static_edge_bind_inspect_stdout | from_json) | length == 1
+      - >-
+        ((vps_public_static_edge_bind_inspect_stdout |
+          from_json) | first).State.Running | bool
+      - >-
+        (((vps_public_static_edge_bind_inspect_stdout |
+           from_json) | first).State.Pid | int) > 0
+    fail_msg: Docker did not return one running Caddy container.
+
+- name: Inspect the expected immutable Caddy bind sources
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  loop:
+    - "{{ vps_public_static_edge_bind_release_dir }}/Caddyfile"
+    - "{{ vps_public_static_edge_bind_release_dir }}/routes"
+  register: vps_public_static_edge_expected_bind_sources
+
+- name: Inspect the effective Caddy bind targets
+  ansible.builtin.stat:
+    path: >-
+      /proc/{{ ((vps_public_static_edge_bind_inspect_stdout |
+                 from_json) | first).State.Pid
+      }}/root{{ item }}
+    follow: true
+  loop:
+    - /etc/caddy/Caddyfile
+    - /etc/caddy/routes
+  register: vps_public_static_edge_effective_bind_targets
+
+- name: Require complete Caddy bind identity evidence
+  ansible.builtin.assert:
+    that:
+      - vps_public_static_edge_expected_bind_sources.results | length == 2
+      - vps_public_static_edge_effective_bind_targets.results | length == 2
+      - >-
+        vps_public_static_edge_expected_bind_sources.results[0].stat.isreg |
+        default(false)
+      - >-
+        vps_public_static_edge_expected_bind_sources.results[1].stat.isdir |
+        default(false)
+      - >-
+        vps_public_static_edge_effective_bind_targets.results[0].stat.isreg |
+        default(false)
+      - >-
+        vps_public_static_edge_effective_bind_targets.results[1].stat.isdir |
+        default(false)
+    fail_msg: Caddy bind mount identity evidence is incomplete.
+
+- name: Record whether Caddy uses the expected immutable bind identities
+  ansible.builtin.set_fact:
+    vps_public_static_edge_bind_identities_match: >-
+      {{ (vps_public_static_edge_expected_bind_sources.results[0].stat.dev ==
+          vps_public_static_edge_effective_bind_targets.results[0].stat.dev) and
+         (vps_public_static_edge_expected_bind_sources.results[0].stat.inode ==
+          vps_public_static_edge_effective_bind_targets.results[0].stat.inode) and
+         (vps_public_static_edge_expected_bind_sources.results[1].stat.dev ==
+          vps_public_static_edge_effective_bind_targets.results[1].stat.dev) and
+         (vps_public_static_edge_expected_bind_sources.results[1].stat.inode ==
+          vps_public_static_edge_effective_bind_targets.results[1].stat.inode) }}

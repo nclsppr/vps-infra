@@ -23,6 +23,14 @@
   register: vps_public_static_edge_inspect
   changed_when: false
 
+- name: Compare verified Caddy bind identities
+  ansible.builtin.include_tasks: inspect-bind-identities.yml
+  vars:
+    vps_public_static_edge_bind_inspect_stdout: >-
+      {{ vps_public_static_edge_inspect.stdout }}
+    vps_public_static_edge_bind_release_dir: >-
+      {{ vps_public_static_edge_release_dir }}
+
 - name: Prove the sole service uses the exact image and is healthy
   ansible.builtin.assert:
     that:
@@ -46,6 +54,7 @@
         (((vps_public_static_edge_inspect.stdout | from_json) |
           first).NetworkSettings.Networks.keys() | list | sort) ==
         [vps_public_static_edge_network]
+      - vps_public_static_edge_bind_identities_match | bool
     fail_msg: The Caddy-only public edge did not match its runtime contract.
 
 - name: Wait for the HTTP listener
