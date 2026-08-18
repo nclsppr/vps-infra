@@ -4,6 +4,7 @@ vps_surplasse_project: surplasse
 vps_surplasse_release_root: /srv/vps/releases/surplasse
 vps_surplasse_runtime_link: /srv/vps/runtime/surplasse
 vps_surplasse_runtime_dir: /srv/vps/runtime/surplasse/applications/surplasse
+vps_surplasse_runtime_config_file: /etc/vps/applications/surplasse.env
 vps_surplasse_unit: vps-surplasse.service
 vps_surplasse_internal_platform_unit: vps-internal-platform.service
 vps_surplasse_public_edge_unit: vps-public-static-edge.service
@@ -82,17 +83,17 @@ vps_surplasse_dns_secrets:
   - ovh-application-key
   - ovh-application-secret
   - ovh-consumer-key
-vps_surplasse_operator_inputs:
-  - ovh-application-key
-  - ovh-application-secret
-  - ovh-consumer-key
+vps_surplasse_application_operator_inputs:
   - surplasse-jwt-jwks
   - surplasse-jwt-key-id
   - surplasse-jwt-private-key
   - surplasse-smtp-host
   - surplasse-smtp-password
-  - surplasse-smtp-port
   - surplasse-smtp-username
   - surplasse-stripe-account-webhook-secret
   - surplasse-stripe-payment-webhook-secret
   - surplasse-stripe-secret-key
+vps_surplasse_dns_operator_inputs:
+  - ovh-application-key
+  - ovh-application-secret
+  - ovh-consumer-key

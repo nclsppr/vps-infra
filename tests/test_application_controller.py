@@ -788,6 +788,175 @@ class ApplicationControllerTests(unittest.TestCase):
             resolve_host="parkventory.com",
         )
 
+    def test_surplasse_edge_requires_exact_managed_network_and_caddy_address(self):
+        network_id = "c" * 64
+        network = subprocess.CompletedProcess(
+            [],
+            0,
+            (
+                f"{network_id}\tapp_surplasse\tbridge\tlocal\tfalse\tfalse\t"
+                "false\ttrue\t1\t172.30.10.0/24\n"
+            ),
+            "",
+        )
+        edge = subprocess.CompletedProcess(
+            [],
+            0,
+            (
+                "running\thealthy\tvps-public-static-edge\t"
+                f"{network_id}\t172.30.10.254\t24\n"
+            ),
+            "",
+        )
+        with mock.patch.object(
+            CONTROLLER,
+            "_run_bounded",
+            side_effect=(network, edge),
+        ) as bounded:
+            CONTROLLER.validate_surplasse_public_edge_attachment(Path("/release"))
+        network_command = bounded.call_args_list[0].args[0]
+        self.assertEqual(network_command[1:3], ["network", "inspect"])
+        self.assertEqual(
+            network_command[-1],
+            CONTROLLER.SURPLASSE_PUBLIC_EDGE_NETWORK,
+        )
+        edge_command = bounded.call_args_list[1].args[0]
+        self.assertEqual(edge_command[1:3], ["container", "inspect"])
+        self.assertIn(".NetworkID", edge_command[-2])
+        self.assertIn(".IPAddress", edge_command[-2])
+
+    def test_surplasse_cutover_uses_the_exact_edge_attachment_preflight(self):
+        candidate = state()
+        route = b"surplasse.com { respond surplasse-release-v1 }\n"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            edge = Path(temporary_directory)
+            route_root = edge / "routes"
+            route_root.mkdir()
+            (route_root / "surplasse.caddy").write_bytes(route)
+            with (
+                mock.patch.object(
+                    CONTROLLER,
+                    "PUBLIC_EDGE_RUNTIME_ROOT",
+                    edge,
+                ),
+                mock.patch.object(CONTROLLER, "require_protected_file"),
+                mock.patch.object(CONTROLLER, "state_release", return_value=edge),
+                mock.patch.object(
+                    CONTROLLER,
+                    "bundle_from_release",
+                    return_value=types.SimpleNamespace(
+                        files={"caddy/surplasse.caddy": route},
+                        probes={
+                            "public": [
+                                {
+                                    "body_contains": "surplasse-release-v1",
+                                    "path": "/.well-known/surplasse-release",
+                                    "status": 200,
+                                }
+                            ]
+                        },
+                    ),
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "validate_surplasse_public_edge_attachment",
+                ) as attachment,
+                mock.patch.object(CONTROLLER, "_probe_http"),
+            ):
+                CONTROLLER.validate_public_edge_cutover(candidate, edge)
+        attachment.assert_called_once_with(edge)
+
+    def test_surplasse_edge_rejects_each_network_identity_mismatch(self):
+        network_id = "c" * 64
+        valid = [
+            network_id,
+            "app_surplasse",
+            "bridge",
+            "local",
+            "false",
+            "false",
+            "false",
+            "true",
+            "1",
+            "172.30.10.0/24",
+        ]
+        mismatches = {
+            "network identifier": (0, "not-a-network-id"),
+            "network name": (1, "app_surplasse_shadow"),
+            "driver": (2, "overlay"),
+            "scope": (3, "swarm"),
+            "internal mode": (4, "true"),
+            "attachable mode": (5, "true"),
+            "ingress mode": (6, "true"),
+            "managed label": (7, "false"),
+            "IPAM count": (8, "2"),
+            "subnet": (9, "172.30.99.0/24"),
+        }
+        for label, (index, replacement) in mismatches.items():
+            with self.subTest(label=label):
+                fields = list(valid)
+                fields[index] = replacement
+                inspected = subprocess.CompletedProcess(
+                    [],
+                    0,
+                    "\t".join(fields) + "\n",
+                    "",
+                )
+                with mock.patch.object(
+                    CONTROLLER,
+                    "_run_bounded",
+                    return_value=inspected,
+                ) as bounded:
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        "network identity differs",
+                    ):
+                        CONTROLLER.validate_surplasse_public_edge_attachment(
+                            Path("/release")
+                        )
+                bounded.assert_called_once()
+
+    def test_surplasse_edge_rejects_wrong_network_id_or_caddy_address(self):
+        network_id = "c" * 64
+        network = subprocess.CompletedProcess(
+            [],
+            0,
+            (
+                f"{network_id}\tapp_surplasse\tbridge\tlocal\tfalse\tfalse\t"
+                "false\ttrue\t1\t172.30.10.0/24\n"
+            ),
+            "",
+        )
+        invalid_edges = {
+            "different network": (
+                "running\thealthy\tvps-public-static-edge\t"
+                f"{'d' * 64}\t172.30.10.254\t24\n"
+            ),
+            "different address": (
+                "running\thealthy\tvps-public-static-edge\t"
+                f"{network_id}\t172.30.10.253\t24\n"
+            ),
+            "different prefix": (
+                "running\thealthy\tvps-public-static-edge\t"
+                f"{network_id}\t172.30.10.254\t16\n"
+            ),
+        }
+        for label, output in invalid_edges.items():
+            with self.subTest(label=label):
+                edge = subprocess.CompletedProcess([], 0, output, "")
+                with mock.patch.object(
+                    CONTROLLER,
+                    "_run_bounded",
+                    side_effect=(network, edge),
+                ):
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        "exact app_surplasse network identity at 172.30.10.254",
+                    ):
+                        CONTROLLER.validate_surplasse_public_edge_attachment(
+                            Path("/release")
+                        )
+
     def test_http_probe_bounds_the_download_before_reading_it(self):
         completed = subprocess.CompletedProcess([], 0, "200", "")
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1109,6 +1278,62 @@ class ApplicationControllerTests(unittest.TestCase):
         self.assertNotIn(
             str(CONTROLLER.RUNTIME_CONFIG_ROOT / "parkventory.env"),
             prefix,
+        )
+
+    def test_surplasse_runtime_snapshot_requires_the_committed_live_inputs(self):
+        profile = CONTROLLER.PROFILES["surplasse"]
+        snapshot = {
+            "SURPLASSE_AUTH_JWT_KEY_ID": "atlas-2026-08",
+            "SURPLASSE_SMTP_HOST": "smtp.example.invalid",
+        }
+        with mock.patch.object(
+            CONTROLLER,
+            "runtime_configuration",
+            return_value=dict(snapshot),
+        ) as current:
+            CONTROLLER.validate_runtime_configuration_snapshot(profile, snapshot)
+        current.assert_called_once_with(profile)
+
+        changed = dict(snapshot)
+        changed["SURPLASSE_SMTP_HOST"] = "other.example.invalid"
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "runtime_configuration",
+                return_value=changed,
+            ),
+            self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "changed after release materialization",
+            ),
+        ):
+            CONTROLLER.validate_runtime_configuration_snapshot(profile, snapshot)
+
+    def test_surplasse_input_commit_uses_the_root_only_helper(self):
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file") as protected,
+            mock.patch.object(
+                CONTROLLER,
+                "_run_bounded",
+                return_value=completed,
+            ) as bounded,
+        ):
+            CONTROLLER.validate_surplasse_input_commit()
+        self.assertEqual(
+            protected.call_args.args[:2],
+            (
+                CONTROLLER.SURPLASSE_INPUT_VALIDATOR_PATH,
+                "Surplasse input validator",
+            ),
+        )
+        self.assertEqual(protected.call_args.kwargs["allowed_modes"], frozenset({0o500}))
+        self.assertEqual(
+            bounded.call_args.args[0],
+            [
+                str(CONTROLLER.SURPLASSE_INPUT_VALIDATOR_PATH),
+                "--operator-only",
+            ],
         )
 
     def test_migration_has_one_deterministic_container_identity(self):

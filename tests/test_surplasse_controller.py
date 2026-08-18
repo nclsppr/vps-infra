@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -23,6 +24,18 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 OPERATOR_MANIFEST = "surplasse-operator-bundle-manifest.json"
 OPERATOR_LOCK = ".surplasse-operator-bundle.lock"
+RUNTIME_CONFIG_NAME = "surplasse.env"
+APPLICATION_CREDENTIAL_NAMES = {
+    "surplasse-jwt-jwks",
+    "surplasse-jwt-private-key",
+    "surplasse-postgres-migrator-password",
+    "surplasse-postgres-runtime-password",
+    "surplasse-smtp-password",
+    "surplasse-smtp-username",
+    "surplasse-stripe-account-webhook-secret",
+    "surplasse-stripe-payment-webhook-secret",
+    "surplasse-stripe-secret-key",
+}
 
 
 def load_script(name: str, path: Path):
@@ -105,15 +118,11 @@ class SurplasseControllerTests(unittest.TestCase):
             "surplasse-jwt-private-key": signing_material,
             "surplasse-jwt-key-id": key_id.encode("ascii") + b"\n",
             "surplasse-smtp-host": b"smtp.example.invalid\n",
-            "surplasse-smtp-port": b"587\n",
             "surplasse-smtp-password": b"smtp-password-for-test-only\n",
             "surplasse-smtp-username": b"surplasse-test\n",
             "surplasse-stripe-account-webhook-secret": b"whsec_" + b"A" * 32 + b"\n",
             "surplasse-stripe-payment-webhook-secret": b"whsec_" + b"B" * 32 + b"\n",
-            "surplasse-stripe-secret-key": b"sk_" + b"live_" + b"C" * 32 + b"\n",
-            "ovh-application-key": b"D" * 16 + b"\n",
-            "ovh-application-secret": b"E" * 32 + b"\n",
-            "ovh-consumer-key": b"F" * 32 + b"\n",
+            "surplasse-stripe-secret-key": b"rk_" + b"live_" + b"C" * 32 + b"\n",
         }
         for name, value in values.items():
             path = root / name
@@ -263,20 +272,25 @@ class SurplasseControllerTests(unittest.TestCase):
                     0o400
                     if name
                     in {
-                        "ovh-application-key",
-                        "ovh-application-secret",
-                        "ovh-consumer-key",
                         "surplasse-jwt-key-id",
                         "surplasse-smtp-host",
-                        "surplasse-smtp-port",
                     }
                     else 0o440
                 )
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
+                self.assertEqual(path.stat().st_nlink, 1)
+            runtime_path = root / "applications" / RUNTIME_CONFIG_NAME
+            self.assertEqual(
+                runtime_path.read_bytes(),
+                b"SURPLASSE_AUTH_JWT_KEY_ID=atlas-2026-08\n"
+                b"SURPLASSE_SMTP_HOST=smtp.example.invalid\n",
+            )
+            self.assertEqual(stat.S_IMODE(runtime_path.stat().st_mode), 0o600)
+            self.assertEqual(runtime_path.stat().st_nlink, 1)
             manifest_path = protected_root / OPERATOR_MANIFEST
             manifest = json.loads(manifest_path.read_text(encoding="ascii"))
             self.assertEqual(manifest["contract"], "surplasse-operator-bundle")
-            self.assertEqual(manifest["version"], 1)
+            self.assertEqual(manifest["version"], 2)
             self.assertEqual(
                 manifest["sha256"],
                 {
@@ -289,6 +303,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 name: (protected_root / name).stat().st_ino for name in values
             }
             manifest_inode = manifest_path.stat().st_ino
+            runtime_inode = runtime_path.stat().st_ino
 
             second = subprocess.run(
                 command, check=False, capture_output=True, text=True, env=environment
@@ -303,6 +318,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 {name: (protected_root / name).stat().st_ino for name in values},
             )
             self.assertEqual(manifest_inode, manifest_path.stat().st_ino)
+            self.assertEqual(runtime_inode, runtime_path.stat().st_ino)
             validation = subprocess.run(
                 [
                     str(SCRIPTS / "materialize-surplasse-secrets"),
@@ -317,6 +333,19 @@ class SurplasseControllerTests(unittest.TestCase):
             )
             self.assertEqual(validation.returncode, 0, validation.stderr)
 
+            database = self.run_secret_helper(protected_root, "--database-only")
+            self.assertEqual(database.returncode, 0, database.stderr)
+            application_secrets = {
+                path.name
+                for path in protected_root.iterdir()
+                if stat.S_IMODE(path.stat().st_mode) == 0o440
+            }
+            self.assertEqual(application_secrets, APPLICATION_CREDENTIAL_NAMES)
+            for name in application_secrets:
+                metadata = (protected_root / name).stat()
+                self.assertEqual(metadata.st_gid, os.getegid())
+                self.assertEqual(metadata.st_nlink, 1)
+
     def test_invalid_operator_bundle_is_rejected_without_materialization(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("the helper intentionally forbids root test mode")
@@ -327,8 +356,6 @@ class SurplasseControllerTests(unittest.TestCase):
             source = root / "source"
             self.write_operator_bundle(source)
             invalid = source / "surplasse-stripe-secret-key"
-            invalid.write_bytes(b"sk_" + b"test_" + b"X" * 32 + b"\n")
-            invalid.chmod(0o600)
             sentinel = protected_root / "surplasse-smtp-host"
             sentinel.write_bytes(b"existing.example.invalid\n")
             sentinel.chmod(0o400)
@@ -338,28 +365,109 @@ class SurplasseControllerTests(unittest.TestCase):
             }
             environment = os.environ.copy()
             environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
-            result = subprocess.run(
-                [
-                    str(SCRIPTS / "materialize-surplasse-secrets"),
-                    "--install-operator-from",
-                    str(source),
-                    "--test-root",
-                    str(protected_root),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=environment,
+            for invalid_value in (
+                b"rk_test_" + b"X" * 32 + b"\n",
+                b"sk_live_" + b"Y" * 32 + b"\n",
+            ):
+                with self.subTest(prefix=invalid_value[:8]):
+                    invalid.write_bytes(invalid_value)
+                    invalid.chmod(0o600)
+                    result = subprocess.run(
+                        [
+                            str(SCRIPTS / "materialize-surplasse-secrets"),
+                            "--install-operator-from",
+                            str(source),
+                            "--test-root",
+                            str(protected_root),
+                        ],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                    )
+                    self.assertEqual(result.returncode, 78)
+                    self.assertIn("stripe-secret-key format", result.stderr)
+                    self.assertEqual(
+                        before,
+                        {
+                            path.name: (path.read_bytes(), path.stat().st_ino)
+                            for path in protected_root.iterdir()
+                            if path.name != OPERATOR_LOCK
+                        },
+                    )
+
+    def test_legacy_dns_and_port_files_fail_closed_without_migration(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source_a = root / "source-a"
+            source_b = root / "source-b"
+            self.write_operator_bundle(source_a)
+            self.write_operator_bundle(source_b)
+            rotated_smtp_input = source_b / "surplasse-smtp-password"
+            rotated_smtp_input.write_bytes(b"rotation-must-not-be-applied\n")
+            rotated_smtp_input.chmod(0o600)
+            install = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source_a)
             )
-            self.assertEqual(result.returncode, 78)
-            self.assertIn("stripe-secret-key format", result.stderr)
+            self.assertEqual(install.returncode, 0, install.stderr)
+            legacy = {
+                "ovh-application-key": b"D" * 16 + b"\n",
+                "ovh-application-secret": b"E" * 32 + b"\n",
+                "ovh-consumer-key": b"F" * 32 + b"\n",
+                "surplasse-smtp-port": b"587\n",
+            }
+            for name, value in legacy.items():
+                path = protected_root / name
+                path.write_bytes(value)
+                path.chmod(0o400)
+            before = {
+                path.name: (path.read_bytes(), path.stat().st_ino)
+                for path in protected_root.iterdir()
+            }
+
+            rotation = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source_b)
+            )
+
+            self.assertEqual(rotation.returncode, 78)
+            self.assertIn("unexpected entry", rotation.stderr)
             self.assertEqual(
                 before,
                 {
                     path.name: (path.read_bytes(), path.stat().st_ino)
                     for path in protected_root.iterdir()
-                    if path.name != OPERATOR_LOCK
                 },
+            )
+            for name, value in legacy.items():
+                self.assertEqual((protected_root / name).read_bytes(), value)
+
+    def test_uppercase_smtp_host_is_rejected_before_runtime_publication(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source = root / "source"
+            self.write_operator_bundle(source)
+            smtp_host = source / "surplasse-smtp-host"
+            smtp_host.write_bytes(b"SMTP.example.invalid\n")
+            smtp_host.chmod(0o600)
+
+            result = self.run_secret_helper(
+                protected_root, "--install-operator-from", str(source)
+            )
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("lowercase DNS name", result.stderr)
+            self.assertFalse((root / "applications" / RUNTIME_CONFIG_NAME).exists())
+            self.assertEqual(
+                {path.name for path in protected_root.iterdir()},
+                {OPERATOR_LOCK},
             )
 
     def test_operator_bundle_rejects_a_jwt_kid_mismatch(self) -> None:
@@ -434,8 +542,8 @@ class SurplasseControllerTests(unittest.TestCase):
             values_b = self.write_operator_bundle(source_b)
             changes = {
                 "surplasse-smtp-password": b"rotated-smtp-password\n",
-                "surplasse-stripe-secret-key": b"sk_live_" + b"G" * 32 + b"\n",
-                "ovh-consumer-key": b"H" * 32 + b"\n",
+                "surplasse-stripe-secret-key": b"rk_live_" + b"G" * 32 + b"\n",
+                "surplasse-smtp-host": b"relay.example.invalid\n",
             }
             values_b.update(changes)
             for name, value in changes.items():
@@ -454,27 +562,52 @@ class SurplasseControllerTests(unittest.TestCase):
                 pending.write_bytes(value)
                 pending.chmod(stat.S_IMODE(destination.stat().st_mode))
                 os.replace(pending, destination)
+            runtime_path = root / "applications" / RUNTIME_CONFIG_NAME
+            runtime_pending = (
+                root
+                / "applications"
+                / ".surplasse.env.000000000000000000000003.pending"
+            )
+            runtime_pending.write_bytes(
+                b"SURPLASSE_AUTH_JWT_KEY_ID=atlas-2026-08\n"
+                b"SURPLASSE_SMTP_HOST=relay.example.invalid\n"
+            )
+            runtime_pending.chmod(0o600)
+            os.replace(runtime_pending, runtime_path)
+            interrupted = self.run_secret_helper(protected_root, "--operator-only")
+            self.assertEqual(interrupted.returncode, 78)
+            self.assertIn("manifest does not match", interrupted.stderr)
+
             orphan = (
                 protected_root
                 / ".surplasse-stripe-secret-key.ffffffffffffffffffffffff.pending"
             )
-            orphan.write_bytes(b"sk_live_" + b"Z" * 32 + b"\n")
+            orphan.write_bytes(b"rk_live_" + b"Z" * 32 + b"\n")
             orphan.chmod(0o440)
-
-            interrupted = self.run_secret_helper(protected_root, "--operator-only")
-            self.assertEqual(interrupted.returncode, 78)
-            self.assertIn("manifest does not match", interrupted.stderr)
-            self.assertFalse(orphan.exists())
+            runtime_orphan = (
+                root
+                / "applications"
+                / ".surplasse.env.ffffffffffffffffffffffff.pending"
+            )
+            runtime_orphan.write_bytes(runtime_path.read_bytes())
+            runtime_orphan.chmod(0o600)
 
             recovery = self.run_secret_helper(
                 protected_root, "--install-operator-from", str(source_b)
             )
             self.assertEqual(recovery.returncode, 0, recovery.stderr)
+            self.assertFalse(orphan.exists())
+            self.assertFalse(runtime_orphan.exists())
             validation = self.run_secret_helper(protected_root, "--operator-only")
             self.assertEqual(validation.returncode, 0, validation.stderr)
             self.assertEqual(
                 values_b,
                 {name: (protected_root / name).read_bytes() for name in values_b},
+            )
+            self.assertEqual(
+                runtime_path.read_bytes(),
+                b"SURPLASSE_AUTH_JWT_KEY_ID=atlas-2026-08\n"
+                b"SURPLASSE_SMTP_HOST=relay.example.invalid\n",
             )
 
     def test_missing_and_malformed_operator_manifest_are_rejected(self) -> None:
@@ -596,6 +729,92 @@ class SurplasseControllerTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
+    def test_database_preparation_rejects_an_unsafe_existing_manifest(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            manifest = protected_root / OPERATOR_MANIFEST
+            manifest.symlink_to(root / "outside")
+
+            result = self.run_secret_helper(protected_root, "--database-only")
+
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("manifest is unsafe", result.stderr)
+            self.assertFalse(
+                (protected_root / "surplasse-postgres-migrator-password").exists()
+            )
+            self.assertFalse(
+                (protected_root / "surplasse-postgres-runtime-password").exists()
+            )
+
+    def test_unsafe_runtime_target_blocks_rotation_before_secret_changes(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        for unsafe_kind in (
+            "directory",
+            "fifo",
+            "symlink",
+            "hardlink",
+            "wrong-mode",
+        ):
+            with self.subTest(unsafe_kind=unsafe_kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                protected_root = root / "target"
+                protected_root.mkdir(mode=0o700)
+                source_a = root / "source-a"
+                source_b = root / "source-b"
+                values_a = self.write_operator_bundle(source_a)
+                self.write_operator_bundle(source_b)
+                rotated_smtp_input = source_b / "surplasse-smtp-password"
+                rotated_smtp_input.write_bytes(b"blocked-runtime-rotation\n")
+                rotated_smtp_input.chmod(0o600)
+                install = self.run_secret_helper(
+                    protected_root, "--install-operator-from", str(source_a)
+                )
+                self.assertEqual(install.returncode, 0, install.stderr)
+                runtime_path = root / "applications" / RUNTIME_CONFIG_NAME
+                if unsafe_kind == "directory":
+                    runtime_path.unlink()
+                    runtime_path.mkdir(mode=0o700)
+                elif unsafe_kind == "fifo":
+                    runtime_path.unlink()
+                    os.mkfifo(runtime_path, mode=0o600)
+                elif unsafe_kind == "symlink":
+                    runtime_path.unlink()
+                    runtime_path.symlink_to(protected_root / "surplasse-smtp-host")
+                elif unsafe_kind == "hardlink":
+                    os.link(runtime_path, root / "external-runtime-link")
+                else:
+                    runtime_path.chmod(0o640)
+                before = {
+                    name: (
+                        (protected_root / name).read_bytes(),
+                        (protected_root / name).stat().st_ino,
+                    )
+                    for name in values_a
+                }
+
+                rotation = self.run_secret_helper(
+                    protected_root, "--install-operator-from", str(source_b)
+                )
+
+                self.assertEqual(rotation.returncode, 78)
+                self.assertIn("runtime configuration", rotation.stderr)
+                self.assertIn("unsafe", rotation.stderr)
+                self.assertEqual(
+                    before,
+                    {
+                        name: (
+                            (protected_root / name).read_bytes(),
+                            (protected_root / name).stat().st_ino,
+                        )
+                        for name in values_a
+                    },
+                )
+
     def test_unrecognized_pending_secret_copy_is_rejected(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("the helper intentionally forbids root test mode")
@@ -661,10 +880,8 @@ class SurplasseControllerTests(unittest.TestCase):
                 "surplasse-stripe-account-webhook-secret": b"whsec_"
                 + b"J" * 32
                 + b"\n",
-                "surplasse-stripe-secret-key": b"sk_live_" + b"K" * 32 + b"\n",
-                "ovh-application-key": b"L" * 16 + b"\n",
-                "ovh-application-secret": b"M" * 32 + b"\n",
-                "ovh-consumer-key": b"N" * 32 + b"\n",
+                "surplasse-stripe-secret-key": b"rk_live_" + b"K" * 32 + b"\n",
+                "surplasse-smtp-host": b"smtp-b.example.invalid\n",
             }
             values_b.update(changes)
             for name, value in changes.items():
@@ -701,6 +918,14 @@ class SurplasseControllerTests(unittest.TestCase):
                 name: (protected_root / name).read_bytes() for name in values_a
             }
             self.assertIn(installed, (values_a, values_b))
+            self.assertEqual(
+                (root / "applications" / RUNTIME_CONFIG_NAME).read_bytes(),
+                b"SURPLASSE_AUTH_JWT_KEY_ID="
+                + installed["surplasse-jwt-key-id"][:-1]
+                + b"\nSURPLASSE_SMTP_HOST="
+                + installed["surplasse-smtp-host"][:-1]
+                + b"\n",
+            )
             validation = self.run_secret_helper(protected_root, "--operator-only")
             self.assertEqual(validation.returncode, 0, validation.stderr)
 
@@ -729,6 +954,67 @@ class SurplasseControllerTests(unittest.TestCase):
                 MATERIALIZER.LOCK_TIMEOUT_SECONDS = previous_timeout
                 os.close(first_lock)
                 os.close(directory_fd)
+
+    def test_mutation_takes_deployment_lock_before_bundle_lock(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally forbids root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            protected_root = root / "target"
+            protected_root.mkdir(mode=0o700)
+            source = root / "source"
+            self.write_operator_bundle(source)
+            deployment_lock = root / "deployment.lock"
+            descriptor = os.open(
+                deployment_lock,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+            )
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            environment = os.environ.copy()
+            environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
+            process = subprocess.Popen(
+                [
+                    str(SCRIPTS / "materialize-surplasse-secrets"),
+                    "--install-operator-from",
+                    str(source),
+                    "--test-root",
+                    str(protected_root),
+                    "--test-deployment-lock",
+                    str(deployment_lock),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+            )
+            try:
+                time.sleep(0.2)
+                self.assertIsNone(process.poll())
+                self.assertFalse((protected_root / OPERATOR_LOCK).exists())
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                stdout, stderr = process.communicate(timeout=20)
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+
+            descriptor = os.open(deployment_lock, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                validation = self.run_secret_helper(
+                    protected_root,
+                    "--operator-only",
+                    "--test-deployment-lock",
+                    str(deployment_lock),
+                )
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            self.assertEqual(validation.returncode, 0, validation.stderr)
 
     def test_postgres_provisioning_sql_separates_roles(self) -> None:
         statements: list[tuple[str, str]] = []
@@ -816,22 +1102,38 @@ class SurplasseControllerTests(unittest.TestCase):
             )
         )
         self.assertEqual(
-            set(defaults["vps_surplasse_operator_inputs"]),
+            set(defaults["vps_surplasse_application_operator_inputs"]),
             {
-                "ovh-application-key",
-                "ovh-application-secret",
-                "ovh-consumer-key",
                 "surplasse-jwt-jwks",
                 "surplasse-jwt-key-id",
                 "surplasse-jwt-private-key",
                 "surplasse-smtp-host",
                 "surplasse-smtp-password",
-                "surplasse-smtp-port",
                 "surplasse-smtp-username",
                 "surplasse-stripe-account-webhook-secret",
                 "surplasse-stripe-payment-webhook-secret",
                 "surplasse-stripe-secret-key",
             },
+        )
+        self.assertEqual(
+            set(defaults["vps_surplasse_application_secrets"]),
+            APPLICATION_CREDENTIAL_NAMES,
+        )
+        self.assertEqual(
+            set(defaults["vps_surplasse_dns_operator_inputs"]),
+            {
+                "ovh-application-key",
+                "ovh-application-secret",
+                "ovh-consumer-key",
+            },
+        )
+        self.assertEqual(
+            defaults["vps_surplasse_dns_secrets"],
+            defaults["vps_surplasse_dns_operator_inputs"],
+        )
+        self.assertEqual(
+            defaults["vps_surplasse_runtime_config_file"],
+            "/etc/vps/applications/surplasse.env",
         )
 
 

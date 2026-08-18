@@ -202,6 +202,11 @@ quarantine state lives under `/srv/applications` and
 `/var/lib/vps-application`; runtime configuration lives under the root-only
 `/etc/vps/applications` directory. Secret bytes remain in
 `/etc/vps/secrets/<application>` and are never copied into state.
+For Surplasse, the root-only input helper derives `surplasse.env` atomically
+from the validated JWT key identifier and SMTP host. The file contains exactly
+those two keys. The same helper commit marker binds the source inputs, runtime
+file, and application deployment validation. Scoped OVH DNS credentials are a
+separate public-edge contract and are not an application installation input.
 
 `vps-application-recover.service` is installed and loaded beside the static
 recovery unit. On 2026-08-18 it was inactive after a successful recovery run

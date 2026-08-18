@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Validate the inactive Surplasse extension of the public static edge."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib.util
+import json
+import os
+import stat
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from typing import Any
+
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+REPOSITORY_ROOT = SCRIPT_DIRECTORY.parent
+BASE_VALIDATOR_PATH = SCRIPT_DIRECTORY / "validate-compose"
+EXPECTED_IMAGES_PATH = (
+    REPOSITORY_ROOT / "platform/public-static-edge/expected-images.json"
+)
+TLS_SNIPPET_PATH = (
+    REPOSITORY_ROOT / "platform/public-static-edge/surplasse-tls.caddy"
+)
+APPROVED_ROUTE_PATH = (
+    REPOSITORY_ROOT / "platform/caddy/routes/surplasse.caddy.disabled"
+)
+
+PROJECT = "vps-public-static-edge"
+APPLICATION_NETWORK = "app_surplasse"
+APPLICATION_ADDRESS = "172.30.10.254"
+RUNTIME_ROUTE_SOURCE = "/srv/vps/runtime/public-static-edge/routes"
+RUNTIME_ROUTE_PATH = f"{RUNTIME_ROUTE_SOURCE}/surplasse.caddy"
+CONTAINER_ROUTE_TARGET = "/etc/caddy/routes"
+TLS_SNIPPET_SOURCE = "/srv/vps/runtime/public-static-edge/surplasse-tls.caddy"
+TLS_SNIPPET_TARGET = "/etc/caddy/surplasse-tls.caddy"
+DNS_CREDENTIAL_ROOT_PATH = "/etc/vps/secrets/dns/surplasse"
+MAX_ROUTE_SIZE = 128 * 1024
+APPROVED_ROUTE_SHA256 = (
+    "20d43c1de5f5dd673536a16153daec39f3fcd0fcf606582a6c09055f108f1464"
+)
+
+DNS_CREDENTIAL_SOURCES = {
+    "surplasse_ovh_application_key": "ovh-application-key",
+    "surplasse_ovh_application_secret": "ovh-application-secret",
+    "surplasse_ovh_consumer_key": "ovh-consumer-key",
+}
+DNS_FILE_VARIABLE_PATHS = {
+    "OVH_APPLICATION_KEY_FILE": "/run/secrets/surplasse_ovh_application_key",
+    "OVH_APPLICATION_SECRET_FILE": "/run/secrets/surplasse_ovh_application_secret",
+    "OVH_CONSUMER_KEY_FILE": "/run/secrets/surplasse_ovh_consumer_key",
+}
+EXPECTED_TLS_SNIPPET = """tls {
+\tdns ovh {
+\t\tendpoint {$OVH_ENDPOINT:ovh-eu}
+\t\tapplication_key {$OVH_APPLICATION_KEY}
+\t\tapplication_secret {$OVH_APPLICATION_SECRET}
+\t\tconsumer_key {$OVH_CONSUMER_KEY}
+\t}
+}
+""".encode()
+
+
+class CandidateError(ValueError):
+    """Raised when the inactive candidate differs from the exact contract."""
+
+
+def fail(message: str) -> None:
+    raise CandidateError(message)
+
+
+def load_base_validator() -> Any:
+    loader = SourceFileLoader("surplasse_candidate_base_policy", str(BASE_VALIDATOR_PATH))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        fail("cannot load the base Compose validator")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def strict_regular_file(path: Path, subject: str, maximum_size: int) -> bytes:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except OSError as exc:
+        fail(f"{subject} cannot be opened safely: {exc}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            fail(f"{subject} must be a regular non-symbolic file")
+        if before.st_size <= 0 or before.st_size > maximum_size:
+            fail(f"{subject} size is outside the contract")
+        chunks: list[bytes] = []
+        remaining = maximum_size + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_after != identity_before or len(content) != before.st_size:
+            fail(f"{subject} changed while it was read")
+        return content
+    except OSError as exc:
+        fail(f"{subject} cannot be read safely: {exc}")
+    finally:
+        os.close(descriptor)
+
+
+def validate_route_content(route: bytes) -> None:
+    try:
+        route_text = route.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail("attested Surplasse route is not UTF-8")
+    if not route_text.endswith("\n") or "\r" in route_text or "\0" in route_text:
+        fail("attested Surplasse route must use canonical LF-terminated text")
+    required_import = f"\timport {TLS_SNIPPET_TARGET}\n"
+    if route_text.count(required_import) != 1:
+        fail("attested Surplasse route must import the exact Atlas TLS snippet once")
+    if "dns ovh" in route_text or "OVH_" in route_text:
+        fail("attested Surplasse route must not own the Atlas DNS provider")
+
+
+def validate_route_bytes(
+    attested_route: Path,
+    installed_route: Path | None,
+    approved_route: Path = APPROVED_ROUTE_PATH,
+) -> None:
+    route = strict_regular_file(attested_route, "attested Surplasse route", MAX_ROUTE_SIZE)
+    approved = strict_regular_file(
+        approved_route, "approved vps-infra Surplasse route", MAX_ROUTE_SIZE
+    )
+    if hashlib.sha256(approved).hexdigest() != APPROVED_ROUTE_SHA256:
+        fail("approved vps-infra Surplasse route differs from its reviewed digest")
+    if route != approved:
+        fail("attested Surplasse route differs from the approved vps-infra route")
+    validate_route_content(route)
+    if installed_route is None:
+        return
+    installed = strict_regular_file(installed_route, "installed Surplasse route", MAX_ROUTE_SIZE)
+    if installed != route:
+        fail("installed Surplasse route differs from the attested route")
+
+
+def validate_tls_snippet(installed_path: Path | None = None) -> None:
+    approved = strict_regular_file(
+        TLS_SNIPPET_PATH, "Atlas Surplasse TLS snippet", len(EXPECTED_TLS_SNIPPET)
+    )
+    if approved != EXPECTED_TLS_SNIPPET:
+        fail("Atlas Surplasse TLS snippet differs from the exact DNS-01 contract")
+    if installed_path is None:
+        return
+    installed = strict_regular_file(
+        installed_path,
+        "installed Atlas Surplasse TLS snippet",
+        len(EXPECTED_TLS_SNIPPET),
+    )
+    if installed != approved:
+        fail("installed Atlas Surplasse TLS snippet differs from the approved snippet")
+
+
+def find_volume(service: dict[str, Any], target: str) -> dict[str, Any]:
+    matching = [
+        volume
+        for volume in service.get("volumes", [])
+        if isinstance(volume, dict) and volume.get("target") == target
+    ]
+    if len(matching) != 1:
+        fail(f"services.caddy.volumes must contain exactly one {target!r} mount")
+    return matching[0]
+
+
+def validate_candidate_compose(document: Any) -> None:
+    if not isinstance(document, dict):
+        fail("rendered Compose candidate must be an object")
+    if set(document) != {"name", "networks", "secrets", "services", "volumes"}:
+        fail("rendered Compose candidate contains an unexpected top-level resource")
+    if document.get("name") != PROJECT:
+        fail(f"name must remain {PROJECT!r}")
+    services = document.get("services")
+    if not isinstance(services, dict) or set(services) != {"caddy"}:
+        fail("candidate must contain exactly the existing Caddy service")
+    caddy = services["caddy"]
+    if not isinstance(caddy, dict):
+        fail("services.caddy must be an object")
+    volumes = caddy.get("volumes")
+    if not isinstance(volumes, list) or any(
+        not isinstance(volume, dict) for volume in volumes
+    ):
+        fail("services.caddy.volumes must be an array of normalized objects")
+
+    expected_credential_mounts = [
+        {"source": name, "target": f"/run/secrets/{name}"}
+        for name in DNS_CREDENTIAL_SOURCES
+    ]
+    if caddy.get("environment") != DNS_FILE_VARIABLE_PATHS:
+        fail("services.caddy.environment differs from the exact file-variable contract")
+    if caddy.get("secrets") != expected_credential_mounts:
+        fail("services.caddy.secrets differs from the exact scoped credential contract")
+    if caddy.get("networks") != {
+        APPLICATION_NETWORK: {"ipv4_address": APPLICATION_ADDRESS},
+        "edge": {},
+    }:
+        fail("services.caddy.networks differs from the exact edge and application attachment")
+
+    route_mount = find_volume(caddy, CONTAINER_ROUTE_TARGET)
+    if route_mount != {
+        "type": "bind",
+        "source": RUNTIME_ROUTE_SOURCE,
+        "target": CONTAINER_ROUTE_TARGET,
+        "read_only": True,
+        "bind": {"create_host_path": False},
+    }:
+        fail(f"{RUNTIME_ROUTE_PATH} is not provided by the exact runtime route mount")
+    tls_mount = find_volume(caddy, TLS_SNIPPET_TARGET)
+    if tls_mount != {
+        "type": "bind",
+        "source": TLS_SNIPPET_SOURCE,
+        "target": TLS_SNIPPET_TARGET,
+        "read_only": True,
+        "bind": {"create_host_path": False},
+    }:
+        fail("Atlas Surplasse TLS snippet mount differs from the exact contract")
+
+    networks = document.get("networks")
+    if not isinstance(networks, dict) or set(networks) != {"edge", APPLICATION_NETWORK}:
+        fail("top-level networks must contain exactly edge and app_surplasse")
+    if networks[APPLICATION_NETWORK] != {
+        "name": APPLICATION_NETWORK,
+        "ipam": {},
+        "external": True,
+    }:
+        fail("top-level app_surplasse network differs from the managed external network")
+
+    secrets = document.get("secrets")
+    expected_credential_definitions = {
+        name: {
+            "name": name,
+            "file": f"{DNS_CREDENTIAL_ROOT_PATH}/{file_name}",
+        }
+        for name, file_name in DNS_CREDENTIAL_SOURCES.items()
+    }
+    if secrets != expected_credential_definitions:
+        fail("top-level DNS secrets differ from the separate scoped directory contract")
+
+    base = copy.deepcopy(document)
+    base_caddy = base["services"]["caddy"]
+    base_caddy.pop("environment", None)
+    base_caddy.pop("secrets", None)
+    base_caddy["networks"].pop(APPLICATION_NETWORK, None)
+    base_caddy["volumes"] = [
+        volume
+        for volume in volumes
+        if volume.get("target") != TLS_SNIPPET_TARGET
+    ]
+    base["networks"].pop(APPLICATION_NETWORK, None)
+    base.pop("secrets", None)
+
+    base_validator = load_base_validator()
+    expected_images = base_validator.load_expected_images(EXPECTED_IMAGES_PATH)
+    try:
+        base_validator.validate_compose(
+            PROJECT,
+            base,
+            expected_images=expected_images,
+            repository_root=REPOSITORY_ROOT,
+        )
+    except base_validator.ComposePolicyError as exc:
+        fail(f"projected public static edge violates its unchanged policy: {exc}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("compose_json", help="rendered candidate from docker compose config")
+    parser.add_argument(
+        "--approved-route",
+        required=True,
+        help="exact route approved by the reviewed vps-infra revision",
+    )
+    parser.add_argument(
+        "--attested-route",
+        help="verified route extracted from the admitted vps-integration artifact",
+    )
+    parser.add_argument(
+        "--installed-route",
+        help="active route to compare byte for byte with the attested route",
+    )
+    parser.add_argument(
+        "--installed-tls-snippet",
+        help="active Atlas TLS snippet to compare with the approved snippet",
+    )
+    parser.add_argument(
+        "--candidate-only",
+        action="store_true",
+        help="validate repository inputs only; this mode cannot prove a live route",
+    )
+    args = parser.parse_args()
+    if args.candidate_only:
+        if args.attested_route or args.installed_route or args.installed_tls_snippet:
+            parser.error(
+                "--candidate-only cannot be combined with live route or TLS inputs"
+            )
+        route_to_validate = Path(args.approved_route)
+        installed_route = None
+        installed_tls_snippet = None
+    else:
+        if (
+            not args.attested_route
+            or not args.installed_route
+            or not args.installed_tls_snippet
+        ):
+            parser.error(
+                "live validation requires the attested route, installed route, and "
+                "installed TLS snippet"
+            )
+        if args.installed_route != RUNTIME_ROUTE_PATH:
+            parser.error(f"--installed-route must be exactly {RUNTIME_ROUTE_PATH}")
+        if args.installed_tls_snippet != TLS_SNIPPET_SOURCE:
+            parser.error(
+                f"--installed-tls-snippet must be exactly {TLS_SNIPPET_SOURCE}"
+            )
+        route_to_validate = Path(args.attested_route)
+        installed_route = Path(args.installed_route)
+        installed_tls_snippet = Path(args.installed_tls_snippet)
+    try:
+        compose_path = Path(args.compose_json)
+        raw = strict_regular_file(compose_path, "rendered Compose candidate", 2 * 1024 * 1024)
+        document = json.loads(raw.decode("utf-8"))
+        validate_candidate_compose(document)
+        validate_tls_snippet(installed_tls_snippet)
+        validate_route_bytes(
+            route_to_validate,
+            installed_route,
+            Path(args.approved_route),
+        )
+    except (CandidateError, json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        print(f"Surplasse public edge candidate validation failed: {exc}", file=sys.stderr)
+        return 1
+    route_evidence = (
+        "repository candidate only; no installed route was inspected"
+        if args.candidate_only
+        else "installed route equals the attested route"
+    )
+    print(
+        "Surplasse public edge candidate valid: inactive exact composition; "
+        f"{route_evidence}; runtime route {RUNTIME_ROUTE_PATH}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,23 +1,13 @@
 https://{$SURPLASSE_DOMAIN:surplasse.com}, https://*.{$SURPLASSE_DOMAIN:surplasse.com} {
-	tls {
-		dns ovh {
-			endpoint {$OVH_ENDPOINT:ovh-eu}
-			application_key {$OVH_APPLICATION_KEY}
-			application_secret {$OVH_APPLICATION_SECRET}
-			consumer_key {$OVH_CONSUMER_KEY}
-		}
-	}
-
 	log
 	import security_headers
+	import /etc/caddy/surplasse-tls.caddy
 
 	@edge_identity path /.well-known/surplasse-edge
 	handle @edge_identity {
 		respond "surplasse-edge-v1" 200
 	}
 
-	# Quarkus management endpoints stay on the private application network.
-	# This covers metrics, detailed health, OpenAPI and Swagger in one invariant.
 	@api_management {
 		host api.{$SURPLASSE_DOMAIN:surplasse.com}
 		path /q /q/*
@@ -78,9 +68,6 @@ https://{$SURPLASSE_DOMAIN:surplasse.com}, https://*.{$SURPLASSE_DOMAIN:surplass
 		redir {$SURPLASSE_BASE_URL:https://surplasse.com}{uri} 308
 	}
 
-	# These endpoints exist only in the Surplasse development server. Do not
-	# send them to the onboarding NGINX image. That image returns a misleading
-	# 404 response and does not implement the Connect operation.
 	@stripe_connect_unavailable {
 		host {$SURPLASSE_DOMAIN:surplasse.com}
 		path /stripe-connect/config /stripe-connect/account-session

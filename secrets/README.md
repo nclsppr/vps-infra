@@ -13,9 +13,6 @@ Les fichiers déchiffrés seront matérialisés sous
 
 | Fichier | Propriétaire et mode attendus |
 |---|---|
-| `ovh-application-key` | `root:root 0400` |
-| `ovh-application-secret` | `root:root 0400` |
-| `ovh-consumer-key` | `root:root 0400` |
 | `postgres-superuser-password` | `root:70 0440` |
 | `postgres-exporter-password` | `root:70 0440` |
 | `grafana-admin-password` | `root:472 0440` |
@@ -42,15 +39,37 @@ valide et ne l'écrit pas dans les sorties Ansible.
 - références Compose uniquement par fichiers sous `/run/secrets` ;
 - sauvegarde de récupération de la clé age testée avant toute activation.
 
+## Identité DNS Surplasse
+
+The inactive public-edge candidate defines a separate, Surplasse-only DNS
+identity under `/etc/vps/secrets/dns/surplasse`:
+
+| File | Expected owner and mode |
+|---|---|
+| `ovh-application-key` | `root:root 0400` |
+| `ovh-application-secret` | `root:root 0400` |
+| `ovh-consumer-key` | `root:root 0400` |
+
+These files are not platform secrets and are not application inputs. No current
+controller materializes them. A later reviewed public-edge controller must
+install them atomically, prove the OVH IAM scope for the `surplasse.com` DNS-01
+operations, and keep them separate from any temporary DNS-cutover identity.
+
 ## Surplasse
 
 The Surplasse preparation controller now creates separate migrator and runtime
 database passwords. It also installs a helper that validates and materializes
-the complete operator bundle under `/etc/vps/secrets/surplasse`. The exact file
-list, metadata, offline format checks, JWT key-pair proof, serialized install,
-and generation-manifest rules are in
+the application operator bundle. Seven mounted secrets and the two generated
+database passwords live under `/etc/vps/secrets/surplasse`. The validated JWT
+key ID and SMTP host are published separately in
+`/etc/vps/applications/surplasse.env`. The exact input list, metadata, offline
+format checks, JWT key-pair proof, serialized install, and generation-manifest
+rules are in
 [`applications/surplasse/README.md`](../applications/surplasse/README.md).
 
-The adapter remains locked. A locally valid OVH token shape does not prove its
-IAM scope, and valid Stripe values do not prove the reviewed Connect release
-gate. Do not activate from the presence of files alone.
+The helper refuses legacy OVH files in the application directory. The adapter
+remains locked. A locally valid OVH token shape does not prove its IAM scope.
+The Stripe input accepts only a dedicated live restricted key, but its prefix
+does not prove its permissions, account, Atlas network restriction, or the
+reviewed Connect release gate. Do not activate from the presence of files
+alone.

@@ -305,8 +305,15 @@ Before a dedicated migration can run, Parkventory must no longer have static
 active state. For both applications, the installed public edge route must equal
 the attested bundle route byte for byte and the healthy edge Caddy container
 must already be attached to the exact application network. The controller does
-not mutate the immutable edge release, so this platform cutover remains a
-separate reviewed prerequisite.
+not mutate the immutable edge release. For Surplasse, the preflight also
+requires the managed `app_surplasse` bridge identity, its exact
+`172.30.10.0/24` subnet, and the same network identifier plus
+`172.30.10.254/24` on Caddy.
+
+The inactive Surplasse Compose override is not a complete cutover controller.
+It cannot atomically stage the route, install the scoped DNS credentials,
+recreate Caddy, prove the new identity, and recover the previous edge release.
+That platform cutover remains a separate reviewed prerequisite.
 
 Activation journals `prepared`, `migration-running`, `migrated`, `started`,
 `probe-rejected`, and `probed`. Only `probed` can become active. Recovery restores

@@ -1,6 +1,6 @@
 module caddy
 
-go 1.26.5
+go 1.26.6
 
 replace golang.org/x/text => golang.org/x/text v0.39.0
 
