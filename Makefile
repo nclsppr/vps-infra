@@ -12,7 +12,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
 	check-public-static-edge check-surplasse-public-edge-candidate \
-	check-surplasse-public-edge-controller \
+	check-surplasse-public-edge-controller check-surplasse-dns-cutover-controller \
 	check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
@@ -95,6 +95,8 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 	$(MISE_EXEC) uv run python -m json.tool \
 		policies/platform-vex-v1.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
+		policies/surplasse-dns-cutover-v1.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
 		applications/surplasse/adapter.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
 		applications/surplasse/expected-images.json >/dev/null
@@ -141,6 +143,10 @@ check-surplasse-public-edge-candidate: check-public-static-edge ## Validate the 
 check-surplasse-public-edge-controller: ## Test the crash-safe Surplasse edge transition controller.
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		tests/test_surplasse_public_edge_controller.py
+
+check-surplasse-dns-cutover-controller: ## Test the inactive Surplasse DNS cutover controller.
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		tests/test_surplasse_dns_cutover.py
 
 check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 	@set -Eeuo pipefail; \

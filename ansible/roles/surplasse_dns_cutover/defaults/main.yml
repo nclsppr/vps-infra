@@ -1,0 +1,9 @@
+---
+vps_surplasse_dns_cutover_controller: >-
+  /usr/local/libexec/vps/surplasse-dns-cutover
+vps_surplasse_dns_cutover_policy: >-
+  /etc/vps/policies/surplasse-dns-cutover-v1.json
+vps_surplasse_dns_cutover_state_root: >-
+  /var/lib/vps-surplasse-dns-cutover
+vps_surplasse_dns_cutover_credential_root: >-
+  /etc/vps/secrets/dns/surplasse-cutover

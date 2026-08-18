@@ -276,6 +276,7 @@ Cette décision est détaillée dans
 - [ADR-0007 - managed transactional email relay for Surplasse](docs/decisions/0007-relais-email-transactionnel-surplasse.md)
 - [ADR-0009 - immutable application release admission](docs/decisions/0009-immutable-application-release-admission.md)
 - [ADR-0010 - disabled transactional application controller](docs/decisions/0010-disabled-transactional-application-controller.md)
+- [ADR-0012 - locked Surplasse DNS cutover controller](docs/decisions/0012-locked-surplasse-dns-cutover-controller.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas

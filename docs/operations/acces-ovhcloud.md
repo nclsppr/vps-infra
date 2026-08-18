@@ -109,6 +109,12 @@ Any API credential copied into a chat is compromised. Revoke it immediately.
 Do not reuse it for Caddy, deployment automation, or a later DNS change. Create
 a new short-lived and zone-scoped identity when another mutation is required.
 
+The locked Surplasse implementation is specified in
+[`surplasse-dns-cutover.md`](surplasse-dns-cutover.md) and
+[ADR-0012](../decisions/0012-locked-surplasse-dns-cutover-controller.md).
+It uses a dedicated credential directory and cannot call OVHcloud while its
+versioned policy remains locked.
+
 ## DNS à exporter avant toute mutation
 
 Pour chaque zone :
