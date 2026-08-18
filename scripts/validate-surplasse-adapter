@@ -25,6 +25,11 @@ SMTP_HOST_RE = re.compile(
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
 )
 JWT_KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+TESTER_PAYMENT_PROFILE = {
+    "audience": "testers",
+    "mode": "test",
+    "schema": 1,
+}
 
 
 class AdapterError(ValueError):
@@ -125,7 +130,7 @@ def validate_backend_environment(environment: dict[str, str]) -> None:
         "STRIPE_ACCOUNT_WEBHOOK_SECRET_FILE": (
             "/run/secrets/surplasse_stripe_account_webhook_secret"
         ),
-        "STRIPE_LIVE_MODE": "true",
+        "STRIPE_LIVE_MODE": "false",
         "STRIPE_PAYMENT_WEBHOOK_SECRET_FILE": (
             "/run/secrets/surplasse_stripe_payment_webhook_secret"
         ),
@@ -335,8 +340,8 @@ def validate_metadata(
         adapter,
         {
             "activation_policy", "blocked_by", "integration", "migration",
-            "runtime_services", "schema", "source_repository", "source_revision",
-            "transient_services",
+            "payment", "runtime_services", "schema", "source_repository",
+            "source_revision", "transient_services",
         },
         "adapter",
     )
@@ -346,6 +351,8 @@ def validate_metadata(
         "backend", "commande", "dashboard", "docs", "onboarding"
     ] or adapter["transient_services"] != ["migrator"]:
         fail("adapter: runtime or transient service set differs from the contract")
+    if adapter["payment"] != TESTER_PAYMENT_PROFILE:
+        fail("adapter.payment: differs from the versioned tester payment profile")
     if adapter["source_repository"] != "nclsppr/surplasse" or re.fullmatch(
         r"[0-9a-f]{40}", adapter["source_revision"]
     ) is None:
