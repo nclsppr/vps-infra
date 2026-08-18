@@ -33,6 +33,12 @@ TITLE_ANNOTATION = "org.opencontainers.image.title"
 
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+PARKVENTORY_POSTGRES_READINESS_CONTRACT = (
+    "vps-infra.parkventory-postgres-readiness.v1"
+)
+PARKVENTORY_POSTGRES_READINESS_PATH = (
+    "/var/lib/vps-readiness/parkventory/postgres.json"
+)
 RFC3339_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
@@ -84,6 +90,7 @@ class ApplicationPolicy:
     integration_repository: str
     component_repositories: Mapping[str, str]
     required_checks: tuple[str, ...]
+    readiness_evidence: Mapping[str, object] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -231,6 +238,8 @@ def load_production_contract(
             "component_repositories",
             "required_checks",
         }
+        if name == "parkventory":
+            fields.add("readiness_evidence")
         _exact_keys(candidate, fields, path_prefix)
         enabled = candidate["enabled"]
         if type(enabled) is not bool:
@@ -262,6 +271,51 @@ def load_production_contract(
                 f"{path_prefix}.required_checks",
                 "must match the exact required check allowlist",
             )
+        readiness_evidence: Mapping[str, object] | None = None
+        if name == "parkventory":
+            readiness = _object(
+                candidate["readiness_evidence"],
+                f"{path_prefix}.readiness_evidence",
+            )
+            _exact_keys(
+                readiness,
+                {"postgres", "encrypted_offsite_backup"},
+                f"{path_prefix}.readiness_evidence",
+            )
+            postgres = _object(
+                readiness["postgres"],
+                f"{path_prefix}.readiness_evidence.postgres",
+            )
+            _exact_keys(
+                postgres,
+                {"contract", "path", "sha256"},
+                f"{path_prefix}.readiness_evidence.postgres",
+            )
+            _literal(
+                postgres["contract"],
+                PARKVENTORY_POSTGRES_READINESS_CONTRACT,
+                f"{path_prefix}.readiness_evidence.postgres.contract",
+            )
+            _literal(
+                postgres["path"],
+                PARKVENTORY_POSTGRES_READINESS_PATH,
+                f"{path_prefix}.readiness_evidence.postgres.path",
+            )
+            postgres_digest = postgres["sha256"]
+            if postgres_digest is not None:
+                _sha256(
+                    postgres_digest,
+                    f"{path_prefix}.readiness_evidence.postgres.sha256",
+                )
+            if readiness["encrypted_offsite_backup"] is not None:
+                _fail(
+                    f"{path_prefix}.readiness_evidence.encrypted_offsite_backup",
+                    "must remain null until the encrypted off-site backup proof verifier is merged",
+                )
+            readiness_evidence = {
+                "postgres": dict(postgres),
+                "encrypted_offsite_backup": None,
+            }
         parsed.append(
             ApplicationPolicy(
                 name=name,
@@ -273,12 +327,33 @@ def load_production_contract(
                 integration_repository=str(expected["integration_repository"]),
                 component_repositories=dict(expected_components),
                 required_checks=tuple(str(item) for item in expected["required_checks"]),
+                readiness_evidence=readiness_evidence,
             )
         )
 
     result = ProductionContract(applications=tuple(parsed))
     if static_contract_path is not None:
         validate_static_exclusivity(result, static_contract_path)
+    parkventory = next(
+        application
+        for application in result.applications
+        if application.name == "parkventory"
+    )
+    if parkventory.enabled:
+        assert parkventory.readiness_evidence is not None
+        postgres = parkventory.readiness_evidence["postgres"]
+        assert isinstance(postgres, dict)
+        if postgres["sha256"] is None:
+            _fail(
+                "application production contract.applications.parkventory."
+                "readiness_evidence.postgres.sha256",
+                "must bind enabled Parkventory to exact PostgreSQL readiness evidence",
+            )
+        _fail(
+            "application production contract.applications.parkventory."
+            "readiness_evidence.encrypted_offsite_backup",
+            "must bind enabled Parkventory to verified encrypted off-site backup evidence",
+        )
     return result
 
 

@@ -958,6 +958,29 @@ platform. A later review must prepare the exact route and network before the
 one-shot migration, satisfy every ADR-0010 blocker, start the runtime services,
 and verify strict internal and public probes.
 
+## Parkventory database preparation
+
+`make plan-parkventory-postgres` and `make verify-parkventory-postgres` are
+non-mutating host paths. `make prepare-parkventory-postgres` is a separately
+selected operation. It creates only missing database password files and the
+dedicated `parkventory` database boundary on the existing shared PostgreSQL
+17.10 cluster. It creates a `NOLOGIN` owner, a migrator that can explicitly
+assume the owner role, and a runtime role limited to connect, schema usage, and
+reviewed default DML privileges.
+
+The shared PostgreSQL port remains unpublished. `db_parkventory` is an internal
+single-host Docker network controlled by the Atlas root boundary. The pilot
+does not use PostgreSQL transport TLS inside that exact boundary. A published
+port, second host, or untrusted container invalidates this exception and
+requires TLS.
+
+Preparation writes canonical root-only evidence after effective SQL checks. It
+does not activate Parkventory, attach Caddy, change DNS, or release the current
+static owner. The application contract keeps the evidence digest empty and
+keeps encrypted off-site backup evidence explicitly absent. A Boolean
+`enabled: true` change is insufficient and is rejected. Follow
+[`operations/parkventory-postgresql.md`](operations/parkventory-postgresql.md).
+
 ## Remaining changes by repository
 
 ### `personal`
