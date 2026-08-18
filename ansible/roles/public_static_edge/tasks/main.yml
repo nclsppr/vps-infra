@@ -44,25 +44,20 @@
       - >-
         vps_public_static_edge_domains | sort ==
         ['nicolas.pieper.fr', 'nicolaspieper.com', 'papersempire.com',
-         'parkventory.com', 'pieper.fr', 'www.nicolas.pieper.fr',
-         'www.nicolaspieper.com', 'www.papersempire.com',
-         'www.parkventory.com', 'www.pieper.fr']
+         'parkventory.com', 'pieper.fr', 'www.nicolaspieper.com',
+         'www.papersempire.com', 'www.parkventory.com']
       - >-
         vps_public_static_edge_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
          {'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'www.nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'www.papersempire.com', 'target': 'papersempire.com'},
          {'source': 'www.parkventory.com', 'target': 'parkventory.com'}]
       - >-
         vps_public_static_edge_direct_http_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
          {'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'www.nicolas.pieper.fr', 'target': 'nicolaspieper.com'}]
+         {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'}]
       - >-
         vps_public_static_edge_pre_cutover_https_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
