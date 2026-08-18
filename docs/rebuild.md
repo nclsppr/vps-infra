@@ -74,8 +74,9 @@ The generic `scripts/deploy <sha40>` controller validates and plans desired
 state but remains dry-run. Static activation uses the separate operational
 controller documented in
 [`operations/static-release-reconciliation.md`](operations/static-release-reconciliation.md).
-The Compose application controller is merged but not proved converged on Atlas;
-both application entries remain disabled.
+Atlas has converged the Compose application controller and root gate from
+revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`; both application entries
+remain `enabled: false`, and no application workflow or active release exists.
 
 ## Phase 0 — préparer sans toucher au trafic
 
@@ -156,14 +157,14 @@ CI toolchain; reconstruction does not install it on Atlas.
 
 Host convergence installs one operator tool outside that CI toolchain: the
 standalone Codex CLI package. It uses no Node.js or npm and runs only as the
-isolated `codex` account through the enforced bounded launcher. When enabled
-for either remote path, a persistent App Server uses a private Unix socket. An
-optional unprivileged SSH gateway requires an external public key. Direct
-mobile control instead uses the App Server's outbound ChatGPT relay and opens
-no inbound port. Persistent state is capped by a dedicated 6 GiB filesystem.
-Authentication and mobile pairing are not part of reconstruction. After
-convergence, an operator may restore access with the ChatGPT-only device flow
-and the manual pairing procedure documented in
+isolated `codex` account through the enforced bounded launcher. On the proved
+2026-08-18 Atlas convergence, `atlas-codex-app-server.service` was active and
+running on its managed private Unix socket. An optional unprivileged SSH gateway
+requires an external public key. Direct mobile control instead uses the App
+Server's outbound ChatGPT relay and opens no inbound port. Persistent state is
+capped by a dedicated 6 GiB filesystem. Authentication and mobile pairing are
+not part of reconstruction. After convergence, an operator may restore access
+with the ChatGPT-only device flow and the manual pairing procedure documented in
 [`operations/codex-cli.md`](operations/codex-cli.md).
 
 The input-free static reconciliation workflow resolves the exact application
@@ -232,8 +233,9 @@ For static recovery:
 1. converge the reviewed static controller revision and public edge;
 2. install the dedicated deploy public key and independently verified host key;
 3. configure the `static-production` environment while deployment is suspended;
-4. confirm that the current canonical producer heads have complete green checks
-   and immutable artifacts;
+4. confirm that the current canonical producer heads have only complete,
+   non-failing observed checks, successful configured required checks, and
+   immutable artifacts;
 5. enable reconciliation and dispatch the input-free workflow;
 6. require all three deploy jobs, protected active tuples, empty transactions,
    and strict public probes.

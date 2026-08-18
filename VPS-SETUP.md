@@ -5,9 +5,10 @@
 > mode, and a complete reboot. The three approved static sites use the Atlas
 > IPv4 address and HTTPS. The private PostgreSQL and observability platform is
 > active. Automatic static reconciliation is enabled and proved by two complete
-> scheduled runs. No dynamic application is active. The Compose application
-> controller is merged but its revision is not proved converged on Atlas. Do not
-> use the archived runbook. Use the
+> scheduled runs and the final central run `32086151183`. No dynamic application
+> is active. Atlas has converged the disabled Compose application controller at
+> `da04a09bfa9788ae8127b63f9f3a6692bef2551b`; installation is not activation.
+> Do not use the archived runbook. Use the
 > [static operations runbook](docs/operations/static-release-reconciliation.md)
 > and [dated rollout evidence](docs/evidence/2026-08-18-static-reconciliation-rollout.md).
 
@@ -134,8 +135,8 @@ Critères :
 - [x] aucune toolchain applicative sur l’hôte ;
 - [x] Codex CLI autonome installé sous un compte dédié sans sudo, Docker,
       SSH direct ni accès aux secrets et releases de production ;
-- [ ] App Server Codex persistant sur socket Unix privé, accessible par une
-      passerelle SSH distincte et sans port public ;
+- [x] App Server Codex persistant `atlas-codex-app-server.service` actif sur son
+      socket Unix privé, sans port public ;
 - [x] logs bornés, redémarrage et reboot vérifiés ;
 - [x] second passage Ansible sans changement ;
 - [x] bounded `--check --diff` invocation covered by CI and executed on the
@@ -149,7 +150,19 @@ reported `changed=0`. This evidence predates the bounded static-edge and
 internal-platform rollout recorded in Phase 7. A full disposable-host platform
 rehearsal remains in Phase 6.
 
+A read-only check after the final convergence on 2026-08-18 found
+`atlas-codex-app-server.service` active and running on its managed private Unix
+socket under the isolated `codex` account. This proves the private service
+boundary, not a current Desktop or mobile authentication and pairing session;
+those remain operator-controlled procedures.
+
 ## Phase 3 — extraire la plateforme commune
+
+This checklist preserves the original extraction acceptance plan. It is not a
+standalone live-status page: checked items have repository or rollout evidence,
+while unchecked items remain future application requirements even when a
+related shared service already exists. Use the README and dated evidence for
+the current Atlas state.
 
 Créer :
 
@@ -169,12 +182,12 @@ platform/
 - [x] reject every HIGH or CRITICAL finding on native `amd64` and `arm64` pull
       request builds, then scan both published child manifests by digest before
       GitHub provenance;
-- [ ] publish and promote the first Caddy digest that passes the complete gate;
-- [ ] importer un fragment de routes par projet ;
-- [ ] servir les releases statiques depuis `/srv/www:ro` ;
+- [x] publish and promote the first Caddy digest that passes the complete gate;
+- [x] importer un fragment de routes par projet statique ;
+- [x] servir les releases statiques depuis `/srv/www:ro` ;
 - [ ] préserver wildcard, CORS, SSE et fermeture des métriques Surplasse ;
-- [ ] valider avant tout reload ;
-- [ ] publier uniquement 80/443.
+- [x] valider avant tout reload ;
+- [x] publier uniquement 80/443.
 - [x] add a deterministic, secret-free OCI publisher for the exact shared
       platform runtime configuration. It verifies both GHCR layers before
       GitHub provenance and does not activate the platform.
@@ -268,7 +281,8 @@ platform/
 - [x] remplacer le `IMAGE_TAG` global par un digest par image ;
 - [x] enregistrer une révision source par composant, y compris pour les images
       inchangées ;
-- [x] ne publier que les composants affectés ;
+- [x] publish the fixed five-image matrix on every canonical `main` push, with
+      every component bound to the same source SHA and referenced by digest;
 - [x] garder SBOM, provenance, attestations et Trivy ;
 - [ ] select a managed transactional email relay and accept its DPA, limits,
       support terms, and costs;
@@ -352,8 +366,12 @@ Critères :
 - [x] configure the real `static-production` environment, serialized matrix,
       global concurrency, dedicated identity, and production switch.
 
-The Compose application controller implementation is merged but not proved
-converged on Atlas. Both protected application entries remain disabled.
+Atlas has converged the Compose application controller from revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root controller and gate are
+installed; `vps-application-recover.service` is loaded, inactive after its
+successful run (`Result=success`, `ExecMainStatus=0`). Both protected
+application entries remain `enabled: false`; no application workflow or live
+application activation exists.
 
 ## Phase 6 — répétition générale
 

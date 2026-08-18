@@ -7,6 +7,14 @@ path. Surplasse now publishes an immutable `application-release` descriptor and
 common integration bundle for the shared admission contract. The protected
 entry remains disabled.
 
+Atlas converged the shared transactional application controller from
+`vps-infra` revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b` on 2026-08-18.
+The root controller and gate are installed, and
+`vps-application-recover.service` is loaded and inactive after a successful run
+(`Result=success`, `ExecMainStatus=0`). This legacy adapter does not invoke that
+gate: Surplasse remains `enabled: false`, with no application deployment
+workflow and no live Atlas application release.
+
 The adapter does not define Caddy, PostgreSQL, Prometheus, Grafana, or an
 exporter. The shared platform owns those services.
 
@@ -54,8 +62,9 @@ The adapter also stays locked for these integration reasons:
 - no managed transactional email provider is selected or provisioned;
 - SPF, DKIM, DMARC, STARTTLS from Atlas, final delivery, bounce handling, and
   operator alerting do not have reviewed evidence;
-- the source branch, image provenance, Stripe Connect production adapter, and
-  Surplasse integration bundle do not have complete release evidence.
+- immutable producer images, integration bundle, and `application-release`
+  publication do not prove the remaining host, branch-protection, Stripe
+  Connect, secret, route, database, migration, or live-activation gates.
 
 The existing disabled candidates are contract inputs. This adapter does not
 duplicate them:
@@ -208,7 +217,7 @@ must use this order:
 5. prepare the immutable Caddy route, Prometheus configuration, and required
    platform network attachments;
 6. require the active edge route to equal the attested bundle and require
-   healthy Caddy on the exact application network before database mutation;
+   healthy Caddy on the exact application network before schema migration;
 7. run the transient migration job and require a successful exit;
 8. start the five long-running services without host ports;
 9. complete strict internal and public probes;

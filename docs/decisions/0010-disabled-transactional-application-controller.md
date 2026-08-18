@@ -2,14 +2,16 @@
 
 ## Status
 
-Accepted on 17 August 2026. The controller source and Ansible installation path
-are merged at `vps-infra` revision
-`0a9a0c1d1c7dd7934876c425cdca64340e10a564`. Live Atlas convergence of that
-revision has not been proved. The last proved static controller revision is
-`27a8064400198611214d18853a87a606f349a2ae`, which predates this controller.
-Both Surplasse and Parkventory remain disabled in the protected production
-contract. This change does not activate an application, create a database,
-provision a secret, change an edge route, or run a migration on Atlas.
+Accepted on 17 August 2026. Atlas proved installation on 18 August 2026 by
+converging `vps-infra` revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root-owned
+`deploy-application` controller and argument-free gate are installed, and
+`vps-application-recover.service` is loaded and inactive after a successful run
+(`Result=success`, `ExecMainStatus=0`). Both Surplasse and Parkventory remain
+`enabled: false` in the protected production contract, and no application
+deployment workflow invokes the gate. Installation did not activate an
+application, create a database, provision a secret, change an edge route, or run
+a migration on Atlas.
 
 ## Context
 
@@ -32,8 +34,8 @@ take the same public identity while static state still owns it.
 ## Decision
 
 Provide `deploy-application` and `deploy-application-live-gate` through the
-deploy Ansible role beside the static controller. A later reviewed convergence
-can install them. They reuse the static controller's registry download, GitHub
+deploy Ansible role beside the static controller. The proved convergence has
+installed them. They reuse the static controller's registry download, GitHub
 trusted-root, attestation, isolated-worker, protected-state, and residue checks.
 Both controllers acquire the exact lock `/run/lock/vps-static.lock`.
 
@@ -46,7 +48,9 @@ For an enabled future entry, the controller performs the following admission
 and materialization sequence:
 
 1. require the supplied source revision to be the exact canonical `main` HEAD;
-2. fetch the supplied `application-release@sha256` manifest and descriptor;
+2. fetch the supplied `application-release@sha256` manifest and descriptor,
+   require every runtime reference to be digest-only, and bind every component
+   and integration source revision to the same exact release source SHA;
 3. verify the release attestation from the allowlisted producer workflow;
 4. fetch every component index, require exactly one `linux/amd64` runtime
    manifest plus its attestation manifest, verify the component attestation,
@@ -150,9 +154,11 @@ deploy-application-live <surplasse|parkventory> <source-sha40> \
 The unprivileged parser validates it, then passes one newline-terminated record
 over stdin to a root-owned gate with no arguments. The gate independently
 revalidates the record and creates a bounded transient systemd unit. Its
-`ExecStopPost` invokes recovery. After convergence, Ansible enables
+`ExecStopPost` invokes recovery. Ansible installs
 `vps-application-recover.service` after static recovery and before the
-public-edge systemd unit. Docker can nevertheless restart the existing
+public-edge systemd unit. Its proved idle state on 2026-08-18 was loaded,
+inactive, `Result=success`, and `ExecMainStatus=0`. Docker can nevertheless
+restart the existing
 `unless-stopped` Caddy container as soon as the daemon starts. This tranche
 therefore does not claim that boot recovery withholds public traffic; closing
 that daemon-level bypass remains an activation blocker.
@@ -168,9 +174,9 @@ that daemon-level bypass remains an activation blocker.
 - A crash after a completed probe can finish the atomic commit; an earlier crash
   restores the previous runtime and conservatively quarantines a mutating
   candidate.
-- Merged installation and recovery wiring do not prove live host installation
-  and do not make either application deployable while its reviewed contract
-  entry remains disabled.
+- Proved host installation and healthy idle recovery do not make either
+  application deployable while its reviewed contract entry remains disabled;
+  there is no application deployment workflow or active runtime.
 - The active state transition is atomic, but the current fixed Compose project
   and network aliases make runtime replacement rolling rather than blue/green:
   Caddy can observe candidate containers before the final public probes. The

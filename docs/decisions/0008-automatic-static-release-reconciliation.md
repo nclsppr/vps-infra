@@ -31,8 +31,9 @@ boundary.
 ## Decision
 
 `vps-infra` owns one scheduled and manually dispatchable reconciliation
-workflow. Every ten minutes it performs these operations independently for the
-three allowlisted applications:
+workflow. Its best-effort GitHub cron requests a run every ten minutes; GitHub
+may delay an individual run. Each invocation performs these operations
+independently for the three allowlisted applications:
 
 1. resolve the exact HEAD of the canonical branch with Git smart HTTP;
 2. read the check runs for that exact SHA;
@@ -104,7 +105,10 @@ classification completes, recovery quarantines the rejected tuple
 conservatively so it cannot cause a repeated availability window. A quarantined tuple cannot
 be retried until an operator removes its record after investigation. An interrupted transaction
 is recovered before a new candidate is considered, by the root gate after a
-failed attempt and by a boot oneshot before the public edge. Each activation
+failed attempt and by a boot oneshot ordered before the systemd-managed public
+edge. Docker can still restart the existing `unless-stopped` Caddy container
+when the daemon starts before that unit ordering; closing this bypass remains a
+platform hardening task. Each activation
 runs in a transient systemd unit whose stop hook invokes the same recovery, so
 an SSH disconnect does not abandon an uncommitted switch. Recovery revalidates
 the protected inventory and release filesystem before it serves or commits a
@@ -142,8 +146,8 @@ an older newly selected candidate.
 
 ## Consequences
 
-- Normal propagation is eventual: ten minutes plus any GitHub schedule delay
-  and deployment duration.
+- Normal propagation is eventual: the next best-effort scheduled run, any
+  GitHub delay, and deployment duration.
 - A transient GitHub API or GHCR failure cannot mutate Atlas; a later run
   retries discovery.
 - All production SSH material remains in one environment of `vps-infra`.

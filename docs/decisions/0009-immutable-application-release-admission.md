@@ -48,7 +48,8 @@ application:
 
 1. resolve the exact canonical branch HEAD;
 2. read all latest check runs for that exact SHA;
-3. require every observed check run to be complete and green;
+3. require every observed check run to be complete and non-failing, accepting
+   only `success`, `neutral`, or `skipped`;
 4. require each application-specific check to conclude with `success`;
 5. read only the `application-release:sha-<HEAD>` OCI manifest;
 6. validate the exact manifest, layer, source, component, integration,
@@ -93,10 +94,13 @@ gate, and boot recovery service described below, while keeping both applications
 disabled. It uses the same deployment lock as the static applicator,
 materializes releases in a separate directory, validates secret metadata
 without storing secret bytes in release state, runs dedicated migrations,
-executes internal and public probes, switches state atomically, and restores the
-previous runtime after failure. It persists a transaction journal and
-quarantines a reproducibly bad release. Boot recovery handles an interrupted
-transaction before the public edge starts.
+executes internal and public probes, and switches state atomically. It persists
+a transaction journal and quarantines a reproducibly bad release. The code can
+restore the previous runtime after migration only when backward compatibility
+is proved; production remains disabled until that invariant is attested or the
+recovery policy is changed to require explicit forward repair. Boot recovery is
+ordered before the systemd edge unit, but Docker may restart the existing Caddy
+container earlier; ADR-0010 records that remaining daemon-level blocker.
 
 The forced SSH boundary remains unusable for either application until a later
 review enables its protected contract entry and completes the platform, secret,

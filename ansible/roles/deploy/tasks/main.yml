@@ -22,6 +22,9 @@
       - vps_deploy_repository_url == 'https://github.com/nclsppr/vps-infra.git'
       - vps_deploy_revision_path == '/usr/local/share/vps-infra/controller-revision'
       - vps_deploy_state_dir == '/var/lib/vps-controller'
+      - >-
+        vps_deploy_key_recovery_marker_dir ==
+        '/var/lib/vps-controller/deploy-key-recovery-nonces'
       - vps_static_state_dir == '/var/lib/vps-static'
       - vps_static_recovery_unit == 'vps-static-recover.service'
       - vps_application_root == '/srv/applications'
@@ -56,6 +59,33 @@
       - not (vps_live_apply_enabled | bool)
     fail_msg: "Le contrat du compte ou de la commande de déploiement a dérivé."
 
+- name: Refuse convergence without a bounded deployment key set
+  ansible.builtin.assert:
+    that:
+      - vps_deploy_authorized_keys is sequence
+      - vps_deploy_authorized_keys is not string
+      - vps_deploy_authorized_keys is not mapping
+      - vps_deploy_authorized_keys | length > 0
+      - vps_deploy_authorized_keys | length <= 4
+      - >-
+        vps_deploy_authorized_keys | unique | length ==
+        vps_deploy_authorized_keys | length
+    fail_msg: >-
+      Refus de vider les clés du compte deploy : déclarer entre une et quatre
+      clés publiques uniques avant toute convergence du rôle.
+
+- name: Validate the one-use deployment key recovery nonce contract
+  ansible.builtin.assert:
+    that:
+      - vps_deploy_key_recovery_nonce is string
+      - >-
+        vps_deploy_key_recovery_nonce == '' or
+        vps_deploy_key_recovery_nonce is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      Le nonce de récupération deploy doit rester vide en fonctionnement
+      normal ou contenir exactement 64 caractères hexadécimaux minuscules.
+  no_log: true
+
 - name: Validate deployment public key syntax
   ansible.builtin.assert:
     that:
@@ -73,16 +103,208 @@
     argv:
       - /usr/bin/ssh-keygen
       - -l
+      - -E
+      - sha256
       - -f
       - /dev/stdin
     stdin: "{{ item }}\n"
+    stdin_add_newline: false
+  check_mode: false
   changed_when: false
-  when:
-    - not ansible_check_mode
-    - vps_deploy_authorized_keys | length > 0
   loop: "{{ vps_deploy_authorized_keys }}"
   loop_control:
     label: "clé deploy déclarée"
+
+- name: Inspect whether the deployment account already exists
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/getent
+      - passwd
+      - "{{ vps_deploy_user }}"
+  register: deploy_account_lookup
+  check_mode: false
+  changed_when: false
+  failed_when: deploy_account_lookup.rc not in [0, 2]
+
+- name: Inspect the installed forced-command key file
+  ansible.builtin.stat:
+    path: "/home/{{ vps_deploy_user }}/.ssh/authorized_keys"
+  register: deploy_authorized_keys_stat
+
+- name: Refuse a non-regular installed forced-command key path
+  ansible.builtin.assert:
+    that:
+      - >-
+        not deploy_authorized_keys_stat.stat.exists or
+        deploy_authorized_keys_stat.stat.isreg
+      - >-
+        not deploy_authorized_keys_stat.stat.exists or
+        not deploy_authorized_keys_stat.stat.islnk
+      - >-
+        not deploy_authorized_keys_stat.stat.exists or
+        deploy_authorized_keys_stat.stat.pw_name == vps_deploy_user
+      - >-
+        not deploy_authorized_keys_stat.stat.exists or
+        deploy_authorized_keys_stat.stat.gr_name == vps_deploy_user
+      - >-
+        not deploy_authorized_keys_stat.stat.exists or
+        deploy_authorized_keys_stat.stat.mode == '0600'
+    fail_msg: >-
+      Refus de remplacer un authorized_keys deploy qui n'est pas un fichier
+      régulier, non symbolique, possédé par deploy et protégé en mode 0600.
+
+- name: Read the installed forced-command keys without changing them
+  ansible.builtin.slurp:
+    src: "/home/{{ vps_deploy_user }}/.ssh/authorized_keys"
+  register: deploy_authorized_keys_file
+  when: deploy_authorized_keys_stat.stat.exists
+
+- name: Normalize installed and desired deployment key records
+  ansible.builtin.set_fact:
+    deploy_installed_key_lines: >-
+      {{
+        (deploy_authorized_keys_file.content | default('') | b64decode).
+        splitlines() | map('trim') | reject('equalto', '') | list
+      }}
+    deploy_desired_key_identities: >-
+      {{
+        vps_deploy_authorized_keys | map('trim') |
+        map('regex_replace', '^([^ ]+ [^ ]+)(?: .*)?$', '\\1') | list
+      }}
+    deploy_first_key_install: >-
+      {{
+        deploy_account_lookup.rc == 2 and
+        not deploy_authorized_keys_stat.stat.exists
+      }}
+
+- name: Extract only exact installed forced-command key identities
+  ansible.builtin.set_fact:
+    deploy_installed_key_identities: >-
+      {{
+        deploy_installed_key_lines |
+        select(
+          'match',
+          '^restrict,command="/usr/local/libexec/vps/forced-command" '
+        ) |
+        map(
+          'regex_replace',
+          '^restrict,command="/usr/local/libexec/vps/forced-command" '
+          ~ '([^ ]+ [^ ]+)(?: .*)?$',
+          '\\1'
+        ) | list
+      }}
+
+- name: Refuse duplicate desired deployment key identities
+  ansible.builtin.assert:
+    that:
+      - >-
+        deploy_desired_key_identities | unique | length ==
+        deploy_desired_key_identities | length
+    fail_msg: >-
+      Refus de converger deux déclarations de la même clé deploy avec des
+      commentaires différents.
+
+- name: Measure overlap with a currently installed deployment key
+  ansible.builtin.set_fact:
+    deploy_key_overlap_count: >-
+      {{
+        deploy_installed_key_identities |
+        intersect(deploy_desired_key_identities) | length
+      }}
+
+- name: Derive the one-use recovery marker without exposing its nonce
+  ansible.builtin.set_fact:
+    deploy_key_recovery_marker_path: >-
+      {{
+        vps_deploy_key_recovery_marker_dir ~ '/' ~
+        (vps_deploy_key_recovery_nonce | hash('sha256'))
+      }}
+  when: vps_deploy_key_recovery_nonce | length > 0
+  no_log: true
+
+- name: Create the private deployment key recovery marker directory
+  ansible.builtin.file:
+    path: "{{ vps_deploy_key_recovery_marker_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: vps_deploy_key_recovery_nonce | length > 0
+
+- name: Inspect whether the recovery nonce was already consumed
+  ansible.builtin.stat:
+    path: "{{ deploy_key_recovery_marker_path }}"
+  register: deploy_key_recovery_marker_stat
+  when: vps_deploy_key_recovery_nonce | length > 0
+  no_log: true
+
+- name: Authorize only first install overlap or explicit unused recovery
+  ansible.builtin.assert:
+    that:
+      - >-
+        deploy_first_key_install or
+        deploy_key_overlap_count | int > 0 or
+        vps_deploy_key_recovery_nonce | length == 64
+      - >-
+        vps_deploy_key_recovery_nonce | length == 0 or
+        (
+          not deploy_first_key_install and
+          deploy_key_overlap_count | int == 0 and
+          vps_deploy_authorized_keys | length == 1
+        )
+      - >-
+        vps_deploy_key_recovery_nonce | length == 0 or
+        not deploy_key_recovery_marker_stat.stat.exists
+    fail_msg: >-
+      Refus de remplacer toutes les clés deploy prouvées. Conserver au moins
+      une clé installée pendant une rotation normale. Une perte totale exige
+      un nouveau nonce de récupération explicite et encore inutilisé.
+  register: deploy_key_rotation_guard
+  no_log: true
+
+- name: Consume the exceptional deployment key recovery nonce
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - >-
+        import os, sys;
+        descriptor = os.open(
+          sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        );
+        marker = os.fdopen(descriptor, 'w', encoding='utf-8');
+        marker.write(sys.argv[2]);
+        marker.flush();
+        os.fsync(marker.fileno());
+        marker.close();
+        directory = os.open(
+          os.path.dirname(sys.argv[1]), os.O_RDONLY | os.O_DIRECTORY
+        );
+        os.fsync(directory);
+        os.close(directory)
+      - "{{ deploy_key_recovery_marker_path }}"
+      - |
+        revision={{ vps_infra_revision }}
+        installed={{ deploy_installed_key_identities | sort | join(',') }}
+        desired={{ deploy_desired_key_identities | sort | join(',') }}
+  register: deploy_key_recovery_marker_creation
+  changed_when: true
+  when:
+    - vps_deploy_key_recovery_nonce | length > 0
+    - not ansible_check_mode
+  no_log: true
+
+- name: Refuse a raced or reused deployment key recovery nonce
+  ansible.builtin.assert:
+    that:
+      - >-
+        ansible_check_mode or
+        deploy_key_recovery_marker_creation.changed
+    fail_msg: >-
+      Refus de continuer : le nonce de récupération deploy n'a pas été consommé
+      de manière exclusive. Générer un nouveau nonce après investigation.
+  when: vps_deploy_key_recovery_nonce | length > 0
+  no_log: true
 
 - name: Create the deployment account with a valid shell
   ansible.builtin.user:
@@ -110,6 +332,27 @@
     owner: "{{ vps_deploy_user }}"
     group: "{{ vps_deploy_user }}"
     mode: "0600"
+    validate: >-
+      /bin/sh -c 'set -eu;
+      file=$1;
+      count=0;
+      prefix="restrict,command=\"/usr/local/libexec/vps/forced-command\" ";
+      while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || exit 1;
+        case "$line" in
+          "$prefix"*) key=${line#"$prefix"} ;;
+          *) exit 1 ;;
+        esac;
+        key_type=${key%% *};
+        key_rest=${key#* };
+        key_blob=${key_rest%% *};
+        printf "%b %b\n" "$key_type" "$key_blob" |
+          /usr/bin/ssh-keygen -l -E sha256 -f /dev/stdin >/dev/null;
+        count=$((count + 1));
+        [ "$count" -le 4 ] || exit 1;
+      done < "$file";
+      [ "$count" -ge 1 ]'
+      vps-deploy-authorized-keys-validator %s
 
 - name: Create root-owned controller directories
   ansible.builtin.file:

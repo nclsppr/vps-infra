@@ -10,15 +10,39 @@ This runbook operates the automatic releases for these three static profiles:
 | `papersempire` | `master` | `static-site` |
 | `parkventory` | `main` | `temporary-static-demo` |
 
-The workflow is `.github/workflows/deploy-static-releases.yml`. It runs every
-ten minutes and also accepts a manual dispatch. The schedule and the dispatch
-use the same resolver, immutable artifact contract, SSH identity, Atlas gate,
-and transaction state machine. A dispatch does not override a red check, select
-an older revision, or accept operator-supplied digests.
+The workflow is `.github/workflows/deploy-static-releases.yml`. It is scheduled
+every ten minutes and also accepts a manual dispatch. GitHub schedules are
+best-effort and can run late; the ten-minute expression is not a delivery-time
+guarantee. The schedule and the dispatch use the same resolver, immutable
+artifact contract, SSH identity, Atlas gate, and transaction state machine. A
+dispatch does not override a red check, select an older revision, or accept
+operator-supplied digests.
 
 This runbook does not authorize a Compose application, a database migration, a
 secret change, a DNS change, or a platform release. Surplasse and the
 Parkventory React/Java application remain disabled.
+
+## Routine release from a producer
+
+A normal content release starts in the producer repository:
+
+| Profile | Producer procedure | Merge branch |
+|---|---|---|
+| `personal` | [Comment déployer sur Atlas](https://github.com/nclsppr/personal#comment-déployer-sur-atlas) | `main` |
+| `papersempire` | [Deploy to Atlas](https://github.com/nclsppr/papersempire#deploy-to-atlas) | `master` |
+| `parkventory` | [Parkventory runbook](https://github.com/nclsppr/parkventory/blob/main/RUNBOOK.md) | `main` |
+
+Open a producer PR, wait for `Validate VPS release`, merge it, then require the
+merged revision's producer workflow `VPS release` to succeed. That workflow
+publishes immutable OCI artifacts and attestations; it has no VPS credential
+and does not deploy by itself. The next best-effort central schedule resolves
+the canonical producer HEAD and activates it only while every gate remains
+valid. Use the dispatch below when an immediate reconciliation is needed.
+
+Do not edit `vps-infra` or copy a digest into Git for a routine content release.
+A platform change is required only when the reviewed deployment contract,
+required checks, Caddy integration, profile enablement, controller, or security
+policy changes.
 
 ## Trust boundary
 
@@ -63,6 +87,44 @@ gh secret list \
   --env static-production
 ```
 
+Verify that the environment admits exactly the `main` branch. The subshell
+stops on the first failed assertion; the last command also displays the
+administrative bypass setting so it cannot be mistaken for an immutable
+repository invariant:
+
+```bash
+(
+  set -euo pipefail
+
+  test "$(gh api \
+    repos/nclsppr/vps-infra/environments/static-production \
+    --jq '.deployment_branch_policy.custom_branch_policies')" = true || {
+    echo "static-production does not use custom branch policies" >&2
+    exit 1
+  }
+  test "$(gh api \
+    repos/nclsppr/vps-infra/environments/static-production \
+    --jq '.deployment_branch_policy.protected_branches')" = false || {
+    echo "static-production unexpectedly uses the protected-branch selector" >&2
+    exit 1
+  }
+  test "$(gh api \
+    repos/nclsppr/vps-infra/environments/static-production/deployment-branch-policies \
+    --jq '[.branch_policies[] | [.type, .name]] == [["branch", "main"]]')" = true || {
+    echo "static-production does not admit exactly the main branch" >&2
+    exit 1
+  }
+  gh api \
+    repos/nclsppr/vps-infra/environments/static-production \
+    --jq '{can_admins_bypass,protection_rules,deployment_branch_policy}'
+)
+```
+
+The environment has no required reviewer because that would make scheduled
+deployment interactive. GitHub administrators can currently bypass environment
+protection; treat that as a revocable administrative boundary, not as an
+alternate routine deployment path.
+
 Enable the deploy step only after Atlas has the matching public key, the host
 key has been verified through an independent channel, and a reviewed
 convergence has installed the static controller:
@@ -89,6 +151,16 @@ job finish, or cancel that exact run only when the incident procedure requires
 it. Atlas transaction recovery does not depend on the SSH client remaining
 connected.
 
+Every `site.yml` convergence must receive a non-empty
+`vps_deploy_authorized_keys` list. Before any role runs, the playbook parses
+every key cryptographically even in check mode. The deploy role then requires
+the desired set to retain at least one installed key identity, except on a true
+first installation. Its template independently refuses to render without that
+guard. Never use an empty value as a way to suspend deployments. Keep
+`vps_deploy_key_recovery_nonce` empty during normal operation, suspend with the
+environment variable above, then rotate or retire keys through the explicit
+procedure below.
+
 ## Dispatch and inspect a run
 
 Dispatch the current `main` workflow without application or digest inputs:
@@ -108,7 +180,8 @@ gh run list \
   --limit 10 \
   --json databaseId,event,headSha,status,conclusion,url
 
-gh run watch <run-id> \
+run_id=32000000000 # replace with the numeric ID selected above
+gh run watch "$run_id" \
   --repo nclsppr/vps-infra \
   --exit-status \
   --interval 10
@@ -117,7 +190,7 @@ gh run watch <run-id> \
 Inspect the job and step set exactly:
 
 ```bash
-gh run view <run-id> \
+gh run view "$run_id" \
   --repo nclsppr/vps-infra \
   --json event,headBranch,headSha,status,conclusion,url,jobs \
   --jq '{event,headBranch,headSha,status,conclusion,url,jobs:[.jobs[] | {name,conclusion,steps:[.steps[] | {name,conclusion}]}]}'
@@ -155,25 +228,57 @@ For a complete three-site reconciliation, require all of these facts:
 Download and search the exact run log:
 
 ```bash
-gh run view <run-id> \
-  --repo nclsppr/vps-infra \
-  --log > /tmp/vps-static-run-<run-id>.log
+(
+  set -euo pipefail
 
-rg -n \
-  'canonical HEAD could not|canonical HEAD changed|VPS_STATIC_DEPLOY_ENABLED is not true|static deployment refused|activation failed' \
-  /tmp/vps-static-run-<run-id>.log
+  log_file=$(mktemp "${TMPDIR:-/tmp}/vps-static-run.XXXXXX")
+  readonly log_file
+  chmod 600 "$log_file"
+  trap 'rm -f -- "$log_file"' EXIT
+
+  gh run view "$run_id" \
+    --repo nclsppr/vps-infra \
+    --log > "$log_file"
+
+  if rg -n \
+    'canonical HEAD could not|canonical HEAD changed|VPS_STATIC_DEPLOY_ENABLED is not true|static deployment refused|activation failed' \
+    "$log_file"; then
+    echo "The run contains a deployment skip, refusal, or activation failure." >&2
+    exit 1
+  else
+    search_status=$?
+    if ((search_status != 1)); then
+      echo "The run log could not be searched safely (rg status ${search_status})." >&2
+      exit "$search_status"
+    fi
+  fi
+)
 ```
 
 No match is necessary but not sufficient. Complete the Atlas checks below.
-Delete the local log after the investigation if it is no longer required.
+The isolated subshell deletes its private local log without replacing a caller's
+existing trap.
 
 ## Inspect Atlas state
 
 Use an administrator SSH identity. Do not use the automated deploy identity for
-an interactive session. Replace the placeholders with local, ignored values:
+an interactive session. Replace the examples with local, ignored values:
 
 ```bash
-ssh -i /absolute/path/to/admin-key <administrator>@<atlas-host>
+atlas_host=atlas.example.invalid # replace with the verified Atlas host or IP
+atlas_port=22
+administrator=ubuntu # replace with the reviewed administrator account
+admin_key=/absolute/path/to/admin-key
+known_hosts=/absolute/path/to/verified-known-hosts
+
+ssh \
+  -p "$atlas_port" \
+  -i "$admin_key" \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile="$known_hosts" \
+  "${administrator}@${atlas_host}"
 ```
 
 Read the installed controller revision and recovery state:
@@ -181,9 +286,18 @@ Read the installed controller revision and recovery state:
 ```bash
 sudo cat /usr/local/share/vps-infra/controller-revision
 sudo systemctl is-enabled vps-static-recover.service
-sudo systemctl status --no-pager vps-static-recover.service
+sudo systemctl show vps-static-recover.service \
+  --property=LoadState,ActiveState,Result,ExecMainCode,ExecMainStatus
 sudo systemctl status --no-pager vps-public-static-edge.service
 ```
+
+`vps-static-recover.service` is a oneshot without `RemainAfterExit`; after a
+successful run its `ActiveState` may be `inactive`. Require `Result=success`,
+and `ExecMainStatus=0` instead of treating inactive as a failure. Some systemd
+versions display the no-longer-running `ExecMainCode` as numeric `0`. The
+systemd edge unit is ordered after recovery, but Docker can restart
+the existing `unless-stopped` Caddy container earlier when the daemon starts.
+This daemon-level bypass is a documented remaining hardening boundary.
 
 Inspect each complete active tuple and its matching symlink:
 
@@ -230,35 +344,80 @@ after strict live HTTPS probe`.
 
 ## Public probes
 
-Run strict IPv4 HTTPS probes from outside Atlas:
+Run strict IPv4 HTTPS probes from outside Atlas. Obtain `atlas_ipv4` from the
+independently verified Atlas inventory or provider console, not from the DNS
+record being tested. This checks public DNS separately, rejects an unexpected
+AAAA record, records the actual remote IP, and then repeats the same TLS/HTTP
+contract with both names pinned directly to Atlas:
 
 ```bash
-for url in \
-  https://nicolaspieper.com/ \
-  https://www.nicolaspieper.com/ \
-  https://papersempire.com/ \
-  https://www.papersempire.com/ \
-  https://parkventory.com/ \
-  https://www.parkventory.com/
-do
-  curl \
-    --ipv4 \
-    --proto '=https' \
-    --tlsv1.2 \
-    --fail \
-    --silent \
-    --show-error \
-    --location \
-    --max-redirs 1 \
-    --output /dev/null \
-    --write-out '%{url_effective} %{http_code} %{num_redirects} %{ssl_verify_result}\n' \
-    "$url"
-done
+atlas_ipv4=REPLACE_WITH_CONSOLE_VERIFIED_ATLAS_IPV4
+failures=0
+
+check_static_host() {
+  local host=$1
+  local apex=$2
+  local redirects=$3
+  local a_records aaaa_records expected mode result
+  local -a curl_args
+
+  a_records=$(dig +short A "$host" | awk '/^[0-9]+\./' | sort -u)
+  aaaa_records=$(dig +short AAAA "$host" | awk '/:/' | sort -u)
+  if [ "$a_records" != "$atlas_ipv4" ] || [ -n "$aaaa_records" ]; then
+    printf 'DNS mismatch for %s: A=%s AAAA=%s\n' \
+      "$host" "$a_records" "$aaaa_records" >&2
+    return 1
+  fi
+
+  expected="https://${apex}/|200|${redirects}|0|${atlas_ipv4}"
+  for mode in dns direct-atlas; do
+    curl_args=(
+      --disable
+      --ipv4
+      --proto '=https'
+      --tlsv1.2
+      --fail
+      --silent
+      --show-error
+      --location
+      --max-redirs 1
+      --connect-timeout 10
+      --max-time 30
+      --output /dev/null
+      --write-out '%{url_effective}|%{http_code}|%{num_redirects}|%{ssl_verify_result}|%{remote_ip}'
+    )
+    if [ "$mode" = direct-atlas ]; then
+      curl_args+=(--resolve "${apex}:443:${atlas_ipv4}")
+      if [ "$host" != "$apex" ]; then
+        curl_args+=(--resolve "${host}:443:${atlas_ipv4}")
+      fi
+    fi
+
+    if ! result=$(curl "${curl_args[@]}" "https://${host}/"); then
+      printf '%s probe failed for %s\n' "$mode" "$host" >&2
+      return 1
+    fi
+    if [ "$result" != "$expected" ]; then
+      printf '%s mismatch for %s: %s != %s\n' \
+        "$mode" "$host" "$result" "$expected" >&2
+      return 1
+    fi
+  done
+}
+
+check_static_host nicolaspieper.com nicolaspieper.com 0 || failures=$((failures + 1))
+check_static_host www.nicolaspieper.com nicolaspieper.com 1 || failures=$((failures + 1))
+check_static_host papersempire.com papersempire.com 0 || failures=$((failures + 1))
+check_static_host www.papersempire.com papersempire.com 1 || failures=$((failures + 1))
+check_static_host parkventory.com parkventory.com 0 || failures=$((failures + 1))
+check_static_host www.parkventory.com parkventory.com 1 || failures=$((failures + 1))
+test "$failures" -eq 0
 ```
 
 Each apex must return `200` with zero redirects and TLS verification result `0`.
 Each `www` name must follow exactly one redirect to its apex, return `200`, and
-have TLS verification result `0`.
+have TLS verification result `0`. Both the DNS-routed and direct-Atlas probes
+must report the independently verified Atlas IPv4 as `remote_ip`.
 
 ## Safe content rollback
 
@@ -283,7 +442,8 @@ and journal. Then invoke only the installed recovery entry point:
 
 ```bash
 sudo systemctl start vps-static-recover.service
-sudo systemctl status --no-pager vps-static-recover.service
+sudo systemctl show vps-static-recover.service \
+  --property=LoadState,ActiveState,Result,ExecMainCode,ExecMainStatus
 sudo journalctl -u vps-static-recover.service -n 200 --no-pager
 ```
 
@@ -311,9 +471,88 @@ Use an overlap rotation. Never print the private key or put it in Git.
 5. replace only the `VPS_STATIC_SSH_PRIVATE_KEY` environment secret;
 6. enable reconciliation, dispatch one run, and prove all three no-ops;
 7. suspend reconciliation again, remove the old public key from the Ansible
-   value, converge, and prove that the retired key is rejected;
+   value, keep `vps_deploy_key_recovery_nonce` empty, converge, and prove that
+   the retired key is rejected;
 8. enable reconciliation and destroy every local copy of the retired private
    key according to the secret-handling procedure.
+
+If every deploy key has already been lost, overlap is impossible. Suspend the
+environment first and preserve the failed run and Atlas SSH journal. Generate
+one replacement Ed25519 key and a separate recovery nonce without printing
+either private value:
+
+```bash
+recovery_nonce=$(openssl rand -hex 32)
+test "${#recovery_nonce}" -eq 64
+```
+
+In the ignored Ansible variable file, declare exactly the one replacement
+public key in `vps_deploy_authorized_keys` and place the 64 lowercase
+hexadecimal characters in `vps_deploy_key_recovery_nonce`. Use the independently
+verified administrator identity to run the reviewed convergence exactly once.
+An optional Ansible `--check` run still performs the cryptographic key parsing
+and overlap/recovery guard evaluation, but it neither consumes the nonce nor
+replaces `authorized_keys`; only the subsequent non-check convergence consumes
+it and runs the point-of-mutation template validator.
+Atlas stores only a SHA-256-derived marker, bound to the controller revision and
+the installed and desired key identities, before it replaces the file. The same
+nonce cannot be reused. If convergence fails after nonce consumption, preserve
+the state, investigate, and generate a different nonce for a reviewed retry.
+
+Immediately restore `vps_deploy_key_recovery_nonce: ""` in the ignored file.
+A nonce left in place makes the next convergence fail closed. Verify the new
+fingerprint and the exact forced `restrict` prefix on Atlas. Then prove the new
+private key reaches the forced-command parser without invoking `sudo`, a deploy
+controller, or a live mutation. Reuse the independently verified `atlas_host`,
+`atlas_port`, and `known_hosts` values from the Atlas inspection section:
+
+```bash
+deploy_user=deploy
+deploy_identity_file=/absolute/path/to/new-deploy-identity
+
+(
+  set -u
+
+  proof_status=0
+  proof_output=$(
+    ssh -T \
+      -p "$atlas_port" \
+      -i "$deploy_identity_file" \
+      -o BatchMode=yes \
+      -o PreferredAuthentications=publickey \
+      -o PasswordAuthentication=no \
+      -o KbdInteractiveAuthentication=no \
+      -o IdentitiesOnly=yes \
+      -o IdentityAgent=none \
+      -o ControlMaster=no \
+      -o ControlPath=none \
+      -o StrictHostKeyChecking=yes \
+      -o UserKnownHostsFile="$known_hosts" \
+      "${deploy_user}@${atlas_host}" \
+      'deploy auth-proof' 2>&1
+  ) || proof_status=$?
+
+  expected='forced-command parser: malformed deploy command'
+  if [ "$proof_status" -eq 255 ]; then
+    echo "SSH transport or public-key authentication failed." >&2
+    exit 1
+  fi
+  if [ "$proof_status" -ne 64 ] || \
+     ! printf '%s\n' "$proof_output" | grep -Fqx -- "$expected"; then
+    echo "The key did not reach the expected non-mutating ForceCommand rejection." >&2
+    exit 1
+  fi
+  echo "Public-key authentication and the forced-command boundary are proved."
+)
+```
+
+Exit `64` with that exact parser line means authentication succeeded and the
+deliberately malformed SHA was rejected before dispatch. Exit `255` means SSH
+transport or authentication failed; do not treat it as a successful boundary
+probe. Only after this proof, replace the GitHub environment private-key secret,
+re-enable reconciliation, dispatch a run, and prove all three no-ops. Do not
+append a key manually without recording the same desired value in the ignored
+Ansible variables; the next convergence would otherwise recreate the outage.
 
 Rotate `VPS_STATIC_KNOWN_HOSTS` separately only after the Atlas host key has
 been verified through the OVH console or another independent trusted channel.

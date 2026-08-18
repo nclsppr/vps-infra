@@ -22,24 +22,25 @@ catalog. Current production evidence is recorded below.
 
 ## Production evidence on 2026-08-18
 
-The canonical static source revisions were:
+The final protected Atlas state observed on that date contained these exact
+static tuples:
 
-| Profile | Source revision |
-|---|---|
-| Personal | `328b535b934560fcaf6324383440a3c2a60641c4` |
-| Papers Empire | `17db1b57414c3c611ce73637d6864dce76cad55b` |
-| Parkventory static demo | `583e0e2b63701097aa4894ecc4fb3de8ad325346` |
+| Profile | Source revision | Site digest | Route digest |
+|---|---|---|---|
+| Personal | `163b9c9643dd9c54e9b1bb5d558d34a670e28e52` | `sha256:98a9e0b8846d74775bf0b6f22dd4519a0f63a6db4b99ed47643cebba55082110` | `sha256:086d7dc704796808d648922b5156d16d01a8fd891cbd22844092d1cc98902a8f` |
+| Papers Empire | `b95f9bdde468aac9d03bd0548c7aa42969e52df7` | `sha256:1de518ac73ef67549ac1c6352ca63c21ad3f1c00255528c0f2b9e6a0ac375b2e` | `sha256:647742f54a63092764a4788c6b73d680d3efea47b8798c49fea908e7b7f18055` |
+| Parkventory static demo | `db9571cc59d0fcc31c6554af259eda4c29988a6a` | `sha256:43eb75214c888ff28fbc295bfdf64af0b01302aee3ab637d1ed3b939b5903844` | `sha256:e893fd9999203c489fb7ac06582ff4cb464a36f567a66d173d3323dfc421431c` |
 
-Scheduled runs
-[`32076871842`](https://github.com/nclsppr/vps-infra/actions/runs/32076871842)
-and
-[`32078379931`](https://github.com/nclsppr/vps-infra/actions/runs/32078379931)
-each contained the resolver plus all three successful deploy jobs. The second
-run proved the complete tuples as healthy Atlas no-ops. Strict external TLS
-probes returned HTTP 200 for all apexes and one redirect from each `www` name.
+Central reconciliation run
+[`32086151183`](https://github.com/nclsppr/vps-infra/actions/runs/32086151183)
+contained the resolver plus all three successful deploy jobs after Atlas
+converged controller revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b`. Strict external TLS probes returned
+HTTP 200 for all apexes and one redirect from each `www` name.
 
-The exact site, route, platform integration, and Caddy digests, Atlas controller
-revision, state-directory result, and TLS observations are in the
+The exact OCI references, platform integration and Caddy digests,
+state-directory result, application-controller boundary, and TLS observations
+are in the
 [dated rollout evidence](evidence/2026-08-18-static-reconciliation-rollout.md).
 This dated record is evidence, not a mutable release manifest.
 

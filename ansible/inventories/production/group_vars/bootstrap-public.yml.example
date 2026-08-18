@@ -4,9 +4,14 @@
 vps_admin_authorized_keys:
   - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIREMPLACER cle-administration
 
-# Peut rester vide jusqu'à la création de l'environnement GitHub production.
+# Requise avant site.yml. Une liste vide doit arrêter la convergence avant que
+# le rôle ne touche au fichier authorized_keys du compte deploy.
 vps_deploy_authorized_keys:
   - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIREMPLACER cle-deploiement-github
+
+# Laisser vide. Le runbook de réconciliation décrit l'exception à usage unique
+# réservée à une perte prouvée de toutes les clés de déploiement.
+vps_deploy_key_recovery_nonce: ""
 
 # Passerelle SSH optionnelle pour Codex desktop. Utiliser une clé dédiée.
 vps_codex_remote_enabled: false

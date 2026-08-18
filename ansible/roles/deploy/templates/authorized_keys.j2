@@ -1,3 +1,28 @@
-{% for key in vps_deploy_authorized_keys %}
+{% set declared_keys = vps_deploy_authorized_keys | default([]) %}
+{% set bounded_keys = (
+  declared_keys is sequence and
+  declared_keys is not string and
+  declared_keys is not mapping and
+  declared_keys | length > 0 and
+  declared_keys | length <= 4 and
+  declared_keys | unique | length == declared_keys | length
+) %}
+{% set rotation_guard_passed = (
+  deploy_key_rotation_guard is defined and
+  not (deploy_key_rotation_guard.failed | default(true) | bool)
+) %}
+{% set recovery_marker_consumed = (
+  vps_deploy_key_recovery_nonce | default('') | length == 0 or
+  ansible_check_mode | default(false) | bool or
+  (
+    deploy_key_recovery_marker_creation is defined and
+    deploy_key_recovery_marker_creation.changed | default(false) | bool
+  )
+) %}
+{% if not bounded_keys or not rotation_guard_passed or not recovery_marker_consumed %}
+vps-deploy-authorized-keys-render-refused
+{% else %}
+{% for key in declared_keys %}
 restrict,command="{{ vps_deploy_gate_path }}" {{ key | trim }}
 {% endfor %}
+{% endif %}

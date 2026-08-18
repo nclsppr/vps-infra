@@ -10,10 +10,10 @@ The project states consolidated on 2026-08-18 are:
 
 | Project | Proved state | VPS consequence |
 |---|---|---|
-| `personal` | Immutable site and route artifacts from `328b535b934560fcaf6324383440a3c2a60641c4` are active on Atlas. | Keep the allowlisted static producer and automatic reconciliation. |
-| `papersempire` | The assembled `site/` and route inventory from `17db1b57414c3c611ce73637d6864dce76cad55b` are active on Atlas. | Publish the CI result, never the checkout. |
-| `parkventory` | The static demo from `583e0e2b63701097aa4894ecc4fb3de8ad325346` is active. Backend, frontend, integration, and application-release artifacts exist but are not active. | Keep the Compose application disabled until the explicit ownership handoff and all ADR-0010 blockers pass. |
-| `surplasse` | An immutable application release and integration bundle exist. No Atlas deployment is proved. | Keep the Compose application disabled until all host, database, secret, route, migration, resource, recovery, and public-proof blockers pass. |
+| `personal` | Immutable site and route artifacts from `163b9c9643dd9c54e9b1bb5d558d34a670e28e52` are active on Atlas. | Keep the allowlisted static producer and automatic reconciliation. |
+| `papersempire` | The assembled `site/` and route inventory from `b95f9bdde468aac9d03bd0548c7aa42969e52df7` are active on Atlas. | Publish the CI result, never the checkout. |
+| `parkventory` | The static demo from `db9571cc59d0fcc31c6554af259eda4c29988a6a` is active. Backend, frontend, integration, and application-release artifacts exist but are not active. | Keep the Compose application disabled until the explicit ownership handoff and all ADR-0010 blockers pass. |
+| `surplasse` | An immutable application release and integration bundle exist. No Atlas application activation is proved. | Keep the Compose application disabled until all host, database, secret, route, migration, resource, recovery, and public-proof blockers pass. |
 
 The exact active static tuples and public probes are in the
 [2026-08-18 rollout evidence](evidence/2026-08-18-static-reconciliation-rollout.md).
@@ -104,6 +104,8 @@ installés directement sur l’hôte. Les builds appartiennent aux runners CI.
 Codex ne change pas cette règle : son paquet autonome ne fournit aucune
 toolchain applicative et son espace de travail est séparé de `/srv/vps`.
 Son App Server n'expose aucun port et reste dans la même slice systemd bornée.
+Après la convergence prouvée du 2026-08-18,
+`atlas-codex-app-server.service` était actif et `running` sur ce socket privé.
 
 Un second passage Ansible doit être sans changement. Le mode
 `ansible-playbook --check --diff` fait partie de la validation, tout en gardant
@@ -299,7 +301,8 @@ annotations. The standalone `deploy-static` primitive:
 
 The automated static form adds a second, narrower state machine around that
 primitive. GitHub Actions in `vps-infra` resolves only the exact canonical HEAD
-whose complete check-run set is finished and green, then converts the two
+whose observed check-run set is finished and non-failing and whose configured
+required checks are successful, then converts the two
 `sha-<HEAD>` tags to immutable manifest digests. Atlas independently confirms
 the HEAD and proves in a bounded `DynamicUser` worker that a new revision
 descends from the managed active revision. It writes a transaction, switches the symlink, and probes the real edge
@@ -349,7 +352,9 @@ The local certificate probe remains the pre-activation content and integration
 proof. The separate live form follows it with a strict TLS probe against the
 running public edge, persistent transaction recovery, rollback, active state,
 and quarantine. The activation runs in a transient systemd unit with a recovery
-stop hook; a boot oneshot completes recovery before the public edge. A policy
+stop hook; a boot oneshot completes recovery before the systemd-managed public
+edge unit. Docker may still restart the existing Caddy container when the
+daemon starts before that ordering is applied. A policy
 that garbage-collects old releases is still pending. Recovery validates managed
 release bytes against the protected inventory and removes bounded labeled
 probe containers, staging directories, and temporary symlinks. The locked dynamic
@@ -388,8 +393,10 @@ que ses processus :
 Les services `edge`, `postgresql`, `prometheus` et `grafana` quittent le Compose
 Surplasse. Le backend reçoit un hostname PostgreSQL externe et n’a plus de
 `depends_on` vers un service local. Les cinq images sont épinglées séparément
-par digest et par révision source afin qu’un changement isolé ne recrée pas tous
-les modules et n’attribue pas un nouveau SHA à une image inchangée.
+par digest et toutes sont liées à la même révision source globale. Le workflow
+actuel reconstruit et publie la matrice fixe de cinq images à chaque push sur
+`main`, même pour une modification isolée. Une publication sélective serait une
+optimisation future, pas une garantie actuelle.
 
 Surplasse publie en plus un artefact OCI `vps-integration` versionné par digest :
 fragment Caddy, targets et règles Prometheus, dashboards Grafana, inventaire des
@@ -601,13 +608,17 @@ immutable releases below
 `/srv/applications/<application>/releases` and keeps root-only active,
 inventory, transaction, and quarantine records below
 `/var/lib/vps-application`. It shares `/run/lock/vps-static.lock` with the
-static controller. After convergence, its boot recovery unit runs before the
-public edge. Live convergence of this application controller is not proved. An
-application cannot reach its dedicated migration until its protected contract
-entry is enabled, Parkventory no longer has a static owner, and the immutable
-public edge already contains the exact attested route and application-network
-attachment. Route preparation remains a platform responsibility and precedes
-migration.
+static controller. After convergence, its boot recovery unit is ordered before
+the systemd-managed public edge, subject to the Docker restart bypass recorded
+by ADR-0010. Atlas converged revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b`; the application controller and
+root gate are installed, and its recovery service completed successfully before
+returning inactive. This is installation evidence only. An application cannot
+reach its dedicated migration until its protected contract entry is enabled,
+Parkventory no longer has a static owner, and the immutable public edge already
+contains the exact attested route and application-network attachment. Route
+preparation remains a platform responsibility and precedes migration. Both
+entries remain `enabled: false`, with no application workflow or active runtime.
 
 Les fichiers SOPS sont chiffrés. La clé age privée est conservée hors du VPS et
 hors de Git, avec au moins une copie de récupération dans un gestionnaire de

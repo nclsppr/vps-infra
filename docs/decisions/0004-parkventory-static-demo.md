@@ -76,9 +76,14 @@ or route still owns the domain.
 
 ## Rollback
 
-Restore the previous Parkventory release symlink or remove only the Parkventory
-route in a reviewed public edge revision. Do not change another static release,
-the internal platform, a volume, or a database.
+Rollback normal content through a reviewed revert in the Parkventory producer.
+The revert must create a new descendant commit, pass its required checks,
+publish both immutable static artifacts, and be selected by the central
+reconciler. Do not repoint `current`, move a tag, request an old source SHA, or
+edit protected Atlas state. A reviewed public-edge change may remove the route
+only for an explicit ownership handoff or emergency containment; it is not the
+normal content rollback. Do not change another static release, the internal
+platform, a volume, or a database.
 
 ## Verification
 

@@ -144,8 +144,8 @@ exits.
 
 An exact source ref in an attestation does not prove that the branch is
 protected. Repository branch protection or an external ruleset is a separate
-production gate. Keep this gate independent for `vps-infra`, Personal, and
-Papers Empire.
+production gate. Keep this gate independent for `vps-infra`, Personal, Papers
+Empire, and Parkventory.
 
 `schemas/static-route-inventory-v1.schema.json` publishes the common JSON
 shape. The dependency-free runtime validator adds application limits, canonical
@@ -158,6 +158,7 @@ The consumer limits are profile-specific:
 |---|---:|---:|---:|---:|
 | `personal` | 50 MiB | 100 MiB | 2,000 | 4,001 |
 | `papersempire` | 75 MiB | 150 MiB | 5,000 | 10,001 |
+| `parkventory` | 50 MiB | 100 MiB | 2,000 | 4,001 |
 
 Each OCI manifest is limited to 64 KiB and the route inventory layer is limited
 to 2 MiB. The integration package applies its own archive and inventory limits.
@@ -175,8 +176,8 @@ The trusted-root execution has runtime, memory, per-file size, inode, and tmpfs
 limits. GitHub CLI does not expose an in-transfer size limit for its internal
 TUF client. Bounded readers request at most the limit plus one byte so an
 oversized local object cannot be accepted. The complete route probe has a
-five-minute Personal budget and a ten-minute Papers Empire budget. Lock
-acquisition stops after one minute.
+five-minute Personal and Parkventory budget and a ten-minute Papers Empire
+budget. Lock acquisition stops after one minute.
 
 The Personal profile accepts the one Git archive PAX comment that contains the
 source SHA. The Papers Empire profile requires its GNU tar normalization. This
@@ -243,7 +244,9 @@ records the exact tuple in `quarantine/` only when both remain unchanged;
 recovery also quarantines conservatively when classification was interrupted,
 while a durable `superseded` phase remains retryable. Interruption is
 recovered before another candidate, after a failed transient activation, and at
-boot before the public edge is handled. Recovery revalidates managed release
+boot before the systemd-managed public edge unit. Docker may still restart the
+existing `unless-stopped` Caddy container as soon as the daemon starts, before
+that ordering is applied. Recovery revalidates managed release
 bytes and removes bounded labeled probe containers, strict staging directories,
 and temporary activation symlinks. Git ancestry is checked in a separate
 bounded network `DynamicUser` worker rather than in the root process.
@@ -257,11 +260,11 @@ profiles classified as `ready`.
 
 ## Disabled Compose application controller
 
-This section specifies the controller merged in repository revision
-`0a9a0c1d1c7dd7934876c425cdca64340e10a564`. The last proved Atlas controller
-revision is `27a8064400198611214d18853a87a606f349a2ae`; it predates this
-application controller. The paths below are therefore installable through
-Ansible, but are not proved live on Atlas.
+This section specifies the controller installed on Atlas by the proved
+convergence of repository revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root-owned
+`deploy-application` executable and argument-free gate are present. Installation
+does not enable either application and no application workflow invokes them.
 
 `deploy-application` consumes only the immutable
 `ghcr.io/nclsppr/<application>/application-release@sha256:<digest>` selected by
@@ -292,8 +295,11 @@ deploy-application-live <surplasse|parkventory> <source-sha40> \
 
 `forced-command` sends that canonical line over stdin to the argument-free
 root gate. The gate creates a bounded transient systemd unit whose stop hook
-runs `deploy-application --recover-live`. After convergence, Ansible installs
-`vps-application-recover.service`; it must finish before the public edge starts.
+runs `deploy-application --recover-live`. Ansible has installed
+`vps-application-recover.service`; on 2026-08-18 it was loaded and inactive after
+a successful run (`Result=success`, `ExecMainStatus=0`). It is ordered before
+the systemd-managed public edge, but does not close Docker's earlier
+`unless-stopped` restart path.
 
 Before a dedicated migration can run, Parkventory must no longer have static
 active state. For both applications, the installed public edge route must equal
