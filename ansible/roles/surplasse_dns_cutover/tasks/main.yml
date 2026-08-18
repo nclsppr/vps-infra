@@ -1,0 +1,56 @@
+---
+- name: Validate the inactive Surplasse DNS cutover controller contract
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_surplasse_dns_cutover_controller ==
+        '/usr/local/libexec/vps/surplasse-dns-cutover'
+      - >-
+        vps_surplasse_dns_cutover_policy ==
+        '/etc/vps/policies/surplasse-dns-cutover-v1.json'
+      - >-
+        vps_surplasse_dns_cutover_state_root ==
+        '/var/lib/vps-surplasse-dns-cutover'
+      - >-
+        vps_surplasse_dns_cutover_credential_root ==
+        '/etc/vps/secrets/dns/surplasse-cutover'
+    fail_msg: The Surplasse DNS cutover paths differ from the reviewed contract.
+
+- name: Create the root-owned Surplasse DNS cutover directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: /usr/local/libexec/vps
+      mode: "0755"
+    - path: /etc/vps/policies
+      mode: "0755"
+    - path: /etc/vps/secrets
+      mode: "0700"
+    - path: /etc/vps/secrets/dns
+      mode: "0700"
+    - path: "{{ vps_surplasse_dns_cutover_credential_root }}"
+      mode: "0700"
+    - path: "{{ vps_surplasse_dns_cutover_state_root }}"
+      mode: "0700"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Install the locked Surplasse DNS cutover policy
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../policies/surplasse-dns-cutover-v1.json"
+    dest: "{{ vps_surplasse_dns_cutover_policy }}"
+    owner: root
+    group: root
+    mode: "0444"
+
+- name: Install the inactive Surplasse DNS cutover controller
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/surplasse-dns-cutover"
+    dest: "{{ vps_surplasse_dns_cutover_controller }}"
+    owner: root
+    group: root
+    mode: "0755"

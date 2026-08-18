@@ -1,0 +1,15 @@
+{
+  "activation_policy": "locked",
+  "atlas_ipv4": "137.74.174.163",
+  "baseline_ipv4": "213.186.33.5",
+  "baseline_ttl": 3600,
+  "contract": "surplasse-dns-cutover-policy",
+  "credential_root": "/etc/vps/secrets/dns/surplasse-cutover",
+  "cutover_ttl": 300,
+  "enabled": false,
+  "endpoint": "https://eu.api.ovh.com/1.0",
+  "plan_ttl_seconds": 900,
+  "schema_version": 1,
+  "ttl_wait_seconds": 3600,
+  "zone": "surplasse.com"
+}

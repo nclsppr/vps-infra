@@ -29,6 +29,7 @@
 
   roles:
     - role: public_static_edge
+    - role: surplasse_dns_cutover
 
   post_tasks:
     - name: Report the bounded public edge state

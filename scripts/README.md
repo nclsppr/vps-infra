@@ -22,6 +22,7 @@ without group or other write permission:
 - `/usr/local/libexec/vps/parse-forced-command`
 - `/usr/local/libexec/vps/plan-digests`
 - `/usr/local/libexec/vps/reconcile`
+- `/usr/local/libexec/vps/surplasse-dns-cutover`
 - `/usr/local/libexec/vps/validate-compose`
 - `/usr/local/libexec/vps/validate-release`
 - `/usr/local/libexec/vps/verify-github-evidence`
@@ -515,4 +516,27 @@ Run its focused adversarial tests with:
 
 ```bash
 make check-surplasse-public-edge-controller
+```
+
+## Locked Surplasse DNS cutover transaction
+
+`surplasse-dns-cutover` is a separate root-owned controller for the later
+`surplasse.com` IPv4 migration. Its versioned policy is disabled and locked.
+While locked, it does not open its dedicated OVHcloud credential directory or
+construct an API client. It never consumes the permanent Caddy DNS-01
+credential bundle.
+
+The controller retains a complete raw API export, a canonical record snapshot,
+digest-bound expiring plans, and a durable per-write journal. It requires a
+TTL-only plan and a full old-TTL wait before the target plan. It verifies all
+authoritative servers and both fixed public recursive resolvers. Verification
+requires an explicit expected DNS RCODE and exact answer name and type, so an
+empty `SERVFAIL` or `REFUSED` response is never accepted as negative evidence.
+A separate rollback plan restores the original A records. See
+[`docs/operations/surplasse-dns-cutover.md`](../docs/operations/surplasse-dns-cutover.md).
+
+Run the local adversarial tests with:
+
+```bash
+make check-surplasse-dns-cutover-controller
 ```

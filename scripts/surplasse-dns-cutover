@@ -1,0 +1,2319 @@
+#!/usr/bin/env python3
+"""Plan and execute the bounded Surplasse OVH DNS cutover."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import dataclasses
+import datetime as dt
+import fcntl
+import hashlib
+import hmac
+import http.client
+import ipaddress
+import json
+import os
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable, Iterable, Protocol
+
+EX_USAGE = 64
+EX_CONFIG = 78
+ZONE = "surplasse.com"
+ATLAS_IPV4 = "137.74.174.163"
+BASELINE_IPV4 = "213.186.33.5"
+BASELINE_TTL = 3600
+CUTOVER_TTL = 300
+TTL_WAIT_SECONDS = 3600
+PLAN_TTL_SECONDS = 900
+ENDPOINT = "https://eu.api.ovh.com/1.0"
+OWNED_SUBDOMAINS = ("", "www", "*")
+FORBIDDEN_TYPES = ("AAAA", "CNAME")
+CONTROLLED_TYPES = ("A", "AAAA", "CNAME")
+RECURSIVE_RESOLVERS = ("1.1.1.1", "8.8.8.8")
+PLAN_ID_RE = re.compile(r"[0-9a-f]{32}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+DNS_LABEL_RE = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\.?", re.ASCII)
+DIG_HEADER_RE = re.compile(
+    r";; ->>HEADER<<- opcode: QUERY, status: ([A-Z][A-Z0-9]*), id: [0-9]+",
+    re.ASCII,
+)
+DNS_RCODE_RE = re.compile(r"[A-Z][A-Z0-9]*", re.ASCII)
+MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_RECORDS = 10_000
+POLICY_CONTRACT = "surplasse-dns-cutover-policy"
+SNAPSHOT_CONTRACT = "surplasse-dns-zone-snapshot"
+PLAN_CONTRACT = "surplasse-dns-cutover-plan"
+JOURNAL_CONTRACT = "surplasse-dns-cutover-journal"
+RESULT_CONTRACT = "surplasse-dns-cutover-result"
+
+
+class CutoverError(RuntimeError):
+    """Raised when the controller must stop without changing more state."""
+
+
+class UsageParser(argparse.ArgumentParser):
+    """Return the standard command-line usage status."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(EX_USAGE)
+
+
+@dataclasses.dataclass(frozen=True)
+class Policy:
+    enabled: bool
+    activation_policy: str
+    credential_root: Path
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimePaths:
+    policy: Path = Path("/etc/vps/policies/surplasse-dns-cutover-v1.json")
+    state_root: Path = Path("/var/lib/vps-surplasse-dns-cutover")
+    deployment_lock: Path = Path("/run/lock/vps-static.lock")
+    dig: Path = Path("/usr/bin/dig")
+    expected_uid: int = 0
+    expected_gid: int = 0
+
+    @property
+    def plans(self) -> Path:
+        return self.state_root / "plans"
+
+    @property
+    def snapshots(self) -> Path:
+        return self.state_root / "snapshots"
+
+    @property
+    def exports(self) -> Path:
+        return self.state_root / "exports"
+
+    @property
+    def journals(self) -> Path:
+        return self.state_root / "journals"
+
+    @property
+    def results(self) -> Path:
+        return self.state_root / "results"
+
+    @property
+    def active(self) -> Path:
+        return self.state_root / "active.json"
+
+
+def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CutoverError("JSON contains a duplicate object member")
+        result[key] = value
+    return result
+
+
+def decode_json(data: bytes, label: str) -> Any:
+    try:
+        return json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=strict_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                CutoverError(f"{label} contains an invalid numeric constant")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CutoverError(f"{label} is not strict UTF-8 JSON") from exc
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        + "\n"
+    ).encode("ascii")
+
+
+def digest_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def digest_object(value: Any) -> str:
+    return digest_bytes(canonical_bytes(value))
+
+
+def iso_time(timestamp: int) -> str:
+    return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def validate_plan_id(value: str, label: str = "plan identifier") -> str:
+    if PLAN_ID_RE.fullmatch(value) is None:
+        raise CutoverError(f"{label} is not a canonical 128-bit identifier")
+    return value
+
+
+def validate_sha256(value: str, label: str = "SHA-256") -> str:
+    if SHA256_RE.fullmatch(value) is None:
+        raise CutoverError(f"{label} is not canonical")
+    return value
+
+
+def validate_policy_document(document: Any) -> Policy:
+    expected_keys = {
+        "activation_policy",
+        "atlas_ipv4",
+        "baseline_ipv4",
+        "baseline_ttl",
+        "contract",
+        "credential_root",
+        "cutover_ttl",
+        "enabled",
+        "endpoint",
+        "plan_ttl_seconds",
+        "schema_version",
+        "ttl_wait_seconds",
+        "zone",
+    }
+    if not isinstance(document, dict) or set(document) != expected_keys:
+        raise CutoverError("cutover policy does not use the exact reviewed schema")
+    fixed = {
+        "atlas_ipv4": ATLAS_IPV4,
+        "baseline_ipv4": BASELINE_IPV4,
+        "baseline_ttl": BASELINE_TTL,
+        "contract": POLICY_CONTRACT,
+        "credential_root": "/etc/vps/secrets/dns/surplasse-cutover",
+        "cutover_ttl": CUTOVER_TTL,
+        "endpoint": ENDPOINT,
+        "plan_ttl_seconds": PLAN_TTL_SECONDS,
+        "schema_version": 1,
+        "ttl_wait_seconds": TTL_WAIT_SECONDS,
+        "zone": ZONE,
+    }
+    for key, value in fixed.items():
+        if document.get(key) != value:
+            raise CutoverError(f"cutover policy {key} differs from the reviewed value")
+    if not isinstance(document.get("enabled"), bool):
+        raise CutoverError("cutover policy enabled must be a Boolean")
+    enabled = document["enabled"]
+    activation_policy = document.get("activation_policy")
+    if enabled:
+        if activation_policy != "ready":
+            raise CutoverError("an enabled cutover policy must use activation_policy=ready")
+    elif activation_policy != "locked":
+        raise CutoverError("a disabled cutover policy must use activation_policy=locked")
+    return Policy(enabled, activation_policy, Path(document["credential_root"]))
+
+
+def load_policy(path: Path, owner: int = 0, group: int = 0) -> Policy:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise CutoverError("cannot read the root-owned cutover policy") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != owner
+            or metadata.st_gid != group
+            or stat.S_IMODE(metadata.st_mode) != 0o444
+            or metadata.st_nlink != 1
+            or metadata.st_size > 4096
+        ):
+            raise CutoverError("root-owned cutover policy has unsafe metadata")
+        data = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    if len(data) > 4096:
+        raise CutoverError("cutover policy exceeds the size limit")
+    return validate_policy_document(decode_json(data, "cutover policy"))
+
+
+def require_active(policy: Policy) -> None:
+    if not policy.enabled or policy.activation_policy != "ready":
+        raise CutoverError("cutover policy is disabled and activation_policy is locked")
+
+
+def validate_directory(path: Path, owner: int, group: int, mode: int) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise CutoverError(f"cannot inspect protected directory {path}") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != owner
+        or metadata.st_gid != group
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise CutoverError(f"protected directory {path} differs from {owner}:{group} {mode:04o}")
+
+
+def ensure_directory(path: Path, owner: int, group: int, mode: int) -> None:
+    try:
+        path.mkdir(mode=mode)
+    except FileExistsError:
+        pass
+    validate_directory(path, owner, group, mode)
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o400) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+
+
+def read_protected(path: Path, owner: int, group: int, limit: int) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise CutoverError(f"cannot open protected state file {path.name}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != owner
+            or metadata.st_gid != group
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or metadata.st_nlink != 1
+            or metadata.st_size > limit
+        ):
+            raise CutoverError(f"protected state file {path.name} has unsafe metadata")
+        data = os.read(descriptor, limit + 1)
+        if len(data) > limit:
+            raise CutoverError(f"protected state file {path.name} exceeds its size limit")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+class StateStore:
+    def __init__(self, paths: RuntimePaths):
+        self.paths = paths
+
+    def ensure(self) -> None:
+        validate_directory(
+            self.paths.state_root,
+            self.paths.expected_uid,
+            self.paths.expected_gid,
+            0o700,
+        )
+        for directory in (
+            self.paths.plans,
+            self.paths.snapshots,
+            self.paths.exports,
+            self.paths.journals,
+            self.paths.results,
+        ):
+            ensure_directory(
+                directory,
+                self.paths.expected_uid,
+                self.paths.expected_gid,
+                0o700,
+            )
+
+    def write_json(self, path: Path, value: Any) -> None:
+        atomic_write(path, canonical_bytes(value))
+
+    def read_json(self, path: Path, label: str) -> Any:
+        data = read_protected(
+            path,
+            self.paths.expected_uid,
+            self.paths.expected_gid,
+            MAX_API_RESPONSE_BYTES,
+        )
+        return decode_json(data, label)
+
+    def optional_json(self, path: Path, label: str) -> Any | None:
+        if not path.exists():
+            return None
+        return self.read_json(path, label)
+
+    def plan_path(self, plan_id: str) -> Path:
+        return self.paths.plans / f"{validate_plan_id(plan_id)}.json"
+
+    def journal_path(self, plan_id: str) -> Path:
+        return self.paths.journals / f"{validate_plan_id(plan_id)}.json"
+
+    def result_path(self, plan_id: str) -> Path:
+        return self.paths.results / f"{validate_plan_id(plan_id)}.json"
+
+    def snapshot_path(self, transaction_id: str) -> Path:
+        return self.paths.snapshots / f"{validate_plan_id(transaction_id, 'transaction identifier')}.json"
+
+    def export_path(self, name: str) -> Path:
+        if re.fullmatch(r"[0-9a-f]{32}\.(?:snapshot|before|apply|after)\.zone", name) is None:
+            raise CutoverError("zone export name is not bounded")
+        return self.paths.exports / name
+
+
+@contextlib.contextmanager
+def deployment_lock(paths: RuntimePaths) -> Iterable[None]:
+    descriptor = os.open(paths.deployment_lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != paths.expected_uid
+            or metadata.st_gid != paths.expected_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise CutoverError("shared deployment lock has unsafe metadata")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+@dataclasses.dataclass(frozen=True, repr=False)
+class OvhCredentials:
+    application_key: str
+    application_signing_value: str
+    consumer_key: str
+
+
+def load_credentials(root: Path, owner: int = 0, group: int = 0) -> OvhCredentials:
+    validate_directory(root, owner, group, 0o700)
+    expected = {"ovh-application-key", "ovh-application-secret", "ovh-consumer-key"}
+    try:
+        actual = {entry.name for entry in os.scandir(root)}
+    except OSError as exc:
+        raise CutoverError("cannot inspect the cutover credential directory") from exc
+    if actual != expected:
+        raise CutoverError("cutover credential directory does not have the exact inventory")
+
+    values: dict[str, str] = {}
+    for name in sorted(expected):
+        path = root / name
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError as exc:
+            raise CutoverError("cannot open one cutover credential file") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != owner
+                or metadata.st_gid != group
+                or stat.S_IMODE(metadata.st_mode) != 0o400
+                or metadata.st_nlink != 1
+                or not 17 <= metadata.st_size <= 129
+            ):
+                raise CutoverError("one cutover credential file has unsafe metadata")
+            content = os.read(descriptor, 130)
+        finally:
+            os.close(descriptor)
+        if (
+            not content.endswith(b"\n")
+            or content.count(b"\n") != 1
+            or re.fullmatch(rb"[A-Za-z0-9_-]{16,128}\n", content) is None
+        ):
+            raise CutoverError("one cutover credential file has an invalid shape")
+        values[name] = content[:-1].decode("ascii")
+    return OvhCredentials(
+        values["ovh-application-key"],
+        values["ovh-application-secret"],
+        values["ovh-consumer-key"],
+    )
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Prevent a redirect from forwarding signed OVH headers to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+class ZoneApi(Protocol):
+    def export_zone(self) -> bytes: ...
+
+    def list_records(self) -> list[dict[str, Any]]: ...
+
+    def put_record(self, record_id: int, record: dict[str, Any]) -> None: ...
+
+    def post_record(self, record: dict[str, Any]) -> dict[str, Any]: ...
+
+    def delete_record(self, record_id: int) -> None: ...
+
+    def refresh(self) -> None: ...
+
+
+class OvhZoneApi:
+    """Minimal OVH API client that uses only the Python standard library."""
+
+    def __init__(
+        self,
+        credentials: OvhCredentials,
+        *,
+        now: Callable[[], float] = time.time,
+        opener: urllib.request.OpenerDirector | None = None,
+    ):
+        self.credentials = credentials
+        self.now = now
+        self.opener = opener or urllib.request.build_opener(NoRedirect())
+        self.zone_path = f"/domain/zone/{urllib.parse.quote(ZONE, safe='')}"
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        raw: bool = False,
+    ) -> Any:
+        if method not in {"GET", "POST", "PUT", "DELETE"}:
+            raise CutoverError("OVH request method is outside the fixed interface")
+        if not path.startswith(self.zone_path) or "?" in path or "#" in path:
+            raise CutoverError("OVH request path is outside the Surplasse zone")
+        encoded_body = b"" if body is None else canonical_bytes(body).rstrip(b"\n")
+        timestamp = str(int(self.now()))
+        url = ENDPOINT + path
+        signature_input = (
+            self.credentials.application_signing_value
+            + "+"
+            + self.credentials.consumer_key
+            + "+"
+            + method
+            + "+"
+            + url
+            + "+"
+            + encoded_body.decode("ascii")
+            + "+"
+            + timestamp
+        ).encode("utf-8")
+        signature = "$1$" + hashlib.sha1(signature_input).hexdigest()  # noqa: S324
+        headers = {
+            "Accept": "application/json" if not raw else "text/plain",
+            "Content-Type": "application/json",
+            "User-Agent": "vps-infra-surplasse-dns-cutover/1",
+            "X-Ovh-Application": self.credentials.application_key,
+            "X-Ovh-Consumer": self.credentials.consumer_key,
+            "X-Ovh-Signature": signature,
+            "X-Ovh-Timestamp": timestamp,
+        }
+        data = encoded_body if method in {"POST", "PUT"} else None
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with self.opener.open(request, timeout=15) as response:
+                content_length = response.headers.get("Content-Length")
+                if content_length is not None and int(content_length) > MAX_API_RESPONSE_BYTES:
+                    raise CutoverError("OVH API response exceeds the size limit")
+                payload = response.read(MAX_API_RESPONSE_BYTES + 1)
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            http.client.HTTPException,
+        ) as exc:
+            raise CutoverError("OVH API request failed") from exc
+        if len(payload) > MAX_API_RESPONSE_BYTES:
+            raise CutoverError("OVH API response exceeds the size limit")
+        if raw:
+            return payload
+        if not payload:
+            return None
+        return decode_json(payload, "OVH API response")
+
+    def export_zone(self) -> bytes:
+        payload = self.request("GET", f"{self.zone_path}/export", raw=True)
+        if not payload or b"\0" in payload:
+            raise CutoverError("OVH zone export is empty or invalid")
+        return payload
+
+    def list_records(self) -> list[dict[str, Any]]:
+        identifiers = self.request("GET", f"{self.zone_path}/record")
+        if (
+            not isinstance(identifiers, list)
+            or len(identifiers) > MAX_RECORDS
+            or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in identifiers)
+            or len(set(identifiers)) != len(identifiers)
+        ):
+            raise CutoverError("OVH record list is invalid or exceeds the bound")
+        records: list[dict[str, Any]] = []
+        for record_id in sorted(identifiers):
+            record = self.request("GET", f"{self.zone_path}/record/{record_id}")
+            records.append(validate_record(record, expected_id=record_id))
+        return canonical_records(records)
+
+    def put_record(self, record_id: int, record: dict[str, Any]) -> None:
+        validate_record_id(record_id)
+        candidate = validate_record(record, expected_id=record_id)
+        self.request(
+            "PUT",
+            f"{self.zone_path}/record/{record_id}",
+            {"target": candidate["target"], "ttl": candidate["ttl"]},
+        )
+
+    def post_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        candidate = validate_record(record, allow_missing_id=True)
+        created = self.request(
+            "POST",
+            f"{self.zone_path}/record",
+            {
+                "fieldType": candidate["fieldType"],
+                "subDomain": candidate["subDomain"],
+                "target": candidate["target"],
+                "ttl": candidate["ttl"],
+            },
+        )
+        return validate_record(created)
+
+    def delete_record(self, record_id: int) -> None:
+        validate_record_id(record_id)
+        self.request("DELETE", f"{self.zone_path}/record/{record_id}")
+
+    def refresh(self) -> None:
+        self.request("POST", f"{self.zone_path}/refresh")
+
+
+def validate_record_id(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise CutoverError("DNS record identifier is invalid")
+    return value
+
+
+def validate_record(
+    value: Any,
+    *,
+    expected_id: int | None = None,
+    allow_missing_id: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CutoverError("DNS record is not an object")
+    required = {"fieldType", "subDomain", "target", "ttl"}
+    if not required.issubset(value):
+        raise CutoverError("DNS record lacks a required member")
+    record_id = value.get("id")
+    if record_id is None and not allow_missing_id:
+        raise CutoverError("DNS record lacks its identifier")
+    if record_id is not None:
+        validate_record_id(record_id)
+    if expected_id is not None and record_id != expected_id:
+        raise CutoverError("DNS record identifier differs from the requested identifier")
+    field_type = value["fieldType"]
+    subdomain = value["subDomain"]
+    target = value["target"]
+    ttl = value["ttl"]
+    if not isinstance(field_type, str) or re.fullmatch(r"[A-Z][A-Z0-9]{0,15}", field_type) is None:
+        raise CutoverError("DNS record type is invalid")
+    if not isinstance(subdomain, str) or len(subdomain.encode("utf-8")) > 253 or "\0" in subdomain:
+        raise CutoverError("DNS record subdomain is invalid")
+    if not isinstance(target, str) or not 1 <= len(target.encode("utf-8")) <= 8192 or "\0" in target:
+        raise CutoverError("DNS record target is invalid")
+    if not isinstance(ttl, int) or isinstance(ttl, bool) or not 0 <= ttl <= 2_147_483_647:
+        raise CutoverError("DNS record TTL is invalid")
+    result: dict[str, Any] = {
+        "fieldType": field_type,
+        "subDomain": subdomain,
+        "target": target,
+        "ttl": ttl,
+    }
+    if record_id is not None:
+        result["id"] = record_id
+    return result
+
+
+def canonical_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = [validate_record(record) for record in records]
+    identifiers = [record["id"] for record in result]
+    if len(identifiers) != len(set(identifiers)) or len(result) > MAX_RECORDS:
+        raise CutoverError("DNS record inventory has duplicate identifiers or exceeds the bound")
+    return sorted(
+        result,
+        key=lambda record: (
+            record["fieldType"],
+            record["subDomain"],
+            record["target"],
+            record["ttl"],
+            record["id"],
+        ),
+    )
+
+
+def normalize_soa_target(target: str) -> str:
+    """Ignore only the provider-managed SOA serial during preservation checks."""
+
+    fields = target.split()
+    if len(fields) == 7 and fields[2].isdigit():
+        fields[2] = "<provider-managed-serial>"
+        return " ".join(fields)
+    return target
+
+
+def normalized_record(record: dict[str, Any]) -> dict[str, Any]:
+    result = dict(validate_record(record))
+    if result["fieldType"] == "SOA":
+        result["target"] = normalize_soa_target(result["target"])
+    return result
+
+
+def is_controlled_record(record: dict[str, Any]) -> bool:
+    return (
+        record["subDomain"] in OWNED_SUBDOMAINS
+        and record["fieldType"] in CONTROLLED_TYPES
+    )
+
+
+def protected_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    return canonical_records(
+        normalized_record(record)
+        for record in records
+        if not is_controlled_record(record)
+    )
+
+
+def protected_digest(records: Iterable[dict[str, Any]]) -> str:
+    return digest_object(protected_records(records))
+
+
+def record_set_digest(records: Iterable[dict[str, Any]]) -> str:
+    return digest_object([normalized_record(record) for record in canonical_records(records)])
+
+
+def matching_records(
+    records: Iterable[dict[str, Any]], subdomain: str, field_type: str
+) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in canonical_records(records)
+        if record["subDomain"] == subdomain and record["fieldType"] == field_type
+    ]
+
+
+def require_common_zone_invariants(records: list[dict[str, Any]]) -> None:
+    canonical = canonical_records(records)
+    for subdomain in OWNED_SUBDOMAINS:
+        for field_type in FORBIDDEN_TYPES:
+            if matching_records(canonical, subdomain, field_type):
+                name = ZONE if subdomain == "" else f"{subdomain}.{ZONE}"
+                raise CutoverError(f"forbidden {field_type} record exists at {name}")
+
+
+def require_exact_a(
+    records: list[dict[str, Any]], subdomain: str, target: str, ttl: int
+) -> dict[str, Any]:
+    matches = matching_records(records, subdomain, "A")
+    if len(matches) != 1 or matches[0]["target"] != target or matches[0]["ttl"] != ttl:
+        name = ZONE if subdomain == "" else f"{subdomain}.{ZONE}"
+        raise CutoverError(f"A record at {name} differs from the exact expected state")
+    return matches[0]
+
+
+def require_absent_a(records: list[dict[str, Any]], subdomain: str) -> None:
+    if matching_records(records, subdomain, "A"):
+        name = ZONE if subdomain == "" else f"{subdomain}.{ZONE}"
+        raise CutoverError(f"A record at {name} must be absent")
+
+
+def require_baseline(records: list[dict[str, Any]]) -> None:
+    require_common_zone_invariants(records)
+    require_exact_a(records, "", BASELINE_IPV4, BASELINE_TTL)
+    require_exact_a(records, "www", BASELINE_IPV4, BASELINE_TTL)
+    require_absent_a(records, "*")
+
+
+def require_lowered(records: list[dict[str, Any]]) -> None:
+    require_common_zone_invariants(records)
+    require_exact_a(records, "", BASELINE_IPV4, CUTOVER_TTL)
+    require_exact_a(records, "www", BASELINE_IPV4, CUTOVER_TTL)
+    require_absent_a(records, "*")
+
+
+def require_cutover(records: list[dict[str, Any]]) -> None:
+    require_common_zone_invariants(records)
+    for subdomain in OWNED_SUBDOMAINS:
+        require_exact_a(records, subdomain, ATLAS_IPV4, CUTOVER_TTL)
+
+
+@dataclasses.dataclass(frozen=True)
+class DnsAnswer:
+    name: str
+    ttl: int
+    field_type: str
+    target: str
+
+
+@dataclasses.dataclass(frozen=True)
+class DnsResponse:
+    rcode: str
+    answers: tuple[DnsAnswer, ...]
+
+
+class DnsReader(Protocol):
+    def query(self, server: str, name: str, field_type: str) -> DnsResponse: ...
+
+
+class DigDnsReader:
+    def __init__(self, dig: Path):
+        self.dig = dig
+
+    def query(self, server: str, name: str, field_type: str) -> DnsResponse:
+        if (
+            field_type not in {"A", "AAAA", "CNAME", "NS", "SOA"}
+            or DNS_LABEL_RE.fullmatch(name) is None
+            or (
+                DNS_LABEL_RE.fullmatch(server) is None
+                and _invalid_resolver_address(server)
+            )
+        ):
+            raise CutoverError("DNS query is outside the fixed verification interface")
+        try:
+            result = subprocess.run(
+                [
+                    str(self.dig),
+                    "+time=5",
+                    "+tries=1",
+                    "+noall",
+                    "+comments",
+                    "+answer",
+                    f"@{server}",
+                    name,
+                    field_type,
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise CutoverError("DNS verification command failed") from exc
+        if result.returncode != 0 or result.stderr or len(result.stdout) > 131_072:
+            raise CutoverError("DNS verification command returned an invalid result")
+        try:
+            lines = result.stdout.decode("ascii", errors="strict").splitlines()
+        except UnicodeDecodeError as exc:
+            raise CutoverError("DNS verification answer is malformed") from exc
+        statuses = [
+            match.group(1)
+            for line in lines
+            if (match := DIG_HEADER_RE.fullmatch(line)) is not None
+        ]
+        if len(statuses) != 1:
+            raise CutoverError("DNS verification result has no unique RCODE")
+        answers: list[DnsAnswer] = []
+        for line in lines:
+            if not line or line.startswith(";"):
+                continue
+            fields = line.split()
+            if len(fields) < 5 or fields[2] != "IN" or not fields[1].isdigit():
+                raise CutoverError("DNS verification answer is malformed")
+            answer_type = fields[3]
+            if answer_type not in {"A", "AAAA", "CNAME", "NS", "SOA"}:
+                raise CutoverError("DNS verification returned an unexpected record type")
+            answers.append(
+                DnsAnswer(
+                    fields[0].lower().rstrip("."),
+                    int(fields[1]),
+                    answer_type,
+                    " ".join(fields[4:]).lower().rstrip("."),
+                )
+            )
+        return exact_dns_response(
+            DnsResponse(statuses[0], tuple(answers)), name, field_type
+        )
+
+
+def _invalid_resolver_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return True
+    return False
+
+
+def exact_dns_response(
+    value: Any, name: str, field_type: str
+) -> DnsResponse:
+    expected_name = name.lower().rstrip(".")
+    if (
+        not isinstance(value, DnsResponse)
+        or DNS_RCODE_RE.fullmatch(value.rcode) is None
+        or not isinstance(value.answers, tuple)
+    ):
+        raise CutoverError("DNS verification response has an invalid schema")
+    for answer in value.answers:
+        if (
+            not isinstance(answer, DnsAnswer)
+            or answer.name != expected_name
+            or answer.field_type != field_type
+            or not isinstance(answer.ttl, int)
+            or isinstance(answer.ttl, bool)
+            or answer.ttl < 0
+            or not isinstance(answer.target, str)
+            or not answer.target
+        ):
+            raise CutoverError(
+                "DNS verification response does not match the exact query name and type"
+            )
+    if value.rcode != "NOERROR" and value.answers:
+        raise CutoverError("DNS error response unexpectedly contains answers")
+    return value
+
+
+def validate_authority(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"nameservers", "soa"}:
+        raise CutoverError("authoritative DNS snapshot has an invalid schema")
+    nameserver_values = value["nameservers"]
+    if (
+        not isinstance(nameserver_values, list)
+        or len(nameserver_values) < 2
+        or nameserver_values != sorted(set(nameserver_values))
+        or any(
+            not isinstance(server, str) or DNS_LABEL_RE.fullmatch(server) is None
+            for server in nameserver_values
+        )
+    ):
+        raise CutoverError("authoritative DNS snapshot has invalid name servers")
+    soa = value["soa"]
+    if not isinstance(soa, str) or not soa or normalize_soa_target(soa) != soa:
+        raise CutoverError("authoritative DNS snapshot has an invalid normalized SOA")
+    soa_fields = soa.split()
+    if (
+        len(soa_fields) != 7
+        or DNS_LABEL_RE.fullmatch(soa_fields[0]) is None
+        or DNS_LABEL_RE.fullmatch(soa_fields[1]) is None
+        or soa_fields[2] != "<provider-managed-serial>"
+        or any(not field.isdigit() for field in soa_fields[3:])
+    ):
+        raise CutoverError("authoritative DNS snapshot has an invalid SOA structure")
+    return {"nameservers": list(nameserver_values), "soa": soa}
+
+
+def capture_authority(reader: DnsReader) -> dict[str, Any]:
+    observations: list[dict[str, Any]] = []
+    for resolver in RECURSIVE_RESOLVERS:
+        try:
+            ns_response = exact_dns_response(
+                reader.query(resolver, ZONE, "NS"), ZONE, "NS"
+            )
+            soa_response = exact_dns_response(
+                reader.query(resolver, ZONE, "SOA"), ZONE, "SOA"
+            )
+        except CutoverError as exc:
+            raise CutoverError("cannot capture delegated NS and SOA state") from exc
+        if ns_response.rcode != "NOERROR" or soa_response.rcode != "NOERROR":
+            raise CutoverError("cannot capture delegated NS and SOA state")
+        ns_answers = ns_response.answers
+        soa_answers = soa_response.answers
+        nameserver_values = sorted(
+            {
+                answer.target.lower().rstrip(".")
+                for answer in ns_answers
+                if answer.field_type == "NS"
+            }
+        )
+        soa_values = {
+            normalize_soa_target(answer.target.lower().rstrip("."))
+            for answer in soa_answers
+            if answer.field_type == "SOA"
+        }
+        if (
+            any(answer.field_type != "NS" for answer in ns_answers)
+            or any(answer.field_type != "SOA" for answer in soa_answers)
+            or len(soa_values) != 1
+        ):
+            raise CutoverError("recursive resolver returned an ambiguous SOA state")
+        observation = validate_authority(
+            {"nameservers": nameserver_values, "soa": next(iter(soa_values))}
+        )
+        observations.append(observation)
+    if observations[0] != observations[1]:
+        raise CutoverError("public recursive resolvers disagree on NS or SOA state")
+    return observations[0]
+
+
+def expected_dns_state(kind: str, snapshot_records: list[dict[str, Any]]) -> dict[str, Any]:
+    if kind == "lower_ttl":
+        return {
+            "apex": {"target": BASELINE_IPV4, "ttl": CUTOVER_TTL},
+            "www": {"target": BASELINE_IPV4, "ttl": CUTOVER_TTL},
+            "wildcard": None,
+        }
+    if kind == "cutover":
+        return {
+            "apex": {"target": ATLAS_IPV4, "ttl": CUTOVER_TTL},
+            "www": {"target": ATLAS_IPV4, "ttl": CUTOVER_TTL},
+            "wildcard": {"target": ATLAS_IPV4, "ttl": CUTOVER_TTL},
+        }
+    if kind == "rollback":
+        apex = require_exact_a(snapshot_records, "", BASELINE_IPV4, BASELINE_TTL)
+        www = require_exact_a(snapshot_records, "www", BASELINE_IPV4, BASELINE_TTL)
+        require_absent_a(snapshot_records, "*")
+        return {
+            "apex": {"target": apex["target"], "ttl": apex["ttl"]},
+            "www": {"target": www["target"], "ttl": www["ttl"]},
+            "wildcard": None,
+        }
+    raise CutoverError("plan kind has no DNS verification contract")
+
+
+def verify_dns(
+    reader: DnsReader,
+    kind: str,
+    snapshot_records: list[dict[str, Any]],
+    authority: dict[str, Any],
+    plan_id: str,
+) -> dict[str, Any]:
+    expected = expected_dns_state(kind, snapshot_records)
+    expected_authority = validate_authority(authority)
+    probe = f"cutover-{validate_plan_id(plan_id)[:16]}.{ZONE}"
+    queries = ((ZONE, "apex"), (f"www.{ZONE}", "www"), (probe, "wildcard"))
+    authoritative_results: list[dict[str, Any]] = []
+    recursive_results: list[dict[str, Any]] = []
+    all_verified = True
+    for scope, servers in (
+        ("authoritative", tuple(expected_authority["nameservers"])),
+        ("recursive", RECURSIVE_RESOLVERS),
+    ):
+        destination = authoritative_results if scope == "authoritative" else recursive_results
+        for server in servers:
+            server_verified = True
+            checked: list[dict[str, Any]] = []
+            ns_response: DnsResponse | None = None
+            soa_response: DnsResponse | None = None
+            try:
+                ns_response = exact_dns_response(
+                    reader.query(server, ZONE, "NS"), ZONE, "NS"
+                )
+                soa_response = exact_dns_response(
+                    reader.query(server, ZONE, "SOA"), ZONE, "SOA"
+                )
+            except CutoverError:
+                server_verified = False
+            ns_answers = ns_response.answers if ns_response is not None else ()
+            soa_answers = soa_response.answers if soa_response is not None else ()
+            observed_nameservers = sorted(
+                {
+                    answer.target.lower().rstrip(".")
+                    for answer in ns_answers
+                    if answer.field_type == "NS"
+                }
+            )
+            observed_soa = {
+                normalize_soa_target(answer.target.lower().rstrip("."))
+                for answer in soa_answers
+                if answer.field_type == "SOA"
+            }
+            authority_verified = (
+                ns_response is not None
+                and soa_response is not None
+                and ns_response.rcode == "NOERROR"
+                and soa_response.rcode == "NOERROR"
+                and all(answer.field_type == "NS" for answer in ns_answers)
+                and all(answer.field_type == "SOA" for answer in soa_answers)
+                and observed_nameservers == expected_authority["nameservers"]
+                and observed_soa == {expected_authority["soa"]}
+            )
+            server_verified = server_verified and authority_verified
+            for name, label in queries:
+                expected_record = expected[label]
+                responses: dict[str, DnsResponse | None] = {}
+                for field_type in ("A", "AAAA", "CNAME"):
+                    try:
+                        responses[field_type] = exact_dns_response(
+                            reader.query(server, name, field_type), name, field_type
+                        )
+                    except CutoverError:
+                        responses[field_type] = None
+                        server_verified = False
+                a_response = responses["A"]
+                a_answers = list(a_response.answers) if a_response is not None else []
+                expected_rcode = "NXDOMAIN" if expected_record is None else "NOERROR"
+                rcodes_verified = all(
+                    response is not None and response.rcode == expected_rcode
+                    for response in responses.values()
+                )
+                if expected_record is None:
+                    name_verified = rcodes_verified and all(
+                        response is not None and not response.answers
+                        for response in responses.values()
+                    )
+                else:
+                    name_verified = (
+                        rcodes_verified
+                        and len(a_answers) == 1
+                        and a_answers[0].target == expected_record["target"]
+                        and responses["AAAA"] is not None
+                        and not responses["AAAA"].answers
+                        and responses["CNAME"] is not None
+                        and not responses["CNAME"].answers
+                    )
+                    if scope == "authoritative":
+                        name_verified = name_verified and a_answers[0].ttl == expected_record["ttl"]
+                server_verified = server_verified and name_verified
+                checked.append(
+                    {
+                        "name": name,
+                        "verified": name_verified,
+                        "a": [answer.target for answer in a_answers],
+                        "aaaa_count": (
+                            len(responses["AAAA"].answers)
+                            if responses["AAAA"] is not None
+                            else 0
+                        ),
+                        "cname_count": (
+                            len(responses["CNAME"].answers)
+                            if responses["CNAME"] is not None
+                            else 0
+                        ),
+                        "rcodes": {
+                            field_type: (
+                                response.rcode if response is not None else None
+                            )
+                            for field_type, response in responses.items()
+                        },
+                    }
+                )
+            destination.append(
+                {
+                    "names": checked,
+                    "ns": observed_nameservers,
+                    "ns_rcode": (
+                        ns_response.rcode if ns_response is not None else None
+                    ),
+                    "server": server,
+                    "soa": sorted(observed_soa),
+                    "soa_rcode": (
+                        soa_response.rcode if soa_response is not None else None
+                    ),
+                    "verified": server_verified,
+                }
+            )
+            all_verified = all_verified and server_verified
+    return {
+        "verified": all_verified,
+        "authoritative": authoritative_results,
+        "recursive": recursive_results,
+    }
+
+
+def replace_record(record: dict[str, Any], *, target: str, ttl: int) -> dict[str, Any]:
+    result = dict(validate_record(record))
+    result["target"] = target
+    result["ttl"] = ttl
+    return result
+
+
+def put_operation(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    old = validate_record(before)
+    new = validate_record(after, expected_id=old["id"])
+    if (
+        old["fieldType"] != "A"
+        or new["fieldType"] != "A"
+        or old["subDomain"] not in OWNED_SUBDOMAINS
+        or old["subDomain"] != new["subDomain"]
+    ):
+        raise CutoverError("PUT operation is outside the three bounded A records")
+    return {"method": "PUT", "record_id": old["id"], "before": old, "after": new}
+
+
+def post_operation(after: dict[str, Any]) -> dict[str, Any]:
+    new = validate_record(after, allow_missing_id=True)
+    if set(new) != {"fieldType", "subDomain", "target", "ttl"} or (
+        new["fieldType"], new["subDomain"], new["target"], new["ttl"]
+    ) != ("A", "*", ATLAS_IPV4, CUTOVER_TTL):
+        raise CutoverError("POST operation is not the exact Atlas wildcard A creation")
+    return {"method": "POST", "before": None, "after": new}
+
+
+def delete_operation(before: dict[str, Any]) -> dict[str, Any]:
+    old = validate_record(before)
+    if (
+        old["fieldType"], old["subDomain"], old["target"], old["ttl"]
+    ) != ("A", "*", ATLAS_IPV4, CUTOVER_TTL):
+        raise CutoverError("DELETE operation is not the exact Atlas wildcard A removal")
+    return {"method": "DELETE", "record_id": old["id"], "before": old, "after": None}
+
+
+def validate_operations(kind: str, operations: Any) -> list[dict[str, Any]]:
+    if not isinstance(operations, list) or not 1 <= len(operations) <= 3:
+        raise CutoverError("plan operation list is invalid")
+    validated: list[dict[str, Any]] = []
+    for operation in operations:
+        if not isinstance(operation, dict) or operation.get("method") not in {"PUT", "POST", "DELETE"}:
+            raise CutoverError("plan contains an invalid operation")
+        method = operation["method"]
+        if method == "PUT":
+            if set(operation) != {"method", "record_id", "before", "after"}:
+                raise CutoverError("PUT operation has an invalid schema")
+            validated.append(put_operation(operation["before"], operation["after"]))
+        elif method == "POST":
+            if set(operation) != {"method", "before", "after"} or operation["before"] is not None:
+                raise CutoverError("POST operation has an invalid schema")
+            validated.append(post_operation(operation["after"]))
+        else:
+            if set(operation) != {"method", "record_id", "before", "after"} or operation["after"] is not None:
+                raise CutoverError("DELETE operation has an invalid schema")
+            validated.append(delete_operation(operation["before"]))
+    methods = [operation["method"] for operation in validated]
+    subdomains = [
+        (operation["after"] or operation["before"])["subDomain"]
+        for operation in validated
+    ]
+    if kind == "lower_ttl" and (methods != ["PUT", "PUT"] or subdomains != ["", "www"]):
+        raise CutoverError("TTL plan does not have the exact operation sequence")
+    if kind == "lower_ttl":
+        for operation in validated:
+            if (
+                operation["before"]["target"],
+                operation["before"]["ttl"],
+                operation["after"]["target"],
+                operation["after"]["ttl"],
+            ) != (BASELINE_IPV4, BASELINE_TTL, BASELINE_IPV4, CUTOVER_TTL):
+                raise CutoverError("TTL plan values differ from the fixed transition")
+    if kind == "cutover" and (methods != ["POST", "PUT", "PUT"] or subdomains != ["*", "", "www"]):
+        raise CutoverError("cutover plan does not have the exact operation sequence")
+    if kind == "cutover":
+        for operation in validated[1:]:
+            if (
+                operation["before"]["target"],
+                operation["before"]["ttl"],
+                operation["after"]["target"],
+                operation["after"]["ttl"],
+            ) != (BASELINE_IPV4, CUTOVER_TTL, ATLAS_IPV4, CUTOVER_TTL):
+                raise CutoverError("cutover plan values differ from the fixed transition")
+    if kind == "rollback":
+        if methods not in (["PUT", "PUT"], ["DELETE", "PUT", "PUT"]):
+            raise CutoverError("rollback plan does not have the exact operation sequence")
+        expected_subdomains = ["", "www"] if len(methods) == 2 else ["*", "", "www"]
+        if subdomains != expected_subdomains:
+            raise CutoverError("rollback plan targets an unexpected record")
+        for operation in validated[-2:]:
+            if (
+                operation["before"]["ttl"] != CUTOVER_TTL
+                or operation["before"]["target"] not in {BASELINE_IPV4, ATLAS_IPV4}
+                or (operation["after"]["target"], operation["after"]["ttl"])
+                != (BASELINE_IPV4, BASELINE_TTL)
+            ):
+                raise CutoverError("rollback plan values differ from the baseline restoration")
+    return validated
+
+
+def simulate_operations(
+    records: list[dict[str, Any]], operations: list[dict[str, Any]], count: int
+) -> list[dict[str, Any]]:
+    if not 0 <= count <= len(operations):
+        raise CutoverError("journal operation cursor is invalid")
+    result = [dict(record) for record in canonical_records(records)]
+    for operation in operations[:count]:
+        method = operation["method"]
+        if method == "PUT":
+            matches = [index for index, record in enumerate(result) if record["id"] == operation["record_id"]]
+            if len(matches) != 1 or result[matches[0]] != operation["before"]:
+                raise CutoverError("plan PUT precondition differs from its record snapshot")
+            result[matches[0]] = dict(operation["after"])
+        elif method == "POST":
+            result.append({**operation["after"], "id": -1})
+        elif method == "DELETE":
+            matches = [index for index, record in enumerate(result) if record["id"] == operation["record_id"]]
+            if len(matches) != 1 or result[matches[0]] != operation["before"]:
+                raise CutoverError("plan DELETE precondition differs from its record snapshot")
+            result.pop(matches[0])
+        else:
+            raise CutoverError("plan operation method is invalid")
+    return sorted(
+        result,
+        key=lambda record: (
+            record["fieldType"],
+            record["subDomain"],
+            record["target"],
+            record["ttl"],
+            record["id"],
+        ),
+    )
+
+
+def records_match(actual: list[dict[str, Any]], expected: list[dict[str, Any]]) -> bool:
+    actual_remaining = [normalized_record(record) for record in canonical_records(actual)]
+    expected_remaining = []
+    for record in expected:
+        if record.get("id") == -1:
+            candidate = dict(record)
+            if candidate.get("fieldType") == "SOA":
+                candidate["target"] = normalize_soa_target(candidate["target"])
+            expected_remaining.append(candidate)
+        else:
+            expected_remaining.append(normalized_record(record))
+    placeholders = [record for record in expected_remaining if record["id"] == -1]
+    expected_remaining = [record for record in expected_remaining if record["id"] != -1]
+    for placeholder in placeholders:
+        semantic = {key: value for key, value in placeholder.items() if key != "id"}
+        matches = [
+            record
+            for record in actual_remaining
+            if {key: value for key, value in record.items() if key != "id"} == semantic
+        ]
+        if len(matches) != 1:
+            return False
+        actual_remaining.remove(matches[0])
+    return sorted(actual_remaining, key=lambda item: canonical_bytes(item)) == sorted(
+        expected_remaining, key=lambda item: canonical_bytes(item)
+    )
+
+
+def validate_plan_document(document: Any) -> dict[str, Any]:
+    expected_keys = {
+        "contract",
+        "created_at",
+        "created_at_iso",
+        "expires_at",
+        "expires_at_iso",
+        "kind",
+        "operations",
+        "plan_id",
+        "plan_sha256",
+        "pre_export_sha256",
+        "protected_records_sha256",
+        "records_before",
+        "records_before_sha256",
+        "schema_version",
+        "snapshot_sha256",
+        "transaction_id",
+        "zone",
+    }
+    if not isinstance(document, dict) or set(document) != expected_keys:
+        raise CutoverError("stored plan does not use the exact schema")
+    if document["contract"] != PLAN_CONTRACT or document["schema_version"] != 1 or document["zone"] != ZONE:
+        raise CutoverError("stored plan differs from the fixed contract")
+    validate_plan_id(document["plan_id"])
+    validate_plan_id(document["transaction_id"], "transaction identifier")
+    validate_sha256(document["plan_sha256"], "plan SHA-256")
+    for key in (
+        "pre_export_sha256",
+        "protected_records_sha256",
+        "records_before_sha256",
+        "snapshot_sha256",
+    ):
+        validate_sha256(document[key], key)
+    if document["kind"] not in {"lower_ttl", "cutover", "rollback"}:
+        raise CutoverError("stored plan kind is invalid")
+    if (
+        not isinstance(document["created_at"], int)
+        or not isinstance(document["expires_at"], int)
+        or document["expires_at"] - document["created_at"] != PLAN_TTL_SECONDS
+        or document["created_at_iso"] != iso_time(document["created_at"])
+        or document["expires_at_iso"] != iso_time(document["expires_at"])
+    ):
+        raise CutoverError("stored plan time bounds are invalid")
+    records = canonical_records(document["records_before"])
+    if record_set_digest(records) != document["records_before_sha256"]:
+        raise CutoverError("stored plan record snapshot digest differs")
+    if protected_digest(records) != document["protected_records_sha256"]:
+        raise CutoverError("stored plan protected record digest differs")
+    operations = validate_operations(document["kind"], document["operations"])
+    validated = dict(document)
+    validated["records_before"] = records
+    validated["operations"] = operations
+    unsigned = dict(validated)
+    supplied_digest = unsigned.pop("plan_sha256")
+    if digest_object(unsigned) != supplied_digest:
+        raise CutoverError("stored plan SHA-256 differs")
+    return validated
+
+
+def validate_snapshot_document(document: Any) -> dict[str, Any]:
+    expected_keys = {
+        "authority",
+        "authority_sha256",
+        "captured_at",
+        "captured_at_iso",
+        "contract",
+        "export_sha256",
+        "protected_records_sha256",
+        "records",
+        "records_sha256",
+        "schema_version",
+        "snapshot_sha256",
+        "transaction_id",
+        "zone",
+    }
+    if not isinstance(document, dict) or set(document) != expected_keys:
+        raise CutoverError("stored zone snapshot does not use the exact schema")
+    if document["contract"] != SNAPSHOT_CONTRACT or document["schema_version"] != 1 or document["zone"] != ZONE:
+        raise CutoverError("stored zone snapshot differs from the fixed contract")
+    validate_plan_id(document["transaction_id"], "transaction identifier")
+    for key in (
+        "authority_sha256",
+        "export_sha256",
+        "protected_records_sha256",
+        "records_sha256",
+        "snapshot_sha256",
+    ):
+        validate_sha256(document[key], key)
+    if not isinstance(document["captured_at"], int) or document["captured_at_iso"] != iso_time(document["captured_at"]):
+        raise CutoverError("stored zone snapshot capture time is invalid")
+    records = canonical_records(document["records"])
+    authority = validate_authority(document["authority"])
+    require_baseline(records)
+    if (
+        record_set_digest(records) != document["records_sha256"]
+        or protected_digest(records) != document["protected_records_sha256"]
+    ):
+        raise CutoverError("stored zone snapshot digest differs")
+    if digest_object(authority) != document["authority_sha256"]:
+        raise CutoverError("stored authoritative DNS snapshot digest differs")
+    unsigned = dict(document)
+    supplied_digest = unsigned.pop("snapshot_sha256")
+    if digest_object(unsigned) != supplied_digest:
+        raise CutoverError("stored zone snapshot SHA-256 differs")
+    result = dict(document)
+    result["records"] = records
+    result["authority"] = authority
+    return result
+
+
+class Controller:
+    def __init__(
+        self,
+        paths: RuntimePaths,
+        policy: Policy,
+        *,
+        api: ZoneApi | None = None,
+        dns: DnsReader | None = None,
+        now: Callable[[], float] = time.time,
+        identifier: Callable[[], str] = lambda: secrets.token_hex(16),
+    ):
+        self.paths = paths
+        self.policy = policy
+        self.store = StateStore(paths)
+        self._api = api
+        self._dns = dns
+        self.now = now
+        self.identifier = identifier
+
+    @property
+    def api(self) -> ZoneApi:
+        require_active(self.policy)
+        if self._api is None:
+            credentials = load_credentials(
+                self.policy.credential_root,
+                self.paths.expected_uid,
+                self.paths.expected_gid,
+            )
+            self._api = OvhZoneApi(credentials, now=self.now)
+        return self._api
+
+    @property
+    def dns(self) -> DnsReader:
+        if self._dns is None:
+            self._dns = DigDnsReader(self.paths.dig)
+        return self._dns
+
+    def doctor(self) -> dict[str, Any]:
+        return {
+            "activation_policy": self.policy.activation_policy,
+            "atlas_ipv4": ATLAS_IPV4,
+            "enabled": self.policy.enabled,
+            "mutations_available": self.policy.enabled
+            and self.policy.activation_policy == "ready",
+            "zone": ZONE,
+        }
+
+    def _capture_zone(self) -> tuple[list[dict[str, Any]], bytes]:
+        records_before = self.api.list_records()
+        export_data = self.api.export_zone()
+        records_after = self.api.list_records()
+        if not records_match(records_after, records_before):
+            raise CutoverError("zone changed while the complete API export was captured")
+        return records_after, export_data
+
+    def _new_identifier(self, label: str) -> str:
+        value = self.identifier()
+        return validate_plan_id(value, label)
+
+    def _active(self) -> dict[str, Any] | None:
+        active = self.store.optional_json(self.paths.active, "active transaction state")
+        if active is None:
+            return None
+        if (
+            not isinstance(active, dict)
+            or active.get("contract") != "surplasse-dns-cutover-active"
+            or active.get("schema_version") != 1
+        ):
+            raise CutoverError("active transaction state has an invalid contract")
+        validate_plan_id(active.get("transaction_id", ""), "transaction identifier")
+        if active.get("phase") not in {
+            "planned_ttl",
+            "ttl_lowered",
+            "planned_cutover",
+            "cutover",
+            "planned_rollback",
+            "rolled_back",
+        }:
+            raise CutoverError("active transaction state has an invalid phase")
+        validate_sha256(active.get("snapshot_sha256", ""), "active snapshot SHA-256")
+        return active
+
+    def _write_active(self, value: dict[str, Any]) -> None:
+        self.store.write_json(self.paths.active, value)
+
+    def _snapshot(self, transaction_id: str) -> dict[str, Any]:
+        snapshot = validate_snapshot_document(
+            self.store.read_json(
+                self.store.snapshot_path(transaction_id), "zone snapshot"
+            )
+        )
+        export_path = self.store.export_path(f"{transaction_id}.snapshot.zone")
+        export_data = read_protected(
+            export_path,
+            self.paths.expected_uid,
+            self.paths.expected_gid,
+            MAX_API_RESPONSE_BYTES,
+        )
+        if digest_bytes(export_data) != snapshot["export_sha256"]:
+            raise CutoverError("stored raw zone export digest differs")
+        return snapshot
+
+    def _require_authority(self, snapshot: dict[str, Any]) -> None:
+        current = capture_authority(self.dns)
+        if current != snapshot["authority"]:
+            raise CutoverError("delegated NS or SOA state changed after the canonical snapshot")
+
+    def _write_snapshot(
+        self,
+        transaction_id: str,
+        records: list[dict[str, Any]],
+        export_data: bytes,
+        authority: dict[str, Any],
+        timestamp: int,
+    ) -> dict[str, Any]:
+        require_baseline(records)
+        export_sha = digest_bytes(export_data)
+        validated_authority = validate_authority(authority)
+        snapshot: dict[str, Any] = {
+            "authority": validated_authority,
+            "authority_sha256": digest_object(validated_authority),
+            "captured_at": timestamp,
+            "captured_at_iso": iso_time(timestamp),
+            "contract": SNAPSHOT_CONTRACT,
+            "export_sha256": export_sha,
+            "protected_records_sha256": protected_digest(records),
+            "records": canonical_records(records),
+            "records_sha256": record_set_digest(records),
+            "schema_version": 1,
+            "transaction_id": transaction_id,
+            "zone": ZONE,
+        }
+        snapshot["snapshot_sha256"] = digest_object(snapshot)
+        atomic_write(
+            self.store.export_path(f"{transaction_id}.snapshot.zone"), export_data
+        )
+        self.store.write_json(self.store.snapshot_path(transaction_id), snapshot)
+        return validate_snapshot_document(snapshot)
+
+    def _write_plan(
+        self,
+        *,
+        kind: str,
+        transaction_id: str,
+        snapshot: dict[str, Any],
+        records: list[dict[str, Any]],
+        export_data: bytes,
+        operations: list[dict[str, Any]],
+        timestamp: int,
+    ) -> dict[str, Any]:
+        plan_id = self._new_identifier("plan identifier")
+        if self.store.plan_path(plan_id).exists():
+            raise CutoverError("generated plan identifier already exists")
+        pre_export_sha = digest_bytes(export_data)
+        plan: dict[str, Any] = {
+            "contract": PLAN_CONTRACT,
+            "created_at": timestamp,
+            "created_at_iso": iso_time(timestamp),
+            "expires_at": timestamp + PLAN_TTL_SECONDS,
+            "expires_at_iso": iso_time(timestamp + PLAN_TTL_SECONDS),
+            "kind": kind,
+            "operations": validate_operations(kind, operations),
+            "plan_id": plan_id,
+            "pre_export_sha256": pre_export_sha,
+            "protected_records_sha256": protected_digest(records),
+            "records_before": canonical_records(records),
+            "records_before_sha256": record_set_digest(records),
+            "schema_version": 1,
+            "snapshot_sha256": snapshot["snapshot_sha256"],
+            "transaction_id": transaction_id,
+            "zone": ZONE,
+        }
+        plan["plan_sha256"] = digest_object(plan)
+        atomic_write(self.store.export_path(f"{plan_id}.before.zone"), export_data)
+        self.store.write_json(self.store.plan_path(plan_id), plan)
+        return validate_plan_document(plan)
+
+    def _plan_summary(self, plan: dict[str, Any], *, not_before: int | None = None) -> dict[str, Any]:
+        changes = []
+        for operation in plan["operations"]:
+            before = operation["before"]
+            after = operation["after"]
+            changes.append(
+                {
+                    "method": operation["method"],
+                    "name": _fqdn((after or before)["subDomain"]),
+                    "type": "A",
+                    "before": None
+                    if before is None
+                    else {"target": before["target"], "ttl": before["ttl"]},
+                    "after": None
+                    if after is None
+                    else {"target": after["target"], "ttl": after["ttl"]},
+                }
+            )
+        summary: dict[str, Any] = {
+            "changes": changes,
+            "expires_at": plan["expires_at_iso"],
+            "kind": plan["kind"],
+            "plan_id": plan["plan_id"],
+            "plan_sha256": plan["plan_sha256"],
+            "snapshot_sha256": plan["snapshot_sha256"],
+            "transaction_id": plan["transaction_id"],
+            "warning": "OVH record writes are sequential and are not an atomic multi-record transaction.",
+            "zone": ZONE,
+        }
+        if not_before is not None:
+            summary["not_before"] = iso_time(not_before)
+        return summary
+
+    def plan(self) -> dict[str, Any]:
+        require_active(self.policy)
+        self.store.ensure()
+        timestamp = int(self.now())
+        with deployment_lock(self.paths):
+            records, export_data = self._capture_zone()
+            active = self._active()
+            if active is not None and active["phase"] in {
+                "planned_ttl",
+                "planned_cutover",
+            }:
+                old_plan_id = active.get("forward_plan_id")
+                if not isinstance(old_plan_id, str):
+                    raise CutoverError("active transaction lacks its forward plan")
+                old_plan = self._load_plan(old_plan_id)
+                if timestamp <= old_plan["expires_at"]:
+                    raise CutoverError("active forward plan has not expired")
+                if (
+                    self.store.journal_path(old_plan_id).exists()
+                    or self.store.result_path(old_plan_id).exists()
+                ):
+                    raise CutoverError("an expired forward plan already has execution state")
+                if not records_match(records, old_plan["records_before"]):
+                    raise CutoverError("DNS state changed after the expired forward plan")
+                snapshot = self._snapshot(active["transaction_id"])
+                self._require_authority(snapshot)
+                if protected_digest(records) != snapshot["protected_records_sha256"]:
+                    raise CutoverError("a protected DNS record changed after the expired plan")
+                replacement = self._write_plan(
+                    kind=old_plan["kind"],
+                    transaction_id=active["transaction_id"],
+                    snapshot=snapshot,
+                    records=records,
+                    export_data=export_data,
+                    operations=old_plan["operations"],
+                    timestamp=timestamp,
+                )
+                active["forward_plan_id"] = replacement["plan_id"]
+                self._write_active(active)
+                not_before = (
+                    active.get("not_before")
+                    if active["phase"] == "planned_cutover"
+                    else None
+                )
+                return self._plan_summary(replacement, not_before=not_before)
+            if active is None:
+                require_baseline(records)
+                transaction_id = self._new_identifier("transaction identifier")
+                authority = capture_authority(self.dns)
+                snapshot = self._write_snapshot(
+                    transaction_id, records, export_data, authority, timestamp
+                )
+                operations = [
+                    put_operation(
+                        require_exact_a(records, "", BASELINE_IPV4, BASELINE_TTL),
+                        replace_record(
+                            require_exact_a(records, "", BASELINE_IPV4, BASELINE_TTL),
+                            target=BASELINE_IPV4,
+                            ttl=CUTOVER_TTL,
+                        ),
+                    ),
+                    put_operation(
+                        require_exact_a(records, "www", BASELINE_IPV4, BASELINE_TTL),
+                        replace_record(
+                            require_exact_a(records, "www", BASELINE_IPV4, BASELINE_TTL),
+                            target=BASELINE_IPV4,
+                            ttl=CUTOVER_TTL,
+                        ),
+                    ),
+                ]
+                plan = self._write_plan(
+                    kind="lower_ttl",
+                    transaction_id=transaction_id,
+                    snapshot=snapshot,
+                    records=records,
+                    export_data=export_data,
+                    operations=operations,
+                    timestamp=timestamp,
+                )
+                self._write_active(
+                    {
+                        "contract": "surplasse-dns-cutover-active",
+                        "forward_plan_id": plan["plan_id"],
+                        "phase": "planned_ttl",
+                        "schema_version": 1,
+                        "snapshot_sha256": snapshot["snapshot_sha256"],
+                        "transaction_id": transaction_id,
+                    }
+                )
+                return self._plan_summary(plan)
+
+            if active["phase"] != "ttl_lowered":
+                raise CutoverError("active DNS transaction is not ready for another forward plan")
+            not_before = active.get("not_before")
+            if not isinstance(not_before, int) or timestamp < not_before:
+                raise CutoverError("cutover cannot be planned before the full previous TTL has elapsed")
+            if active.get("forward_result_status") != "verified":
+                raise CutoverError("TTL lowering must have a verified result before cutover planning")
+            require_lowered(records)
+            snapshot = self._snapshot(active["transaction_id"])
+            self._require_authority(snapshot)
+            if active["snapshot_sha256"] != snapshot["snapshot_sha256"]:
+                raise CutoverError("active transaction snapshot digest differs")
+            if protected_digest(records) != snapshot["protected_records_sha256"]:
+                raise CutoverError("a protected DNS record changed after TTL lowering")
+            operations = [
+                post_operation(
+                    {
+                        "fieldType": "A",
+                        "subDomain": "*",
+                        "target": ATLAS_IPV4,
+                        "ttl": CUTOVER_TTL,
+                    }
+                ),
+                put_operation(
+                    require_exact_a(records, "", BASELINE_IPV4, CUTOVER_TTL),
+                    replace_record(
+                        require_exact_a(records, "", BASELINE_IPV4, CUTOVER_TTL),
+                        target=ATLAS_IPV4,
+                        ttl=CUTOVER_TTL,
+                    ),
+                ),
+                put_operation(
+                    require_exact_a(records, "www", BASELINE_IPV4, CUTOVER_TTL),
+                    replace_record(
+                        require_exact_a(records, "www", BASELINE_IPV4, CUTOVER_TTL),
+                        target=ATLAS_IPV4,
+                        ttl=CUTOVER_TTL,
+                    ),
+                ),
+            ]
+            plan = self._write_plan(
+                kind="cutover",
+                transaction_id=active["transaction_id"],
+                snapshot=snapshot,
+                records=records,
+                export_data=export_data,
+                operations=operations,
+                timestamp=timestamp,
+            )
+            active.update({"forward_plan_id": plan["plan_id"], "phase": "planned_cutover"})
+            self._write_active(active)
+            return self._plan_summary(plan, not_before=not_before)
+
+    def plan_rollback(self, transaction_id: str) -> dict[str, Any]:
+        require_active(self.policy)
+        self.store.ensure()
+        transaction_id = validate_plan_id(transaction_id, "transaction identifier")
+        timestamp = int(self.now())
+        with deployment_lock(self.paths):
+            active = self._active()
+            if active is None or active["transaction_id"] != transaction_id:
+                raise CutoverError("rollback transaction is not the active DNS transaction")
+            if active["phase"] == "planned_rollback":
+                old_plan_id = active.get("rollback_plan_id")
+                if not isinstance(old_plan_id, str):
+                    raise CutoverError("active transaction lacks its rollback plan")
+                old_plan = self._load_plan(old_plan_id)
+                if timestamp <= old_plan["expires_at"]:
+                    raise CutoverError("active rollback plan has not expired")
+                if (
+                    self.store.journal_path(old_plan_id).exists()
+                    or self.store.result_path(old_plan_id).exists()
+                ):
+                    raise CutoverError("an expired rollback plan already has execution state")
+                records, export_data = self._capture_zone()
+                if not records_match(records, old_plan["records_before"]):
+                    raise CutoverError("DNS state changed after the expired rollback plan")
+                snapshot = self._snapshot(transaction_id)
+                self._require_authority(snapshot)
+                if protected_digest(records) != snapshot["protected_records_sha256"]:
+                    raise CutoverError("a protected DNS record changed after the expired rollback plan")
+                replacement = self._write_plan(
+                    kind="rollback",
+                    transaction_id=transaction_id,
+                    snapshot=snapshot,
+                    records=records,
+                    export_data=export_data,
+                    operations=old_plan["operations"],
+                    timestamp=timestamp,
+                )
+                active["rollback_plan_id"] = replacement["plan_id"]
+                self._write_active(active)
+                return self._plan_summary(replacement)
+            if active["phase"] not in {"ttl_lowered", "cutover"}:
+                raise CutoverError("active DNS transaction is not in a rollback-eligible phase")
+            snapshot = self._snapshot(transaction_id)
+            self._require_authority(snapshot)
+            records, export_data = self._capture_zone()
+            if protected_digest(records) != snapshot["protected_records_sha256"]:
+                raise CutoverError("a protected DNS record changed before rollback planning")
+            forward_plan_id = active.get("forward_plan_id")
+            if not isinstance(forward_plan_id, str):
+                raise CutoverError("active transaction lacks its forward plan")
+            forward_plan = self._load_plan(forward_plan_id)
+            expected_current = simulate_operations(
+                forward_plan["records_before"],
+                forward_plan["operations"],
+                len(forward_plan["operations"]),
+            )
+            if not records_match(records, expected_current):
+                raise CutoverError("current DNS state differs from the applied forward plan")
+            original_apex = require_exact_a(
+                snapshot["records"], "", BASELINE_IPV4, BASELINE_TTL
+            )
+            original_www = require_exact_a(
+                snapshot["records"], "www", BASELINE_IPV4, BASELINE_TTL
+            )
+            operations: list[dict[str, Any]] = []
+            if active["phase"] == "cutover":
+                operations.append(
+                    delete_operation(
+                        require_exact_a(records, "*", ATLAS_IPV4, CUTOVER_TTL)
+                    )
+                )
+            current_target = (
+                ATLAS_IPV4 if active["phase"] == "cutover" else BASELINE_IPV4
+            )
+            operations.extend(
+                [
+                    put_operation(
+                        require_exact_a(records, "", current_target, CUTOVER_TTL),
+                        original_apex,
+                    ),
+                    put_operation(
+                        require_exact_a(records, "www", current_target, CUTOVER_TTL),
+                        original_www,
+                    ),
+                ]
+            )
+            plan = self._write_plan(
+                kind="rollback",
+                transaction_id=transaction_id,
+                snapshot=snapshot,
+                records=records,
+                export_data=export_data,
+                operations=operations,
+                timestamp=timestamp,
+            )
+            active.update(
+                {
+                    "phase_before_rollback": active["phase"],
+                    "phase": "planned_rollback",
+                    "rollback_plan_id": plan["plan_id"],
+                }
+            )
+            self._write_active(active)
+            return self._plan_summary(plan)
+
+    def _load_plan(self, plan_id: str, supplied_sha256: str | None = None) -> dict[str, Any]:
+        plan_id = validate_plan_id(plan_id)
+        plan = validate_plan_document(
+            self.store.read_json(self.store.plan_path(plan_id), "stored plan")
+        )
+        if plan["plan_id"] != plan_id:
+            raise CutoverError("stored plan identifier differs from its file name")
+        if supplied_sha256 is not None:
+            validate_sha256(supplied_sha256, "confirmed plan SHA-256")
+            if not hmac.compare_digest(plan["plan_sha256"], supplied_sha256):
+                raise CutoverError("confirmed plan SHA-256 differs from the stored plan")
+        export_data = read_protected(
+            self.store.export_path(f"{plan_id}.before.zone"),
+            self.paths.expected_uid,
+            self.paths.expected_gid,
+            MAX_API_RESPONSE_BYTES,
+        )
+        if digest_bytes(export_data) != plan["pre_export_sha256"]:
+            raise CutoverError("stored pre-mutation zone export digest differs")
+        snapshot = self._snapshot(plan["transaction_id"])
+        if snapshot["snapshot_sha256"] != plan["snapshot_sha256"]:
+            raise CutoverError("stored plan refers to a different zone snapshot")
+        return plan
+
+    def _validate_active_plan(self, active: dict[str, Any], plan: dict[str, Any]) -> None:
+        if active["transaction_id"] != plan["transaction_id"] or active["snapshot_sha256"] != plan["snapshot_sha256"]:
+            raise CutoverError("active transaction differs from the confirmed plan")
+        expected_phase = {
+            "lower_ttl": "planned_ttl",
+            "cutover": "planned_cutover",
+            "rollback": "planned_rollback",
+        }[plan["kind"]]
+        expected_key = "rollback_plan_id" if plan["kind"] == "rollback" else "forward_plan_id"
+        if active["phase"] != expected_phase or active.get(expected_key) != plan["plan_id"]:
+            raise CutoverError("confirmed plan is not the active transaction step")
+
+    def _initial_journal(self, plan: dict[str, Any], timestamp: int) -> dict[str, Any]:
+        return {
+            "api_mutations": [],
+            "contract": JOURNAL_CONTRACT,
+            "created_at": timestamp,
+            "cursor": 0,
+            "plan_id": plan["plan_id"],
+            "plan_sha256": plan["plan_sha256"],
+            "refreshed_at": None,
+            "schema_version": 1,
+            "status": "applying",
+            "transaction_id": plan["transaction_id"],
+            "updated_at": timestamp,
+        }
+
+    def _validate_journal(self, value: Any, plan: dict[str, Any]) -> dict[str, Any]:
+        expected_keys = {
+            "api_mutations",
+            "contract",
+            "created_at",
+            "cursor",
+            "plan_id",
+            "plan_sha256",
+            "refreshed_at",
+            "schema_version",
+            "status",
+            "transaction_id",
+            "updated_at",
+        }
+        if not isinstance(value, dict) or set(value) != expected_keys:
+            raise CutoverError("transaction journal does not use the exact schema")
+        if (
+            value["contract"] != JOURNAL_CONTRACT
+            or value["schema_version"] != 1
+            or value["plan_id"] != plan["plan_id"]
+            or value["plan_sha256"] != plan["plan_sha256"]
+            or value["transaction_id"] != plan["transaction_id"]
+            or value["status"] not in {"applying", "refresh_pending", "refresh_complete", "complete"}
+            or not isinstance(value["cursor"], int)
+            or not 0 <= value["cursor"] <= len(plan["operations"])
+            or not isinstance(value["api_mutations"], list)
+            or len(value["api_mutations"]) != value["cursor"]
+            or not isinstance(value["created_at"], int)
+            or not isinstance(value["updated_at"], int)
+            or (value["refreshed_at"] is not None and not isinstance(value["refreshed_at"], int))
+        ):
+            raise CutoverError("transaction journal differs from the confirmed plan")
+        return dict(value)
+
+    def _write_journal(self, plan_id: str, journal: dict[str, Any]) -> None:
+        self.store.write_json(self.store.journal_path(plan_id), journal)
+
+    def _execute_operation(self, operation: dict[str, Any]) -> int | None:
+        method = operation["method"]
+        if method == "PUT":
+            self.api.put_record(operation["record_id"], operation["after"])
+            return operation["record_id"]
+        if method == "POST":
+            created = self.api.post_record(operation["after"])
+            if any(created[key] != operation["after"][key] for key in ("fieldType", "subDomain", "target", "ttl")):
+                raise CutoverError("OVH API returned a different created record")
+            return created["id"]
+        if method == "DELETE":
+            self.api.delete_record(operation["record_id"])
+            return operation["record_id"]
+        raise CutoverError("journal requested an invalid operation")
+
+    def _observe_operation_id(
+        self, operation: dict[str, Any], records: list[dict[str, Any]]
+    ) -> int | None:
+        if operation["method"] != "POST":
+            return operation.get("record_id")
+        matches = [
+            record
+            for record in records
+            if all(record[key] == operation["after"][key] for key in ("fieldType", "subDomain", "target", "ttl"))
+        ]
+        if len(matches) != 1:
+            raise CutoverError("created wildcard record identity is ambiguous")
+        return matches[0]["id"]
+
+    def _resume_mutations(self, plan: dict[str, Any], journal: dict[str, Any]) -> dict[str, Any]:
+        operations = plan["operations"]
+        while journal["cursor"] < len(operations):
+            index = journal["cursor"]
+            operation = operations[index]
+            current = self.api.list_records()
+            if protected_digest(current) != plan["protected_records_sha256"]:
+                raise CutoverError("a protected DNS record changed during the transaction")
+            before = simulate_operations(plan["records_before"], operations, index)
+            after = simulate_operations(plan["records_before"], operations, index + 1)
+            if records_match(current, before):
+                self._execute_operation(operation)
+                current = self.api.list_records()
+                if not records_match(current, after):
+                    raise CutoverError("OVH API write did not produce the planned record state")
+                observation = "written"
+            elif records_match(current, after):
+                observation = "observed_after_interruption"
+            else:
+                raise CutoverError("DNS state differs from both sides of the next planned write")
+            record_id = self._observe_operation_id(operation, current)
+            journal["api_mutations"].append(
+                {
+                    "index": index,
+                    "method": operation["method"],
+                    "record_id": record_id,
+                    "status": observation,
+                }
+            )
+            journal["cursor"] = index + 1
+            journal["updated_at"] = int(self.now())
+            self._write_journal(plan["plan_id"], journal)
+        return journal
+
+    def _result_summary(self, result: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "api_mutations": result["api_mutations"],
+            "api_readback": result["api_readback"],
+            "dns_authoritative": result["dns"]["authoritative"],
+            "dns_recursive": result["dns"]["recursive"],
+            "plan_id": result["plan_id"],
+            "refresh": result["refresh"],
+            "status": result["status"],
+            "transaction_id": result["transaction_id"],
+        }
+
+    def _update_active_after_result(self, plan: dict[str, Any], result: dict[str, Any]) -> None:
+        active = self._active()
+        if active is None or active["transaction_id"] != plan["transaction_id"]:
+            raise CutoverError("active transaction disappeared before result commit")
+        if plan["kind"] == "lower_ttl":
+            refreshed_at = result["refresh"]["completed_at"]
+            ttl_anchor = (
+                result["completed_at"]
+                if result["status"] == "verified"
+                else refreshed_at
+            )
+            active.update(
+                {
+                    "forward_plan_id": plan["plan_id"],
+                    "forward_result_status": result["status"],
+                    "not_before": ttl_anchor + TTL_WAIT_SECONDS,
+                    "phase": "ttl_lowered",
+                    "ttl_lowered_at": ttl_anchor,
+                }
+            )
+        elif plan["kind"] == "cutover":
+            active.update(
+                {
+                    "forward_plan_id": plan["plan_id"],
+                    "forward_result_status": result["status"],
+                    "phase": "cutover",
+                }
+            )
+        else:
+            active.update(
+                {
+                    "phase": "rolled_back",
+                    "rollback_plan_id": plan["plan_id"],
+                    "rollback_result_status": result["status"],
+                }
+            )
+        self._write_active(active)
+
+    def _complete(self, plan: dict[str, Any], journal: dict[str, Any]) -> dict[str, Any]:
+        snapshot = self._snapshot(plan["transaction_id"])
+        self._require_authority(snapshot)
+        journal = self._resume_mutations(plan, journal)
+        if journal["status"] == "applying":
+            journal["status"] = "refresh_pending"
+            journal["updated_at"] = int(self.now())
+            self._write_journal(plan["plan_id"], journal)
+        if journal["status"] == "refresh_pending":
+            self.api.refresh()
+            journal["refreshed_at"] = int(self.now())
+            journal["status"] = "refresh_complete"
+            journal["updated_at"] = journal["refreshed_at"]
+            self._write_journal(plan["plan_id"], journal)
+        if journal["status"] != "refresh_complete":
+            raise CutoverError("transaction journal cannot enter final readback")
+
+        records = self.api.list_records()
+        expected = simulate_operations(
+            plan["records_before"], plan["operations"], len(plan["operations"])
+        )
+        if not records_match(records, expected):
+            raise CutoverError("API readback differs from the complete planned record state")
+        if protected_digest(records) != snapshot["protected_records_sha256"]:
+            raise CutoverError("API readback changed a protected DNS record")
+        if plan["kind"] == "lower_ttl":
+            require_lowered(records)
+        elif plan["kind"] == "cutover":
+            require_cutover(records)
+        else:
+            if not records_match(records, snapshot["records"]):
+                raise CutoverError("rollback API readback does not restore the canonical snapshot")
+            require_baseline(records)
+        records_after_read, export_data = self._capture_zone()
+        if not records_match(records_after_read, records):
+            raise CutoverError("DNS state changed during the final export capture")
+        after_path = self.store.export_path(f"{plan['plan_id']}.after.zone")
+        atomic_write(after_path, export_data)
+        try:
+            dns_result = verify_dns(
+                self.dns,
+                plan["kind"],
+                snapshot["records"],
+                snapshot["authority"],
+                plan["plan_id"],
+            )
+        except CutoverError:
+            dns_result = {
+                "authoritative": [],
+                "recursive": [],
+                "verified": False,
+            }
+        status_value = "verified" if dns_result["verified"] else "applied_unverified"
+        result: dict[str, Any] = {
+            "api_mutations": journal["api_mutations"],
+            "api_readback": {
+                "export_sha256": digest_bytes(export_data),
+                "protected_records_sha256": protected_digest(records),
+                "records_sha256": record_set_digest(records),
+                "status": "exact",
+            },
+            "completed_at": int(self.now()),
+            "contract": RESULT_CONTRACT,
+            "dns": dns_result,
+            "kind": plan["kind"],
+            "plan_id": plan["plan_id"],
+            "plan_sha256": plan["plan_sha256"],
+            "refresh": {
+                "completed_at": journal["refreshed_at"],
+                "status": "requested",
+            },
+            "schema_version": 1,
+            "status": status_value,
+            "transaction_id": plan["transaction_id"],
+            "verification_attempts": 0,
+        }
+        self.store.write_json(self.store.result_path(plan["plan_id"]), result)
+        self._update_active_after_result(plan, result)
+        journal["status"] = "complete"
+        journal["updated_at"] = int(self.now())
+        self._write_journal(plan["plan_id"], journal)
+        return self._result_summary(result)
+
+    def apply(self, plan_id: str, plan_sha256: str) -> dict[str, Any]:
+        require_active(self.policy)
+        self.store.ensure()
+        with deployment_lock(self.paths):
+            plan = self._load_plan(plan_id, plan_sha256)
+            if self.store.result_path(plan["plan_id"]).exists():
+                raise CutoverError("confirmed plan was already applied")
+            if self.store.journal_path(plan["plan_id"]).exists():
+                raise CutoverError("confirmed plan already has a journal; use recover")
+            if int(self.now()) > plan["expires_at"]:
+                raise CutoverError("confirmed plan has expired")
+            active = self._active()
+            if active is None:
+                raise CutoverError("confirmed plan has no active transaction")
+            self._validate_active_plan(active, plan)
+            records = self.api.list_records()
+            if not records_match(records, plan["records_before"]):
+                raise CutoverError("DNS state changed after planning")
+            if protected_digest(records) != plan["protected_records_sha256"]:
+                raise CutoverError("a protected DNS record changed after planning")
+            records_after_read, apply_export = self._capture_zone()
+            if not records_match(records_after_read, records):
+                raise CutoverError("DNS state changed during the apply export capture")
+            atomic_write(
+                self.store.export_path(f"{plan['plan_id']}.apply.zone"),
+                apply_export,
+            )
+            journal = self._initial_journal(plan, int(self.now()))
+            self._write_journal(plan["plan_id"], journal)
+            return self._complete(plan, journal)
+
+    def recover(self, plan_id: str, plan_sha256: str) -> dict[str, Any]:
+        require_active(self.policy)
+        self.store.ensure()
+        with deployment_lock(self.paths):
+            plan = self._load_plan(plan_id, plan_sha256)
+            result_path = self.store.result_path(plan["plan_id"])
+            if result_path.exists():
+                result = self.store.read_json(result_path, "transaction result")
+                if not isinstance(result, dict) or result.get("plan_sha256") != plan["plan_sha256"]:
+                    raise CutoverError("stored result differs from the confirmed plan")
+                active = self._active()
+                if active is not None and active["phase"] in {
+                    "planned_ttl",
+                    "planned_cutover",
+                    "planned_rollback",
+                }:
+                    self._update_active_after_result(plan, result)
+                return self._result_summary(result)
+            journal_path = self.store.journal_path(plan["plan_id"])
+            if not journal_path.exists():
+                raise CutoverError("confirmed plan has no recovery journal")
+            journal = self._validate_journal(
+                self.store.read_json(journal_path, "transaction journal"), plan
+            )
+            if journal["status"] == "complete":
+                raise CutoverError("completed plan has no recoverable work")
+            active = self._active()
+            if active is None:
+                raise CutoverError("recovery plan has no active transaction")
+            self._validate_active_plan(active, plan)
+            return self._complete(plan, journal)
+
+    def verify(self, plan_id: str) -> dict[str, Any]:
+        require_active(self.policy)
+        self.store.ensure()
+        with deployment_lock(self.paths):
+            plan = self._load_plan(plan_id)
+            result_path = self.store.result_path(plan["plan_id"])
+            if not result_path.exists():
+                raise CutoverError("plan has no applied result to verify")
+            result = self.store.read_json(result_path, "transaction result")
+            if (
+                not isinstance(result, dict)
+                or result.get("contract") != RESULT_CONTRACT
+                or result.get("plan_sha256") != plan["plan_sha256"]
+                or result.get("status") != "applied_unverified"
+                or result.get("verification_attempts") != 0
+            ):
+                raise CutoverError("plan is not eligible for its one separate verification")
+            records = self.api.list_records()
+            expected = simulate_operations(
+                plan["records_before"], plan["operations"], len(plan["operations"])
+            )
+            snapshot = self._snapshot(plan["transaction_id"])
+            if (
+                not records_match(records, expected)
+                or protected_digest(records) != snapshot["protected_records_sha256"]
+            ):
+                raise CutoverError("API state changed before separate DNS verification")
+            dns_result = verify_dns(
+                self.dns,
+                plan["kind"],
+                snapshot["records"],
+                snapshot["authority"],
+                plan["plan_id"],
+            )
+            result["dns"] = dns_result
+            result["verification_attempts"] = 1
+            result["verified_at"] = int(self.now())
+            result["status"] = (
+                "verified" if dns_result["verified"] else "verification_failed"
+            )
+            self.store.write_json(result_path, result)
+            active = self._active()
+            if active is None or active["transaction_id"] != plan["transaction_id"]:
+                raise CutoverError("active transaction differs before verification commit")
+            status_key = (
+                "rollback_result_status"
+                if plan["kind"] == "rollback"
+                else "forward_result_status"
+            )
+            active[status_key] = result["status"]
+            if plan["kind"] == "lower_ttl" and result["status"] == "verified":
+                active["ttl_lowered_at"] = result["verified_at"]
+                active["not_before"] = result["verified_at"] + TTL_WAIT_SECONDS
+            self._write_active(active)
+            return self._result_summary(result)
+
+
+def _fqdn(subdomain: str) -> str:
+    if subdomain == "":
+        return ZONE
+    return f"{subdomain}.{ZONE}"
+
+
+def parser() -> UsageParser:
+    argument_parser = UsageParser(description=__doc__)
+    subparsers = argument_parser.add_subparsers(dest="command", required=True)
+    doctor = subparsers.add_parser("doctor")
+    doctor.add_argument("--json", action="store_true", required=True)
+    plan = subparsers.add_parser("plan")
+    plan.add_argument("--json", action="store_true", required=True)
+    rollback = subparsers.add_parser("plan-rollback")
+    rollback.add_argument("--transaction-id", required=True)
+    rollback.add_argument("--json", action="store_true", required=True)
+    for name in ("apply", "recover"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--plan-id", required=True)
+        command.add_argument("--plan-sha256", required=True)
+        command.add_argument("--json", action="store_true", required=True)
+    verify = subparsers.add_parser("verify")
+    verify.add_argument("--plan-id", required=True)
+    verify.add_argument("--json", action="store_true", required=True)
+    return argument_parser
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if os.geteuid() != 0:
+        print("Surplasse DNS cutover refused: root execution is required", file=sys.stderr)
+        return EX_CONFIG
+    try:
+        paths = RuntimePaths()
+        policy = load_policy(paths.policy, paths.expected_uid, paths.expected_gid)
+        controller = Controller(paths, policy)
+        if args.command == "doctor":
+            output = controller.doctor()
+        elif args.command == "plan":
+            output = controller.plan()
+        elif args.command == "plan-rollback":
+            output = controller.plan_rollback(args.transaction_id)
+        elif args.command == "apply":
+            output = controller.apply(args.plan_id, args.plan_sha256)
+        elif args.command == "recover":
+            output = controller.recover(args.plan_id, args.plan_sha256)
+        elif args.command == "verify":
+            output = controller.verify(args.plan_id)
+        else:
+            raise CutoverError("unknown command")
+    except CutoverError as exc:
+        print(f"Surplasse DNS cutover refused: {exc}", file=sys.stderr)
+        return EX_CONFIG
+    print(json.dumps(output, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

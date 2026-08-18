@@ -1591,7 +1591,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertEqual(
             [entry["role"] for entry in playbook[0]["roles"]],
-            ["public_static_edge"],
+            ["public_static_edge", "surplasse_dns_cutover"],
         )
         role_text = (
             ROOT / "ansible/roles/public_static_edge/tasks/main.yml"
