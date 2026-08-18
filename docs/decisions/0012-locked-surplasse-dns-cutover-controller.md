@@ -106,8 +106,9 @@ set back to its historical number.
 - The two-phase TTL procedure bounds cache exposure before the target change.
 - The journal supports explicit recovery without claiming API-level
   multi-record atomicity.
-- DNS success is separate from application and commercial activation. The
-  Surplasse application remains disabled and its adapter remains locked.
+- DNS success is separate from application and commercial activation. ADR-0013
+  enables canonical application admission, while this DNS policy and the
+  legacy adapter remain locked.
 
 ## Activation blockers retained
 

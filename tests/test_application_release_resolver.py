@@ -164,6 +164,189 @@ class AdmissionResolverTests(unittest.TestCase):
             manifest_response(second_manifest or first_manifest),
         ]
 
+    def test_ghcr_blob_redirect_is_one_hop_and_drops_authorization(self):
+        descriptor = release_bytes(self.surplasse)
+        digest = RESOLVER.content_digest(descriptor)
+        target = (
+            "https://pkg-containers.githubusercontent.com/ghcrblobs12/blobs/"
+            f"{digest}?se=2026-08-18T12%3A00%3A00Z&sig=signed-value"
+        )
+        client = FakeClient(
+            [
+                RESOLVER.HttpsRedirect(307, target),
+                response(descriptor),
+            ]
+        )
+
+        result = RESOLVER._registry_blob_response(
+            client,
+            "nclsppr/surplasse/application-release",
+            digest,
+            "registry-token",
+            max_bytes=RESOLVER.MAX_RELEASE_BYTES,
+        )
+
+        self.assertEqual(result.body, descriptor)
+        self.assertEqual(len(client.requests), 2)
+        first_url, first_headers, _, first_attempts = client.requests[0]
+        second_url, second_headers, _, second_attempts = client.requests[1]
+        self.assertEqual(
+            first_url,
+            f"https://ghcr.io/v2/nclsppr/surplasse/application-release/blobs/{digest}",
+        )
+        self.assertEqual(first_headers["Authorization"], "Bearer registry-token")
+        self.assertEqual(second_url, target)
+        self.assertNotIn("Authorization", second_headers)
+        self.assertEqual(second_headers, {"Accept": "application/octet-stream"})
+        self.assertEqual((first_attempts, second_attempts), (3, 3))
+
+    def test_ghcr_blob_direct_response_remains_accepted(self):
+        descriptor = release_bytes(self.surplasse)
+        digest = RESOLVER.content_digest(descriptor)
+        client = FakeClient([response(descriptor)])
+
+        result = RESOLVER._registry_blob_response(
+            client,
+            "nclsppr/surplasse/application-release",
+            digest,
+            "registry-token",
+            max_bytes=RESOLVER.MAX_RELEASE_BYTES,
+        )
+
+        self.assertEqual(result.body, descriptor)
+        self.assertEqual(len(client.requests), 1)
+
+    def test_ghcr_blob_redirect_rejects_every_target_boundary_bypass(self):
+        digest = DIGEST_A
+        valid = (
+            "https://pkg-containers.githubusercontent.com/ghcrblobs12/blobs/"
+            f"{digest}?se=2026-08-18T12%3A00%3A00Z&sig=do-not-log-this"
+        )
+        cases = (
+            ("status", 302, valid, "status-is-invalid"),
+            ("scheme", 307, valid.replace("https://", "http://"), "target-is-invalid"),
+            (
+                "host",
+                307,
+                valid.replace(
+                    "pkg-containers.githubusercontent.com",
+                    "pkg-containers.githubusercontent.com.example.invalid",
+                ),
+                "target-is-invalid",
+            ),
+            (
+                "port",
+                307,
+                valid.replace(
+                    "pkg-containers.githubusercontent.com",
+                    "pkg-containers.githubusercontent.com:443",
+                ),
+                "target-is-invalid",
+            ),
+            (
+                "userinfo",
+                307,
+                valid.replace(
+                    "pkg-containers.githubusercontent.com",
+                    "user@pkg-containers.githubusercontent.com",
+                ),
+                "target-is-invalid",
+            ),
+            ("fragment", 307, valid + "#fragment", "target-is-invalid"),
+            (
+                "path-prefix",
+                307,
+                valid.replace("/ghcrblobs12/", "/ghcr1/"),
+                "target-is-invalid",
+            ),
+            (
+                "wrong-digest",
+                307,
+                valid.replace(digest, DIGEST_B),
+                "target-is-invalid",
+            ),
+            ("missing-query", 307, valid.split("?", maxsplit=1)[0], "target-is-invalid"),
+            ("non-ascii", 307, valid + "&label=caf\u00e9", "location-is-not-ascii"),
+            (
+                "control-character",
+                307,
+                valid + "\n",
+                "location-characters-are-invalid",
+            ),
+            (
+                "oversized",
+                307,
+                valid + "&padding=" + ("a" * RESOLVER.MAX_REDIRECT_URL_BYTES),
+                "location-size-is-invalid",
+            ),
+            ("missing-location", 307, None, "location-is-missing"),
+        )
+        for name, status, location, reason in cases:
+            with self.subTest(name=name):
+                client = FakeClient([RESOLVER.HttpsRedirect(status, location)])
+                with self.assertRaisesRegex(RESOLVER.BlockedEvidence, reason) as raised:
+                    RESOLVER._registry_blob_response(
+                        client,
+                        "nclsppr/surplasse/application-release",
+                        digest,
+                        "registry-token",
+                        max_bytes=RESOLVER.MAX_RELEASE_BYTES,
+                    )
+                self.assertNotIn("do-not-log-this", str(raised.exception))
+                self.assertEqual(len(client.requests), 1)
+
+    def test_ghcr_blob_redirect_chain_is_rejected_without_leaking_target(self):
+        digest = DIGEST_A
+        first = (
+            "https://pkg-containers.githubusercontent.com/ghcrblobs12/blobs/"
+            f"{digest}?sig=first-secret"
+        )
+        second = (
+            "https://pkg-containers.githubusercontent.com/ghcrblobs12/blobs/"
+            f"{digest}?sig=second-secret"
+        )
+        client = FakeClient(
+            [
+                RESOLVER.HttpsRedirect(307, first),
+                RESOLVER.HttpsRedirect(307, second),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            RESOLVER.BlockedEvidence,
+            "redirect-chain-is-not-permitted",
+        ) as raised:
+            RESOLVER._registry_blob_response(
+                client,
+                "nclsppr/surplasse/application-release",
+                digest,
+                "registry-token",
+                max_bytes=RESOLVER.MAX_RELEASE_BYTES,
+            )
+        self.assertNotIn("first-secret", str(raised.exception))
+        self.assertNotIn("second-secret", str(raised.exception))
+        self.assertEqual(len(client.requests), 2)
+        self.assertNotIn("Authorization", client.requests[1][1])
+
+    def test_redirect_handler_captures_target_without_logging_it(self):
+        target = (
+            "https://pkg-containers.githubusercontent.com/ghcrblobs12/blobs/"
+            f"{DIGEST_A}?sig=handler-secret"
+        )
+        with self.assertRaises(RESOLVER.HttpsRedirect) as raised:
+            RESOLVER.RejectRedirects().redirect_request(
+                object(),
+                object(),
+                307,
+                "Temporary Redirect",
+                {"Location": target},
+                target,
+            )
+        self.assertEqual(raised.exception.status, 307)
+        self.assertEqual(raised.exception.location, target)
+        self.assertNotIn(target, str(raised.exception))
+        self.assertNotIn("handler-secret", str(raised.exception))
+
     def test_disabled_application_performs_zero_network_or_head_resolution(self):
         client = FakeClient()
         head = mock.Mock(side_effect=AssertionError("head resolver called"))

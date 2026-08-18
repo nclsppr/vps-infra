@@ -160,9 +160,9 @@ The generic controller can validate and plan. Static activation has its own
 reviewed gate. The 2026-08-18 rollout converged repository revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b` and proved that the root-owned
 `deploy-application` controller and its argument-free gate are installed.
-Surplasse and Parkventory are both `enabled: false` in the protected application
-contract, so the controller refuses them before any runtime validation or
-network operation. No application deployment workflow invokes the gate.
+Canonical Surplasse tester admission is enabled. Parkventory remains disabled.
+No application deployment workflow invokes the gate, and admission does not
+prove live runtime state.
 
 The deploy role declares GitHub CLI 2.97.0 from its official release archive.
 On convergence, it selects `amd64` or `arm64`, verifies the archive SHA-256,
@@ -214,8 +214,9 @@ recovery unit. On 2026-08-18 it was inactive after a successful recovery run
 edge. That ordering has the same Docker restart bypass described above.
 Application activation also requires an exact pre-staged public edge route and
 application-network attachment before it may run the dedicated migrator. The
-controller does not perform that platform cutover itself, and the current
-contracts keep both applications disabled.
+controller does not perform that platform cutover itself. Canonical Surplasse
+tester admission is enabled, but no workflow invokes the gate and Parkventory
+remains disabled.
 
 The caller supplies the application, the application source revision, the
 exact site and route references, the platform integration revision and
@@ -340,10 +341,12 @@ before accepting production data.
 
 Ansible creates seven external Docker networks with fixed properties. The
 isolated public static edge joins only `edge`. The locked complete platform
-definition joins only `ops` and `db_monitoring`. PostgreSQL joins only
-`db_monitoring`. Its Caddy and Prometheus services join only `ops`.
+definition uses `ops`, `db_monitoring`, and `db_surplasse`. PostgreSQL joins
+only `db_monitoring` and `db_surplasse`. Its Caddy and Prometheus services join
+only `ops`.
 
-The four application networks remain empty until a reviewed application
-integration package attaches the required services. An existing network with
-an unexpected driver, internal flag, CIDR, or management label stops
-convergence. Ansible does not delete that network.
+`db_surplasse` has PostgreSQL as its only platform member. The other application
+networks remain empty until a reviewed application integration package attaches
+the required services. An existing network with an unexpected driver, internal
+flag, CIDR, or management label stops convergence. Ansible does not delete that
+network.

@@ -3,9 +3,10 @@
 ## Current state
 
 The controller is installed as a locked candidate. It performs no OVHcloud
-request in this revision. The application release also remains disabled. This
-runbook defines the future operator sequence. It is not an activation
-instruction for the current revision.
+request in this revision. Canonical application admission is enabled, but the
+DNS policy remains independent and locked. This runbook defines the future
+operator sequence. It is not an activation instruction for the current
+revision.
 
 Run the read-only policy check:
 
@@ -13,7 +14,7 @@ Run the read-only policy check:
 sudo -n -- /usr/local/libexec/vps/surplasse-dns-cutover doctor --json
 ```
 
-Require `enabled: false`, `activation_policy: locked`, and
+Require the DNS policy values `enabled: false`, `activation_policy: locked`, and
 `mutations_available: false` until a separate reviewed activation change is
 ready.
 

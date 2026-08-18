@@ -26,6 +26,7 @@ vps_internal_platform_all_image_services:
 vps_internal_platform_network_contract:
   postgresql:
     - db_monitoring
+    - db_surplasse
   prometheus:
     - ops
   grafana:

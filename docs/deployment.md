@@ -9,7 +9,8 @@ No operator supplies an application SHA or digest to that workflow. Atlas then
 revalidates the exact source and artifacts through a bounded controller.
 
 Platform and Compose application promotion remain separate reviewed paths.
-Both Compose application entries are disabled. Atlas can fetch an explicit
+The canonical Surplasse tester admission entry is enabled. Parkventory and the
+legacy Compose entries remain disabled. Atlas can fetch an explicit
 infrastructure commit, but it never checks out an application branch and never
 builds application source.
 
@@ -133,9 +134,10 @@ même avec des champs de preuve syntaxiquement complets. Le manifeste commité
 garde donc la plateforme et les quatre applications désactivées. Le marqueur
 hôte et l’applicateur générique `apply-release` restent absents. Le rollout du
 18 août 2026 a installé le contrôleur Compose séparé depuis la révision convergée
-`da04a09bfa9788ae8127b63f9f3a6692bef2551b`. Les deux entrées restent
-`enabled: false` et sont refusées avant tout accès réseau ou runtime. Aucun
-workflow de déploiement applicatif n'invoque son gate root.
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b`. ADR-0013 active ensuite uniquement
+l'admission canonique Surplasse testeurs. Parkventory reste refusé avant tout
+accès réseau ou runtime. Aucun workflow de déploiement applicatif n'invoque le
+gate root.
 
 ### Locked platform candidate declaration
 
@@ -446,8 +448,8 @@ dedicated key and the same strict known-hosts model. It sends only the canonical
 the exact host lock `/run/lock/vps-static.lock` with this path; GitHub
 concurrency alone is not a sufficient exclusion boundary for operator-initiated
 commands. The 2026-08-18 rollout converged the controller and argument-free gate
-from revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`, but no application workflow
-invokes them while both application entries are disabled.
+from revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`. Canonical Surplasse
+admission is now enabled, but no application workflow invokes the gate.
 
 Le VPS n’héberge pas de runner GitHub Actions persistant. Un workflow arbitraire
 exécuté directement sur la machine de production aurait accès à ses volumes,
@@ -610,7 +612,7 @@ systemd unit. The unit survives the SSH client and runs `--recover-live` from
 its stop hook. This design does not depend on sudoers argument regex support,
 which Atlas `sudo-rs` does not provide.
 
-The disabled Compose application boundary uses the parallel canonical record:
+The Compose application boundary uses the parallel canonical record:
 
 ```text
 deploy-application-live <surplasse|parkventory> <source-sha40> \
@@ -625,8 +627,10 @@ bundle bytes, rendered Compose, root-owned secret metadata, exact migration and
 probe inventories, source ancestry, and the canonical source HEAD. It never
 stores secret bytes. It refuses migration until the immutable public-edge route
 equals the attested route and Caddy is healthy on the exact application network.
-Both protected application entries remain disabled, so this boundary currently
-stops before runtime validation or network access.
+Canonical Surplasse tester admission is enabled, but no application workflow
+invokes this boundary. Parkventory remains disabled and stops before runtime
+validation or network access. Surplasse still requires the explicit forced
+command and every runtime gate above.
 
 For Surplasse, the immutable integration contract contains the exact tester
 payment profile. Materialization and the first activation preflight both bind
@@ -875,23 +879,27 @@ make stop-internal-platform \
 ```
 
 After the internal platform is healthy, install the daily local PostgreSQL
-backup and monthly isolated restore rehearsal. Run one immediate backup and
-one rehearsal before an application migration. The local stage is explicitly
-not encrypted and not off-site. Follow
+backup and monthly isolated restore rehearsal. For the first Surplasse tester
+activation, one immediate backup and rehearsal are strongly recommended, but
+their absence is an explicitly accepted, non-blocking risk. They are mandatory
+before the real public launch and before any later schema-changing migration.
+The local stage is explicitly not encrypted and not off-site. Follow
 [`operations/postgresql-backup.md`](operations/postgresql-backup.md) for the
 commands, guarantees, and remaining disaster-recovery decision.
 
 ## Deploy a Compose application
 
-Both protected entries remain `enabled: false`. The controller is installed and
-its idle recovery is healthy, but no application deployment workflow or live
-application release exists. A future reviewed enablement must keep this order:
+The canonical Surplasse entry is `enabled: true`; Parkventory remains disabled.
+Admission does not invoke the gate, and no live application release follows from
+this repository change alone. A deliberate Surplasse activation must keep this
+order:
 
 1. render non-secret configuration from the immutable release;
 2. verify every root-owned secret file and exact service allocation;
 3. pull and attest the exact image and integration digests;
-4. prove the database, backup, restore, resource, and migration-compatibility
-   prerequisites;
+4. prove the database, resource, and migration-compatibility prerequisites, and
+   record the strongly recommended local backup and restore evidence or its
+   accepted absence for this first tester activation;
 5. prepare the immutable public-edge route and attach healthy Caddy to the exact
    application network;
 6. require that the installed route equals the attested route before any
@@ -937,8 +945,12 @@ Pendant une livraison :
 
 - un seul déploiement applicatif peut migrer à la fois ;
 - le wrapper détecte la présence de nouvelles migrations ;
-- une sauvegarde ou un point de restauration est exigé selon la politique à
-  définir ;
+- pour la première activation testeurs, la sauvegarde locale et la répétition
+  de restauration sont fortement recommandées, mais leur absence est un risque
+  accepté et non bloquant ;
+- avant l’ouverture publique réelle ou toute migration ultérieure, une
+  sauvegarde exploitable et une répétition de restauration réussie sont
+  exigées ;
 - les migrations incompatibles utilisent une stratégie expand/contract ;
 - une migration déjà appliquée n’est jamais « annulée » automatiquement.
 
@@ -960,13 +972,13 @@ rejects a history rollback. Follow the
 ### Application
 
 Use a reviewed release change and the same pipeline. A prepared-only failure can
-restore the previous runtime without a schema transition. After migration, the
-previous runtime may start only when an attested invariant proves compatibility
-with the changed schema. The current controller does not enforce that evidence,
-so both application entries must remain disabled. Before enablement, either add
-that enforced invariant or change recovery to stop for explicit forward repair.
-Git remains desired state and must receive a revert or corrective change before
-another reconciliation.
+restore the previous runtime without a schema transition. The first Surplasse
+tester activation has no previous application runtime, so ADR-0013 accepts this
+bounded initial case. After that activation, do not deploy a schema-changing
+release until an attested invariant proves that the previous runtime is
+compatible, or until recovery stops for explicit forward repair. Git remains
+desired state and must receive a revert or corrective change before another
+reconciliation.
 
 ### Plateforme
 
@@ -994,9 +1006,10 @@ le même VPS.
 
 `make prepare-surplasse` is a bounded production operation. It validates and
 stages the exact locked adapter before it changes database state. It creates
-only the missing database passwords. It then connects the healthy shared
-PostgreSQL container to `db_surplasse` for the provisioning transaction and
-removes that temporary connection.
+only the missing database passwords. It uses the healthy shared PostgreSQL
+container through its durable `db_surplasse` membership. Against an older
+platform revision only, the preparation role creates and then removes a
+temporary connection.
 
 The transaction creates one database owner with `NOLOGIN`, one migrator login,
 and one runtime login. The runtime role cannot create schema objects. No
@@ -1004,12 +1017,12 @@ service publishes port 5432. This operation does not start Surplasse, modify
 Caddy or Prometheus, consume OVH credentials, or change DNS.
 
 `make activate-surplasse` remains a fail-closed legacy-adapter command. The
-canonical producer now publishes an immutable application release and common
-integration bundle, but the legacy adapter does not become an activation path.
-The controller rejects activation before it changes the application or shared
-platform. A later review must prepare the exact route and network before the
-one-shot migration, satisfy every ADR-0010 blocker, start the runtime services,
-and verify strict internal and public probes.
+canonical producer publishes an immutable application release and common
+integration bundle, and ADR-0013 enables only the canonical admission path. The
+legacy adapter does not become an activation path. The operator must prepare
+the exact route and network before the one-shot migration and must satisfy the
+existing secret, SMTP, Stripe test, recovery, internal probe, and public HTTPS
+checks.
 
 ## Remaining changes by repository
 
@@ -1039,8 +1052,9 @@ public probes remain unproved.
 ### `surplasse`
 
 The canonical producer publishes independently pinned components, the common
-integration bundle, and one immutable application-release descriptor. Keep the
-Compose contract disabled while external networks, database and roles, secrets,
-SMTP, observability, edge route, migration compatibility, blue/green or
-maintenance cutover, resource budgets, retention, boot recovery, and strict
-public probes remain unproved.
+integration bundle, and one immutable application-release descriptor. Canonical
+tester admission is enabled, but the legacy adapter stays locked and admission
+is not live activation. Before the deliberate operator activation, prove the
+database and roles, secrets, SMTP, observability, edge route and network
+attachment, migration, resource budgets, boot recovery, and strict public
+probes.

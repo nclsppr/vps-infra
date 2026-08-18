@@ -231,8 +231,8 @@ records the active tuples without making them a mutable configuration source.
 ## Network boundaries
 
 Ansible creates seven external Docker networks. The isolated public static
-edge joins only `edge`. The locked complete platform definition continues to
-use `ops` and `db_monitoring`:
+edge joins only `edge`. The internal platform uses `ops`, `db_monitoring`, and
+the private Surplasse database network:
 
 | Network | Subnet | Reviewed members |
 |---|---|---|
@@ -240,7 +240,7 @@ use `ops` and `db_monitoring`:
 | `ops` | `172.30.30.0/24` | Locked complete platform Caddy, Prometheus, Grafana, and exporters |
 | `db_monitoring` | `172.30.31.0/24` | PostgreSQL and PostgreSQL Exporter |
 | `app_surplasse` | `172.30.10.0/24` | None |
-| `db_surplasse` | `172.30.11.0/24` | None |
+| `db_surplasse` | `172.30.11.0/24` | PostgreSQL |
 | `app_parkventory` | `172.30.20.0/24` | None |
 | `db_parkventory` | `172.30.21.0/24` | None |
 
@@ -248,10 +248,11 @@ A reviewed application integration package attaches only the required
 services to an application network. It must use a unique alias such as
 `surplasse-backend`. It must not use a generic alias such as `backend`.
 
-PostgreSQL does not join `ops`. Caddy, Grafana, and Prometheus have no direct
-TCP path to PostgreSQL. PostgreSQL Exporter joins `db_monitoring` for SQL access
-and `ops` for metrics access. Database roles and `pg_hba.conf` enforce the
-database authorization boundary.
+PostgreSQL joins `db_monitoring` and `db_surplasse`, with the stable
+`postgresql` alias on both. It does not join `ops`. Caddy, Grafana, and
+Prometheus have no direct TCP path to PostgreSQL. PostgreSQL Exporter joins
+`db_monitoring` for SQL access and `ops` for metrics access. Database roles and
+`pg_hba.conf` enforce the database authorization boundary.
 
 The isolated public static edge does not join `ops`. The exact Compose policy
 rejects an `ops` attachment for this unit.

@@ -1128,15 +1128,12 @@ class SurplasseControllerTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(set(internal["services"]), {"postgresql", "prometheus"})
-        self.assertEqual(
-            set(internal["services"]["postgresql"]["networks"]),
-            {"db_monitoring", "db_surplasse"},
-        )
+        self.assertEqual(set(internal["services"]), {"prometheus"})
         self.assertEqual(
             set(internal["services"]["prometheus"]["networks"]),
             {"ops", "app_surplasse"},
         )
+        self.assertNotIn("db_surplasse", internal["networks"])
         edge = yaml.safe_load(
             (integration / "public-edge.override.yaml").read_text(encoding="utf-8")
         )

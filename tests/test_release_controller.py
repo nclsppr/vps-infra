@@ -785,7 +785,7 @@ def platform_document(*, include_grafana: bool = True) -> dict:
     del include_grafana
     postgresql = hardened_service(
         image("ghcr.io/nclsppr/vps-infra/postgres"),
-        {"db_monitoring"},
+        {"db_monitoring", "db_surplasse"},
         user="70:70",
     )
     postgresql["secrets"] = [
@@ -1834,6 +1834,15 @@ class ComposePolicyTests(unittest.TestCase):
             mode=0o777,
         )
         with self.assertRaisesRegex(COMPOSE_POLICY.ComposePolicyError, "source and target keys"):
+            validate_platform_document(document)
+
+    def test_platform_postgresql_requires_the_durable_surplasse_database_network(self) -> None:
+        document = platform_document()
+        del document["services"]["postgresql"]["networks"]["db_surplasse"]
+        with self.assertRaisesRegex(
+            COMPOSE_POLICY.ComposePolicyError,
+            "expected db_monitoring, db_surplasse",
+        ):
             validate_platform_document(document)
 
 

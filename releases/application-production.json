@@ -2,7 +2,7 @@
   "schema": 1,
   "applications": {
     "surplasse": {
-      "enabled": false,
+      "enabled": true,
       "mode": "compose",
       "source_repository": "nclsppr/surplasse",
       "source_branch": "main",

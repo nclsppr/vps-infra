@@ -1860,6 +1860,10 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             defaults["vps_internal_platform_runtime_dir"],
             "/srv/vps/runtime/internal-platform/platform",
         )
+        self.assertEqual(
+            set(defaults["vps_internal_platform_network_contract"]["postgresql"]),
+            {"db_monitoring", "db_surplasse"},
+        )
 
         role = (
             ROOT / "ansible/roles/internal_platform/tasks/main.yml"
@@ -1911,6 +1915,8 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("labels.job', 'equalto', 'caddy'", runtime)
         self.assertIn("RepoDigests", runtime)
         self.assertIn("regex_replace('^docker\\\\.io/', '')", runtime)
+        self.assertIn("'db_surplasse'].Aliases", runtime)
+        self.assertIn("172.30.11.0/24", role)
 
         materializer_helper = ROOT / "scripts/materialize-internal-platform-secrets"
         helper_text = materializer_helper.read_text(encoding="utf-8")

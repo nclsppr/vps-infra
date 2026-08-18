@@ -59,6 +59,8 @@ GOOD_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 BEARER_RE = re.compile(r"^[!-~]{1,8192}$")
+GHCR_BLOB_REDIRECT_HOST = "pkg-containers.githubusercontent.com"
+MAX_REDIRECT_URL_BYTES = 8192
 
 
 class PendingEvidence(ApplicationReleaseError):
@@ -77,6 +79,14 @@ class HttpFailure(ApplicationReleaseError):
         self.status = status
 
 
+class HttpsRedirect(HttpFailure):
+    """One rejected HTTPS redirect without its signed target in the message."""
+
+    def __init__(self, status: int, location: str | None) -> None:
+        super().__init__(status, "HTTPS redirect requires endpoint-specific validation")
+        self.location = location
+
+
 @dataclasses.dataclass(frozen=True)
 class HttpResponse:
     body: bytes
@@ -86,8 +96,17 @@ class HttpResponse:
 class RejectRedirects(urllib.request.HTTPRedirectHandler):
     """Reject redirects before an authorization header can leave its endpoint."""
 
-    def redirect_request(self, *_arguments: object, **_keywords: object) -> None:
-        raise HttpFailure(None, "HTTPS redirects are not permitted")
+    def redirect_request(
+        self,
+        _request: object,
+        _file: object,
+        code: int,
+        _message: str,
+        headers: Mapping[str, str],
+        _new_url: str,
+    ) -> None:
+        location = headers.get("Location")
+        raise HttpsRedirect(code, location if isinstance(location, str) else None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -470,6 +489,88 @@ def _manifest_response(
     return response
 
 
+def _validated_ghcr_blob_redirect(location: str | None, digest: str) -> str:
+    if location is None:
+        raise BlockedEvidence("application-release-descriptor-redirect-location-is-missing")
+    try:
+        encoded = location.encode("ascii", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise BlockedEvidence(
+            "application-release-descriptor-redirect-location-is-not-ascii"
+        ) from exc
+    if any(byte < 0x21 or byte > 0x7E for byte in encoded):
+        raise BlockedEvidence(
+            "application-release-descriptor-redirect-location-characters-are-invalid"
+        )
+    if not 1 <= len(encoded) <= MAX_REDIRECT_URL_BYTES:
+        raise BlockedEvidence(
+            "application-release-descriptor-redirect-location-size-is-invalid"
+        )
+    parsed = urllib.parse.urlsplit(location)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise BlockedEvidence(
+            "application-release-descriptor-redirect-authority-is-invalid"
+        ) from exc
+    expected_path = re.compile(
+        rf"^/ghcrblobs[0-9]+/blobs/{re.escape(digest)}$"
+    )
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != GHCR_BLOB_REDIRECT_HOST
+        or parsed.hostname != GHCR_BLOB_REDIRECT_HOST
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or not parsed.query
+        or expected_path.fullmatch(parsed.path) is None
+    ):
+        raise BlockedEvidence(
+            "application-release-descriptor-redirect-target-is-invalid"
+        )
+    return location
+
+
+def _registry_blob_response(
+    client: BoundedHttpClient,
+    repository_path: str,
+    digest: str,
+    bearer: str,
+    *,
+    max_bytes: int,
+) -> HttpResponse:
+    source = f"https://ghcr.io/v2/{repository_path}/blobs/{digest}"
+    try:
+        return client.get(
+            source,
+            headers={
+                "Accept": "application/octet-stream",
+                "Authorization": f"Bearer {bearer}",
+            },
+            max_bytes=max_bytes,
+            attempts=3,
+        )
+    except HttpsRedirect as redirect:
+        if redirect.status != 307:
+            raise BlockedEvidence(
+                "application-release-descriptor-redirect-status-is-invalid"
+            ) from redirect
+        target = _validated_ghcr_blob_redirect(redirect.location, digest)
+        try:
+            return client.get(
+                target,
+                headers={"Accept": "application/octet-stream"},
+                max_bytes=max_bytes,
+                attempts=3,
+            )
+        except HttpsRedirect as chained:
+            raise BlockedEvidence(
+                "application-release-descriptor-redirect-chain-is-not-permitted"
+            ) from chained
+
+
 def resolve_release(
     client: BoundedHttpClient,
     application: ApplicationPolicy,
@@ -482,14 +583,12 @@ def resolve_release(
     first = _manifest_response(client, repository_path, tag, bearer)
     layer = validate_release_manifest(first.body, application, revision)
     try:
-        blob = client.get(
-            f"https://ghcr.io/v2/{repository_path}/blobs/{layer.digest}",
-            headers={
-                "Accept": "application/octet-stream",
-                "Authorization": f"Bearer {bearer}",
-            },
+        blob = _registry_blob_response(
+            client,
+            repository_path,
+            layer.digest,
+            bearer,
             max_bytes=MAX_RELEASE_BYTES,
-            attempts=3,
         )
     except HttpFailure as exc:
         if exc.status == 404:

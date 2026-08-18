@@ -164,6 +164,11 @@
          first).NetworkSettings.Networks.keys() | list | sort ==
         vps_internal_platform_network_contract[item.item.item] | sort
       - >-
+        item.item.item != 'postgresql' or
+        ('postgresql' in
+         (((item.stdout | from_json) | first).NetworkSettings.Networks[
+           'db_surplasse'].Aliases | default([])))
+      - >-
         item.item.item == 'grafana' or
         (((item.stdout | from_json) | first).NetworkSettings.Ports |
          dict2items | rejectattr('value', 'equalto', none) | list | length == 0)

@@ -251,7 +251,7 @@ class Fixture:
 
 
 class CutoverTests(unittest.TestCase):
-    def test_repository_policy_is_locked_and_adapter_stays_locked(self) -> None:
+    def test_dns_and_legacy_adapter_stay_locked_after_canonical_admission(self) -> None:
         policy = json.loads(
             (ROOT / "policies/surplasse-dns-cutover-v1.json").read_text(encoding="utf-8")
         )
@@ -264,7 +264,7 @@ class CutoverTests(unittest.TestCase):
         release = json.loads(
             (ROOT / "releases/application-production.json").read_text(encoding="utf-8")
         )
-        self.assertFalse(release["applications"]["surplasse"]["enabled"])
+        self.assertTrue(release["applications"]["surplasse"]["enabled"])
 
         tasks = (ROOT / "ansible/roles/surplasse_dns_cutover/tasks/main.yml").read_text(
             encoding="utf-8"

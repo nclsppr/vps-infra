@@ -3,9 +3,10 @@
 These scripts form the local VPS control plane. They do not build an image. The
 static controller is converged and its bounded transactional activation path is
 operational. The generic controller remains locked. The Compose application
-controller source and Ansible wiring are merged, but convergence of that
-revision on Atlas has not been proved and both application contracts remain
-disabled.
+controller and recovery wiring are converged and proved healthy while idle on
+Atlas. The canonical contract admits only the Surplasse tester release.
+Parkventory and the legacy Compose entries remain disabled, no application
+workflow invokes the gate, and no live Surplasse activation is proved.
 
 ## Installation contract
 
@@ -293,22 +294,28 @@ to inspect resolver status, Atlas active state, transactions, quarantine,
 recovery, public probes, and key rotation. A green workflow can cover only the
 profiles classified as `ready`.
 
-## Disabled Compose application controller
+## Canonical Compose application controller
 
 This section specifies the controller installed on Atlas by the proved
 convergence of repository revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root-owned
-`deploy-application` executable and argument-free gate are present. Installation
-does not enable either application and no application workflow invokes them.
+`deploy-application` executable and argument-free gate are present. The
+repository now enables only the canonical Surplasse tester admission entry.
+Parkventory remains disabled, and no application workflow invokes either gate.
 
 `deploy-application` consumes only the immutable
 `ghcr.io/nclsppr/<application>/application-release@sha256:<digest>` selected by
 the admission resolver. It supports the exact `surplasse` and `parkventory`
-profiles. Both remain `enabled: false` in
-`releases/application-production.json`; that check happens before runtime
-validation or network access.
+profiles. `releases/application-production.json` enables only Surplasse. A
+disabled application still stops before runtime validation or network access.
+An enabled entry authorizes admission, but it does not invoke live activation.
 
-For a future enabled entry, the controller independently verifies the release,
+The resolver normally rejects every redirect. Its only exception is one GHCR
+descriptor-blob `307` to the exact GitHub package content host and the path for
+the expected digest. The second request receives no registry bearer and cannot
+redirect again. The descriptor size and digest checks remain mandatory.
+
+For an enabled entry, the controller independently verifies the release,
 every component image index and config, the application integration manifest,
 and all allowlisted GitHub attestations. It validates the common two-layer
 integration bundle, canonical inventories, safe archive metadata, migration and
@@ -358,10 +365,12 @@ potentially mutating phase. SQL migrations themselves are not reversible; they
 must remain compatible with both the current and previous runtime images.
 
 The controller does not yet verify an attested backward-compatibility invariant
-for that post-migration restore. Production enablement must therefore remain
-fail-closed until such evidence is enforced, or recovery is changed to stop for
-explicit forward repair after migration. Neither disabled application may use
-the current restore behavior as production readiness evidence.
+for that post-migration restore. The first Surplasse tester activation has no
+previous application runtime, and ADR-0013 accepts only that bounded initial
+case. Later schema-changing updates must remain fail-closed until compatibility
+evidence is enforced, or recovery stops for explicit forward repair after
+migration. Parkventory remains disabled, and Surplasse cannot use the current
+restore behavior as readiness evidence for such an update.
 
 ## États séparés
 
