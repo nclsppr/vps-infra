@@ -105,6 +105,7 @@ done
   --volume "$secrets/application-secret:/run/secrets/ovh-application-secret:ro" \
   --volume "$secrets/consumer-key:/run/secrets/ovh-consumer-key:ro" \
   --volume "$repository_root/platform/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  --volume "$repository_root/platform/public-static-edge/surplasse-tls.caddy:/etc/caddy/surplasse-tls.caddy:ro" \
   --volume "$candidate_routes:/etc/caddy/routes:ro" \
   "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
   || fail "candidate Caddy configuration is invalid"

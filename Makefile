@@ -11,7 +11,8 @@ COMPOSE := $(MISE_EXEC) docker-compose
 
 .PHONY: help setup check check-fast check-yaml check-actions check-ansible \
 	check-controller check-public-safe check-platform check-platform-config \
-	check-public-static-edge check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
+	check-public-static-edge check-surplasse-public-edge-candidate \
+	check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	activate-public-static-edge stop-public-static-edge \
@@ -65,7 +66,8 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
 	$(MISE_EXEC) shellcheck scripts/validate-caddy-build-inputs \
-		scripts/verify-caddy-image scripts/validate-postgres-build-inputs \
+		scripts/verify-caddy-image scripts/verify-surplasse-public-edge-caddy \
+		scripts/validate-postgres-build-inputs \
 		scripts/verify-postgres-image \
 		platform/caddy/entrypoint.sh platform/postgres/initdb/10-platform-exporter.sh
 
@@ -99,7 +101,7 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 		applications/surplasse/migrations.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool renovate.json >/dev/null
 
-check-platform: check-platform-config check-public-static-edge check-surplasse-adapter check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, application candidates, and custom images.
+check-platform: check-platform-config check-public-static-edge check-surplasse-public-edge-candidate check-surplasse-adapter check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, application candidates, and custom images.
 
 check-platform-config: ## Render Compose and apply the production policy.
 	@rendered="$$(mktemp)"; \
@@ -119,6 +121,21 @@ check-public-static-edge: ## Validate the isolated Caddy-only public edge.
 	./scripts/validate-compose \
 		--expected-images platform/public-static-edge/expected-images.json \
 		vps-public-static-edge "$$rendered"
+
+check-surplasse-public-edge-candidate: check-public-static-edge ## Validate the inactive exact Surplasse public edge extension.
+	@set -Eeuo pipefail; \
+	rendered="$$(mktemp)"; \
+	trap 'rm -f -- "$$rendered"' EXIT; \
+	$(COMPOSE) --file platform/public-static-edge/compose.yaml \
+		--file applications/surplasse/integration/public-edge.override.yaml \
+		config --format json >"$$rendered"; \
+	./scripts/validate-surplasse-public-edge-candidate \
+		--approved-route platform/caddy/routes/surplasse.caddy.disabled \
+		--candidate-only \
+		"$$rendered"; \
+	image="$$(jq -r .caddy platform/public-static-edge/expected-images.json)"; \
+	./scripts/verify-surplasse-public-edge-caddy \
+		"$$image" platform/caddy/routes/surplasse.caddy.disabled
 
 check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 	@set -Eeuo pipefail; \

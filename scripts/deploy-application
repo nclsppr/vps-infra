@@ -104,8 +104,14 @@ STATIC_TRANSACTION_ROOT = Path("/var/lib/vps-static/transactions")
 STATIC_PARKVENTORY_CURRENT = Path("/srv/www/parkventory/current")
 PUBLIC_EDGE_RUNTIME_ROOT = Path("/srv/vps/runtime/public-static-edge")
 PUBLIC_EDGE_CONTAINER = "vps-public-static-edge-caddy-1"
+SURPLASSE_PUBLIC_EDGE_NETWORK = "app_surplasse"
+SURPLASSE_PUBLIC_EDGE_SUBNET = "172.30.10.0/24"
+SURPLASSE_PUBLIC_EDGE_ADDRESS = "172.30.10.254"
 RUNTIME_DIRECTORY_ENV = "VPS_APPLICATION_RUNTIME_DIRECTORY"
 VALIDATE_COMPOSE_PATH = SCRIPT_DIRECTORY / "validate-compose"
+SURPLASSE_INPUT_VALIDATOR_PATH = (
+    SCRIPT_DIRECTORY / "materialize-surplasse-secrets"
+)
 DOCKER_PATH = Path("/usr/bin/docker")
 GIT_PATH = Path("/usr/bin/git")
 CURL_PATH = Path("/usr/bin/curl")
@@ -565,6 +571,8 @@ def deployment_lock(timeout_seconds: int = 60) -> Iterator[None]:
 
 
 def runtime_configuration(profile: BundleProfile) -> dict[str, str]:
+    if profile.application == "surplasse":
+        validate_surplasse_input_commit()
     path = RUNTIME_CONFIG_ROOT / f"{profile.application}.env"
     metadata = require_protected_file(
         path,
@@ -598,6 +606,15 @@ def runtime_configuration(profile: BundleProfile) -> dict[str, str]:
     if tuple(sorted(result)) != tuple(sorted(profile.runtime_configuration_keys)):
         fail(f"{profile.application} runtime configuration key allowlist differs")
     return result
+
+
+def validate_runtime_configuration_snapshot(
+    profile: BundleProfile, snapshot: Mapping[str, str]
+) -> None:
+    if profile.application != "surplasse":
+        return
+    if runtime_configuration(profile) != dict(snapshot):
+        fail("Surplasse runtime configuration changed after release materialization")
 
 
 def _registry_fetch(
@@ -1084,6 +1101,23 @@ def _run_bounded(
         detail = result.stderr.strip() or result.stdout.strip() or "no diagnostic"
         fail(f"command {command[0]} failed: {detail[:1000]}")
     return result
+
+
+def validate_surplasse_input_commit() -> None:
+    require_protected_file(
+        SURPLASSE_INPUT_VALIDATOR_PATH,
+        "Surplasse input validator",
+        allowed_modes=frozenset({0o500}),
+        maximum_size=2 * 1024 * 1024,
+    )
+    result = _run_bounded(
+        [str(SURPLASSE_INPUT_VALIDATOR_PATH), "--operator-only"],
+        environment=safe_environment(RUNTIME_CONFIG_ROOT),
+        timeout=45,
+        maximum_stdout=1024,
+    )
+    if result.stdout or result.stderr:
+        fail("Surplasse input validation returned unexpected output")
 
 
 def write_release_file(path: Path, raw: bytes, label: str) -> None:
@@ -1823,6 +1857,7 @@ def validate_materialized_runtime_policy(
     validate_materialized_release(release, state)
     bundle = bundle_from_release(release, state)
     configuration = materialized_runtime_configuration(release, profile)
+    validate_runtime_configuration_snapshot(profile, configuration)
     environment = compose_environment(
         profile,
         bundle,
@@ -2329,6 +2364,77 @@ def probe_runtime(state: ApplicationState, work: Path) -> None:
         )
 
 
+def validate_surplasse_public_edge_attachment(release: Path) -> None:
+    network_inspection = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "network",
+            "inspect",
+            "--format",
+            (
+                "{{.Id}}\t{{.Name}}\t{{.Driver}}\t{{.Scope}}\t"
+                "{{.Internal}}\t{{.Attachable}}\t{{.Ingress}}\t"
+                "{{index .Labels \"com.nclsppr.vps-infra.managed\"}}\t"
+                "{{len .IPAM.Config}}\t"
+                "{{range .IPAM.Config}}{{.Subnet}}{{end}}"
+            ),
+            SURPLASSE_PUBLIC_EDGE_NETWORK,
+        ],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    fields = network_inspection.stdout.removesuffix("\n").split("\t")
+    expected_identity = [
+        SURPLASSE_PUBLIC_EDGE_NETWORK,
+        "bridge",
+        "local",
+        "false",
+        "false",
+        "false",
+        "true",
+        "1",
+        SURPLASSE_PUBLIC_EDGE_SUBNET,
+    ]
+    if (
+        len(fields) != 10
+        or CONTAINER_ID_RE.fullmatch(fields[0]) is None
+        or fields[1:] != expected_identity
+        or network_inspection.stderr
+        or not network_inspection.stdout.endswith("\n")
+    ):
+        fail("app_surplasse network identity differs from the managed host contract")
+    network_id = fields[0]
+    edge_inspection = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            (
+                "{{.State.Status}}\t"
+                "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
+                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+                f"{{{{with index .NetworkSettings.Networks \"{SURPLASSE_PUBLIC_EDGE_NETWORK}\"}}}}"
+                "{{.NetworkID}}\t{{.IPAddress}}\t{{.IPPrefixLen}}{{end}}"
+            ),
+            PUBLIC_EDGE_CONTAINER,
+        ],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    expected_edge = (
+        "running\thealthy\tvps-public-static-edge\t"
+        f"{network_id}\t{SURPLASSE_PUBLIC_EDGE_ADDRESS}\t24\n"
+    )
+    if edge_inspection.stdout != expected_edge or edge_inspection.stderr:
+        fail(
+            "public edge is not healthy and attached to the exact app_surplasse "
+            "network identity at 172.30.10.254"
+        )
+
+
 def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
     profile = PROFILES[state.application]
     release = state_release(state)
@@ -2351,30 +2457,38 @@ def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
         fail(f"cannot read {state.application} public edge route: {exc}")
     if route_bytes != bundle.files[route_relative]:
         fail("public edge route is not the attested application route")
-    network = f"app_{state.application}"
-    inspected = _run_bounded(
-        [
-            str(DOCKER_PATH),
-            "container",
-            "inspect",
-            "--format",
-            (
-                "{{.State.Status}}\t"
-                "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
-                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
-                f"{{{{if index .NetworkSettings.Networks \"{network}\"}}}}"
-                "attached{{end}}"
-            ),
-            PUBLIC_EDGE_CONTAINER,
-        ],
-        environment=safe_environment(release),
-        timeout=30,
-        maximum_stdout=256,
-    )
-    if inspected.stdout != "running\thealthy\tvps-public-static-edge\tattached\n" or inspected.stderr:
-        fail(
-            "public edge is not healthy and attached to the exact application network"
+    if state.application == "surplasse":
+        validate_surplasse_public_edge_attachment(release)
+    else:
+        network = f"app_{state.application}"
+        inspected = _run_bounded(
+            [
+                str(DOCKER_PATH),
+                "container",
+                "inspect",
+                "--format",
+                (
+                    "{{.State.Status}}\t"
+                    "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
+                    "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+                    f"{{{{if index .NetworkSettings.Networks \"{network}\"}}}}"
+                    "attached{{end}}"
+                ),
+                PUBLIC_EDGE_CONTAINER,
+            ],
+            environment=safe_environment(release),
+            timeout=30,
+            maximum_stdout=256,
         )
+        if (
+            inspected.stdout
+            != "running\thealthy\tvps-public-static-edge\tattached\n"
+            or inspected.stderr
+        ):
+            fail(
+                "public edge is not healthy and attached to the exact "
+                "application network"
+            )
     if profile.default_public_host not in route_bytes.decode("utf-8"):
         fail("public edge route does not name the canonical application host")
     public_probes = bundle.probes.get("public")

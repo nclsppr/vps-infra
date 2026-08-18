@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  printf 'usage: %s IMAGE APPROVED_ROUTE\n' "${0##*/}" >&2
+  exit 2
+}
+
+fail() {
+  printf 'Surplasse public edge Caddy verification failed: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ $# -eq 2 ]] || usage
+image=$1
+approved_route=$2
+[[ $image =~ ^ghcr\.io/nclsppr/vps-infra/caddy:[^@]+@sha256:[0-9a-f]{64}$ ]] \
+  || fail "Caddy image is not the immutable platform image"
+[[ -f $approved_route && ! -L $approved_route ]] \
+  || fail "approved route must be a regular non-symbolic file"
+
+script_directory=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd -P)
+cmp -s -- \
+  "$repository_root/platform/caddy/routes/surplasse.caddy.disabled" \
+  "$approved_route" \
+  || fail "route differs from the exact vps-infra-approved candidate"
+routes=$(mktemp -d)
+secrets=$(mktemp -d)
+adapted=$(mktemp)
+trap 'rm -rf -- "$routes" "$secrets"; rm -f -- "$adapted"' EXIT
+
+cp -- "$repository_root/platform/public-static-edge/routes-activate/"*.caddy "$routes/"
+cp -- "$approved_route" "$routes/surplasse.caddy"
+for name in application-key application-secret consumer-key; do
+  printf 'validation-placeholder\n' >"$secrets/$name"
+done
+
+docker_run=(
+  docker run --rm
+  --env OVH_APPLICATION_KEY_FILE=/run/secrets/surplasse_ovh_application_key
+  --env OVH_APPLICATION_SECRET_FILE=/run/secrets/surplasse_ovh_application_secret
+  --env OVH_CONSUMER_KEY_FILE=/run/secrets/surplasse_ovh_consumer_key
+  --volume "$secrets/application-key:/run/secrets/surplasse_ovh_application_key:ro"
+  --volume "$secrets/application-secret:/run/secrets/surplasse_ovh_application_secret:ro"
+  --volume "$secrets/consumer-key:/run/secrets/surplasse_ovh_consumer_key:ro"
+  --volume "$repository_root/platform/public-static-edge/Caddyfile:/etc/caddy/Caddyfile:ro"
+  --volume "$repository_root/platform/public-static-edge/surplasse-tls.caddy:/etc/caddy/surplasse-tls.caddy:ro"
+  --volume "$routes:/etc/caddy/routes:ro"
+)
+
+"${docker_run[@]}" "$image" \
+  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
+  || fail "the exact image, entry point, approved route, and scoped TLS snippet are incompatible"
+
+if docker run --rm \
+  --env OVH_APPLICATION_KEY_FILE=/run/secrets/surplasse_ovh_application_key \
+  --env OVH_APPLICATION_SECRET_FILE=/run/secrets/surplasse_ovh_application_secret \
+  --env OVH_CONSUMER_KEY_FILE=/run/secrets/surplasse_ovh_consumer_key \
+  --volume "$secrets/application-key:/run/secrets/surplasse_ovh_application_key:ro" \
+  --volume "$secrets/application-secret:/run/secrets/surplasse_ovh_application_secret:ro" \
+  --volume "$repository_root/platform/public-static-edge/Caddyfile:/etc/caddy/Caddyfile:ro" \
+  --volume "$repository_root/platform/public-static-edge/surplasse-tls.caddy:/etc/caddy/surplasse-tls.caddy:ro" \
+  --volume "$routes:/etc/caddy/routes:ro" \
+  "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
+  >/dev/null 2>&1; then
+  fail "the entry point accepted an incomplete DNS credential set"
+fi
+
+"${docker_run[@]}" "$image" \
+  caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile \
+  >"$adapted"
+
+jq -e '
+  [
+    .apps.tls.automation.policies[]
+    | select(any(.issuers[]?; .challenges.dns.provider.name == "ovh"))
+  ] as $dns_policies
+  | ($dns_policies | length) == 1
+  and (($dns_policies[0].subjects | sort) == ["*.surplasse.com", "surplasse.com"])
+  and all(
+    $dns_policies[0].issuers[];
+    .challenges.dns.provider == {
+      "application_key": "validation-placeholder",
+      "application_secret": "validation-placeholder",
+      "consumer_key": "validation-placeholder",
+      "endpoint": "ovh-eu",
+      "name": "ovh"
+    }
+  )
+' "$adapted" >/dev/null \
+  || fail "DNS-01 automation is not scoped exactly to the Surplasse subjects"
+
+printf 'Surplasse public edge Caddy candidate verified: %s\n' "$image"

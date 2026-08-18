@@ -11,8 +11,8 @@ services:
       - surplasse_ovh_consumer_key
     volumes:
       - type: bind
-        source: /srv/vps/runtime/surplasse/integration/caddy/surplasse.caddy
-        target: /etc/caddy/routes/surplasse.caddy
+        source: /srv/vps/runtime/public-static-edge/surplasse-tls.caddy
+        target: /etc/caddy/surplasse-tls.caddy
         read_only: true
         bind:
           create_host_path: false
@@ -29,10 +29,10 @@ networks:
 secrets:
   surplasse_ovh_application_key:
     name: surplasse_ovh_application_key
-    file: /etc/vps/secrets/surplasse/ovh-application-key
+    file: /etc/vps/secrets/dns/surplasse/ovh-application-key
   surplasse_ovh_application_secret:
     name: surplasse_ovh_application_secret
-    file: /etc/vps/secrets/surplasse/ovh-application-secret
+    file: /etc/vps/secrets/dns/surplasse/ovh-application-secret
   surplasse_ovh_consumer_key:
     name: surplasse_ovh_consumer_key
-    file: /etc/vps/secrets/surplasse/ovh-consumer-key
+    file: /etc/vps/secrets/dns/surplasse/ovh-consumer-key

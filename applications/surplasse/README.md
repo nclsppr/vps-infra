@@ -90,35 +90,30 @@ development seed.
 
 The preparation controller installs a root-only helper at
 `/usr/local/libexec/vps/materialize-surplasse-secrets`. It creates the two
-database passwords, but it never creates an operator value. The operator must
-stage the following files in a separate `root:root 0700` directory. Each source
-file must be root-owned, regular, single-linked, and inaccessible to group and
-other users:
+database passwords, but it never creates an operator value. The application
+operator must stage exactly the following nine files in a separate
+`root:root 0700` directory. Each source file must be root-owned, regular,
+single-linked, and inaccessible to group and other users:
 
 ```text
 surplasse-jwt-jwks
 surplasse-jwt-private-key
 surplasse-jwt-key-id
 surplasse-smtp-host
-surplasse-smtp-port
 surplasse-smtp-password
 surplasse-smtp-username
 surplasse-stripe-account-webhook-secret
 surplasse-stripe-payment-webhook-secret
 surplasse-stripe-secret-key
-ovh-application-key
-ovh-application-secret
-ovh-consumer-key
 ```
 
 Every single-line input must end with one newline. The Stripe key must be a
 live secret key. Both webhook values must have the Stripe signing-secret
-prefix, and the two values must be distinct. The OVH values must match their
-documented token lengths. The application secret and consumer key must be
-distinct. The secret materializer accepts a DNS name and a bounded TCP port as
-operator input. This input validation is not SMTP readiness evidence.
+prefix, and the two values must be distinct. The secret materializer accepts a
+bounded DNS name as operator input. This input validation is not SMTP readiness
+evidence.
 
-The rendered adapter requires a lowercase DNS name, port `587`,
+The rendered adapter requires a lowercase DNS name and the constant port `587`,
 `SMTP_START_TLS=REQUIRED`, `SMTP_TLS=false`,
 `QUARKUS_MAILER_AUTH_METHODS=PLAIN LOGIN`, the fixed sender, and the exact
 secret paths. A later provider-selection change must bind the SMTP host to a
@@ -150,41 +145,84 @@ sudo /usr/local/libexec/vps/materialize-surplasse-secrets \
 sudo /usr/local/libexec/vps/materialize-surplasse-secrets --operator-only
 ```
 
-The destination is `/etc/vps/secrets/surplasse`. Values mounted in the Backend
-are `root:10001 0440`. The OVH values and the three controller-only inputs
-(`surplasse-jwt-key-id`, `surplasse-smtp-host`, and
-`surplasse-smtp-port`) are `root:root 0400`. The helper stages each replacement
-in the destination, calls `fsync`, and uses an atomic rename. An exclusive,
-bounded lock serializes installers and validators. After all value renames are
-durable, the helper publishes a root-only manifest as the final rename. The
-manifest binds the contract version and SHA-256 value of every operator file.
-It contains no secret value. A missing, stale, malformed, or mismatched
-manifest makes validation fail. The helper removes bounded orphan staging files
-under the same lock after an interrupted process. It rejects any other entry.
-It does not print a value. Repeating the command with the same valid bundle is
-safe.
+The secret destination is `/etc/vps/secrets/surplasse`. The seven supplied
+values mounted in the Backend are `root:10001 0440`.
+`surplasse-jwt-key-id` and `surplasse-smtp-host` are controller-only files with
+mode `root:root 0400`. Under the same bundle lock, the helper derives
+`/etc/vps/applications/surplasse.env`. This file is regular, single-linked,
+`root:root 0600`, and contains exactly these canonical records:
+
+```text
+SURPLASSE_AUTH_JWT_KEY_ID=<validated kid>
+SURPLASSE_SMTP_HOST=<validated DNS name>
+```
+
+Each record has one LF terminator. The file has no additional key. Port `587`
+is an adapter constant and is not an operator input.
+
+The helper stages each replacement, calls `fsync`, and uses an atomic rename.
+Each mutating mode takes `/run/lock/vps-static.lock` before the bounded bundle
+lock. This order excludes a secret or runtime change while the application
+controller owns the deployment lock. `--operator-only` takes only the bundle
+lock, so the controller can call it while it owns the deployment lock. The
+helper replaces the supplied application files, then the runtime file, and
+publishes manifest version 2 as the final commit marker. The manifest binds the
+contract version and SHA-256 value of all nine supplied application files. It
+contains no secret value. A crash before the final manifest rename leaves an
+absent or stale marker. Validation then fails even if both the supplied files
+and runtime file contain the new generation. A missing, stale, malformed, or
+mismatched manifest makes validation fail. The helper removes bounded orphan
+staging files during the next mutating operation under both locks.
+`--operator-only` is read-only and rejects an orphan staging file. The helper
+rejects any other application entry. It does not print a value. Repeating the
+command with the same valid bundle is safe.
 
 The manifest proves the installed on-disk generation. An atomic host rename
 does not update an existing Docker file bind mount. A rotation controller must
 validate the manifest, recreate each affected service in a controlled order,
 and pass its probes before it reports the rotation as complete.
 
-The helper also owns these generated files in the same destination:
+The helper also owns these two generated files in the same destination:
 
 ```text
 surplasse-postgres-migrator-password
 surplasse-postgres-runtime-password
 ```
 
+These two files and the seven supplied mounted values form the exact set of nine
+application secrets. Each one is `root:10001 0440`, regular, and single-linked.
 GID `10001` is the dedicated group of the Backend and migrator containers.
-Docker Compose file secrets preserve the host file ownership; they do not
-remap it. The repository contains only file names and validation rules. It
-contains no value.
+Docker Compose file secrets preserve the host file ownership; they do not remap
+it. The repository contains only file names and validation rules. It contains
+no value.
 
-Offline token validation cannot prove OVH IAM scope. Activation must still
-verify that the permanent Caddy identity is limited to the `surplasse.com`
-DNS-01 operations. Never reuse an OVH credential after it appeared in a chat,
-issue, log, or commit.
+The three OVH DNS values form a different operator contract:
+
+```text
+ovh-application-key
+ovh-application-secret
+ovh-consumer-key
+```
+
+The application helper does not accept, require, move, or delete these files.
+It rejects a legacy OVH file in `/etc/vps/secrets/surplasse` as an unexpected
+application entry. A later public-edge change must define and prove a separate
+atomic migration before it enables the disabled Caddy integration. Do not
+remove an existing value as part of application installation.
+The helper also rejects the obsolete `surplasse-smtp-port` file without
+deleting it. Port `587` remains in the reviewed adapter policy.
+
+Before it materializes a release, `deploy-application` runs the helper in
+`--operator-only` mode. Before activation and runtime operations, it repeats
+that validation and requires the current two-line runtime file to equal the
+immutable release snapshot. An operator cannot bypass the commit marker by
+calling only the deployment controller.
+
+The application helper performs no OVH token validation. The future public-edge
+controller must prove both the protected file contract and that the permanent
+Caddy identity is limited to the `surplasse.com` DNS-01 operations. A token
+shape alone cannot prove IAM scope. Never reuse an OVH credential after it
+appeared in a chat, issue, log, or commit.
 
 ## Local validation
 
@@ -214,14 +252,15 @@ must use this order:
 2. prove a restorable PostgreSQL backup;
 3. provision the database and the three roles;
 4. install and verify every exact root-owned secret and runtime configuration;
-5. prepare the immutable Caddy route, Prometheus configuration, and required
-   platform network attachments;
-6. require the active edge route to equal the attested bundle and require
-   healthy Caddy on the exact application network before schema migration;
+5. stage and activate the exact Caddy route, TLS snippet, and platform network
+   attachments while public DNS still points away from Atlas;
+6. require the deployment controller to revalidate that public-edge identity
+   and healthy Caddy on the exact application network before schema migration;
 7. run the transient migration job and require a successful exit;
-8. start the five long-running services without host ports;
-9. complete strict internal and public probes;
-10. change DNS only after the direct Atlas probe succeeds.
+8. start the five long-running services without host ports, complete strict
+   internal and direct-Atlas public probes, and commit the runtime tuple;
+9. change DNS only after the direct Atlas probe succeeds, then verify recursive
+   DNS, certificates, and public probes.
 
 The verified Backend digest satisfies the migration-entrypoint image gate. The
 adapter remains locked by the other release, integration, secret, restore, and
