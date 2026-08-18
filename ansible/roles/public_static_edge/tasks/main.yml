@@ -743,15 +743,15 @@
           {{ vps_public_static_edge_runtime_link.stat.lnk_source |
              default('') }}
 
+    - name: Refuse an unmanaged base switch over an active Surplasse edge
+      ansible.builtin.command:
+        argv:
+          - "{{ vps_public_static_edge_surplasse_controller }}"
+          - --assert-base-switch-safe
+      changed_when: false
+
     - name: Switch and reconcile the public static edge
       block:
-        - name: Refuse an unmanaged base switch over an active Surplasse edge
-          ansible.builtin.command:
-            argv:
-              - "{{ vps_public_static_edge_surplasse_controller }}"
-              - --assert-base-switch-safe
-          changed_when: false
-
         - name: Create the next public edge release link
           ansible.builtin.file:
             src: "{{ vps_public_static_edge_release_dir }}"

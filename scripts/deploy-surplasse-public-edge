@@ -29,7 +29,8 @@ APPLICATION_RELEASE_RE = re.compile(
     r"integration/caddy/surplasse\.caddy$"
 )
 BASE_RELEASE_RE = re.compile(
-    r"^/srv/vps/releases/public-static-edge/[0-9a-f]{40}-(?:prepare|activate)$"
+    r"^/srv/vps/releases/public-static-edge/[0-9a-f]{40}-"
+    r"(?:prepare|precutover|activate)$"
 )
 EXTENSION_RELEASE_RE = re.compile(
     r"^/srv/vps/releases/public-static-edge-surplasse/[0-9a-f]{64}$"
@@ -60,6 +61,8 @@ TRANSACTION_PHASES = frozenset({"prepared", "switched", "reconciled", "verified"
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_STATE_BYTES = 16 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
+MAX_DOCKER_EXECUTABLE_BYTES = 64 * 1024 * 1024
 LOCK_TIMEOUT_SECONDS = 60
 REPOSITORY_FILE_MODES = frozenset({0o444, 0o644})
 
@@ -587,22 +590,33 @@ def require_runtime(paths: RuntimePaths, *, recovery: bool = False) -> None:
         (paths.runtime_link.parent, "public edge runtime parent", frozenset({0o755})),
     ):
         require_directory(path, label, paths, modes=modes)
-    for path, label, modes in (
+    for path, label, modes, maximum_size in (
         (
             Path(__file__).resolve(),
             "Surplasse edge controller",
             frozenset({0o555, 0o755}),
+            MAX_EXECUTABLE_BYTES,
         ),
         (
             paths.systemctl,
             "systemctl executable",
             frozenset({0o755}),
+            MAX_EXECUTABLE_BYTES,
         ),
-        (paths.docker, "Docker executable", frozenset({0o755})),
+        (
+            paths.docker,
+            "Docker executable",
+            frozenset({0o755}),
+            MAX_DOCKER_EXECUTABLE_BYTES,
+        ),
     ):
         if paths.expected_uid == 0:
             read_protected_file(
-                path, label, paths, modes=modes, maximum_size=16 * 1024 * 1024
+                path,
+                label,
+                paths,
+                modes=modes,
+                maximum_size=maximum_size,
             )
     if recovery:
         return
@@ -672,7 +686,9 @@ def validate_release_path(release: Path, paths: RuntimePaths, label: str) -> Non
         valid = (
             BASE_RELEASE_RE.fullmatch(str(release)) is not None
             if paths.expected_uid == 0
-            else re.fullmatch(r"[0-9a-f]{40}-(?:prepare|activate)", release.name)
+            else re.fullmatch(
+                r"[0-9a-f]{40}-(?:prepare|precutover|activate)", release.name
+            )
             is not None
         )
     elif release.parent == paths.extension_release_root:
@@ -756,7 +772,11 @@ def validate_base_release(
     phase = phase_raw.decode("ascii", errors="strict").removesuffix("\n")
     if revision_raw != f"{revision}\n".encode() or SHA40_RE.fullmatch(revision) is None:
         fail("public edge source revision is invalid")
-    if phase_raw != f"{phase}\n".encode() or phase not in {"prepare", "activate"}:
+    if phase_raw != f"{phase}\n".encode() or phase not in {
+        "prepare",
+        "precutover",
+        "activate",
+    }:
         fail("public edge phase is invalid")
     if require_current_revision and revision != controller_revision(paths):
         fail("public edge base release and installed controller revisions differ")

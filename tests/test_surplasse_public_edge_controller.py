@@ -13,6 +13,8 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/deploy-surplasse-public-edge"
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -106,8 +108,8 @@ class ControllerFixture:
         )
         protected_file(self.attested, self.route)
 
-    def create_base(self) -> Path:
-        base = self.paths.base_release_root / f"{REVISION}-prepare"
+    def create_base(self, phase: str = "prepare") -> Path:
+        base = self.paths.base_release_root / f"{REVISION}-{phase}"
         routes = base / "routes"
         routes.mkdir(parents=True)
         for name in CONTROLLER.ROUTE_NAMES:
@@ -116,7 +118,7 @@ class ControllerFixture:
             ("Caddyfile", b"import /etc/caddy/routes/*.caddy\n", 0o444),
             ("compose.yaml", b"name: vps-public-static-edge\n", 0o444),
             ("expected-images.json", b"{}\n", 0o444),
-            ("phase", b"prepare\n", 0o444),
+            ("phase", f"{phase}\n".encode(), 0o444),
             ("source-revision", f"{REVISION}\n".encode(), 0o444),
             ("validate-compose", b"#!/bin/sh\nexit 0\n", 0o555),
         ):
@@ -155,6 +157,66 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_runtime_accepts_a_bounded_docker_executable_above_16_mib(
+        self,
+    ) -> None:
+        production_sized_docker = 48 * 1024 * 1024
+        self.fixture.paths.docker.write_bytes(b"docker\n")
+        self.fixture.paths.docker.chmod(0o755)
+        os.truncate(self.fixture.paths.docker, production_sized_docker)
+        self.assertTrue(
+            CONTROLLER._metadata_is_file(
+                self.fixture.paths.docker.stat(),
+                self.fixture.paths,
+                modes=frozenset({0o755}),
+                maximum_size=CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES,
+            )
+        )
+        self.assertFalse(
+            CONTROLLER._metadata_is_file(
+                self.fixture.paths.docker.stat(),
+                self.fixture.paths,
+                modes=frozenset({0o755}),
+                maximum_size=CONTROLLER.MAX_EXECUTABLE_BYTES,
+            )
+        )
+
+        root_paths = CONTROLLER.dataclasses.replace(
+            self.fixture.paths,
+            expected_uid=0,
+            expected_gid=0,
+        )
+        with (
+            mock.patch.object(CONTROLLER.os, "geteuid", return_value=0),
+            mock.patch.object(CONTROLLER.os, "getegid", return_value=0),
+            mock.patch.object(CONTROLLER, "require_directory"),
+            mock.patch.object(
+                CONTROLLER, "read_protected_file", return_value=b"protected"
+            ) as read_protected,
+        ):
+            CONTROLLER.require_runtime(root_paths, recovery=True)
+
+        executable_limits = {
+            call.args[1]: call.kwargs["maximum_size"]
+            for call in read_protected.call_args_list
+        }
+        self.assertEqual(
+            executable_limits,
+            {
+                "Surplasse edge controller": CONTROLLER.MAX_EXECUTABLE_BYTES,
+                "systemctl executable": CONTROLLER.MAX_EXECUTABLE_BYTES,
+                "Docker executable": CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES,
+            },
+        )
+
+    def test_pre_cutover_is_a_valid_public_edge_base_phase(self) -> None:
+        release = self.fixture.create_base("precutover")
+        revision, phase = CONTROLLER.validate_base_release(
+            release, self.fixture.paths
+        )
+        self.assertEqual(revision, REVISION)
+        self.assertEqual(phase, "precutover")
 
     def test_stage_retains_every_static_route_and_publishes_exact_inputs(self) -> None:
         state = self.fixture.stage()
@@ -536,6 +598,31 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
                 "Refuse an unmanaged base switch over an active Surplasse edge"
             ),
             tasks.index("Create the next public edge release link"),
+        )
+        top_level_tasks = yaml.safe_load(tasks)
+        convergence = next(
+            task
+            for task in top_level_tasks
+            if task.get("name")
+            == "Stage, switch, and verify the isolated public static edge"
+        )
+        convergence_tasks = convergence["block"]
+        preflight = next(
+            task
+            for task in convergence_tasks
+            if task.get("name")
+            == "Refuse an unmanaged base switch over an active Surplasse edge"
+        )
+        self.assertIn("ansible.builtin.command", preflight)
+        transaction = next(
+            task
+            for task in convergence_tasks
+            if task.get("name") == "Switch and reconcile the public static edge"
+        )
+        nested_names = {task.get("name") for task in transaction["block"]}
+        self.assertNotIn(
+            "Refuse an unmanaged base switch over an active Surplasse edge",
+            nested_names,
         )
 
     def test_application_release_contracts_remain_locked(self) -> None:
