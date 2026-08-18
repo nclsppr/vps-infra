@@ -8,6 +8,21 @@
       - vps_public_static_edge_runtime_dir == '/srv/vps/runtime/public-static-edge'
       - vps_public_static_edge_unit == 'vps-public-static-edge.service'
       - vps_public_static_edge_container == 'vps-public-static-edge-caddy-1'
+      - >-
+        vps_public_static_edge_surplasse_controller ==
+        '/usr/local/libexec/vps/deploy-surplasse-public-edge'
+      - >-
+        vps_public_static_edge_surplasse_release_root ==
+        '/srv/vps/releases/public-static-edge-surplasse'
+      - >-
+        vps_public_static_edge_surplasse_state_root ==
+        '/var/lib/vps-public-edge-surplasse'
+      - >-
+        vps_public_static_edge_surplasse_recovery_unit ==
+        'vps-public-edge-surplasse-recover.service'
+      - >-
+        vps_public_static_edge_surplasse_dns_materializer ==
+        '/usr/local/libexec/vps/materialize-surplasse-dns-secrets'
       - vps_public_static_edge_network == 'edge'
       - vps_public_static_edge_network_subnet == '172.30.32.0/24'
       - >-
@@ -37,6 +52,43 @@
         map(attribute='names') | flatten | list | sort ==
         vps_public_static_edge_domains | sort
     fail_msg: The public static edge inputs differ from the reviewed contract.
+
+- name: Create protected Surplasse public edge controller roots
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: "{{ vps_public_static_edge_surplasse_release_root }}"
+      mode: "0755"
+    - path: "{{ vps_public_static_edge_surplasse_state_root }}"
+      mode: "0700"
+
+- name: Install the Surplasse public edge transition controller
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/deploy-surplasse-public-edge"
+    dest: "{{ vps_public_static_edge_surplasse_controller }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the Surplasse public edge recovery unit
+  ansible.builtin.template:
+    src: vps-public-edge-surplasse-recover.service.j2
+    dest: >-
+      /etc/systemd/system/{{ vps_public_static_edge_surplasse_recovery_unit }}
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable Surplasse public edge recovery at boot
+  ansible.builtin.systemd_service:
+    name: "{{ vps_public_static_edge_surplasse_recovery_unit }}"
+    enabled: true
+    daemon_reload: true
+  when: not ansible_check_mode
 
 - name: Inspect the public static edge unit
   ansible.builtin.stat:
@@ -667,6 +719,13 @@
 
     - name: Switch and reconcile the public static edge
       block:
+        - name: Refuse an unmanaged base switch over an active Surplasse edge
+          ansible.builtin.command:
+            argv:
+              - "{{ vps_public_static_edge_surplasse_controller }}"
+              - --assert-base-switch-safe
+          changed_when: false
+
         - name: Create the next public edge release link
           ansible.builtin.file:
             src: "{{ vps_public_static_edge_release_dir }}"

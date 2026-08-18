@@ -49,10 +49,11 @@ APPLICATION_STATE = load_script_module(
 class SupplyChainContractTests(unittest.TestCase):
     def test_surplasse_public_edge_adversarial_tests_are_canonical(self) -> None:
         runner = (ROOT / "tests/run").read_text(encoding="utf-8")
-        invocation = (
-            'python3 "$TESTS_DIR/test_surplasse_public_edge_candidate.py"'
-        )
-        self.assertEqual(runner.count(invocation), 1)
+        for invocation in (
+            'python3 "$TESTS_DIR/test_surplasse_public_edge_candidate.py"',
+            'python3 "$TESTS_DIR/test_surplasse_public_edge_controller.py"',
+        ):
+            self.assertEqual(runner.count(invocation), 1)
 
     def test_caddy_build_inputs_are_separate_from_runtime_state(self) -> None:
         def assignments(path: Path) -> dict[str, str]:

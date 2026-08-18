@@ -2,7 +2,9 @@
 Description=VPS public static Caddy edge
 Wants=network-online.target
 After=network-online.target docker.service vps-docker-ingress-firewall.service vps-application-recover.service vps-static-recover.service
+After={{ vps_public_static_edge_surplasse_recovery_unit }}
 Requires=docker.service vps-docker-ingress-firewall.service vps-application-recover.service vps-static-recover.service
+Requires={{ vps_public_static_edge_surplasse_recovery_unit }}
 
 [Service]
 Type=oneshot

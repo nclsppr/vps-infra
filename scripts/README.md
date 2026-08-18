@@ -344,10 +344,11 @@ requires the managed `app_surplasse` bridge identity, its exact
 `172.30.10.0/24` subnet, and the same network identifier plus
 `172.30.10.254/24` on Caddy.
 
-The inactive Surplasse Compose override is not a complete cutover controller.
-It cannot atomically stage the route, install the scoped DNS credentials,
-recreate Caddy, prove the new identity, and recover the previous edge release.
-That platform cutover remains a separate reviewed prerequisite.
+The inactive Surplasse Compose override is not a cutover command. The separate
+`deploy-surplasse-public-edge` controller stages the route and Atlas snippet,
+recreates Caddy, proves the new runtime identity, and recovers the previous
+edge release. It does not install DNS credentials and does not change DNS.
+Those external operations remain separate reviewed prerequisites.
 
 Activation journals `prepared`, `migration-running`, `migrated`, `started`,
 `probe-rejected`, and `probed`. Only `probed` can become active. Recovery restores
@@ -494,3 +495,24 @@ then fetches both blobs from GHCR and runs the package verifier again.
 `write-platform-integration-evidence` writes the canonical raw audit record only
 after the workflow has verified GitHub provenance. These tools do not publish,
 promote, or activate a release when an operator runs them locally.
+
+## Surplasse public edge transaction
+
+`deploy-surplasse-public-edge` stages, switches, verifies, and recovers the
+optional Surplasse extension of the existing Caddy project. It never changes
+DNS and never materializes a credential. It calls
+`materialize-surplasse-dns-secrets --check` while it owns the shared deployment
+lock. The controller retains every base static route and named volume. It
+records its active and transaction state under
+`/var/lib/vps-public-edge-surplasse`.
+
+Each activation forces Caddy recreation. This is required after the DNS helper
+atomically replaces a credential because an existing bind mount keeps the old
+inode. A read-only live verification does not claim that a rotated inode is
+already mounted.
+
+Run its focused adversarial tests with:
+
+```bash
+make check-surplasse-public-edge-controller
+```

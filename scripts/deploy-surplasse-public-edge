@@ -1,0 +1,1567 @@
+#!/usr/bin/env python3
+"""Stage, activate, verify, and recover the Surplasse public edge extension."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Iterator, Mapping, Sequence
+
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RELEASE_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
+APPLICATION_RELEASE_RE = re.compile(
+    r"^/srv/applications/surplasse/releases/sha256-[0-9a-f]{64}/"
+    r"integration/caddy/surplasse\.caddy$"
+)
+BASE_RELEASE_RE = re.compile(
+    r"^/srv/vps/releases/public-static-edge/[0-9a-f]{40}-(?:prepare|activate)$"
+)
+EXTENSION_RELEASE_RE = re.compile(
+    r"^/srv/vps/releases/public-static-edge-surplasse/[0-9a-f]{64}$"
+)
+
+PROJECT = "vps-public-static-edge"
+UNIT = "vps-public-static-edge.service"
+CONTAINER = "vps-public-static-edge-caddy-1"
+IMAGE_DIGEST_RE = re.compile(
+    r"^ghcr\.io/nclsppr/vps-infra/caddy:[A-Za-z0-9_.-]+" r"@sha256:[0-9a-f]{64}$"
+)
+APP_NETWORK = "app_surplasse"
+APP_SUBNET = "172.30.10.0/24"
+APP_ADDRESS = "172.30.10.254"
+EDGE_NETWORK = "edge"
+ROUTE_SHA256 = "645931a03bd1c80ab5b3982d6a285e673906d68fb010adbd1756d43d8a0cd306"
+ROUTE_NAMES = ("papersempire.caddy", "parkventory.caddy", "personal.caddy")
+BASE_FILES = (
+    "Caddyfile",
+    "compose.yaml",
+    "expected-images.json",
+    "phase",
+    "source-revision",
+    "validate-compose",
+)
+CANDIDATE_FILES = (*BASE_FILES, "candidate.json", "surplasse-tls.caddy")
+TRANSACTION_PHASES = frozenset({"prepared", "switched", "reconciled", "verified"})
+MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_STATE_BYTES = 16 * 1024
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+LOCK_TIMEOUT_SECONDS = 60
+REPOSITORY_FILE_MODES = frozenset({0o444, 0o644})
+
+
+class EdgeDeploymentError(ValueError):
+    """The public edge transition violates the reviewed contract."""
+
+
+def fail(message: str) -> None:
+    raise EdgeDeploymentError(message)
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimePaths:
+    runtime_link: Path = Path("/srv/vps/runtime/public-static-edge")
+    base_release_root: Path = Path("/srv/vps/releases/public-static-edge")
+    extension_release_root: Path = Path(
+        "/srv/vps/releases/public-static-edge-surplasse"
+    )
+    state_root: Path = Path("/var/lib/vps-public-edge-surplasse")
+    repository_root: Path = Path("/srv/vps/repository")
+    controller_revision: Path = Path("/usr/local/share/vps-infra/controller-revision")
+    dns_materializer: Path = Path(
+        "/usr/local/libexec/vps/materialize-surplasse-dns-secrets"
+    )
+    dns_bundle_root: Path = Path("/etc/vps/secrets/dns/surplasse")
+    deployment_lock: Path = Path("/run/lock/vps-static.lock")
+    docker: Path = Path("/usr/bin/docker")
+    systemctl: Path = Path("/usr/bin/systemctl")
+    expected_uid: int = 0
+    expected_gid: int = 0
+
+    @property
+    def active_path(self) -> Path:
+        return self.state_root / "active.json"
+
+    @property
+    def transaction_path(self) -> Path:
+        return self.state_root / "transaction.json"
+
+    @property
+    def approved_route(self) -> Path:
+        return self.repository_root / "platform/caddy/routes/surplasse.caddy.disabled"
+
+    @property
+    def tls_snippet(self) -> Path:
+        return self.repository_root / "platform/public-static-edge/surplasse-tls.caddy"
+
+    @property
+    def overlay(self) -> Path:
+        return (
+            self.repository_root
+            / "applications/surplasse/integration/public-edge.override.yaml"
+        )
+
+    @property
+    def candidate_validator(self) -> Path:
+        return self.repository_root / "scripts/validate-surplasse-public-edge-candidate"
+
+    @property
+    def caddy_verifier(self) -> Path:
+        return self.repository_root / "scripts/verify-surplasse-public-edge-caddy"
+
+
+@dataclasses.dataclass(frozen=True)
+class EdgeState:
+    base_release: str
+    release: str
+    source_revision: str
+    attested_route: str
+    route_sha256: str
+    compose_sha256: str
+    tls_sha256: str
+    overlay_sha256: str
+    caddy_image: str
+    fingerprint: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "attested_route": self.attested_route,
+            "base_release": self.base_release,
+            "caddy_image": self.caddy_image,
+            "compose_sha256": self.compose_sha256,
+            "fingerprint": self.fingerprint,
+            "overlay_sha256": self.overlay_sha256,
+            "release": self.release,
+            "route_sha256": self.route_sha256,
+            "schema": 1,
+            "source_revision": self.source_revision,
+            "tls_sha256": self.tls_sha256,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class EdgeTransaction:
+    candidate: EdgeState
+    previous: EdgeState | None
+    previous_release: str
+    phase: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "candidate": self.candidate.as_dict(),
+            "phase": self.phase,
+            "previous": None if self.previous is None else self.previous.as_dict(),
+            "previous_release": self.previous_release,
+            "schema": 1,
+        }
+
+
+def safe_environment() -> dict[str, str]:
+    return {
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+
+
+def canonical_json(value: object) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("ascii")
+
+
+def strict_json(raw: bytes, label: str) -> object:
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                fail(f"{label} contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            raw.decode("ascii"),
+            object_pairs_hook=object_pairs,
+            parse_constant=lambda value: fail(
+                f"{label} contains invalid JSON constant {value}"
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"{label} is not strict ASCII JSON: {exc}")
+
+
+def _metadata_is_file(
+    metadata: os.stat_result,
+    paths: RuntimePaths,
+    *,
+    modes: frozenset[int],
+    maximum_size: int,
+) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == paths.expected_uid
+        and metadata.st_gid == paths.expected_gid
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) in modes
+        and 0 < metadata.st_size <= maximum_size
+    )
+
+
+def read_protected_file(
+    path: Path,
+    label: str,
+    paths: RuntimePaths,
+    *,
+    modes: frozenset[int] = frozenset({0o444}),
+    maximum_size: int = MAX_FILE_BYTES,
+) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        fail(f"cannot open {label} safely: {exc}")
+    try:
+        before = os.fstat(descriptor)
+        if not _metadata_is_file(before, paths, modes=modes, maximum_size=maximum_size):
+            fail(f"{label} is not one protected regular file")
+        chunks: list[bytes] = []
+        remaining = maximum_size + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        result = b"".join(chunks)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after or len(result) != before.st_size:
+            fail(f"{label} changed while it was read")
+        return result
+    except OSError as exc:
+        fail(f"cannot read {label}: {exc}")
+    finally:
+        os.close(descriptor)
+
+
+def require_directory(
+    path: Path,
+    label: str,
+    paths: RuntimePaths,
+    *,
+    modes: frozenset[int],
+) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != paths.expected_uid
+        or metadata.st_gid != paths.expected_gid
+        or stat.S_IMODE(metadata.st_mode) not in modes
+    ):
+        fail(f"{label} is not one protected directory")
+
+
+def sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def run(
+    arguments: Sequence[str | Path],
+    *,
+    timeout: int,
+    input_bytes: bytes | None = None,
+    maximum_stdout: int = MAX_OUTPUT_BYTES,
+    sensitive: bool = False,
+) -> subprocess.CompletedProcess[bytes]:
+    command = [str(item) for item in arguments]
+    try:
+        result = subprocess.run(
+            command,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=safe_environment(),
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"command {command[0]} could not complete: {exc}")
+    if len(result.stdout) > maximum_stdout or len(result.stderr) > maximum_stdout:
+        fail(f"command {command[0]} exceeded its bounded output")
+    if result.returncode != 0:
+        if sensitive:
+            fail(f"sensitive command {command[0]} failed without retained diagnostics")
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        fail(f"command {command[0]} failed: {stderr or 'no diagnostic'}")
+    return result
+
+
+def validate_state(value: object, paths: RuntimePaths, label: str) -> EdgeState:
+    fields = {
+        "attested_route",
+        "base_release",
+        "caddy_image",
+        "compose_sha256",
+        "fingerprint",
+        "overlay_sha256",
+        "release",
+        "route_sha256",
+        "schema",
+        "source_revision",
+        "tls_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        fail(f"{label} has an invalid shape")
+    if value["schema"] != 1 or isinstance(value["schema"], bool):
+        fail(f"{label} schema is invalid")
+    if any(not isinstance(value[key], str) for key in fields - {"schema"}):
+        fail(f"{label} contains a non-string field")
+    state = EdgeState(
+        base_release=value["base_release"],
+        release=value["release"],
+        source_revision=value["source_revision"],
+        attested_route=value["attested_route"],
+        route_sha256=value["route_sha256"],
+        compose_sha256=value["compose_sha256"],
+        tls_sha256=value["tls_sha256"],
+        overlay_sha256=value["overlay_sha256"],
+        caddy_image=value["caddy_image"],
+        fingerprint=value["fingerprint"],
+    )
+    if SHA40_RE.fullmatch(state.source_revision) is None:
+        fail(f"{label} source revision is invalid")
+    if any(
+        SHA256_RE.fullmatch(item) is None
+        for item in (
+            state.route_sha256,
+            state.compose_sha256,
+            state.tls_sha256,
+            state.overlay_sha256,
+            state.fingerprint,
+        )
+    ):
+        fail(f"{label} contains an invalid SHA-256 value")
+    if state.route_sha256 != ROUTE_SHA256:
+        fail(f"{label} route digest differs from the approved route")
+    if IMAGE_DIGEST_RE.fullmatch(state.caddy_image) is None:
+        fail(f"{label} Caddy image is not one immutable approved repository reference")
+    if paths.expected_uid == 0:
+        if BASE_RELEASE_RE.fullmatch(state.base_release) is None:
+            fail(f"{label} base release path is invalid")
+        if EXTENSION_RELEASE_RE.fullmatch(state.release) is None:
+            fail(f"{label} release path is invalid")
+        if APPLICATION_RELEASE_RE.fullmatch(state.attested_route) is None:
+            fail(f"{label} attested route path is invalid")
+    else:
+        if Path(state.base_release).parent != paths.base_release_root:
+            fail(f"{label} test base release path is invalid")
+        if Path(state.release).parent != paths.extension_release_root:
+            fail(f"{label} test release path is invalid")
+    if Path(state.release).name != state.fingerprint:
+        fail(f"{label} release name does not match its fingerprint")
+    return state
+
+
+def validate_transaction(
+    value: object, paths: RuntimePaths, label: str
+) -> EdgeTransaction:
+    if not isinstance(value, dict) or set(value) != {
+        "candidate",
+        "phase",
+        "previous",
+        "previous_release",
+        "schema",
+    }:
+        fail(f"{label} has an invalid shape")
+    if value["schema"] != 1 or isinstance(value["schema"], bool):
+        fail(f"{label} schema is invalid")
+    candidate = validate_state(value["candidate"], paths, f"{label} candidate")
+    previous = (
+        None
+        if value["previous"] is None
+        else validate_state(value["previous"], paths, f"{label} previous state")
+    )
+    phase = value["phase"]
+    previous_release = value["previous_release"]
+    if not isinstance(phase, str) or phase not in TRANSACTION_PHASES:
+        fail(f"{label} phase is invalid")
+    if not isinstance(previous_release, str):
+        fail(f"{label} previous release is invalid")
+    if candidate.release == previous_release:
+        fail(f"{label} candidate and previous release must differ")
+    if previous is not None and previous.release != previous_release:
+        fail(f"{label} previous state and release differ")
+    if previous is not None and candidate.base_release != previous.base_release:
+        fail(f"{label} candidate and previous state retain different bases")
+    if previous is None:
+        if paths.expected_uid == 0:
+            if BASE_RELEASE_RE.fullmatch(previous_release) is None:
+                fail(f"{label} previous base release is invalid")
+        elif Path(previous_release).parent != paths.base_release_root:
+            fail(f"{label} previous test base release is invalid")
+        if candidate.base_release != previous_release:
+            fail(f"{label} candidate does not retain its previous base release")
+    return EdgeTransaction(
+        candidate=candidate,
+        previous=previous,
+        previous_release=previous_release,
+        phase=phase,
+    )
+
+
+def _read_state(
+    path: Path,
+    paths: RuntimePaths,
+    label: str,
+    *,
+    modes: frozenset[int] = frozenset({0o400}),
+) -> object | None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        fail(f"cannot inspect {label}: {exc}")
+    raw = read_protected_file(
+        path,
+        label,
+        paths,
+        modes=modes,
+        maximum_size=MAX_STATE_BYTES,
+    )
+    value = strict_json(raw, label)
+    if raw != canonical_json(value):
+        fail(f"{label} is not canonical JSON")
+    return value
+
+
+def read_active(paths: RuntimePaths) -> EdgeState | None:
+    value = _read_state(paths.active_path, paths, "Surplasse edge active state")
+    return (
+        None
+        if value is None
+        else validate_state(value, paths, "Surplasse edge active state")
+    )
+
+
+def read_transaction(paths: RuntimePaths) -> EdgeTransaction | None:
+    value = _read_state(paths.transaction_path, paths, "Surplasse edge transaction")
+    return (
+        None
+        if value is None
+        else validate_transaction(value, paths, "Surplasse edge transaction")
+    )
+
+
+def write_state(path: Path, value: Mapping[str, object], paths: RuntimePaths) -> None:
+    encoded = canonical_json(value)
+    if len(encoded) > MAX_STATE_BYTES:
+        fail("Surplasse edge state exceeds its size limit")
+    require_directory(
+        paths.state_root, "Surplasse edge state root", paths, modes=frozenset({0o700})
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=paths.state_root
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o400)
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        parent = os.open(paths.state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except OSError as exc:
+        fail(f"cannot write protected Surplasse edge state: {exc}")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def remove_state(path: Path, paths: RuntimePaths) -> None:
+    require_directory(
+        paths.state_root, "Surplasse edge state root", paths, modes=frozenset({0o700})
+    )
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        fail(f"cannot remove protected Surplasse edge state: {exc}")
+    parent = os.open(paths.state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+@contextlib.contextmanager
+def deployment_lock(paths: RuntimePaths) -> Iterator[None]:
+    try:
+        descriptor = os.open(
+            paths.deployment_lock,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as exc:
+        fail(f"cannot open the shared deployment lock: {exc}")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            metadata.st_uid != paths.expected_uid
+            or metadata.st_gid != paths.expected_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
+            fail("shared deployment lock is not protected")
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    fail("another deployment holds the shared lock")
+                time.sleep(0.2)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def require_runtime(paths: RuntimePaths, *, recovery: bool = False) -> None:
+    if paths.expected_uid == 0 and (os.geteuid() != 0 or os.getegid() != 0):
+        fail("Surplasse public edge control must run as root")
+    for path, label, modes in (
+        (paths.state_root, "Surplasse edge state root", frozenset({0o700})),
+        (
+            paths.extension_release_root,
+            "Surplasse edge release root",
+            frozenset({0o755}),
+        ),
+        (paths.base_release_root, "public edge base release root", frozenset({0o755})),
+        (paths.runtime_link.parent, "public edge runtime parent", frozenset({0o755})),
+    ):
+        require_directory(path, label, paths, modes=modes)
+    for path, label, modes in (
+        (
+            Path(__file__).resolve(),
+            "Surplasse edge controller",
+            frozenset({0o555, 0o755}),
+        ),
+        (
+            paths.systemctl,
+            "systemctl executable",
+            frozenset({0o755}),
+        ),
+        (paths.docker, "Docker executable", frozenset({0o755})),
+    ):
+        if paths.expected_uid == 0:
+            read_protected_file(
+                path, label, paths, modes=modes, maximum_size=16 * 1024 * 1024
+            )
+    if recovery:
+        return
+    for path, label in ((paths.repository_root, "vps-infra repository"),):
+        require_directory(path, label, paths, modes=frozenset({0o700, 0o755}))
+    read_protected_file(
+        paths.controller_revision,
+        "controller revision",
+        paths,
+        modes=frozenset({0o444}),
+        maximum_size=41,
+    )
+
+
+def current_release(paths: RuntimePaths) -> Path:
+    try:
+        metadata = paths.runtime_link.lstat()
+    except OSError as exc:
+        fail(f"cannot inspect the public edge runtime link: {exc}")
+    if (
+        not stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != paths.expected_uid
+        or metadata.st_gid != paths.expected_gid
+    ):
+        fail("public edge runtime path is not one protected symbolic link")
+    target = os.readlink(paths.runtime_link)
+    if not os.path.isabs(target):
+        fail("public edge runtime link must use one absolute release target")
+    release = Path(target)
+    validate_release_path(release, paths, "public edge runtime release")
+    require_directory(
+        release, "active public edge release", paths, modes=frozenset({0o555})
+    )
+    return release
+
+
+def switch_release(paths: RuntimePaths, release: Path) -> None:
+    validate_release_path(release, paths, "public edge switch target")
+    require_directory(
+        release, "public edge switch release", paths, modes=frozenset({0o555})
+    )
+    parent_descriptor = os.open(
+        paths.runtime_link.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    temporary = f".{paths.runtime_link.name}.{secrets.token_hex(8)}"
+    try:
+        os.symlink(str(release), temporary, dir_fd=parent_descriptor)
+        os.replace(
+            temporary,
+            paths.runtime_link.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        os.fsync(parent_descriptor)
+    except OSError as exc:
+        fail(f"cannot atomically switch the public edge release: {exc}")
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent_descriptor)
+        os.close(parent_descriptor)
+
+
+def validate_release_path(release: Path, paths: RuntimePaths, label: str) -> None:
+    if not release.is_absolute():
+        fail(f"{label} must be absolute")
+    if release.parent == paths.base_release_root:
+        valid = (
+            BASE_RELEASE_RE.fullmatch(str(release)) is not None
+            if paths.expected_uid == 0
+            else re.fullmatch(r"[0-9a-f]{40}-(?:prepare|activate)", release.name)
+            is not None
+        )
+    elif release.parent == paths.extension_release_root:
+        valid = (
+            EXTENSION_RELEASE_RE.fullmatch(str(release)) is not None
+            if paths.expected_uid == 0
+            else RELEASE_NAME_RE.fullmatch(release.name) is not None
+        )
+    else:
+        fail(f"{label} escapes the bounded release roots")
+    if not valid:
+        fail(f"{label} has an invalid release name")
+
+
+def controller_revision(paths: RuntimePaths) -> str:
+    raw = read_protected_file(
+        paths.controller_revision,
+        "controller revision",
+        paths,
+        modes=frozenset({0o444}),
+        maximum_size=41,
+    )
+    try:
+        value = raw.decode("ascii").removesuffix("\n")
+    except UnicodeDecodeError as exc:
+        fail(f"controller revision is not ASCII: {exc}")
+    if raw != f"{value}\n".encode("ascii") or SHA40_RE.fullmatch(value) is None:
+        fail("controller revision framing is invalid")
+    return value
+
+
+def _list_directory(path: Path, label: str) -> list[str]:
+    try:
+        return sorted(item.name for item in path.iterdir())
+    except OSError as exc:
+        fail(f"cannot enumerate {label}: {exc}")
+
+
+def validate_base_release(
+    release: Path,
+    paths: RuntimePaths,
+    *,
+    require_current_revision: bool = True,
+) -> tuple[str, str]:
+    if release.parent != paths.base_release_root:
+        fail("public edge base release path is outside its bounded root")
+    if paths.expected_uid == 0 and BASE_RELEASE_RE.fullmatch(str(release)) is None:
+        fail("public edge base release path is invalid")
+    require_directory(
+        release, "public edge base release", paths, modes=frozenset({0o555})
+    )
+    expected_entries = sorted((*BASE_FILES, "routes"))
+    if _list_directory(release, "public edge base release") != expected_entries:
+        fail("public edge base release has an unexpected entry set")
+    routes = release / "routes"
+    require_directory(
+        routes, "public edge base route directory", paths, modes=frozenset({0o555})
+    )
+    if _list_directory(routes, "public edge base routes") != list(ROUTE_NAMES):
+        fail("public edge base release does not contain the exact static route set")
+    for name in BASE_FILES:
+        read_protected_file(
+            release / name,
+            f"public edge base {name}",
+            paths,
+            modes=(
+                frozenset({0o555}) if name == "validate-compose" else frozenset({0o444})
+            ),
+        )
+    for name in ROUTE_NAMES:
+        read_protected_file(
+            routes / name,
+            f"public edge static route {name}",
+            paths,
+        )
+    revision_raw = read_protected_file(
+        release / "source-revision", "public edge source revision", paths
+    )
+    phase_raw = read_protected_file(release / "phase", "public edge phase", paths)
+    revision = revision_raw.decode("ascii", errors="strict").removesuffix("\n")
+    phase = phase_raw.decode("ascii", errors="strict").removesuffix("\n")
+    if revision_raw != f"{revision}\n".encode() or SHA40_RE.fullmatch(revision) is None:
+        fail("public edge source revision is invalid")
+    if phase_raw != f"{phase}\n".encode() or phase not in {"prepare", "activate"}:
+        fail("public edge phase is invalid")
+    if require_current_revision and revision != controller_revision(paths):
+        fail("public edge base release and installed controller revisions differ")
+    return revision, phase
+
+
+def validate_attested_route(path: Path, paths: RuntimePaths) -> bytes:
+    if not path.is_absolute():
+        fail("attested Surplasse route path must be absolute")
+    if paths.expected_uid == 0:
+        if APPLICATION_RELEASE_RE.fullmatch(str(path)) is None:
+            fail("attested Surplasse route is outside an admitted application release")
+        for directory, label in (
+            (path.parents[0], "attested route caddy directory"),
+            (path.parents[1], "attested route integration directory"),
+            (path.parents[2], "attested application release"),
+            (path.parents[3], "Surplasse application release root"),
+        ):
+            require_directory(directory, label, paths, modes=frozenset({0o755}))
+    route = read_protected_file(path, "attested Surplasse route", paths)
+    approved = read_protected_file(
+        paths.approved_route,
+        "approved Surplasse route",
+        paths,
+        modes=REPOSITORY_FILE_MODES,
+    )
+    if sha256(approved) != ROUTE_SHA256:
+        fail("approved Surplasse route differs from its reviewed digest")
+    if route != approved:
+        fail("attested Surplasse route differs from the approved route")
+    return route
+
+
+def validate_repository_inputs(paths: RuntimePaths) -> tuple[bytes, bytes]:
+    tls = read_protected_file(
+        paths.tls_snippet,
+        "approved Surplasse TLS snippet",
+        paths,
+        modes=REPOSITORY_FILE_MODES,
+    )
+    overlay = read_protected_file(
+        paths.overlay,
+        "approved Surplasse public edge overlay",
+        paths,
+        modes=REPOSITORY_FILE_MODES,
+    )
+    for path, label in (
+        (paths.candidate_validator, "Surplasse public edge validator"),
+        (paths.caddy_verifier, "Surplasse Caddy verifier"),
+    ):
+        read_protected_file(
+            path,
+            label,
+            paths,
+            modes=frozenset({0o555, 0o755}),
+            maximum_size=MAX_FILE_BYTES,
+        )
+    return tls, overlay
+
+
+def require_dns_secrets(paths: RuntimePaths) -> None:
+    read_protected_file(
+        paths.dns_materializer,
+        "Surplasse DNS secret materializer",
+        paths,
+        modes=frozenset({0o500, 0o555, 0o755}),
+        maximum_size=MAX_FILE_BYTES,
+    )
+    result = run(
+        [paths.dns_materializer, "--check"],
+        timeout=30,
+        maximum_stdout=64 * 1024,
+    )
+    if result.stdout != b"Surplasse DNS credential contract valid\n" or result.stderr:
+        fail("Surplasse DNS secret materializer returned an unexpected result")
+
+
+def render_candidate_compose(
+    base_release: Path, staging: Path, paths: RuntimePaths
+) -> tuple[bytes, dict[str, Any]]:
+    result = run(
+        [
+            paths.docker,
+            "compose",
+            "--project-directory",
+            staging,
+            "--file",
+            base_release / "compose.yaml",
+            "--file",
+            paths.overlay,
+            "config",
+            "--format",
+            "json",
+        ],
+        timeout=60,
+    )
+    value = strict_json(result.stdout, "rendered Surplasse public edge Compose")
+    if not isinstance(value, dict):
+        fail("rendered Surplasse public edge Compose is not an object")
+    rendered = canonical_json(value)
+    compose_path = staging / "compose.yaml"
+    compose_path.write_bytes(rendered)
+    os.chmod(compose_path, 0o444)
+    run(
+        [
+            paths.candidate_validator,
+            compose_path,
+            "--approved-route",
+            paths.approved_route,
+            "--candidate-only",
+        ],
+        timeout=60,
+    )
+    services = value.get("services")
+    if not isinstance(services, dict) or set(services) != {"caddy"}:
+        fail("rendered public edge candidate does not retain the sole Caddy service")
+    caddy = services["caddy"]
+    if not isinstance(caddy, dict) or not isinstance(caddy.get("image"), str):
+        fail("rendered public edge candidate has no exact Caddy image")
+    return rendered, value
+
+
+def validate_local_image(image: str, paths: RuntimePaths) -> None:
+    if IMAGE_DIGEST_RE.fullmatch(image) is None:
+        fail("public edge candidate image is not one immutable Caddy reference")
+    inspected = run(
+        [paths.docker, "image", "inspect", image],
+        timeout=60,
+        maximum_stdout=MAX_OUTPUT_BYTES,
+    )
+    value = strict_json(inspected.stdout, "local Caddy image inspection")
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        fail("local Caddy image inspection is ambiguous")
+    repository_digest = re.sub(r":[^/@]+@sha256:", "@sha256:", image)
+    if repository_digest not in value[0].get("RepoDigests", []):
+        fail("local Caddy image does not contain the reviewed registry digest")
+
+
+def validate_caddy_candidate(release: Path, image: str, paths: RuntimePaths) -> None:
+    run([paths.caddy_verifier, image, paths.approved_route], timeout=120)
+    credential_mapping = (
+        (
+            "OVH_APPLICATION_KEY_FILE",
+            "surplasse_ovh_application_key",
+            "ovh-application-key",
+        ),
+        (
+            "OVH_APPLICATION_SECRET_FILE",
+            "surplasse_ovh_application_secret",
+            "ovh-application-secret",
+        ),
+        (
+            "OVH_CONSUMER_KEY_FILE",
+            "surplasse_ovh_consumer_key",
+            "ovh-consumer-key",
+        ),
+    )
+    arguments: list[str | Path] = [
+        paths.docker,
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--pids-limit",
+        "64",
+        "--memory",
+        "256m",
+        "--tmpfs",
+        "/tmp:size=16m,mode=1777",
+        "--tmpfs",
+        "/run:size=8m,mode=0755",
+    ]
+    for variable, secret_name, file_name in credential_mapping:
+        arguments.extend(
+            [
+                "--env",
+                f"{variable}=/run/secrets/{secret_name}",
+                "--volume",
+                f"{paths.dns_bundle_root / file_name}:/run/secrets/{secret_name}:ro",
+            ]
+        )
+    arguments.extend(
+        [
+            "--volume",
+            f"{release / 'Caddyfile'}:/etc/caddy/Caddyfile:ro",
+            "--volume",
+            f"{release / 'routes'}:/etc/caddy/routes:ro",
+            "--volume",
+            f"{release / 'surplasse-tls.caddy'}:/etc/caddy/surplasse-tls.caddy:ro",
+            image,
+            "caddy",
+            "validate",
+            "--config",
+            "/etc/caddy/Caddyfile",
+            "--adapter",
+            "caddyfile",
+        ]
+    )
+    run(arguments, timeout=120, sensitive=True)
+
+
+def _copy_exact(
+    source: Path, destination: Path, mode: int, paths: RuntimePaths
+) -> bytes:
+    raw = read_protected_file(
+        source,
+        source.name,
+        paths,
+        modes=frozenset({0o444, 0o555}),
+        maximum_size=MAX_FILE_BYTES,
+    )
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        mode,
+    )
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return raw
+
+
+def candidate_fingerprint(
+    *,
+    base_release: Path,
+    revision: str,
+    attested_route: Path,
+    route: bytes,
+    tls: bytes,
+    overlay: bytes,
+) -> str:
+    subject = {
+        "attested_route": str(attested_route),
+        "base_release": str(base_release),
+        "overlay_sha256": sha256(overlay),
+        "route_sha256": sha256(route),
+        "schema": 1,
+        "source_revision": revision,
+        "tls_sha256": sha256(tls),
+    }
+    return sha256(canonical_json(subject))
+
+
+def stage_candidate(attested_route: Path, paths: RuntimePaths) -> EdgeState:
+    require_dns_secrets(paths)
+    active = read_active(paths)
+    current = current_release(paths)
+    if active is None:
+        base_release = current
+    else:
+        if current != Path(active.release):
+            fail("active Surplasse edge state does not match the runtime link")
+        validate_candidate_release(Path(active.release), active, paths)
+        base_release = Path(active.base_release)
+    revision, _phase = validate_base_release(base_release, paths)
+    route = validate_attested_route(attested_route, paths)
+    tls, overlay = validate_repository_inputs(paths)
+    fingerprint = candidate_fingerprint(
+        base_release=base_release,
+        revision=revision,
+        attested_route=attested_route,
+        route=route,
+        tls=tls,
+        overlay=overlay,
+    )
+    release = paths.extension_release_root / fingerprint
+    if release.exists():
+        require_directory(
+            release,
+            "existing Surplasse edge candidate",
+            paths,
+            modes=frozenset({0o555}),
+        )
+        value = _read_state(
+            release / "candidate.json",
+            paths,
+            "staged edge candidate",
+            modes=frozenset({0o444}),
+        )
+        state = validate_state(value, paths, "staged edge candidate")
+        validate_candidate_release(release, state, paths)
+        return state
+
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{fingerprint}.", dir=paths.extension_release_root)
+    )
+    try:
+        os.chmod(staging, 0o755)
+        routes = staging / "routes"
+        routes.mkdir(mode=0o755)
+        for name in BASE_FILES:
+            if name == "compose.yaml":
+                continue
+            _copy_exact(
+                base_release / name,
+                staging / name,
+                0o555 if name == "validate-compose" else 0o444,
+                paths,
+            )
+        for name in ROUTE_NAMES:
+            _copy_exact(base_release / "routes" / name, routes / name, 0o444, paths)
+        route_path = routes / "surplasse.caddy"
+        route_path.write_bytes(route)
+        os.chmod(route_path, 0o444)
+        tls_path = staging / "surplasse-tls.caddy"
+        tls_path.write_bytes(tls)
+        os.chmod(tls_path, 0o444)
+        rendered, document = render_candidate_compose(base_release, staging, paths)
+        image = document["services"]["caddy"]["image"]
+        if not isinstance(image, str):
+            fail("rendered Caddy image is not a string")
+        state = EdgeState(
+            base_release=str(base_release),
+            release=str(release),
+            source_revision=revision,
+            attested_route=str(attested_route),
+            route_sha256=sha256(route),
+            compose_sha256=sha256(rendered),
+            tls_sha256=sha256(tls),
+            overlay_sha256=sha256(overlay),
+            caddy_image=image,
+            fingerprint=fingerprint,
+        )
+        candidate_path = staging / "candidate.json"
+        candidate_path.write_bytes(canonical_json(state.as_dict()))
+        os.chmod(candidate_path, 0o444)
+        validate_local_image(image, paths)
+        validate_caddy_candidate(staging, image, paths)
+        for directory in (routes, staging):
+            descriptor = os.open(
+                directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.chmod(directory, 0o555)
+        os.replace(staging, release)
+        parent = os.open(
+            paths.extension_release_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+        validate_candidate_release(release, state, paths)
+        return state
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+
+
+def validate_candidate_release(
+    release: Path, state: EdgeState, paths: RuntimePaths
+) -> None:
+    validate_state(state.as_dict(), paths, "edge candidate state")
+    if release != Path(state.release):
+        fail("edge candidate release differs from its state")
+    base_revision, _base_phase = validate_base_release(
+        Path(state.base_release), paths, require_current_revision=False
+    )
+    if base_revision != state.source_revision:
+        fail("edge candidate source revision differs from its retained base")
+    require_directory(
+        release, "Surplasse edge candidate", paths, modes=frozenset({0o555})
+    )
+    if _list_directory(release, "Surplasse edge candidate") != sorted(
+        (*CANDIDATE_FILES, "routes")
+    ):
+        fail("Surplasse edge candidate has an unexpected entry set")
+    routes = release / "routes"
+    require_directory(
+        routes, "Surplasse edge candidate routes", paths, modes=frozenset({0o555})
+    )
+    if _list_directory(routes, "Surplasse edge candidate routes") != sorted(
+        (*ROUTE_NAMES, "surplasse.caddy")
+    ):
+        fail("Surplasse edge candidate does not retain the exact route set")
+    manifest = read_protected_file(
+        release / "candidate.json", "edge candidate manifest", paths
+    )
+    if manifest != canonical_json(state.as_dict()):
+        fail("edge candidate manifest differs from its durable state")
+    for name in BASE_FILES:
+        candidate = read_protected_file(
+            release / name,
+            f"edge candidate {name}",
+            paths,
+            modes=(
+                frozenset({0o555}) if name == "validate-compose" else frozenset({0o444})
+            ),
+        )
+        if name != "compose.yaml":
+            base = read_protected_file(
+                Path(state.base_release) / name,
+                f"base edge {name}",
+                paths,
+                modes=(
+                    frozenset({0o555})
+                    if name == "validate-compose"
+                    else frozenset({0o444})
+                ),
+            )
+            if candidate != base:
+                fail(f"edge candidate changed retained base file {name}")
+    compose = read_protected_file(
+        release / "compose.yaml", "edge candidate Compose", paths
+    )
+    route = read_protected_file(
+        routes / "surplasse.caddy", "installed Surplasse route", paths
+    )
+    tls = read_protected_file(
+        release / "surplasse-tls.caddy", "installed Surplasse TLS snippet", paths
+    )
+    if sha256(compose) != state.compose_sha256:
+        fail("edge candidate Compose digest differs from its state")
+    if sha256(route) != state.route_sha256 or route != read_protected_file(
+        paths.approved_route,
+        "approved Surplasse route",
+        paths,
+        modes=REPOSITORY_FILE_MODES,
+    ):
+        fail("edge candidate route differs from its attested bytes")
+    if sha256(tls) != state.tls_sha256 or tls != read_protected_file(
+        paths.tls_snippet,
+        "approved Surplasse TLS snippet",
+        paths,
+        modes=REPOSITORY_FILE_MODES,
+    ):
+        fail("edge candidate TLS snippet differs from the Atlas-owned source")
+    overlay = read_protected_file(
+        paths.overlay,
+        "approved Surplasse public edge overlay",
+        paths,
+        modes=REPOSITORY_FILE_MODES,
+    )
+    if sha256(overlay) != state.overlay_sha256:
+        fail("edge candidate overlay source differs from its staged digest")
+    expected_fingerprint = candidate_fingerprint(
+        base_release=Path(state.base_release),
+        revision=state.source_revision,
+        attested_route=Path(state.attested_route),
+        route=route,
+        tls=tls,
+        overlay=overlay,
+    )
+    if expected_fingerprint != state.fingerprint:
+        fail("edge candidate fingerprint differs from its exact staged inputs")
+    for name in ROUTE_NAMES:
+        retained = read_protected_file(
+            routes / name, f"retained static route {name}", paths
+        )
+        original = read_protected_file(
+            Path(state.base_release) / "routes" / name,
+            f"base static route {name}",
+            paths,
+        )
+        if retained != original:
+            fail(f"edge candidate changed retained static route {name}")
+
+
+def compose_document(release: Path, paths: RuntimePaths) -> dict[str, Any]:
+    rendered = run(
+        [
+            paths.docker,
+            "compose",
+            "--project-directory",
+            release,
+            "--file",
+            release / "compose.yaml",
+            "config",
+            "--format",
+            "json",
+        ],
+        timeout=60,
+    )
+    value = strict_json(rendered.stdout, "live public edge Compose")
+    if not isinstance(value, dict):
+        fail("live public edge Compose is not an object")
+    return value
+
+
+def network_identity(name: str, paths: RuntimePaths) -> tuple[str, dict[str, Any]]:
+    inspected = run([paths.docker, "network", "inspect", name], timeout=30)
+    value = strict_json(inspected.stdout, f"Docker network {name}")
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        fail(f"Docker network {name} inspection is ambiguous")
+    network = value[0]
+    identifier = network.get("Id")
+    if not isinstance(identifier, str) or not identifier:
+        fail(f"Docker network {name} has no stable identifier")
+    return identifier, network
+
+
+def verify_live_runtime(paths: RuntimePaths, state: EdgeState | None = None) -> None:
+    release = current_release(paths)
+    if state is not None:
+        if release != Path(state.release):
+            fail("live public edge release differs from the expected candidate")
+        validate_candidate_release(release, state, paths)
+    else:
+        validate_base_release(release, paths, require_current_revision=False)
+    document = compose_document(release, paths)
+    services = document.get("services")
+    if not isinstance(services, dict) or set(services) != {"caddy"}:
+        fail("live public edge does not have the sole Caddy service")
+    caddy = services["caddy"]
+    if not isinstance(caddy, dict) or not isinstance(caddy.get("image"), str):
+        fail("live public edge Caddy image is invalid")
+    expected_image = caddy["image"]
+    if state is not None and expected_image != state.caddy_image:
+        fail("live public edge image differs from the staged candidate")
+    services_result = run(
+        [
+            paths.docker,
+            "compose",
+            "--project-directory",
+            release,
+            "--file",
+            release / "compose.yaml",
+            "ps",
+            "--all",
+            "--services",
+        ],
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    if services_result.stdout != b"caddy\n" or services_result.stderr:
+        fail("public edge project does not contain exactly the Caddy service")
+    inspected = run([paths.docker, "container", "inspect", CONTAINER], timeout=30)
+    value = strict_json(inspected.stdout, "public edge Caddy container")
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
+        fail("public edge Caddy container inspection is ambiguous")
+    container = value[0]
+    status_value = container.get("State", {})
+    config = container.get("Config", {})
+    network_settings = container.get("NetworkSettings", {})
+    networks = network_settings.get("Networks", {})
+    if (
+        status_value.get("Status") != "running"
+        or status_value.get("Health", {}).get("Status") != "healthy"
+        or config.get("Image") != expected_image
+        or config.get("Labels", {}).get("com.docker.compose.project") != PROJECT
+        or not isinstance(networks, dict)
+    ):
+        fail("public edge Caddy container identity or health differs")
+    expected_networks = {EDGE_NETWORK} if state is None else {EDGE_NETWORK, APP_NETWORK}
+    if set(networks) != expected_networks:
+        fail("public edge Caddy network set differs from the expected composition")
+    if state is not None:
+        network_id, network = network_identity(APP_NETWORK, paths)
+        ipam = network.get("IPAM", {}).get("Config", [])
+        if (
+            network.get("Name") != APP_NETWORK
+            or network.get("Driver") != "bridge"
+            or network.get("Scope") != "local"
+            or network.get("Internal") is not False
+            or network.get("Labels", {}).get("com.nclsppr.vps-infra.managed") != "true"
+            or not isinstance(ipam, list)
+            or len(ipam) != 1
+            or ipam[0].get("Subnet") != APP_SUBNET
+        ):
+            fail("app_surplasse network differs from the managed host contract")
+        attachment = networks.get(APP_NETWORK, {})
+        if (
+            attachment.get("NetworkID") != network_id
+            or attachment.get("IPAddress") != APP_ADDRESS
+            or attachment.get("IPPrefixLen") != 24
+        ):
+            fail("public edge Caddy does not own the exact app_surplasse address")
+
+
+def restart_edge(paths: RuntimePaths) -> None:
+    release = current_release(paths)
+    run(
+        [
+            paths.docker,
+            "compose",
+            "--project-directory",
+            release,
+            "--file",
+            release / "compose.yaml",
+            "up",
+            "--detach",
+            "--wait",
+            "--no-build",
+            "--pull",
+            "never",
+            "--force-recreate",
+            "--remove-orphans",
+            "caddy",
+        ],
+        timeout=300,
+        maximum_stdout=64 * 1024,
+    )
+
+
+def verify_unit_active(paths: RuntimePaths) -> None:
+    status = run([paths.systemctl, "is-active", UNIT], timeout=30, maximum_stdout=1024)
+    if status.stdout != b"active\n" or status.stderr:
+        fail("public edge systemd unit is not active")
+
+
+def _write_transaction(transaction: EdgeTransaction, paths: RuntimePaths) -> None:
+    validate_transaction(transaction.as_dict(), paths, "Surplasse edge transaction")
+    write_state(paths.transaction_path, transaction.as_dict(), paths)
+
+
+def _commit_active(transaction: EdgeTransaction, paths: RuntimePaths) -> None:
+    if transaction.phase != "verified":
+        fail("only a verified Surplasse edge transaction can be committed")
+    write_state(paths.active_path, transaction.candidate.as_dict(), paths)
+    remove_state(paths.transaction_path, paths)
+
+
+def rollback(transaction: EdgeTransaction, paths: RuntimePaths) -> None:
+    previous_release = Path(transaction.previous_release)
+    if transaction.previous is None:
+        validate_base_release(previous_release, paths, require_current_revision=False)
+    else:
+        validate_candidate_release(previous_release, transaction.previous, paths)
+    switch_release(paths, previous_release)
+    restart_edge(paths)
+    verify_live_runtime(paths, transaction.previous)
+    if transaction.previous is None:
+        remove_state(paths.active_path, paths)
+    else:
+        write_state(paths.active_path, transaction.previous.as_dict(), paths)
+    remove_state(paths.transaction_path, paths)
+
+
+def recover_locked(paths: RuntimePaths) -> None:
+    transaction = read_transaction(paths)
+    if transaction is None:
+        active = read_active(paths)
+        if active is not None:
+            require_directory(
+                paths.repository_root,
+                "vps-infra repository",
+                paths,
+                modes=frozenset({0o700, 0o755}),
+            )
+            if current_release(paths) != Path(active.release):
+                fail("active Surplasse edge state differs from the runtime link")
+            validate_candidate_release(Path(active.release), active, paths)
+        return
+    current = current_release(paths)
+    candidate_release = Path(transaction.candidate.release)
+    previous_release = Path(transaction.previous_release)
+    if current not in {candidate_release, previous_release}:
+        fail("interrupted edge transaction found an unexpected runtime release")
+    if transaction.phase in {"reconciled", "verified"} and current == candidate_release:
+        try:
+            require_directory(
+                paths.repository_root,
+                "vps-infra repository",
+                paths,
+                modes=frozenset({0o700, 0o755}),
+            )
+            verify_live_runtime(paths, transaction.candidate)
+        except BaseException as verification_error:
+            rollback(transaction, paths)
+            print(
+                "Surplasse public edge recovery restored the previous release "
+                f"after candidate verification failed: {verification_error}",
+                file=sys.stderr,
+            )
+            return
+        verified = dataclasses.replace(transaction, phase="verified")
+        if transaction.phase != "verified":
+            _write_transaction(verified, paths)
+        _commit_active(verified, paths)
+        return
+    rollback(transaction, paths)
+
+
+def activate_candidate(release: Path, paths: RuntimePaths) -> None:
+    recover_locked(paths)
+    verify_unit_active(paths)
+    require_directory(
+        release, "staged Surplasse edge candidate", paths, modes=frozenset({0o555})
+    )
+    value = _read_state(
+        release / "candidate.json",
+        paths,
+        "staged edge candidate",
+        modes=frozenset({0o444}),
+    )
+    state = validate_state(value, paths, "staged edge candidate")
+    validate_candidate_release(release, state, paths)
+    require_dns_secrets(paths)
+    validate_local_image(state.caddy_image, paths)
+    validate_caddy_candidate(release, state.caddy_image, paths)
+    previous = read_active(paths)
+    current = current_release(paths)
+    if previous is not None and current != Path(previous.release):
+        fail("active Surplasse edge state differs from the runtime link")
+    if previous == state and current == release:
+        restart_edge(paths)
+        verify_live_runtime(paths, state)
+        print(f"Surplasse public edge recreated and verified: {release}")
+        return
+    if previous is None and current.parent != paths.base_release_root:
+        fail("untracked Surplasse public edge candidate is already active")
+    transaction = EdgeTransaction(
+        candidate=state,
+        previous=previous,
+        previous_release=str(current),
+        phase="prepared",
+    )
+    _write_transaction(transaction, paths)
+    try:
+        switch_release(paths, release)
+        transaction = dataclasses.replace(transaction, phase="switched")
+        _write_transaction(transaction, paths)
+        restart_edge(paths)
+        transaction = dataclasses.replace(transaction, phase="reconciled")
+        _write_transaction(transaction, paths)
+        verify_live_runtime(paths, state)
+        transaction = dataclasses.replace(transaction, phase="verified")
+        _write_transaction(transaction, paths)
+        _commit_active(transaction, paths)
+    except BaseException as activation_error:
+        try:
+            persisted = read_transaction(paths)
+            if persisted is not None:
+                rollback(persisted, paths)
+        except BaseException as recovery_error:
+            raise EdgeDeploymentError(
+                "Surplasse edge activation and immediate recovery both failed: "
+                f"{activation_error}; {recovery_error}"
+            ) from recovery_error
+        raise
+    print(f"Surplasse public edge active and verified: {release}")
+
+
+def assert_base_switch_safe(paths: RuntimePaths) -> None:
+    recover_locked(paths)
+    active = read_active(paths)
+    if active is not None:
+        fail(
+            "base edge convergence cannot replace an active Surplasse extension; "
+            "use the edge controller to perform a reviewed rebase"
+        )
+
+
+def parse_release_path(value: str, paths: RuntimePaths) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or path.parent != paths.extension_release_root:
+        fail(
+            "candidate release must be an absolute path under the bounded release root"
+        )
+    if RELEASE_NAME_RE.fullmatch(path.name) is None:
+        fail("candidate release name must be one SHA-256 fingerprint")
+    return path
+
+
+def main(argv: list[str] | None = None, *, paths: RuntimePaths | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--stage", metavar="ATTESTED_ROUTE")
+    modes.add_argument("--activate", metavar="CANDIDATE_RELEASE")
+    modes.add_argument("--recover", action="store_true")
+    modes.add_argument("--verify-live", action="store_true")
+    modes.add_argument("--assert-base-switch-safe", action="store_true")
+    args = parser.parse_args(argv)
+    runtime = RuntimePaths() if paths is None else paths
+    try:
+        require_runtime(runtime, recovery=args.recover)
+        with deployment_lock(runtime):
+            if args.recover:
+                recover_locked(runtime)
+                print("Surplasse public edge recovery complete")
+            elif args.stage is not None:
+                recover_locked(runtime)
+                state = stage_candidate(Path(args.stage), runtime)
+                print(f"Surplasse public edge candidate staged: {state.release}")
+            elif args.activate is not None:
+                activate_candidate(parse_release_path(args.activate, runtime), runtime)
+            elif args.verify_live:
+                active = read_active(runtime)
+                if active is None:
+                    fail("no active Surplasse public edge state exists")
+                verify_unit_active(runtime)
+                verify_live_runtime(runtime, active)
+                print("Surplasse public edge is active and verified")
+            else:
+                assert_base_switch_safe(runtime)
+                print("public edge base switch is safe")
+    except (EdgeDeploymentError, OSError, UnicodeError) as exc:
+        print(f"Surplasse public edge control failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,25 @@
+[Unit]
+Description=Recover interrupted Surplasse public edge transactions
+After=local-fs.target docker.service vps-application-recover.service vps-static-recover.service
+Before={{ vps_public_static_edge_unit }}
+Requires=docker.service vps-application-recover.service vps-static-recover.service
+RequiresMountsFor={{ vps_public_static_edge_release_root }} {{ vps_public_static_edge_surplasse_release_root }} {{ vps_public_static_edge_surplasse_state_root }}
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=256
+Environment=HOME=/root
+Environment=LANG=C
+Environment=LC_ALL=C
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+StandardInput=null
+ExecStart={{ vps_public_static_edge_surplasse_controller }} --recover
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

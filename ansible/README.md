@@ -279,6 +279,15 @@ The project joins only the managed `edge` bridge on `172.30.32.0/24`. The
 playbook rejects a missing or incompatible bridge and verifies that the live
 Caddy container has no attachment to `ops`.
 
+The public edge role also installs
+`/usr/local/libexec/vps/deploy-surplasse-public-edge` and enables
+`vps-public-edge-surplasse-recover.service`. The recovery unit runs after the
+static and application recovery units and before Caddy. It completes or rolls
+back one durable Surplasse edge transaction. The base public edge role refuses
+its normal link switch while an active Surplasse edge state exists. This guard
+prevents a later convergence from silently removing the Surplasse composition
+or replacing its retained static routes.
+
 The internal platform remains necessary for the application stacks. Its later
 activation keeps Grafana on loopback and every database or metrics endpoint off
 the public host interfaces.

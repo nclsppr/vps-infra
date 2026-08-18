@@ -214,9 +214,10 @@ ovh-consumer-key
 
 The application helper does not accept, require, move, or delete these files.
 It rejects a legacy OVH file in `/etc/vps/secrets/surplasse` as an unexpected
-application entry. A later public-edge change must define and prove a separate
-atomic migration before it enables the disabled Caddy integration. Do not
-remove an existing value as part of application installation.
+application entry. The separate public-edge secret helper owns their protected
+materialization. The edge transition controller accepts only its successful
+read-only `--check` result. Do not remove an existing value as part of
+application installation.
 The helper also rejects the obsolete `surplasse-smtp-port` file without
 deleting it. Port `587` remains in the reviewed adapter policy.
 
@@ -226,11 +227,12 @@ that validation and requires the current two-line runtime file to equal the
 immutable release snapshot. An operator cannot bypass the commit marker by
 calling only the deployment controller.
 
-The application helper performs no OVH token validation. The future public-edge
-controller must prove both the protected file contract and that the permanent
-Caddy identity is limited to the `surplasse.com` DNS-01 operations. A token
-shape alone cannot prove IAM scope. Never reuse an OVH credential after it
-appeared in a chat, issue, log, or commit.
+The application helper performs no OVH token validation. The public-edge
+controller proves the protected bundle contract and that Caddy applies the OVH
+provider only to the `surplasse.com` apex and wildcard subjects. A token shape
+or a successful certificate request cannot prove the complete IAM scope.
+Review that scope at OVHcloud. Never reuse an OVH credential after it appeared
+in a chat, issue, log, or commit.
 
 ## Local validation
 
