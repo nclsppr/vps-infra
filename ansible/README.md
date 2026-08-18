@@ -305,6 +305,25 @@ This stage is not encrypted and is not off-site. See
 [`docs/operations/postgresql-backup.md`](../docs/operations/postgresql-backup.md)
 before accepting production data.
 
+The separate off-site candidate stays stopped by default. It requires a
+selected S3-compatible endpoint, a bucket with versioning and Object Lock, an
+age public recipient, a pre-provisioned `PutObject`-only credential, a separate
+off-host restore identity, and retained failure-domain evidence. After all
+gates are reviewed, the bounded entry points are:
+
+```bash
+make install-postgres-offsite-backup \
+  ANSIBLE_EXTRA_VARS=/absolute/private/path/bootstrap-public.yml
+make upload-postgres-offsite-now \
+  ANSIBLE_EXTRA_VARS=/absolute/private/path/bootstrap-public.yml
+make stop-postgres-offsite-backup-schedule \
+  ANSIBLE_EXTRA_VARS=/absolute/private/path/bootstrap-public.yml
+```
+
+These modes do not change the local backup, a PostgreSQL volume, Caddy, DNS, or
+an application. The uploader has no remote read or delete command. Follow the
+off-host recovery procedure in the PostgreSQL backup runbook.
+
 ## Prepared Docker networks
 
 Ansible creates seven external Docker networks with fixed properties. The

@@ -1,0 +1,411 @@
+---
+- name: Validate the PostgreSQL off-site controller contract
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_postgres_offsite_state in
+        ['installed', 'stopped', 'upload-now']
+      - >-
+        vps_postgres_offsite_root ==
+        '/srv/vps/backups/postgresql-offsite'
+      - >-
+        vps_postgres_offsite_script ==
+        '/usr/local/libexec/vps/postgres-offsite-backup'
+      - >-
+        vps_postgres_offsite_service ==
+        'vps-postgres-offsite-backup.service'
+      - >-
+        vps_postgres_offsite_timer ==
+        'vps-postgres-offsite-backup.timer'
+      - >-
+        vps_postgres_offsite_config_root ==
+        '/etc/vps/postgres-offsite'
+      - >-
+        vps_postgres_offsite_config ==
+        '/etc/vps/postgres-offsite/config.json'
+      - >-
+        vps_postgres_offsite_aws_config ==
+        '/etc/vps/postgres-offsite/aws-config'
+      - >-
+        vps_postgres_offsite_upload_credentials ==
+        '/etc/vps/secrets/postgres-offsite/upload.credentials'
+      - >-
+        vps_postgres_offsite_packages ==
+        ['age', 'awscli', 'python3', 'tar']
+    fail_msg: >-
+      The PostgreSQL off-site inputs differ from the reviewed host contract.
+
+- name: Validate the external PostgreSQL backup gates
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_postgres_offsite_endpoint is match(
+        '^https://[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::[0-9]{1,5})?$')
+      - >-
+        vps_postgres_offsite_region is match(
+        '^[a-z0-9][a-z0-9-]{0,62}$')
+      - >-
+        vps_postgres_offsite_bucket is match(
+        '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+      - "'..' not in vps_postgres_offsite_bucket"
+      - >-
+        vps_postgres_offsite_prefix is match(
+        '^[a-z0-9][a-z0-9._/-]{0,126}$')
+      - "'//' not in vps_postgres_offsite_prefix"
+      - >-
+        vps_postgres_offsite_addressing_style in ['path', 'virtual']
+      - >-
+        vps_postgres_offsite_age_recipient is match(
+        '^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$')
+      - vps_postgres_offsite_bucket_object_lock_verified | bool
+      - vps_postgres_offsite_bucket_versioning_verified | bool
+      - >-
+        vps_postgres_offsite_failure_domain_independence_reviewed | bool
+      - vps_postgres_offsite_recovery_key_off_host_verified | bool
+      - >-
+        vps_postgres_offsite_restore_identity_separate_verified | bool
+    fail_msg: >-
+      Select the provider and retain every bucket, recovery, and failure-domain
+      proof before installing the PostgreSQL off-site uploader.
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Inspect the local PostgreSQL backup executable
+  ansible.builtin.stat:
+    path: /usr/local/libexec/vps/postgres-backup
+    follow: false
+  register: vps_postgres_offsite_local_script
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Inspect the local PostgreSQL backup root
+  ansible.builtin.stat:
+    path: /srv/vps/backups/postgresql
+    follow: false
+  register: vps_postgres_offsite_local_root
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Require the exact local backup boundary
+  ansible.builtin.assert:
+    that:
+      - vps_postgres_offsite_local_script.stat.exists
+      - vps_postgres_offsite_local_script.stat.isreg
+      - not vps_postgres_offsite_local_script.stat.islnk
+      - vps_postgres_offsite_local_script.stat.uid == 0
+      - vps_postgres_offsite_local_script.stat.gid == 0
+      - vps_postgres_offsite_local_script.stat.mode == '0500'
+      - vps_postgres_offsite_local_root.stat.exists
+      - vps_postgres_offsite_local_root.stat.isdir
+      - not vps_postgres_offsite_local_root.stat.islnk
+      - vps_postgres_offsite_local_root.stat.uid == 0
+      - vps_postgres_offsite_local_root.stat.gid == 0
+      - vps_postgres_offsite_local_root.stat.mode == '0700'
+    fail_msg: >-
+      Install and verify the local PostgreSQL backup stage before off-site
+      preparation.
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Inspect the pre-provisioned upload-only S3 credential file
+  ansible.builtin.stat:
+    path: "{{ vps_postgres_offsite_upload_credentials }}"
+    follow: false
+  register: vps_postgres_offsite_upload_identity
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Require the protected upload-only S3 identity
+  ansible.builtin.assert:
+    that:
+      - vps_postgres_offsite_upload_identity.stat.exists
+      - vps_postgres_offsite_upload_identity.stat.isreg
+      - not vps_postgres_offsite_upload_identity.stat.islnk
+      - vps_postgres_offsite_upload_identity.stat.uid == 0
+      - vps_postgres_offsite_upload_identity.stat.gid == 0
+      - >-
+        vps_postgres_offsite_upload_identity.stat.mode in ['0400', '0600']
+      - vps_postgres_offsite_upload_identity.stat.nlink == 1
+    fail_msg: >-
+      Provision one root-owned upload-only S3 credential file outside Git.
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Install the Ubuntu off-site backup tools
+  ansible.builtin.apt:
+    name: "{{ vps_postgres_offsite_packages }}"
+    state: present
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: 3600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+    NEEDRESTART_MODE: a
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Read the installed Ubuntu off-site package state
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/dpkg-query
+      - --show
+      - "--showformat=${db:Status-Status} ${Version}\n"
+      - "{{ item }}"
+  register: vps_postgres_offsite_package_state
+  changed_when: false
+  loop: "{{ vps_postgres_offsite_packages }}"
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Prove the signed Ubuntu off-site tools are installed
+  ansible.builtin.assert:
+    that:
+      - item.stdout is match('^installed [^ ]+\n$')
+    fail_msg: >-
+      One required off-site tool is not an installed Ubuntu package.
+  loop: "{{ vps_postgres_offsite_package_state.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Inspect the exact PostgreSQL off-site executable paths
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: true
+  register: vps_postgres_offsite_executables
+  loop:
+    - /usr/bin/age
+    - /usr/bin/aws
+    - /usr/bin/python3
+    - /usr/bin/tar
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Prove the PostgreSQL off-site tools are root-owned executables
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.executable
+    fail_msg: >-
+      One required PostgreSQL off-site executable path is unsafe.
+  loop: "{{ vps_postgres_offsite_executables.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Read the packaged AWS PutObject input contract
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/aws
+      - s3api
+      - put-object
+      - --generate-cli-skeleton
+      - input
+  environment:
+    AWS_CONFIG_FILE: /dev/null
+    AWS_EC2_METADATA_DISABLED: "true"
+    AWS_PAGER: ""
+    AWS_SHARED_CREDENTIALS_FILE: /dev/null
+    HOME: /nonexistent
+    LC_ALL: C.UTF-8
+  register: vps_postgres_offsite_put_contract
+  changed_when: false
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Read the packaged AWS GetObject input contract
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/aws
+      - s3api
+      - get-object
+      - --generate-cli-skeleton
+      - input
+  environment:
+    AWS_CONFIG_FILE: /dev/null
+    AWS_EC2_METADATA_DISABLED: "true"
+    AWS_PAGER: ""
+    AWS_SHARED_CREDENTIALS_FILE: /dev/null
+    HOME: /nonexistent
+    LC_ALL: C.UTF-8
+  register: vps_postgres_offsite_get_contract
+  changed_when: false
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Prove the packaged AWS CLI exposes the required S3 controls
+  ansible.builtin.assert:
+    that:
+      - >-
+        ['Bucket', 'Key', 'Body', 'Metadata', 'ChecksumAlgorithm',
+         'ChecksumSHA256', 'IfNoneMatch'] |
+        difference(vps_postgres_offsite_put_contract.stdout | from_json |
+        list) | length == 0
+      - >-
+        ['Bucket', 'Key', 'VersionId', 'ChecksumMode'] |
+        difference(vps_postgres_offsite_get_contract.stdout | from_json |
+        list) | length == 0
+    fail_msg: >-
+      The signed Ubuntu AWS CLI package lacks one required conditional,
+      checksum, metadata, or exact-version S3 input.
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Create the protected off-site backup directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: /usr/local/libexec/vps
+      mode: "0755"
+    - path: /srv/vps/backups
+      mode: "0700"
+    - path: "{{ vps_postgres_offsite_root }}"
+      mode: "0700"
+    - path: "{{ vps_postgres_offsite_root }}/transactions"
+      mode: "0700"
+    - path: "{{ vps_postgres_offsite_root }}/receipts"
+      mode: "0700"
+    - path: "{{ vps_postgres_offsite_config_root }}"
+      mode: "0755"
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Install the bounded PostgreSQL off-site executable
+  ansible.builtin.copy:
+    src: "{{ playbook_dir ~ '/../../scripts/postgres-offsite-backup' }}"
+    dest: "{{ vps_postgres_offsite_script }}"
+    owner: root
+    group: root
+    mode: "0500"
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Install the public PostgreSQL off-site contract
+  ansible.builtin.copy:
+    content: >-
+      {{
+        {
+          'contract': 'vps-postgres-offsite-config-v1',
+          'endpoint': vps_postgres_offsite_endpoint,
+          'region': vps_postgres_offsite_region,
+          'bucket': vps_postgres_offsite_bucket,
+          'prefix': vps_postgres_offsite_prefix,
+          'addressing_style': vps_postgres_offsite_addressing_style,
+          'age_recipient': vps_postgres_offsite_age_recipient,
+          'gates': {
+            'bucket_object_lock_verified':
+              vps_postgres_offsite_bucket_object_lock_verified | bool,
+            'bucket_versioning_verified':
+              vps_postgres_offsite_bucket_versioning_verified | bool,
+            'failure_domain_independence_reviewed':
+              vps_postgres_offsite_failure_domain_independence_reviewed | bool,
+            'recovery_key_off_host_verified':
+              vps_postgres_offsite_recovery_key_off_host_verified | bool,
+            'restore_identity_separate_verified':
+              vps_postgres_offsite_restore_identity_separate_verified | bool
+          }
+        } | to_nice_json
+      }}
+    dest: "{{ vps_postgres_offsite_config }}"
+    owner: root
+    group: root
+    mode: "0444"
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Install the public AWS CLI addressing contract
+  ansible.builtin.template:
+    src: aws-config.j2
+    dest: "{{ vps_postgres_offsite_aws_config }}"
+    owner: root
+    group: root
+    mode: "0444"
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Install the PostgreSQL off-site systemd units
+  ansible.builtin.template:
+    src: "{{ item.source }}"
+    dest: "/etc/systemd/system/{{ item.destination }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - source: vps-postgres-offsite-backup.service.j2
+      destination: "{{ vps_postgres_offsite_service }}"
+    - source: vps-postgres-offsite-backup.timer.j2
+      destination: "{{ vps_postgres_offsite_timer }}"
+  register: vps_postgres_offsite_units
+  when: vps_postgres_offsite_state != 'stopped'
+
+- name: Reload systemd after PostgreSQL off-site unit changes
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - vps_postgres_offsite_state != 'stopped'
+    - vps_postgres_offsite_units.changed
+
+- name: Enable the daily encrypted off-site upload timer
+  ansible.builtin.systemd_service:
+    name: "{{ vps_postgres_offsite_timer }}"
+    enabled: true
+    state: started
+  when: vps_postgres_offsite_state == 'installed'
+
+- name: Disable the PostgreSQL off-site timer without deleting backup data
+  ansible.builtin.systemd_service:
+    name: "{{ vps_postgres_offsite_timer }}"
+    enabled: false
+    state: stopped
+    daemon_reload: true
+  failed_when: false
+  when: vps_postgres_offsite_state == 'stopped'
+
+- name: Upload the latest verified local PostgreSQL backup now
+  ansible.builtin.systemd_service:
+    name: "{{ vps_postgres_offsite_service }}"
+    state: started
+  when: vps_postgres_offsite_state == 'upload-now'
+
+- name: Read PostgreSQL off-site timer enablement
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-enabled
+      - "{{ vps_postgres_offsite_timer }}"
+  register: vps_postgres_offsite_timer_enablement
+  changed_when: false
+  failed_when: false
+  when: vps_postgres_offsite_state in ['installed', 'stopped']
+
+- name: Read PostgreSQL off-site timer activity
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - "{{ vps_postgres_offsite_timer }}"
+  register: vps_postgres_offsite_timer_activity
+  changed_when: false
+  failed_when: false
+  when: vps_postgres_offsite_state in ['installed', 'stopped']
+
+- name: Prove PostgreSQL off-site timer enablement
+  ansible.builtin.assert:
+    that:
+      - >-
+        (vps_postgres_offsite_state == 'stopped' and
+         vps_postgres_offsite_timer_enablement.rc != 0 and
+         vps_postgres_offsite_timer_enablement.stdout in
+         ['disabled', 'masked', 'not-found']) or
+        (vps_postgres_offsite_state == 'installed' and
+         vps_postgres_offsite_timer_enablement.rc == 0 and
+         vps_postgres_offsite_timer_enablement.stdout == 'enabled')
+    fail_msg: >-
+      The PostgreSQL off-site timer differs from the requested state.
+  when: vps_postgres_offsite_state in ['installed', 'stopped']
+
+- name: Prove PostgreSQL off-site timer activity
+  ansible.builtin.assert:
+    that:
+      - >-
+        (vps_postgres_offsite_state == 'stopped' and
+         vps_postgres_offsite_timer_activity.rc != 0 and
+         vps_postgres_offsite_timer_activity.stdout in
+         ['inactive', 'failed']) or
+        (vps_postgres_offsite_state == 'installed' and
+         vps_postgres_offsite_timer_activity.rc == 0 and
+         vps_postgres_offsite_timer_activity.stdout == 'active')
+    fail_msg: >-
+      The PostgreSQL off-site timer differs from the requested activity.
+  when: vps_postgres_offsite_state in ['installed', 'stopped']

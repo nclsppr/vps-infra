@@ -138,6 +138,10 @@ for enablement, suspension, run inspection, rollback, recovery, and key
 rotation. A green workflow conclusion alone is not proof that all three
 profiles were `ready`.
 
+The encrypted off-site PostgreSQL layer is a disabled candidate. No provider,
+bucket, upload identity, age recipient, timer, remote object, or approved
+off-host receipt is configured by this repository state.
+
 This bounded rollout does not enable the dynamic release manifest or invoke the
 Compose application controller. The manifest keeps every dynamic application
 at `enabled: false`. The application controller is installed, but no application
@@ -276,6 +280,7 @@ Cette décision est détaillée dans
 - [ADR-0007 - managed transactional email relay for Surplasse](docs/decisions/0007-relais-email-transactionnel-surplasse.md)
 - [ADR-0009 - immutable application release admission](docs/decisions/0009-immutable-application-release-admission.md)
 - [ADR-0010 - disabled transactional application controller](docs/decisions/0010-disabled-transactional-application-controller.md)
+- [ADR-0011 - encrypted off-site PostgreSQL backup](docs/decisions/0011-encrypted-offsite-postgresql-backup.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas

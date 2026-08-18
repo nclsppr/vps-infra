@@ -54,3 +54,29 @@ and generation-manifest rules are in
 The adapter remains locked. A locally valid OVH token shape does not prove its
 IAM scope, and valid Stripe values do not prove the reviewed Connect release
 gate. Do not activate from the presence of files alone.
+
+## PostgreSQL off-site upload identity
+
+The encrypted off-site backup candidate accepts one secret file:
+
+| File | Expected owner and mode |
+|---|---|
+| `/etc/vps/secrets/postgres-offsite/upload.credentials` | `root:root 0400` or `0600` |
+
+The file contains one exact AWS shared-credentials profile named `default` and
+only `aws_access_key_id` plus `aws_secret_access_key`. The provider policy must
+limit this identity to `PutObject` for the exact PostgreSQL backup prefix. The
+identity must not read, list, overwrite, delete, change retention, or change a
+bucket policy.
+
+Systemd copies the file into the service credential directory. The controller
+accepts only the canonical
+`/run/credentials/vps-postgres-offsite-backup.service` directory and an exact
+public AWS CLI configuration. It rejects a `credential_process`, another
+profile, or an extra directive.
+
+The age public recipient is not a secret. Its private identity and the separate
+S3 restore credential never enter Atlas. Keep both on the trusted recovery host
+and in independent protected recovery copies. An approved off-host receipt is
+also a required recovery input. Do not infer recovery state from the latest S3
+object version.

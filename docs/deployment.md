@@ -824,10 +824,12 @@ make stop-internal-platform \
 
 After the internal platform is healthy, install the daily local PostgreSQL
 backup and monthly isolated restore rehearsal. Run one immediate backup and
-one rehearsal before an application migration. The local stage is explicitly
-not encrypted and not off-site. Follow
+one rehearsal before an application migration. The separate off-site candidate
+encrypts one verified local backup with an age public recipient and uses one
+conditional S3 `PutObject`. It stays disabled until its provider, bucket,
+identity, recovery-key, and independent restore gates are complete. Follow
 [`operations/postgresql-backup.md`](operations/postgresql-backup.md) for the
-commands, guarantees, and remaining disaster-recovery decision.
+commands, guarantees, and disaster-recovery gates.
 
 ## Deploy a Compose application
 

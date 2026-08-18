@@ -18,6 +18,8 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	start-internal-platform stop-internal-platform \
 	install-postgres-backup stop-postgres-backup-schedule \
 	backup-postgres-now rehearse-postgres-restore \
+	install-postgres-offsite-backup \
+	stop-postgres-offsite-backup-schedule upload-postgres-offsite-now \
 	prepare-surplasse activate-surplasse stop-surplasse \
 	doctor-local
 
@@ -58,6 +60,9 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/postgres-backup.yml
+	cd ansible && ../.venv/bin/ansible-playbook \
+		--inventory inventories/production/hosts.example.yml \
+		--syntax-check playbooks/postgres-offsite-backup.yml
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/surplasse.yml
@@ -263,6 +268,21 @@ rehearse-postgres-restore: ## Restore the latest backup in a disposable containe
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --rehearse-postgres-restore
+
+install-postgres-offsite-backup: ## Install the encrypted off-site upload timer.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --install-postgres-offsite-backup
+
+stop-postgres-offsite-backup-schedule: ## Disable off-site uploads and preserve data.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --stop-postgres-offsite-backup-schedule
+
+upload-postgres-offsite-now: ## Encrypt and upload the latest local backup now.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --upload-postgres-offsite-now
 
 prepare-surplasse: ## Stage Surplasse and provision only its private database boundary.
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
