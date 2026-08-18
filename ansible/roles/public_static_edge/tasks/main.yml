@@ -2,7 +2,9 @@
 - name: Validate the public static edge contract
   ansible.builtin.assert:
     that:
-      - vps_public_static_edge_state in ['prepare', 'activate', 'stopped']
+      - >-
+        vps_public_static_edge_state in
+        ['prepare', 'precutover', 'activate', 'stopped']
       - vps_public_static_edge_project == 'vps-public-static-edge'
       - vps_public_static_edge_release_root == '/srv/vps/releases/public-static-edge'
       - vps_public_static_edge_runtime_dir == '/srv/vps/runtime/public-static-edge'
@@ -36,17 +38,41 @@
         ['papersempire.caddy', 'parkventory.caddy', 'personal.caddy']
       - >-
         vps_public_static_edge_route_sources ==
-        {'prepare': 'routes-prepare', 'activate': 'routes-activate'}
+        {'prepare': 'routes-prepare',
+         'precutover': 'routes-precutover',
+         'activate': 'routes-activate'}
       - >-
         vps_public_static_edge_domains | sort ==
-        ['nicolaspieper.com', 'papersempire.com', 'parkventory.com',
+        ['nicolas.pieper.fr', 'nicolaspieper.com', 'papersempire.com',
+         'parkventory.com', 'pieper.fr', 'www.nicolas.pieper.fr',
          'www.nicolaspieper.com', 'www.papersempire.com',
-         'www.parkventory.com']
-      - vps_public_static_edge_dns_zones | length == 3
+         'www.parkventory.com', 'www.pieper.fr']
+      - >-
+        vps_public_static_edge_redirects ==
+        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
+         {'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'www.nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'www.papersempire.com', 'target': 'papersempire.com'},
+         {'source': 'www.parkventory.com', 'target': 'parkventory.com'}]
+      - >-
+        vps_public_static_edge_direct_http_redirects ==
+        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
+         {'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'www.nicolas.pieper.fr', 'target': 'nicolaspieper.com'}]
+      - >-
+        vps_public_static_edge_pre_cutover_https_redirects ==
+        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
+         {'source': 'www.papersempire.com', 'target': 'papersempire.com'},
+         {'source': 'www.parkventory.com', 'target': 'parkventory.com'}]
+      - vps_public_static_edge_dns_zones | length == 4
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='zone') | list | sort ==
-        ['nicolaspieper.com', 'papersempire.com', 'parkventory.com']
+        ['nicolaspieper.com', 'papersempire.com', 'parkventory.com', 'pieper.fr']
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='names') | flatten | list | sort ==
@@ -183,7 +209,7 @@
         fail_msg: The public static edge still owns a container or public listener.
 
 - name: Stage, switch, and verify the isolated public static edge
-  when: vps_public_static_edge_state in ['prepare', 'activate']
+  when: vps_public_static_edge_state in ['prepare', 'precutover', 'activate']
   block:
     - name: Derive the immutable public edge release paths
       ansible.builtin.set_fact:

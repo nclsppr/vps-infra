@@ -4683,13 +4683,14 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
             self.assertIn(profile.canonical_domain, route)
             for domain in profile.live_redirect_domains:
                 self.assertIn(domain, route)
-        self.assertNotIn(
-            "nicolas.pieper.fr",
-            (
-                ROOT
-                / "platform/public-static-edge/routes-activate/personal.caddy"
-            ).read_text(encoding="utf-8"),
-        )
+        integration_route = (
+            ROOT / "platform/caddy/routes/personal.caddy.disabled"
+        ).read_text(encoding="utf-8")
+        for domain in MATERIALIZER.PROFILES["personal"].redirect_domains:
+            self.assertIn(domain, integration_route)
+        self.assertNotIn("PERSONAL_LEGACY_APEX_DOMAIN", integration_route)
+        self.assertNotIn("PERSONAL_LEGACY_WWW_DOMAIN", integration_route)
+        self.assertNotIn("PERSONAL_LEGACY_NESTED_WWW_DOMAIN", integration_route)
 
     def test_live_probe_requires_valid_tls_and_the_public_redirect_set(self) -> None:
         profile = MATERIALIZER.PROFILES["personal"]

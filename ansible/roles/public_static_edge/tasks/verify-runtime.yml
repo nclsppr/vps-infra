@@ -55,13 +55,13 @@
     state: started
     timeout: 10
 
-- name: Wait for the HTTPS listener after activation
+- name: Wait for the HTTPS listener in an HTTPS edge state
   ansible.builtin.wait_for:
     host: 127.0.0.1
     port: 443
     state: started
     timeout: 30
-  when: vps_public_static_edge_state == 'activate'
+  when: vps_public_static_edge_state in ['precutover', 'activate']
 
 - name: Probe every HTTP host from the operator network during preparation
   ansible.builtin.uri:
@@ -91,7 +91,40 @@
   become: false
   delegate_to: localhost
 
-- name: Probe HTTPS apex sites from the operator network after DNS activation
+- name: Probe pending one-hop HTTP redirects directly on Atlas before DNS cutover
+  ansible.builtin.uri:
+    url: >-
+      http://{{ ansible_default_ipv4.address
+      }}/__vps_redirect_probe__?source=atlas-precutover
+    headers:
+      Host: "{{ item.source }}"
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+  register: vps_public_static_edge_pre_cutover_http_redirect_probe
+  until:
+    - vps_public_static_edge_pre_cutover_http_redirect_probe.status == 308
+    - >-
+      vps_public_static_edge_pre_cutover_http_redirect_probe.location ==
+      'https://' ~ item.target ~
+      '/__vps_redirect_probe__?source=atlas-precutover'
+    - vps_public_static_edge_pre_cutover_http_redirect_probe.server is not defined
+    - >-
+      vps_public_static_edge_pre_cutover_http_redirect_probe.strict_transport_security
+      is not defined
+    - >-
+      vps_public_static_edge_pre_cutover_http_redirect_probe.x_content_type_options |
+      default('') == 'nosniff'
+  retries: 6
+  delay: 5
+  loop: "{{ vps_public_static_edge_direct_http_redirects }}"
+  loop_control:
+    label: "{{ item.source }}"
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_state == 'precutover'
+
+- name: Probe established HTTPS apex sites from the operator network
   ansible.builtin.uri:
     url: "https://{{ item }}/"
     follow_redirects: none
@@ -108,23 +141,85 @@
     - parkventory.com
   become: false
   delegate_to: localhost
+  when: vps_public_static_edge_state in ['precutover', 'activate']
+
+- name: Probe established HTTPS redirects during pre-cutover
+  ansible.builtin.uri:
+    url: "https://{{ item.source }}/__vps_redirect_probe__?source=atlas-precutover"
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+    validate_certs: true
+  register: vps_public_static_edge_pre_cutover_https_redirect_probe
+  until:
+    - vps_public_static_edge_pre_cutover_https_redirect_probe.status == 308
+    - >-
+      vps_public_static_edge_pre_cutover_https_redirect_probe.location ==
+      'https://' ~ item.target ~
+      '/__vps_redirect_probe__?source=atlas-precutover'
+  retries: 12
+  delay: 5
+  loop: "{{ vps_public_static_edge_pre_cutover_https_redirects }}"
+  loop_control:
+    label: "{{ item.source }}"
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_state == 'precutover'
+
+- name: Probe one-hop HTTP redirects after DNS activation
+  ansible.builtin.uri:
+    url: "http://{{ item.source }}/__vps_redirect_probe__?source=atlas"
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+  register: vps_public_static_edge_external_http_redirect_probe
+  until:
+    - vps_public_static_edge_external_http_redirect_probe.status == 308
+    - >-
+      vps_public_static_edge_external_http_redirect_probe.location ==
+      'https://' ~ item.target ~ '/__vps_redirect_probe__?source=atlas'
+    - vps_public_static_edge_external_http_redirect_probe.server is not defined
+    - >-
+      vps_public_static_edge_external_http_redirect_probe.strict_transport_security
+      is not defined
+    - >-
+      vps_public_static_edge_external_http_redirect_probe.x_content_type_options |
+      default('') == 'nosniff'
+  retries: 36
+  delay: 5
+  loop: "{{ vps_public_static_edge_direct_http_redirects }}"
+  loop_control:
+    label: "{{ item.source }}"
+  become: false
+  delegate_to: localhost
   when: vps_public_static_edge_state == 'activate'
 
-- name: Probe HTTPS redirects from the operator network after DNS activation
+- name: Probe one-hop HTTPS redirects after DNS activation
   ansible.builtin.uri:
-    url: "https://{{ item }}/"
+    url: "https://{{ item.source }}/__vps_redirect_probe__?source=atlas"
     follow_redirects: none
     status_code: 308
     return_content: false
     validate_certs: true
   register: vps_public_static_edge_external_https_redirect_probe
-  until: vps_public_static_edge_external_https_redirect_probe.status == 308
+  until:
+    - vps_public_static_edge_external_https_redirect_probe.status == 308
+    - >-
+      vps_public_static_edge_external_https_redirect_probe.location ==
+      'https://' ~ item.target ~ '/__vps_redirect_probe__?source=atlas'
+    - vps_public_static_edge_external_https_redirect_probe.server is not defined
+    - >-
+      vps_public_static_edge_external_https_redirect_probe.x_content_type_options |
+      default('') == 'nosniff'
+    - >-
+      item.target != 'nicolaspieper.com' or
+      vps_public_static_edge_external_https_redirect_probe.strict_transport_security
+      is not defined
   retries: 36
   delay: 5
-  loop:
-    - www.nicolaspieper.com
-    - www.papersempire.com
-    - www.parkventory.com
+  loop: "{{ vps_public_static_edge_redirects }}"
+  loop_control:
+    label: "{{ item.source }}"
   become: false
   delegate_to: localhost
   when: vps_public_static_edge_state == 'activate'

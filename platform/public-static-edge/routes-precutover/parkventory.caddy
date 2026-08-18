@@ -1,6 +1,6 @@
-http://nicolaspieper.com, http://www.nicolaspieper.com, http://pieper.fr, http://www.pieper.fr, http://nicolas.pieper.fr, http://www.nicolas.pieper.fr {
+parkventory.com {
 	log
-	root * /srv/www/personal/current
+	root * /srv/www/parkventory/current
 	import static_site
 	handle_errors {
 		import security_headers
@@ -9,4 +9,9 @@ http://nicolaspieper.com, http://www.nicolaspieper.com, http://pieper.fr, http:/
 		rewrite @not_found /404.html
 		file_server
 	}
+}
+
+www.parkventory.com {
+	import security_headers
+	redir https://parkventory.com{uri} 308
 }

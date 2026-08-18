@@ -407,6 +407,10 @@ check_static_host() {
 
 check_static_host nicolaspieper.com nicolaspieper.com 0 || failures=$((failures + 1))
 check_static_host www.nicolaspieper.com nicolaspieper.com 1 || failures=$((failures + 1))
+check_static_host pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
+check_static_host www.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
+check_static_host nicolas.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
+check_static_host www.nicolas.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
 check_static_host papersempire.com papersempire.com 0 || failures=$((failures + 1))
 check_static_host www.papersempire.com papersempire.com 1 || failures=$((failures + 1))
 check_static_host parkventory.com parkventory.com 0 || failures=$((failures + 1))
@@ -415,9 +419,29 @@ test "$failures" -eq 0
 ```
 
 Each apex must return `200` with zero redirects and TLS verification result `0`.
-Each `www` name must follow exactly one redirect to its apex, return `200`, and
-have TLS verification result `0`. Both the DNS-routed and direct-Atlas probes
-must report the independently verified Atlas IPv4 as `remote_ip`.
+Each alias must follow exactly one HTTPS redirect to its canonical apex, return
+`200`, and have TLS verification result `0`. For the Personal aliases, the
+Ansible runtime probe also requires a direct `308` from HTTP and HTTPS for a path
+with a query. Both the DNS-routed and direct-Atlas probes must report the
+independently verified Atlas IPv4 as `remote_ip`.
+
+Before the `.fr` DNS change, the pre-cutover edge intentionally has no HTTPS
+site block for those pending aliases. Probe their path-preserving HTTP redirects
+directly on Atlas instead:
+
+```bash
+for host in pieper.fr www.pieper.fr nicolas.pieper.fr www.nicolas.pieper.fr; do
+  curl --disable --silent --show-error --output /dev/null \
+    --dump-header - \
+    --header "Host: ${host}" \
+    "http://${atlas_ipv4}/__vps_redirect_probe__?source=operator-precutover"
+done
+```
+
+Each response must be `308` with an exact `Location` of
+`https://nicolaspieper.com/__vps_redirect_probe__?source=operator-precutover`.
+Run the complete valid-TLS probe set above only after DNS activation and the
+bounded certificate issuance step.
 
 ## Safe content rollback
 

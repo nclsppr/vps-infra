@@ -16,7 +16,7 @@ http://www.nicolaspieper.com, http://pieper.fr, http://www.pieper.fr, http://nic
 	redir https://nicolaspieper.com{uri} 308
 }
 
-www.nicolaspieper.com, pieper.fr, www.pieper.fr, nicolas.pieper.fr, www.nicolas.pieper.fr {
+www.nicolaspieper.com {
 	import redirect_security_headers
 	redir https://nicolaspieper.com{uri} 308
 }

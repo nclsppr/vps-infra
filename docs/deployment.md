@@ -528,10 +528,13 @@ publics voulus. Il exclut notamment :
 Before publication, the allowlist generates one inventory entry for every
 regular file. The producer workflow does not start an HTTP server. The VPS
 materializer probes each resulting file route through temporary Caddy.
-Host-based redirects, including `nicolas.pieper.fr`, are not file routes. They
-are separate assertions in the temporary integration probe. The live edge
-contract is narrower: it verifies `www.nicolaspieper.com`; Atlas does not claim
-or probe the legacy domain.
+Host-based redirects are not file routes. The temporary probe verifies only the
+redirects carried by the exact platform integration pinned in
+`releases/static-production.json`; it must not assume routes from a newer
+checkout. The live public edge separately verifies `www.nicolaspieper.com`,
+`pieper.fr`, `www.pieper.fr`, `nicolas.pieper.fr`, and
+`www.nicolas.pieper.fr`. Each live alias must return one permanent redirect to
+`https://nicolaspieper.com` while preserving the request path and query.
 
 ### Papers Empire
 
@@ -773,6 +776,46 @@ make stop-public-static-edge \
 
 Stopping the edge preserves all three static release trees and the ACME volumes.
 DNS rollback restores the exact records captured before the cutover.
+
+### Add the `pieper.fr` aliases to an already active edge
+
+Do not run the HTTP-only preparation mode over the active HTTPS edge. First
+export the complete current `pieper.fr` zone. Lower only the TTL of the four web
+names `pieper.fr`, `www.pieper.fr`, `nicolas.pieper.fr`, and
+`www.nicolas.pieper.fr`; do not change their targets, MX, TXT, DNSSEC, or any
+other record. Wait at least the previous web TTL, measured from the point at
+which every authoritative server returns the lower TTL. A lower TTL published
+now does not expire answers already cached with the previous value.
+
+After that wait, install the safe pre-cutover release:
+
+```bash
+make precutover-public-static-edge \
+  ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
+```
+
+This atomic switch preserves the three established HTTPS apexes and their
+existing `www` redirects. It adds only HTTP `308` routes for the four pending
+`.fr` aliases and probes those routes directly on the Atlas IPv4 address, so it
+neither depends on the old DNS answers nor asks ACME for the pending names.
+
+Change only the four web A answers to the Atlas IPv4 address and remove their
+old AAAA answers. Once every authoritative server and the recursive probes show
+the exact target, immediately run `make activate-public-static-edge`. The
+activation atomically replaces the pre-cutover routes with the full HTTPS
+redirect set. Caddy then requests the four alias certificates, so a short HTTPS
+issuance interval follows the switch; HTTP continues to redirect during that
+interval. None of the aliases currently provides a functional HTTPS redirect,
+but the three established sites must remain available throughout.
+
+If activation or its strict certificate probes fail, the Ansible rescue restores
+the previous pre-cutover release and restarts it. Restore the four exact web
+records from the DNS export; do not stop the shared edge and do not modify mail
+or DNSSEC records. Re-run the established HTTPS probes and the direct-Atlas HTTP
+alias probes before a new attempt. The alias redirect blocks intentionally emit
+no HSTS, including after full activation, so a failed cutover cannot pin browsers
+to Atlas during the rollback TTL window. This does not remove HSTS from the
+established canonical sites.
 
 This deployment does not waive or cancel the internal platform. PostgreSQL and
 Grafana are still required for Surplasse and Parkventory. They are admitted and
