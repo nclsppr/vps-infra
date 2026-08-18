@@ -26,7 +26,13 @@
       /proc/{{ ((vps_public_static_edge_bind_inspect_stdout |
                  from_json) | first).State.Pid
       }}/root{{ item }}
-    follow: true
+    # Following /proc/<pid>/root makes the module resolve that magic link to
+    # the host root before it inspects the final target. Keep the proc-root
+    # traversal intact and disable unrelated file metadata probes.
+    follow: false
+    get_attributes: false
+    get_checksum: false
+    get_mime: false
   loop:
     - /etc/caddy/Caddyfile
     - /etc/caddy/routes
