@@ -293,6 +293,55 @@ class ApplicationBundleTests(unittest.TestCase):
                 probe_inventory_digest=BUNDLE.content_digest(files["probes.json"]),
             )
 
+    def test_surplasse_bundle_rejects_every_tester_payment_profile_divergence(self):
+        profile = BUNDLE.PROFILES["surplasse"]
+        invalid_profiles = {
+            "missing": None,
+            "live": {"audience": "testers", "mode": "live", "schema": 1},
+            "public": {"audience": "public", "mode": "test", "schema": 1},
+            "schema": {"audience": "testers", "mode": "test", "schema": 2},
+            "boolean-schema": {
+                "audience": "testers",
+                "mode": "test",
+                "schema": True,
+            },
+            "extra": {
+                "audience": "testers",
+                "mode": "test",
+                "schema": 1,
+                "operator_override": True,
+            },
+        }
+        for label, payment in invalid_profiles.items():
+            with self.subTest(divergence=label):
+                files, component_references = fixture_files(profile)
+                contract = json.loads(files["contract.json"])
+                if payment is None:
+                    contract.pop("payment")
+                else:
+                    contract["payment"] = payment
+                files["contract.json"] = BUNDLE.canonical_json(contract)
+                archive = build_archive(profile, files)
+                inventory = build_inventory(profile, files)
+                with self.assertRaisesRegex(
+                    BUNDLE.ApplicationBundleError,
+                    "exact canonical profile",
+                ):
+                    BUNDLE.validate_bundle(
+                        archive,
+                        inventory,
+                        profile=profile,
+                        revision=REVISION,
+                        created=CREATED,
+                        component_references=component_references,
+                        migration_inventory_digest=BUNDLE.content_digest(
+                            files["migrations.json"]
+                        ),
+                        probe_inventory_digest=BUNDLE.content_digest(
+                            files["probes.json"]
+                        ),
+                    )
+
     def test_surplasse_expected_images_cannot_diverge_from_release(self):
         profile = BUNDLE.PROFILES["surplasse"]
         files, component_references = fixture_files(profile)

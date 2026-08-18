@@ -3,9 +3,10 @@
 This directory is a legacy, locked preparation adapter. It remains useful for
 local policy tests and the bounded database-preparation command. It is not the
 canonical application-release producer and it is not a production activation
-path. Surplasse now publishes an immutable `application-release` descriptor and
-common integration bundle for the shared admission contract. The protected
-entry remains disabled.
+path. The canonical controller reads only its exact `payment` projection as an
+independent versioned Atlas policy input. Surplasse publishes an immutable
+`application-release` descriptor and common integration bundle for the shared
+admission contract. The protected entry remains disabled.
 
 Atlas converged the shared transactional application controller from
 `vps-infra` revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b` on 2026-08-18.
@@ -96,12 +97,24 @@ the correct account, or that it has the reviewed least-privilege permissions.
 Activation evidence must prove those properties through Stripe without logging
 the key.
 
+The immutable integration `contract.json` repeats the exact tester payment
+profile. During materialization, the canonical `deploy-application` controller
+requires that contract to equal the versioned adapter, requires the rendered
+Backend environment to contain `STRIPE_LIVE_MODE=false`, and explicitly parses
+the protected operator manifest as version `3` with `payment_mode=test` and the
+exact nine input digests. It repeats the complete binding from the materialized
+release before `prepare_transaction`. A divergence therefore stops before an
+image pull, public-edge preflight, migration, container start, or transaction
+journal write. `validate-surplasse-adapter` is still useful locally, but it is
+not the activation proof.
+
 Before a later public launch with real payments, replace this complete profile
 atomically. The application release must publish the matching live public key,
 Atlas must receive a dedicated `rk_live_` key and two new live webhook signing
 secrets, and the Backend must receive `STRIPE_LIVE_MODE=true`. Do not combine a
 test key, a live key, test webhooks, live webhooks, or a public key from another
-mode.
+mode. This tester tranche does not implement that live credential rotation or
+the controlled service recreation needed after file-secret replacement.
 
 ## Database boundary
 

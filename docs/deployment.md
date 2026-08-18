@@ -628,6 +628,16 @@ equals the attested route and Caddy is healthy on the exact application network.
 Both protected application entries remain disabled, so this boundary currently
 stops before runtime validation or network access.
 
+For Surplasse, the immutable integration contract contains the exact tester
+payment profile. Materialization and the first activation preflight both bind
+that object to the versioned Atlas adapter, rendered
+`STRIPE_LIVE_MODE=false`, and protected operator manifest version `3` with
+`payment_mode=test` and the exact input digest set. A mismatch stops before
+`prepare_transaction`, image pulls, migration, or container start. The legacy
+adapter validator alone is not canonical activation evidence. A later live
+profile requires one separate atomic application, Atlas key, webhook, and
+service-recreation change.
+
 The application profile fixes the site repository, route repository, source
 repository, source ref, and signer workflow. The integration repository,
 `vps-infra` source repository, `refs/heads/main` source ref, and platform

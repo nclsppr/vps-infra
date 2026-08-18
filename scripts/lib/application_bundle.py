@@ -60,6 +60,12 @@ RFC3339_RE = re.compile(
     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
 
+SURPLASSE_PAYMENT_PROFILE: Mapping[str, object] = {
+    "audience": "testers",
+    "mode": "test",
+    "schema": 1,
+}
+
 
 class ApplicationBundleError(ValueError):
     """An integration bundle is outside the exact Atlas contract."""
@@ -589,6 +595,7 @@ def _expected_contract(profile: BundleProfile, revision: str) -> dict[str, objec
                     "docs": "SURPLASSE_DOCS_IMAGE",
                     "onboarding": "SURPLASSE_ONBOARDING_IMAGE",
                 },
+                "payment": dict(SURPLASSE_PAYMENT_PROFILE),
                 "route_owner": "compose",
                 "secrets": [
                     name.replace("_", "-") for name in profile.credential_files
@@ -613,7 +620,8 @@ def _expected_contract(profile: BundleProfile, revision: str) -> dict[str, objec
 
 def _validate_contract(raw: bytes, profile: BundleProfile, revision: str) -> dict[str, Any]:
     value = _object(strict_json(raw, "integration contract", maximum=MAX_FILE_BYTES), "integration contract")
-    if raw != canonical_json(value) or value != _expected_contract(profile, revision):
+    expected = _expected_contract(profile, revision)
+    if raw != canonical_json(value) or raw != canonical_json(expected):
         _fail("integration contract", "differs from the exact canonical profile")
     return value
 

@@ -31,6 +31,11 @@ Record this exact payment profile in the versioned Surplasse adapter:
 }
 ```
 
+Record the same object in the immutable integration `contract.json`. The
+shared bundle admission rejects a missing field, live mode, public audience,
+schema change, or additional operator override. The legacy adapter validator
+is not sufficient evidence for canonical application activation.
+
 Keep `DEPLOYMENT_PROFILE=production` for the Atlas runtime. Set
 `STRIPE_LIVE_MODE=false` in the reviewed Compose definition. The infrastructure
 contract rejects `STRIPE_LIVE_MODE=true` while this payment profile is active.
@@ -47,6 +52,19 @@ The materializer requires two distinct `whsec_` values. One value signs Stripe
 account webhooks. The other value signs payment webhooks. A shared value is not
 accepted. Operator manifest version `3` records the fixed payment mode and the
 digest of every supplied file without recording a secret value.
+
+At materialization, `deploy-application` binds four independent projections:
+
+1. the versioned adapter payment object;
+2. the admitted immutable integration contract payment object;
+3. `STRIPE_LIVE_MODE=false` in rendered Compose;
+4. `payment_mode=test` in the protected operator manifest version `3`, whose
+   digest map must name exactly the nine operator inputs.
+
+The controller repeats this binding from the materialized release at the first
+step of activation, before it prepares a transaction or performs any image,
+edge, database, migration, or container mutation. Every divergence fails
+closed. Calling only `validate-surplasse-adapter` cannot satisfy this boundary.
 
 Offline validation proves only framing and mode consistency. Before activation,
 the operator must use the protected Atlas input path and prove all of these
@@ -66,6 +84,9 @@ The activation change must prove that contract and reject a test and live
 mixture. A future live profile needs a separate reviewed change. That change
 must atomically switch the application public key, the Atlas restricted key,
 both webhook endpoints and signing secrets, and `STRIPE_LIVE_MODE`.
+The tester tranche does not implement the live secret rotation controller or
+the controlled service recreation needed to refresh Docker file-secret bind
+mounts.
 
 ## Consequences
 
