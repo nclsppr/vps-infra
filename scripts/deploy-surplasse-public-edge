@@ -59,10 +59,10 @@ BASE_FILES = (
 CANDIDATE_FILES = (*BASE_FILES, "candidate.json", "surplasse-tls.caddy")
 TRANSACTION_PHASES = frozenset({"prepared", "switched", "reconciled", "verified"})
 MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_CONTROL_EXECUTABLE_BYTES = 16 * 1024 * 1024
+MAX_DOCKER_EXECUTABLE_BYTES = 128 * 1024 * 1024
 MAX_STATE_BYTES = 16 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
-MAX_EXECUTABLE_BYTES = 16 * 1024 * 1024
-MAX_DOCKER_EXECUTABLE_BYTES = 64 * 1024 * 1024
 LOCK_TIMEOUT_SECONDS = 60
 REPOSITORY_FILE_MODES = frozenset({0o444, 0o644})
 
@@ -226,6 +226,68 @@ def _metadata_is_file(
         and stat.S_IMODE(metadata.st_mode) in modes
         and 0 < metadata.st_size <= maximum_size
     )
+
+
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def validate_protected_executable(
+    path: Path,
+    label: str,
+    paths: RuntimePaths,
+    *,
+    modes: frozenset[int],
+    maximum_size: int,
+) -> None:
+    require_directory(
+        path.parent,
+        f"{label} parent",
+        paths,
+        modes=frozenset({0o755}),
+    )
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        fail(f"cannot open {label} safely: {exc}")
+    try:
+        before = os.fstat(descriptor)
+        if not _metadata_is_file(
+            before, paths, modes=modes, maximum_size=maximum_size
+        ):
+            fail(f"{label} is not one protected executable")
+        path_before = path.lstat()
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+        expected_identity = _metadata_identity(before)
+        if any(
+            not _metadata_is_file(
+                metadata, paths, modes=modes, maximum_size=maximum_size
+            )
+            or _metadata_identity(metadata) != expected_identity
+            for metadata in (path_before, after, path_after)
+        ):
+            fail(f"{label} changed while it was validated")
+    except OSError as exc:
+        fail(f"cannot validate {label}: {exc}")
+    finally:
+        os.close(descriptor)
 
 
 def read_protected_file(
@@ -595,13 +657,13 @@ def require_runtime(paths: RuntimePaths, *, recovery: bool = False) -> None:
             Path(__file__).resolve(),
             "Surplasse edge controller",
             frozenset({0o555, 0o755}),
-            MAX_EXECUTABLE_BYTES,
+            MAX_CONTROL_EXECUTABLE_BYTES,
         ),
         (
             paths.systemctl,
             "systemctl executable",
             frozenset({0o755}),
-            MAX_EXECUTABLE_BYTES,
+            MAX_CONTROL_EXECUTABLE_BYTES,
         ),
         (
             paths.docker,
@@ -611,7 +673,7 @@ def require_runtime(paths: RuntimePaths, *, recovery: bool = False) -> None:
         ),
     ):
         if paths.expected_uid == 0:
-            read_protected_file(
+            validate_protected_executable(
                 path,
                 label,
                 paths,
