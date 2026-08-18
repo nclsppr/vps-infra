@@ -610,6 +610,7 @@ class SupplyChainContractTests(unittest.TestCase):
                 "check-public-static-edge",
                 "check-surplasse-public-edge-candidate",
                 "check-surplasse-adapter",
+                "check-parkventory-postgres",
                 "check-prometheus",
                 "check-caddy",
                 "check-postgres-image",

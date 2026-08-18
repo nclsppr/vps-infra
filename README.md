@@ -106,6 +106,11 @@ Le premier socle exécutable est livré :
   `vps-application-recover.service` is loaded, inactive after a successful
   recovery (`Result=success`, `ExecMainStatus=0`). Both protected entries remain
   `enabled: false`; no application deployment workflow invokes the controller.
+- a fail-closed Parkventory PostgreSQL 17.10 preparation path. It can create
+  separate owner, migrator, and runtime roles plus root-owned file secrets and
+  canonical readiness evidence. The path is not run by normal convergence and
+  cannot activate Parkventory. Encrypted off-site backup evidence remains an
+  explicit unsatisfied gate.
 
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
@@ -263,6 +268,7 @@ Cette décision est détaillée dans
 - [Sauvegarde PostgreSQL et répétition de restauration](docs/operations/postgresql-backup.md)
 - [Static release reconciliation operations](docs/operations/static-release-reconciliation.md)
 - [Static reconciliation rollout evidence, 2026-08-18](docs/evidence/2026-08-18-static-reconciliation-rollout.md)
+- [Parkventory PostgreSQL preparation](docs/operations/parkventory-postgresql.md)
 - [Contrat des secrets](secrets/README.md)
 - [Sources et preuves d’audit](docs/references.md)
 - [Plan de mise en œuvre](VPS-SETUP.md)

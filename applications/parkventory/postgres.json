@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "contract": "vps-infra.parkventory-postgres.v1",
+  "postgres": {
+    "project": "vps-platform",
+    "service": "postgresql",
+    "major": 17,
+    "version": "17.10"
+  },
+  "database": {
+    "name": "parkventory",
+    "owner": "parkventory_owner",
+    "schema": "public",
+    "encoding": "UTF8"
+  },
+  "roles": {
+    "migrator": "parkventory_migrator",
+    "runtime": "parkventory_runtime"
+  },
+  "network": {
+    "name": "db_parkventory",
+    "subnet": "172.30.21.0/24",
+    "internal": true,
+    "published_postgres_port": false,
+    "tls": false
+  },
+  "secrets": {
+    "migrator": "/etc/vps/secrets/parkventory/parkventory-postgres-migrator-password",
+    "runtime": "/etc/vps/secrets/parkventory/parkventory-postgres-runtime-password",
+    "uid": 0,
+    "gid": 10001,
+    "mode": "0440"
+  },
+  "readiness": {
+    "contract": "vps-infra.parkventory-postgres-readiness.v1",
+    "path": "/var/lib/vps-readiness/parkventory/postgres.json"
+  }
+}

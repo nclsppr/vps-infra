@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""Provision or verify the isolated Parkventory PostgreSQL boundary."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+EX_CONFIG = 78
+CONTRACT_PATH = Path("/usr/local/share/vps-infra/contracts/parkventory-postgres.json")
+CREDENTIAL_ROOT = Path("/etc/vps/secrets/parkventory")
+EVIDENCE_PATH = Path("/var/lib/vps-readiness/parkventory/postgres.json")
+CREDENTIAL_RE = re.compile(rb"[A-Za-z0-9_-]{64}\n")
+POSTGRES_IMAGE_RE = re.compile(
+    r"^ghcr\.io/nclsppr/vps-infra/postgres:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$"
+)
+MAX_FILE_BYTES = 64 * 1024
+EXPECTED_CONTRACT: dict[str, object] = {
+    "schema": 1,
+    "contract": "vps-infra.parkventory-postgres.v1",
+    "postgres": {
+        "project": "vps-platform",
+        "service": "postgresql",
+        "major": 17,
+        "version": "17.10",
+    },
+    "database": {
+        "name": "parkventory",
+        "owner": "parkventory_owner",
+        "schema": "public",
+        "encoding": "UTF8",
+    },
+    "roles": {
+        "migrator": "parkventory_migrator",
+        "runtime": "parkventory_runtime",
+    },
+    "network": {
+        "name": "db_parkventory",
+        "subnet": "172.30.21.0/24",
+        "internal": True,
+        "published_postgres_port": False,
+        "tls": False,
+    },
+    "secrets": {
+        "migrator": (
+            "/etc/vps/secrets/parkventory/"
+            "parkventory-postgres-migrator-password"
+        ),
+        "runtime": (
+            "/etc/vps/secrets/parkventory/"
+            "parkventory-postgres-runtime-password"
+        ),
+        "uid": 0,
+        "gid": 10001,
+        "mode": "0440",
+    },
+    "readiness": {
+        "contract": "vps-infra.parkventory-postgres-readiness.v1",
+        "path": "/var/lib/vps-readiness/parkventory/postgres.json",
+    },
+}
+
+
+class ProvisionError(RuntimeError):
+    """The live database boundary differs from the reviewed contract."""
+
+
+def fail(message: str) -> int:
+    print(f"Parkventory PostgreSQL provisioning refused: {message}", file=sys.stderr)
+    return EX_CONFIG
+
+
+def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProvisionError(f"JSON contains duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def canonical_json(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+
+
+def load_contract(path: Path) -> tuple[dict[str, object], str]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ProvisionError(f"cannot read PostgreSQL contract {path}: {exc}") from exc
+    if not 1 <= len(raw) <= MAX_FILE_BYTES:
+        raise ProvisionError("PostgreSQL contract size is outside the limit")
+    try:
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda item: (_ for _ in ()).throw(
+                ProvisionError(f"JSON constant {item!r} is forbidden")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProvisionError("PostgreSQL contract is not strict UTF-8 JSON") from exc
+    if value != EXPECTED_CONTRACT:
+        raise ProvisionError("PostgreSQL contract differs from the reviewed 17.10 boundary")
+    return value, f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def command(
+    arguments: list[str], *, input_text: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            arguments,
+            input=input_text,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"},
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProvisionError(f"cannot execute bounded command {arguments[0]}") from exc
+
+
+def docker_json(arguments: list[str], label: str) -> Any:
+    result = command(["/usr/bin/docker", *arguments])
+    if result.returncode != 0:
+        raise ProvisionError(f"cannot inspect {label}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProvisionError(f"Docker returned invalid JSON for {label}") from exc
+
+
+def resolve_postgres(contract: dict[str, object], *, require_network: bool) -> tuple[str, str]:
+    postgres = contract["postgres"]
+    network = contract["network"]
+    assert isinstance(postgres, dict) and isinstance(network, dict)
+    result = command(
+        [
+            "/usr/bin/docker",
+            "ps",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={postgres['project']}",
+            "--filter",
+            f"label=com.docker.compose.service={postgres['service']}",
+        ]
+    )
+    containers = [line for line in result.stdout.splitlines() if line]
+    if result.returncode != 0 or len(containers) != 1:
+        raise ProvisionError("expected exactly one running shared PostgreSQL container")
+    container = containers[0]
+    inspected = docker_json(["inspect", container], "shared PostgreSQL")
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        raise ProvisionError("shared PostgreSQL inspection is incomplete")
+    state = inspected[0]
+    labels = state.get("Config", {}).get("Labels", {})
+    networks = state.get("NetworkSettings", {}).get("Networks", {})
+    image = state.get("Config", {}).get("Image")
+    if (
+        labels.get("com.docker.compose.project") != postgres["project"]
+        or labels.get("com.docker.compose.service") != postgres["service"]
+        or state.get("State", {}).get("Health", {}).get("Status") != "healthy"
+        or not isinstance(image, str)
+        or POSTGRES_IMAGE_RE.fullmatch(image) is None
+        or (require_network and network["name"] not in networks)
+    ):
+        raise ProvisionError("shared PostgreSQL differs from the healthy immutable boundary")
+    network_state = docker_json(["network", "inspect", str(network["name"])], "database network")
+    if not isinstance(network_state, list) or len(network_state) != 1:
+        raise ProvisionError("database network inspection is incomplete")
+    candidate = network_state[0]
+    subnets = [item.get("Subnet") for item in candidate.get("IPAM", {}).get("Config", [])]
+    if (
+        candidate.get("Name") != network["name"]
+        or candidate.get("Driver") != "bridge"
+        or candidate.get("Internal") is not True
+        or subnets != [network["subnet"]]
+        or candidate.get("Labels", {}).get("com.nclsppr.vps-infra.managed") != "true"
+    ):
+        raise ProvisionError("db_parkventory differs from the managed private network")
+    return container, image
+
+
+def read_password(path: Path) -> tuple[str, str]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise ProvisionError(f"cannot open protected password {path.name}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 10001
+            or stat.S_IMODE(metadata.st_mode) != 0o440
+        ):
+            raise ProvisionError(f"password {path.name} has unsafe metadata")
+        content = os.read(descriptor, 130)
+        if CREDENTIAL_RE.fullmatch(content) is None:
+            raise ProvisionError(f"password {path.name} has an invalid format")
+        return content[:-1].decode("ascii"), f"sha256:{hashlib.sha256(content).hexdigest()}"
+    finally:
+        os.close(descriptor)
+
+
+def sql_literal(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]{64}", value) is None:
+        raise ProvisionError("a password left the validated character set")
+    return "'" + value + "'"
+
+
+def psql(container: str, database: str, sql: str) -> str:
+    result = command(
+        [
+            "/usr/bin/docker",
+            "exec",
+            "--interactive",
+            container,
+            "psql",
+            "--no-password",
+            "--username",
+            "platform_admin",
+            "--dbname",
+            database,
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--quiet",
+        ],
+        input_text=sql,
+    )
+    if result.returncode != 0:
+        raise ProvisionError("PostgreSQL rejected the bounded operation")
+    return result.stdout.strip()
+
+
+def apply_database(container: str, migrator_password: str, runtime_password: str) -> None:
+    cluster_sql = f"""
+BEGIN;
+DO $provision$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'parkventory_owner') THEN
+    CREATE ROLE parkventory_owner NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'parkventory_migrator') THEN
+    CREATE ROLE parkventory_migrator LOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'parkventory_runtime') THEN
+    CREATE ROLE parkventory_runtime LOGIN;
+  END IF;
+END
+$provision$;
+ALTER ROLE parkventory_owner NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE parkventory_migrator LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD {sql_literal(migrator_password)};
+ALTER ROLE parkventory_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 20 PASSWORD {sql_literal(runtime_password)};
+GRANT parkventory_owner TO parkventory_migrator;
+COMMIT;
+SELECT 'CREATE DATABASE parkventory OWNER parkventory_owner TEMPLATE template0 ENCODING ''UTF8'''
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'parkventory')\\gexec
+REVOKE ALL PRIVILEGES ON DATABASE parkventory FROM PUBLIC;
+GRANT CONNECT ON DATABASE parkventory TO parkventory_migrator, parkventory_runtime;
+ALTER DATABASE parkventory OWNER TO parkventory_owner;
+ALTER ROLE parkventory_migrator IN DATABASE parkventory SET ROLE TO parkventory_owner;
+ALTER ROLE parkventory_migrator IN DATABASE parkventory SET search_path TO public;
+ALTER ROLE parkventory_runtime IN DATABASE parkventory SET search_path TO public;
+"""
+    psql(container, "postgres", cluster_sql)
+    database_sql = """
+BEGIN;
+ALTER SCHEMA public OWNER TO parkventory_owner;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM parkventory_runtime;
+GRANT USAGE ON SCHEMA public TO parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TABLES FROM parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON SEQUENCES FROM parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TYPES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TYPES FROM parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public GRANT USAGE ON TYPES TO parkventory_runtime;
+COMMIT;
+"""
+    psql(container, "parkventory", database_sql)
+
+
+def proof_sql() -> str:
+    privilege_array = """
+      SELECT COALESCE(json_agg(privilege_type ORDER BY privilege_type), '[]'::json)
+      FROM pg_default_acl d
+      CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+      WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = 'parkventory_owner')
+        AND d.defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+        AND d.defaclobjtype = {object_type}
+        AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'parkventory_runtime')
+    """
+    return "SELECT json_build_object(" + ",".join(
+        (
+            "'server_version_num', current_setting('server_version_num')::integer",
+            "'owner_can_login', (SELECT rolcanlogin FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_is_superuser', (SELECT rolsuper FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'migrator_can_login', (SELECT rolcanlogin FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_inherits', (SELECT rolinherit FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'runtime_can_login', (SELECT rolcanlogin FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_bypasses_rls', (SELECT rolbypassrls FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'database_owner', (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='parkventory')",
+            "'database_encoding', (SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='parkventory')",
+            "'public_can_connect', EXISTS (SELECT 1 FROM pg_database d CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) a WHERE d.datname='parkventory' AND a.grantee=0 AND a.privilege_type='CONNECT')",
+            "'public_can_temp', EXISTS (SELECT 1 FROM pg_database d CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) a WHERE d.datname='parkventory' AND a.grantee=0 AND a.privilege_type='TEMPORARY')",
+            "'migrator_can_connect', has_database_privilege('parkventory_migrator','parkventory','CONNECT')",
+            "'runtime_can_connect', has_database_privilege('parkventory_runtime','parkventory','CONNECT')",
+            "'schema_owner', (SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='public')",
+            "'runtime_can_use_schema', has_schema_privilege('parkventory_runtime','public','USAGE')",
+            "'runtime_can_create_schema', has_schema_privilege('parkventory_runtime','public','CREATE')",
+            "'migrator_is_owner_member', pg_has_role('parkventory_migrator','parkventory_owner','MEMBER')",
+            "'runtime_has_owner_membership', pg_has_role('parkventory_runtime','parkventory_owner','MEMBER')",
+            "'migrator_settings', EXISTS (SELECT 1 FROM pg_db_role_setting s WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory') AND 'role=parkventory_owner'=ANY(s.setconfig) AND 'search_path=public'=ANY(s.setconfig))",
+            "'runtime_settings', EXISTS (SELECT 1 FROM pg_db_role_setting s WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory') AND 'search_path=public'=ANY(s.setconfig))",
+            "'default_table_privileges', (" + privilege_array.format(object_type="'r'") + ")",
+            "'default_sequence_privileges', (" + privilege_array.format(object_type="'S'") + ")",
+            "'default_function_privileges', (" + privilege_array.format(object_type="'f'") + ")",
+            "'default_type_privileges', (" + privilege_array.format(object_type="'T'") + ")",
+            "'unexpected_default_grantee', EXISTS (SELECT 1 FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE d.defaclrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') AND d.defaclnamespace=(SELECT oid FROM pg_namespace WHERE nspname='public') AND a.grantee NOT IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')))"
+        )
+    ) + ");"
+
+
+EXPECTED_PROOF = {
+    "server_version_num": 170010,
+    "owner_can_login": False,
+    "owner_is_superuser": False,
+    "migrator_can_login": True,
+    "migrator_inherits": False,
+    "runtime_can_login": True,
+    "runtime_bypasses_rls": False,
+    "database_owner": "parkventory_owner",
+    "database_encoding": "UTF8",
+    "public_can_connect": False,
+    "public_can_temp": False,
+    "migrator_can_connect": True,
+    "runtime_can_connect": True,
+    "schema_owner": "parkventory_owner",
+    "runtime_can_use_schema": True,
+    "runtime_can_create_schema": False,
+    "migrator_is_owner_member": True,
+    "runtime_has_owner_membership": False,
+    "migrator_settings": True,
+    "runtime_settings": True,
+    "default_table_privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"],
+    "default_sequence_privileges": ["SELECT", "UPDATE", "USAGE"],
+    "default_function_privileges": ["EXECUTE"],
+    "default_type_privileges": ["USAGE"],
+    "unexpected_default_grantee": False,
+}
+
+
+def observe(container: str) -> dict[str, object]:
+    raw = psql(container, "parkventory", proof_sql())
+    try:
+        proof = json.loads(raw, object_pairs_hook=unique_object)
+    except json.JSONDecodeError as exc:
+        raise ProvisionError("PostgreSQL returned invalid readiness JSON") from exc
+    if proof != EXPECTED_PROOF:
+        raise ProvisionError("effective database roles or default privileges differ from the contract")
+    return proof
+
+
+def evidence_document(
+    contract_digest: str,
+    image: str,
+    proof: dict[str, object],
+    credential_digests: dict[str, str],
+) -> bytes:
+    return canonical_json(
+        {
+            "contract": "vps-infra.parkventory-postgres-readiness.v1",
+            "database_contract_sha256": contract_digest,
+            "postgres_image": image,
+            "proof": proof,
+            "secret_files": {
+                "migrator": {
+                    "path": str(CREDENTIAL_ROOT / "parkventory-postgres-migrator-password"),
+                    "sha256": credential_digests["migrator"],
+                    "uid": 0,
+                    "gid": 10001,
+                    "mode": "0440",
+                },
+                "runtime": {
+                    "path": str(CREDENTIAL_ROOT / "parkventory-postgres-runtime-password"),
+                    "sha256": credential_digests["runtime"],
+                    "uid": 0,
+                    "gid": 10001,
+                    "mode": "0440",
+                },
+            },
+            "transport": {
+                "network": "db_parkventory",
+                "subnet": "172.30.21.0/24",
+                "internal": True,
+                "postgres_attached": True,
+                "published_postgres_port": False,
+                "tls": False,
+            },
+            "validity": {
+                "requires_live_check": True,
+                "requires_postgres_network_attachment": True,
+            },
+        }
+    )
+
+
+def require_evidence(expected: bytes) -> None:
+    try:
+        descriptor = os.open(EVIDENCE_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise ProvisionError("PostgreSQL readiness evidence is missing or unsafe") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or metadata.st_size != len(expected)
+        ):
+            raise ProvisionError("PostgreSQL readiness evidence has unsafe metadata")
+        if os.read(descriptor, MAX_FILE_BYTES + 1) != expected:
+            raise ProvisionError("PostgreSQL readiness evidence is stale")
+    finally:
+        os.close(descriptor)
+
+
+def require_safe_evidence_target() -> None:
+    try:
+        metadata = EVIDENCE_PATH.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ProvisionError("cannot inspect PostgreSQL readiness evidence") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o400
+        or not 1 <= metadata.st_size <= MAX_FILE_BYTES
+    ):
+        raise ProvisionError("PostgreSQL readiness evidence target is unsafe")
+
+
+def write_evidence(content: bytes) -> None:
+    for path in (Path("/var/lib/vps-readiness"), EVIDENCE_PATH.parent):
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        metadata = path.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ProvisionError(f"readiness directory {path} is unsafe")
+    require_safe_evidence_target()
+    temporary = EVIDENCE_PATH.parent / f".postgres.{secrets.token_hex(16)}.pending"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o400,
+    )
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o400)
+        written = 0
+        while written < len(content):
+            written += os.write(descriptor, content[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, EVIDENCE_PATH)
+        directory = os.open(EVIDENCE_PATH.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--apply", dest="mode", action="store_const", const="apply")
+    modes.add_argument("--check", dest="mode", action="store_const", const="check")
+    modes.add_argument("--dry-run", dest="mode", action="store_const", const="dry-run")
+    parser.set_defaults(mode="check")
+    parser.add_argument("--validate-contract", action="store_true")
+    parser.add_argument("--contract", type=Path, default=CONTRACT_PATH)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_args()
+    try:
+        contract, contract_digest = load_contract(arguments.contract)
+        if arguments.validate_contract:
+            print(f"Parkventory PostgreSQL contract valid: {arguments.contract}")
+            return 0
+        if os.geteuid() != 0 or arguments.contract != CONTRACT_PATH:
+            raise ProvisionError("live PostgreSQL verification requires root and the fixed contract")
+        container, image = resolve_postgres(
+            contract, require_network=arguments.mode in {"apply", "check"}
+        )
+        if arguments.mode == "dry-run":
+            print(canonical_json({"changed": True, "mode": "dry-run", "ready": False}).decode(), end="")
+            return 0
+        migrator, migrator_digest = read_password(
+            CREDENTIAL_ROOT / "parkventory-postgres-migrator-password"
+        )
+        runtime, runtime_digest = read_password(
+            CREDENTIAL_ROOT / "parkventory-postgres-runtime-password"
+        )
+        if migrator == runtime:
+            raise ProvisionError("migrator and runtime passwords must be distinct")
+        credential_digests = {
+            "migrator": migrator_digest,
+            "runtime": runtime_digest,
+        }
+        changed = False
+        if arguments.mode == "apply":
+            require_safe_evidence_target()
+            try:
+                proof = observe(container)
+                evidence = evidence_document(
+                    contract_digest, image, proof, credential_digests
+                )
+                require_evidence(evidence)
+            except ProvisionError:
+                apply_database(container, migrator, runtime)
+                proof = observe(container)
+                evidence = evidence_document(
+                    contract_digest, image, proof, credential_digests
+                )
+                write_evidence(evidence)
+                changed = True
+        else:
+            proof = observe(container)
+            evidence = evidence_document(
+                contract_digest, image, proof, credential_digests
+            )
+            require_evidence(evidence)
+    except ProvisionError as exc:
+        return fail(str(exc))
+    print(
+        canonical_json(
+            {"changed": changed, "mode": arguments.mode, "ready": True}
+        ).decode(),
+        end="",
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

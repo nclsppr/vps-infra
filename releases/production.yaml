@@ -83,6 +83,7 @@
       "published_ports": [],
       "blocked_by": [
         "domain-and-dns",
+        "encrypted-offsite-backup",
         "file-based-secrets",
         "postgres-adr-alignment",
         "postgres-compatibility",

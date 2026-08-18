@@ -78,16 +78,14 @@ prove OVH API access or replace the required full zone export.
 
 ### Choisir la version PostgreSQL
 
-- [ ] tester Parkventory avec les images exactes PostgreSQL 17.10 et 18.3 ;
-- [ ] vérifier `btree_gist`, les contraintes d’exclusion, V1 seule puis V1→V2 ;
+- [x] retain PostgreSQL 17.10 on the shared Atlas cluster for the Parkventory
+      pilot; do not add a second PostgreSQL 18 cluster;
+- [ ] re-run the exact Parkventory migration and extension checks before the
+      first dynamic activation;
 - [ ] tester Surplasse avec l’image exacte PostgreSQL 17.10, pas seulement le
       tag majeur `17` ;
-- [ ] si elle est verte, retenir PostgreSQL 17.10 pour le premier cluster ;
-- [ ] aligner explicitement les ADR Parkventory et Surplasse sur la version
-      réellement retenue ;
-- [ ] sinon, retarder Parkventory ; si le besoin produit l’impose, documenter
-      par ADR un second cluster 18 ou, en dernier choix, une migration coordonnée
-      vers 18 avec répétition des restaurations ;
+- [x] align the Parkventory infrastructure contract with PostgreSQL 17.10;
+- [ ] align the Surplasse ADR with the retained PostgreSQL version;
 - [ ] définir owner, migrateur et runtime pour chaque base.
 
 ### Secrets
@@ -263,6 +261,8 @@ platform/
 - [ ] satisfaire la matrice PostgreSQL ;
 - [ ] forcer RLS et prouver par tests négatifs l’isolation tenant A/B ;
 - [ ] prouver une restauration sur une base jetable ;
+- [ ] prove an encrypted off-site backup that includes the Parkventory
+      database; local backup and local restore rehearsal are insufficient;
 - [ ] consommer les secrets de production par fichiers ;
 - [ ] versionner domaine, DNS, healthchecks et smoke public ;
 - [ ] protéger `main` ;

@@ -13,7 +13,8 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	check-controller check-public-safe check-platform check-platform-config \
 	check-public-static-edge check-surplasse-public-edge-candidate \
 	check-surplasse-public-edge-controller check-surplasse-dns-cutover-controller \
-	check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
+	check-surplasse-adapter check-parkventory-postgres check-prometheus \
+	check-caddy check-postgres-image \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	activate-public-static-edge stop-public-static-edge \
@@ -21,6 +22,8 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	install-postgres-backup stop-postgres-backup-schedule \
 	backup-postgres-now rehearse-postgres-restore \
 	prepare-surplasse activate-surplasse stop-surplasse \
+	plan-parkventory-postgres verify-parkventory-postgres \
+	prepare-parkventory-postgres \
 	doctor-local
 
 help: ## Show the available commands.
@@ -63,6 +66,9 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/surplasse.yml
+	cd ansible && ../.venv/bin/ansible-playbook \
+		--inventory inventories/production/hosts.example.yml \
+		--syntax-check playbooks/parkventory-postgres.yml
 
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
@@ -102,9 +108,11 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 		applications/surplasse/expected-images.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
 		applications/surplasse/migrations.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		applications/parkventory/postgres.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool renovate.json >/dev/null
 
-check-platform: check-platform-config check-public-static-edge check-surplasse-public-edge-candidate check-surplasse-adapter check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, application candidates, and custom images.
+check-platform: check-platform-config check-public-static-edge check-surplasse-public-edge-candidate check-surplasse-adapter check-parkventory-postgres check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, application candidates, and custom images.
 
 check-platform-config: ## Render Compose and apply the production policy.
 	@rendered="$$(mktemp)"; \
@@ -158,7 +166,11 @@ check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 	./scripts/validate-compose \
 		--expected-images applications/surplasse/expected-images.json \
 		surplasse "$$rendered"; \
-	./scripts/validate-surplasse-adapter "$$rendered"
+		./scripts/validate-surplasse-adapter "$$rendered"
+
+check-parkventory-postgres: ## Validate the locked Parkventory PostgreSQL 17.10 contract.
+	./scripts/provision-parkventory-postgres --validate-contract \
+		--contract applications/parkventory/postgres.json
 
 check-prometheus: ## Validate active and inactive Prometheus rules in the pinned image.
 	@set -Eeuo pipefail; \
@@ -306,6 +318,21 @@ stop-surplasse: ## Stop only Surplasse application containers and preserve state
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --stop-surplasse
+
+plan-parkventory-postgres: ## Inspect the Parkventory database plan without mutation.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --plan-parkventory-postgres
+
+verify-parkventory-postgres: ## Verify existing Parkventory database readiness evidence.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --verify-parkventory-postgres
+
+prepare-parkventory-postgres: ## Provision only Parkventory roles, database, and evidence.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --prepare-parkventory-postgres
 
 doctor-local: ## Audit the local checkout without contact with the VPS.
 	./scripts/doctor --local
