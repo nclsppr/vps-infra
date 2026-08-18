@@ -6,6 +6,7 @@ vps_deploy_static_path: /usr/local/libexec/vps/deploy-static
 vps_deploy_static_gate_path: /usr/local/libexec/vps/deploy-static-live-gate
 vps_deploy_application_path: /usr/local/libexec/vps/deploy-application
 vps_deploy_application_gate_path: /usr/local/libexec/vps/deploy-application-live-gate
+vps_surplasse_dns_materializer_path: /usr/local/libexec/vps/materialize-surplasse-dns-secrets
 vps_deploy_git_sha_length: 40
 vps_deploy_schema_root: /usr/local/share/vps-infra/schemas
 vps_deploy_repository_dir: /srv/vps/repository
@@ -49,3 +50,5 @@ vps_deploy_executables:
   - validate-release
   - verify-github-evidence
   - verify-state
+vps_deploy_root_helpers:
+  - materialize-surplasse-dns-secrets

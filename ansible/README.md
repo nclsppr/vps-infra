@@ -247,6 +247,13 @@ verifies a clean checkout before it installs root-owned controller files. The
 file `/usr/local/share/vps-infra/controller-revision` records the installed
 commit.
 
+The deploy role also installs
+`/usr/local/libexec/vps/materialize-surplasse-dns-secrets` as `root:root 0500`
+from that same proven mirror. This helper owns only the local Surplasse DNS
+credential file contract. Normal convergence does not supply a source
+directory, invoke the helper, read a credential, contact OVHcloud, change DNS,
+or enable the Surplasse public edge.
+
 ## Public static edge playbook
 
 `playbooks/public-static-edge.yml` is the only current live service path. The

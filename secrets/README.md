@@ -50,10 +50,19 @@ identity under `/etc/vps/secrets/dns/surplasse`:
 | `ovh-application-secret` | `root:root 0400` |
 | `ovh-consumer-key` | `root:root 0400` |
 
-These files are not platform secrets and are not application inputs. No current
-controller materializes them. A later reviewed public-edge controller must
-install them atomically, prove the OVH IAM scope for the `surplasse.com` DNS-01
-operations, and keep them separate from any temporary DNS-cutover identity.
+These files are not platform secrets and are not application inputs. Ansible
+installs the root-only `materialize-surplasse-dns-secrets` helper from the proven
+infrastructure mirror. The helper accepts an exact absolute `root:root 0700`
+source directory. It stages the three files, synchronizes them, and publishes a
+`root:root 0400` manifest last. Read-only validation requires the exact files,
+the private bundle lock, and the matching final manifest. An unexpected or
+incomplete entry stops both validation and rotation without implicit cleanup.
+
+This local file contract does not prove the OVH IAM scope. The reviewed
+public-edge controller must still prove that the identity permits only the
+`surplasse.com` DNS-01 operations. Keep this permanent Caddy identity separate
+from every temporary DNS-cutover identity. The helper makes no OVHcloud API
+call, DNS change, Caddy change, route change, or activation decision.
 
 ## Surplasse
 
