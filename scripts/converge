@@ -106,17 +106,19 @@ tar_executable=$(resolve_executable tar)
 mise_executable=$(resolve_executable mise)
 mktemp_executable=$(resolve_executable mktemp)
 env_executable=$(resolve_executable env)
+install_executable=$(resolve_executable install)
 readonly git_executable tar_executable mise_executable mktemp_executable env_executable
+readonly install_executable
 
-inventory=${ANSIBLE_INVENTORY:-}
+inventory_source=${ANSIBLE_INVENTORY:-}
 extra_vars=${ANSIBLE_EXTRA_VARS:-}
-[[ -n $inventory && -f $inventory && ! -L $inventory ]] || \
+[[ -n $inventory_source && -f $inventory_source && ! -L $inventory_source ]] || \
   fail "ANSIBLE_INVENTORY must identify a regular local inventory file" "$EX_USAGE"
 [[ -n $extra_vars && -f $extra_vars && ! -L $extra_vars ]] || \
   fail "ANSIBLE_EXTRA_VARS must identify a regular local public-key variable file" "$EX_USAGE"
-inventory=$(realpath -- "$inventory")
+inventory_source=$(realpath -- "$inventory_source")
 extra_vars=$(realpath -- "$extra_vars")
-readonly inventory extra_vars
+readonly inventory_source extra_vars
 
 ssh_auth_sock=${SSH_AUTH_SOCK:-}
 if [[ -n $ssh_auth_sock ]]; then
@@ -194,6 +196,24 @@ mkdir -m 0700 -- "$checkout" "$isolated_home" "$control_path_dir"
 safe_git -C "$REPOSITORY_ROOT" archive --format=tar "$revision" | \
   "$tar_executable" -xf - -C "$checkout"
 
+isolated_inventory_directory="$checkout/ansible/inventories/production"
+isolated_inventory="$isolated_inventory_directory/hosts.yml"
+isolated_inventory_group_vars="$isolated_inventory_directory/group_vars/all.yml"
+readonly isolated_inventory_directory isolated_inventory isolated_inventory_group_vars
+for trusted_directory in \
+  "$checkout/ansible" \
+  "$checkout/ansible/inventories" \
+  "$isolated_inventory_directory" \
+  "$isolated_inventory_directory/group_vars"; do
+  [[ -d $trusted_directory && ! -L $trusted_directory ]] || \
+    fail "origin/main inventory directory is absent or symbolic" "$EX_CONFIG"
+done
+[[ -f $isolated_inventory_group_vars && ! -L $isolated_inventory_group_vars ]] || \
+  fail "captured origin/main inventory variables are unavailable" "$EX_CONFIG"
+[[ ! -e $isolated_inventory && ! -L $isolated_inventory ]] || \
+  fail "origin/main archive unexpectedly contains the private inventory" "$EX_CONFIG"
+"$install_executable" -m 0600 -- "$inventory_source" "$isolated_inventory"
+
 clean_command() {
   "$env_executable" -i \
     HOME="$isolated_home" \
@@ -236,7 +256,7 @@ install_locked_tools() {
     ansible_playbook_command+=("${ansible_playbook_options[@]}")
   fi
   ansible_playbook_command+=(
-    --inventory "$inventory"
+    --inventory "$isolated_inventory"
     --extra-vars "@$extra_vars"
     --extra-vars "vps_infra_revision=$revision"
   )

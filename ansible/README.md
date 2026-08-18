@@ -90,12 +90,19 @@ agent. The script resolves and validates a caller-owned `SSH_AUTH_SOCK`, then
 passes that socket only to `ansible-playbook`. Git, mise, dependency setup, and
 Ansible Galaxy continue to run without access to the agent.
 
-The script uses absolute external inventory and public-key variable files. It
-starts Git and Ansible commands with a small environment allowlist. Therefore,
-a divergent branch, a tracked local modification, an untracked role, or an
-external Ansible plugin path cannot change the executed playbook tree. A fetch,
-archive, dependency, or collection failure stops before Ansible contacts the
-host.
+The script accepts external inventory and public-key variable files, then
+canonicalizes their paths before it captures `origin/main`. The inventory input
+is one static YAML file. Each local file path inside it must be absolute.
+It copies only the private inventory file into the exported production
+inventory directory before Ansible starts. The tracked `group_vars` therefore
+come from the captured `origin/main` commit, not from the caller's checkout or
+the directory that contains the external inventory. The public-key variable
+file stays an explicit extra-vars input. Git and Ansible commands start with a
+small environment allowlist. Therefore, a divergent branch, a tracked local
+modification, an untracked role, adjacent external `group_vars`, or an external
+Ansible plugin path cannot change the executed playbook tree. A fetch, archive,
+dependency, collection, or inventory-copy failure stops before Ansible contacts
+the host.
 
 `site.yml` rejects the `root` and `deploy` connection users. Run a second
 convergence and a predictive check after the first successful convergence.
@@ -150,8 +157,8 @@ accepts only `deploy <full-git-sha>` or the exact `deploy-static-live` or
 The controller files are installed under `/usr/local/libexec/vps`. The marker
 `/etc/vps/production-enabled` and the executable `apply-release` are absent.
 The generic controller can validate and plan. Static activation has its own
-reviewed gate. Atlas converged repository revision
-`da04a09bfa9788ae8127b63f9f3a6692bef2551b`; the root-owned
+reviewed gate. The 2026-08-18 rollout converged repository revision
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b` and proved that the root-owned
 `deploy-application` controller and its argument-free gate are installed.
 Surplasse and Parkventory are both `enabled: false` in the protected application
 contract, so the controller refuses them before any runtime validation or

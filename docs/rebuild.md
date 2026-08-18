@@ -74,8 +74,8 @@ The generic `scripts/deploy <sha40>` controller validates and plans desired
 state but remains dry-run. Static activation uses the separate operational
 controller documented in
 [`operations/static-release-reconciliation.md`](operations/static-release-reconciliation.md).
-Atlas has converged the Compose application controller and root gate from
-revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`; both application entries
+The 2026-08-18 rollout converged the Compose application controller and root
+gate from revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`; both application entries
 remain `enabled: false`, and no application workflow or active release exists.
 
 ## Phase 0 — préparer sans toucher au trafic
