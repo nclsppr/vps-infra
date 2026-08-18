@@ -62,6 +62,18 @@ case $# in
         playbook=playbooks/postgres-backup.yml
         ansible_extra_options=(--extra-vars vps_postgres_backup_state=rehearse-latest)
         ;;
+      --install-postgres-offsite-backup)
+        playbook=playbooks/postgres-offsite-backup.yml
+        ansible_extra_options=(--extra-vars vps_postgres_offsite_state=installed)
+        ;;
+      --stop-postgres-offsite-backup-schedule)
+        playbook=playbooks/postgres-offsite-backup.yml
+        ansible_extra_options=(--extra-vars vps_postgres_offsite_state=stopped)
+        ;;
+      --upload-postgres-offsite-now)
+        playbook=playbooks/postgres-offsite-backup.yml
+        ansible_extra_options=(--extra-vars vps_postgres_offsite_state=upload-now)
+        ;;
       --prepare-surplasse)
         playbook=playbooks/surplasse.yml
         ansible_extra_options=(--extra-vars vps_surplasse_state=prepare)

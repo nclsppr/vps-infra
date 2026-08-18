@@ -1,0 +1,43 @@
+---
+- name: Install or invoke the encrypted PostgreSQL off-site controller
+  hosts: vps
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+
+  pre_tasks:
+    - name: Prove the administrator and host boundary
+      ansible.builtin.assert:
+        that:
+          - (ansible_user | default('')) == vps_admin_user
+          - (ansible_user | default('')) not in ['root', vps_deploy_user]
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version in vps_supported_ubuntu_releases
+          - ansible_port | int == vps_ssh_port | int
+          - vps_ssh_port | int == 22
+          - vps_admin_authorized_keys | length > 0
+          - vps_infra_revision is match('^[0-9a-f]{40}$')
+          - >-
+            vps_postgres_offsite_state in
+            ['installed', 'stopped', 'upload-now']
+        fail_msg: >-
+          The PostgreSQL off-site controller requires the converged Atlas
+          administrator boundary and one exact infrastructure revision.
+
+    - name: Confirm the current connection is still responsive
+      ansible.builtin.wait_for_connection:
+        timeout: 20
+
+  roles:
+    - role: postgres_offsite_backup
+
+  post_tasks:
+    - name: Report the bounded PostgreSQL off-site state
+      ansible.builtin.debug:
+        msg: >-
+          PostgreSQL off-site controller state is
+          {{ vps_postgres_offsite_state }}. No public route, DNS record,
+          application, local backup, or production PostgreSQL volume was
+          changed. Provider-side retention and off-host recovery evidence
+          remain external gates.

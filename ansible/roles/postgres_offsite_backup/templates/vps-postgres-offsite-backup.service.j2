@@ -1,0 +1,38 @@
+[Unit]
+Description=Encrypt and upload one verified PostgreSQL backup off-site
+After=network-online.target vps-postgres-backup.service
+Wants=network-online.target
+ConditionPathIsDirectory=/srv/vps/backups/postgresql
+ConditionPathIsDirectory={{ vps_postgres_offsite_root }}
+
+[Service]
+Type=oneshot
+ExecStart={{ vps_postgres_offsite_script }} upload --latest
+TimeoutStartSec=7200
+UMask=0077
+User=root
+Group=root
+LoadCredential=upload:{{ vps_postgres_offsite_upload_credentials }}
+Environment=HOME=/nonexistent
+Environment=LC_ALL=C.UTF-8
+Environment=PATH=/usr/bin:/bin
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+InaccessiblePaths=/etc/vps/secrets -/run/docker.sock -/var/run/docker.sock -/run/systemd/private
+ReadOnlyPaths=/srv/vps/backups/postgresql {{ vps_postgres_offsite_config_root }}
+ReadWritePaths={{ vps_postgres_offsite_root }} /run/lock
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

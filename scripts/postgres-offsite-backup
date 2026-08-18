@@ -1,0 +1,1914 @@
+#!/usr/bin/env python3
+"""Upload one encrypted PostgreSQL backup or recover it off the production host."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import resource
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import uuid
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from types import ModuleType
+from urllib.parse import urlsplit
+
+
+EX_CONFIG = 78
+CONFIG_CONTRACT = "vps-postgres-offsite-config-v1"
+TRANSACTION_CONTRACT = "vps-postgres-offsite-transaction-v1"
+RECEIPT_CONTRACT = "vps-postgres-offsite-receipt-v2"
+LOCAL_BACKUP_CONTRACT = "vps-postgres-logical-backup-v1"
+PRODUCTION_LOCAL_ROOT = Path("/srv/vps/backups/postgresql")
+PRODUCTION_OFFSITE_ROOT = Path("/srv/vps/backups/postgresql-offsite")
+PRODUCTION_CONFIG = Path("/etc/vps/postgres-offsite/config.json")
+PRODUCTION_AWS_CONFIG = Path("/etc/vps/postgres-offsite/aws-config")
+PRODUCTION_LOCAL_SCRIPT = Path("/usr/local/libexec/vps/postgres-backup")
+PRODUCTION_LOCAL_LOCK = Path("/run/lock/vps-postgres-backup.lock")
+PRODUCTION_OFFSITE_LOCK = Path("/run/lock/vps-postgres-offsite.lock")
+PRODUCTION_AGE = Path("/usr/bin/age")
+PRODUCTION_AWS = Path("/usr/bin/aws")
+PRODUCTION_TAR = Path("/usr/bin/tar")
+BACKUP_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}$")
+AGE_RECIPIENT_RE = re.compile(r"^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+REGION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,126}$")
+VERSION_ID_RE = re.compile(r"^[^\x00-\x20\x7f]{1,256}$")
+MAX_CONFIG_BYTES = 64 * 1024
+MAX_CAPTURE_BYTES = 64 * 1024
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_GLOBALS_BYTES = 16 * 1024 * 1024
+MAX_BUNDLE_BYTES = 128 * 1024 * 1024 * 1024
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
+CLEAN_ENVIRONMENT = {
+    "HOME": "/nonexistent",
+    "PATH": "/usr/bin:/bin",
+    "LC_ALL": "C.UTF-8",
+    "AWS_EC2_METADATA_DISABLED": "true",
+    "AWS_MAX_ATTEMPTS": "1",
+    "AWS_PAGER": "",
+}
+REQUIRED_GATES = {
+    "bucket_object_lock_verified",
+    "bucket_versioning_verified",
+    "failure_domain_independence_reviewed",
+    "recovery_key_off_host_verified",
+    "restore_identity_separate_verified",
+}
+
+
+class OffsiteError(RuntimeError):
+    """Raised when an off-site operation differs from the strict contract."""
+
+
+def fail(message: str, status: int = EX_CONFIG) -> int:
+    print(f"PostgreSQL off-site backup refused: {message}", file=sys.stderr)
+    return status
+
+
+def strict_json(raw: bytes, label: str) -> object:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise OffsiteError(f"{label} contains duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OffsiteError(f"{label} is not strict UTF-8 JSON") from exc
+
+
+def exact_keys(candidate: dict[str, object], expected: set[str], label: str) -> None:
+    if set(candidate) != expected:
+        raise OffsiteError(f"{label} has unexpected fields")
+
+
+def require_dictionary(candidate: object, label: str) -> dict[str, object]:
+    if not isinstance(candidate, dict):
+        raise OffsiteError(f"{label} is not an object")
+    return candidate
+
+
+def require_string(candidate: object, label: str) -> str:
+    if not isinstance(candidate, str):
+        raise OffsiteError(f"{label} is not a string")
+    return candidate
+
+
+def require_integer(candidate: object, label: str) -> int:
+    if isinstance(candidate, bool) or not isinstance(candidate, int):
+        raise OffsiteError(f"{label} is not an integer")
+    return candidate
+
+
+def clean_environment(
+    credentials: Path,
+    aws_config: Path,
+) -> dict[str, str]:
+    environment = CLEAN_ENVIRONMENT.copy()
+    environment.update(
+        {
+            "AWS_SHARED_CREDENTIALS_FILE": str(credentials),
+            "AWS_CONFIG_FILE": str(aws_config),
+        }
+    )
+    return environment
+
+
+def file_size_limit(maximum: int):
+    """Return a child setup hook that cannot write a file beyond maximum."""
+
+    def constrain() -> None:
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        limits = [maximum]
+        if soft != resource.RLIM_INFINITY:
+            limits.append(soft)
+        if hard != resource.RLIM_INFINITY:
+            limits.append(hard)
+        bounded = min(limits)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (bounded, bounded))
+
+    return constrain
+
+
+def read_bounded_file(path: Path, maximum: int, label: str) -> bytes:
+    try:
+        descriptor = os.open(path, FILE_FLAGS)
+    except OSError as exc:
+        raise OffsiteError(f"cannot open {label}: {exc.strerror}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise OffsiteError(f"{label} is not one regular file")
+        if metadata.st_size <= 0 or metadata.st_size > maximum:
+            raise OffsiteError(f"{label} size is outside its limit")
+        raw = bytearray()
+        while len(raw) <= maximum:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) != metadata.st_size:
+            raise OffsiteError(f"{label} changed while it was read")
+        return bytes(raw)
+    finally:
+        os.close(descriptor)
+
+
+def check_owned_file(
+    path: Path,
+    owner: int,
+    modes: set[int],
+    label: str,
+) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise OffsiteError(f"cannot inspect {label}: {exc.strerror}") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or path.is_symlink()
+        or metadata.st_nlink != 1
+        or metadata.st_uid != owner
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) not in modes
+    ):
+        raise OffsiteError(f"{label} has unsafe metadata")
+    return metadata
+
+
+def check_owned_directory(path: Path, owner: int, mode: int, label: str) -> int:
+    try:
+        descriptor = os.open(path, DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise OffsiteError(f"cannot open {label}: {exc.strerror}") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != owner
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        os.close(descriptor)
+        raise OffsiteError(f"{label} has unsafe metadata")
+    return descriptor
+
+
+def acquire_lock(path: Path, owner: int, label: str) -> int:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as exc:
+        raise OffsiteError(f"cannot open {label}: {exc.strerror}") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != owner
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        os.close(descriptor)
+        raise OffsiteError(f"{label} has unsafe metadata")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(descriptor)
+        raise OffsiteError(f"another operation owns {label}") from exc
+    return descriptor
+
+
+def sha256_file(path: Path) -> tuple[str, str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        descriptor = os.open(path, FILE_FLAGS)
+    except OSError as exc:
+        raise OffsiteError(f"cannot open the encrypted bundle: {exc.strerror}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise OffsiteError("the encrypted bundle is not one regular file")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_BUNDLE_BYTES:
+                raise OffsiteError("the encrypted bundle exceeds its size limit")
+            digest.update(chunk)
+        if size != metadata.st_size or size <= 0:
+            raise OffsiteError("the encrypted bundle changed or is empty")
+    finally:
+        os.close(descriptor)
+    raw_digest = digest.digest()
+    return digest.hexdigest(), base64.b64encode(raw_digest).decode("ascii"), size
+
+
+def validate_endpoint(value: object) -> str:
+    endpoint = require_string(value, "S3 endpoint")
+    try:
+        parsed = urlsplit(endpoint)
+        port = parsed.port
+    except ValueError as exc:
+        raise OffsiteError("S3 endpoint is invalid") from exc
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or endpoint.endswith("/")
+        or hostname != hostname.lower()
+        or re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?",
+            hostname,
+        )
+        is None
+        or ".." in hostname
+        or (port is not None and not 1 <= port <= 65535)
+    ):
+        raise OffsiteError("S3 endpoint must be one canonical HTTPS origin")
+    expected_netloc = hostname if port is None else f"{hostname}:{port}"
+    if parsed.netloc != expected_netloc or endpoint != f"https://{expected_netloc}":
+        raise OffsiteError("S3 endpoint must use a canonical lowercase host")
+    return endpoint
+
+
+def validate_config(candidate: object) -> dict[str, object]:
+    config = require_dictionary(candidate, "off-site configuration")
+    exact_keys(
+        config,
+        {
+            "contract",
+            "endpoint",
+            "region",
+            "bucket",
+            "prefix",
+            "addressing_style",
+            "age_recipient",
+            "gates",
+        },
+        "off-site configuration",
+    )
+    if config["contract"] != CONFIG_CONTRACT:
+        raise OffsiteError("off-site configuration contract is unsupported")
+    config["endpoint"] = validate_endpoint(config["endpoint"])
+    region = require_string(config["region"], "S3 region")
+    bucket = require_string(config["bucket"], "S3 bucket")
+    prefix = require_string(config["prefix"], "S3 key prefix")
+    addressing_style = require_string(config["addressing_style"], "S3 addressing style")
+    recipient = require_string(config["age_recipient"], "age recipient")
+    if REGION_RE.fullmatch(region) is None:
+        raise OffsiteError("S3 region has an invalid format")
+    if BUCKET_RE.fullmatch(bucket) is None or ".." in bucket:
+        raise OffsiteError("S3 bucket has an invalid DNS-compatible format")
+    if PREFIX_RE.fullmatch(prefix) is None or any(
+        segment in {"", ".", ".."} for segment in prefix.split("/")
+    ):
+        raise OffsiteError("S3 key prefix has an invalid format")
+    if addressing_style not in {"path", "virtual"}:
+        raise OffsiteError("S3 addressing style must be path or virtual")
+    if AGE_RECIPIENT_RE.fullmatch(recipient) is None:
+        raise OffsiteError("age recipient is not one X25519 recipient")
+    gates = require_dictionary(config["gates"], "off-site configuration gates")
+    exact_keys(gates, REQUIRED_GATES, "off-site configuration gates")
+    if any(gates[name] is not True for name in REQUIRED_GATES):
+        raise OffsiteError("every off-site provider and recovery gate must be true")
+    return config
+
+
+def load_config(path: Path, owner: int, modes: set[int]) -> dict[str, object]:
+    check_owned_file(path, owner, modes, "off-site configuration")
+    return validate_config(strict_json(read_bounded_file(path, MAX_CONFIG_BYTES, "off-site configuration"), "off-site configuration"))
+
+
+def expected_aws_config(config: dict[str, object]) -> bytes:
+    return (
+        "[default]\n"
+        f"region = {config['region']}\n"
+        "s3 =\n"
+        f"    addressing_style = {config['addressing_style']}\n"
+    ).encode("ascii")
+
+
+def validate_aws_config(
+    path: Path,
+    owner: int,
+    modes: set[int],
+    config: dict[str, object],
+) -> None:
+    check_owned_file(path, owner, modes, "AWS CLI configuration")
+    if read_bounded_file(path, MAX_CONFIG_BYTES, "AWS CLI configuration") != expected_aws_config(config):
+        raise OffsiteError("AWS CLI configuration differs from the exact public contract")
+
+
+def validate_credentials(path: Path, owner: int) -> None:
+    check_owned_file(path, owner, {0o400, 0o600}, "S3 credential file")
+    raw = read_bounded_file(path, 16 * 1024, "S3 credential file")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OffsiteError("S3 credential file is not strict UTF-8") from exc
+    if "\r" in content or not content.endswith("\n"):
+        raise OffsiteError("S3 credential file differs from the exact upload identity format")
+    lines = content.splitlines()
+    prefixes = (
+        "aws_access_key_id = ",
+        "aws_secret_access_key = ",
+    )
+    if (
+        len(lines) != 3
+        or lines[0] != "[default]"
+        or not lines[1].startswith(prefixes[0])
+        or not lines[2].startswith(prefixes[1])
+    ):
+        raise OffsiteError("S3 credential file differs from the exact upload identity format")
+    values = (
+        lines[1].removeprefix(prefixes[0]),
+        lines[2].removeprefix(prefixes[1]),
+    )
+    for value in values:
+        if (
+            not 3 <= len(value) <= 512
+            or not value.isascii()
+            or any(not 0x21 <= ord(character) <= 0x7E for character in value)
+            or re.search(r"%[(][^)]{1,128}[)][A-Za-z]|[$][{][^}]{1,128}[}]", value)
+        ):
+            raise OffsiteError("S3 credential file contains an invalid credential field")
+
+
+def load_local_backup_module(path: Path) -> ModuleType:
+    loader = SourceFileLoader(f"vps_postgres_backup_{uuid.uuid4().hex}", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise OffsiteError("cannot load the local PostgreSQL backup validator")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise OffsiteError("cannot load the local PostgreSQL backup validator") from exc
+    if (
+        getattr(module, "BACKUP_CONTRACT", None) != LOCAL_BACKUP_CONTRACT
+        or not callable(getattr(module, "verify_backup", None))
+        or not callable(getattr(module, "latest_backup_id", None))
+    ):
+        raise OffsiteError("local PostgreSQL backup validator has an incompatible contract")
+    return module
+
+
+def write_new_file(directory_fd: int, name: str, content: bytes, mode: int = 0o600) -> None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise OffsiteError(f"cannot create transaction file {name}: {exc.strerror}") from exc
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OffsiteError(f"cannot write transaction file {name}")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class UploadRuntime:
+    def __init__(
+        self,
+        *,
+        local_root: Path,
+        offsite_root: Path,
+        config_path: Path,
+        aws_config: Path,
+        credentials: Path,
+        local_script: Path,
+        local_lock: Path,
+        offsite_lock: Path,
+        age: Path,
+        aws: Path,
+        tar: Path,
+        owner: int,
+    ) -> None:
+        self.local_root = local_root
+        self.offsite_root = offsite_root
+        self.config_path = config_path
+        self.aws_config = aws_config
+        self.credentials = credentials
+        self.local_script = local_script
+        self.local_lock = local_lock
+        self.offsite_lock = offsite_lock
+        self.age = age
+        self.aws = aws
+        self.tar = tar
+        self.owner = owner
+
+    @property
+    def transactions(self) -> Path:
+        return self.offsite_root / "transactions"
+
+    @property
+    def receipts(self) -> Path:
+        return self.offsite_root / "receipts"
+
+
+def configured_upload_runtime(args: argparse.Namespace) -> UploadRuntime:
+    if args.test_root is None:
+        if os.geteuid() != 0:
+            raise OffsiteError("production upload mode requires root")
+        if any(
+            value is not None
+            for value in (
+                args.test_local_root,
+                args.test_config,
+                args.test_aws_config,
+                args.test_credentials,
+                args.test_local_script,
+                args.test_age,
+                args.test_aws,
+                args.test_tar,
+            )
+        ):
+            raise OffsiteError("production upload mode rejects path overrides")
+        credential_directory = os.environ.get("CREDENTIALS_DIRECTORY", "")
+        if credential_directory != "/run/credentials/vps-postgres-offsite-backup.service":
+            raise OffsiteError("systemd did not supply the upload credential directory")
+        return UploadRuntime(
+            local_root=PRODUCTION_LOCAL_ROOT,
+            offsite_root=PRODUCTION_OFFSITE_ROOT,
+            config_path=PRODUCTION_CONFIG,
+            aws_config=PRODUCTION_AWS_CONFIG,
+            credentials=Path(credential_directory) / "upload",
+            local_script=PRODUCTION_LOCAL_SCRIPT,
+            local_lock=PRODUCTION_LOCAL_LOCK,
+            offsite_lock=PRODUCTION_OFFSITE_LOCK,
+            age=PRODUCTION_AGE,
+            aws=PRODUCTION_AWS,
+            tar=PRODUCTION_TAR,
+            owner=0,
+        )
+    if os.geteuid() == 0:
+        raise OffsiteError("root cannot use upload test mode")
+    if os.environ.get("VPS_POSTGRES_OFFSITE_TESTING") != "1":
+        raise OffsiteError("upload test mode requires an explicit environment guard")
+    required_paths = (
+        args.test_root,
+        args.test_local_root,
+        args.test_config,
+        args.test_aws_config,
+        args.test_credentials,
+        args.test_local_script,
+        args.test_age,
+        args.test_aws,
+        args.test_tar,
+    )
+    if any(path is None or not path.is_absolute() for path in required_paths):
+        raise OffsiteError("upload test mode requires every absolute path override")
+    assert args.test_root is not None
+    assert args.test_local_root is not None
+    assert args.test_config is not None
+    assert args.test_aws_config is not None
+    assert args.test_credentials is not None
+    assert args.test_local_script is not None
+    assert args.test_age is not None
+    assert args.test_aws is not None
+    assert args.test_tar is not None
+    return UploadRuntime(
+        local_root=args.test_local_root,
+        offsite_root=args.test_root,
+        config_path=args.test_config,
+        aws_config=args.test_aws_config,
+        credentials=args.test_credentials,
+        local_script=args.test_local_script,
+        local_lock=args.test_root.parent / ".postgres-local.lock",
+        offsite_lock=args.test_root.parent / ".postgres-offsite.lock",
+        age=args.test_age,
+        aws=args.test_aws,
+        tar=args.test_tar,
+        owner=os.geteuid(),
+    )
+
+
+def object_key(config: dict[str, object], backup_id: str) -> str:
+    return f"{require_string(config['prefix'], 'S3 key prefix')}/{backup_id}.tar.age"
+
+
+def recipient_digest(config: dict[str, object]) -> str:
+    recipient = require_string(config["age_recipient"], "age recipient")
+    return hashlib.sha256(recipient.encode("ascii")).hexdigest()
+
+
+def validate_local_script(path: Path, owner: int, production: bool) -> None:
+    modes = {0o500} if production else {0o500, 0o555, 0o700, 0o755}
+    check_owned_file(path, owner, modes, "local PostgreSQL backup validator")
+    if not os.access(path, os.X_OK):
+        raise OffsiteError("local PostgreSQL backup validator is not executable")
+
+
+def create_pending_transaction(
+    runtime: UploadRuntime,
+    config: dict[str, object],
+    selector: str | None,
+) -> tuple[Path | None, str]:
+    production = runtime.owner == 0
+    validate_local_script(runtime.local_script, runtime.owner, production)
+    module = load_local_backup_module(runtime.local_script)
+    local_lock_fd = acquire_lock(runtime.local_lock, runtime.owner, "local backup lock")
+    staging_path: Path | None = None
+    try:
+        local_runtime = module.Runtime(
+            runtime.local_root,
+            runtime.local_lock,
+            Path("/usr/bin/docker"),
+            runtime.owner,
+        )
+        backup_id = module.latest_backup_id(local_runtime) if selector is None else selector
+        if not isinstance(backup_id, str) or BACKUP_ID_RE.fullmatch(backup_id) is None:
+            raise OffsiteError("selected local backup identifier is invalid")
+        manifest = module.verify_backup(local_runtime, backup_id)
+        if not isinstance(manifest, dict):
+            raise OffsiteError("local backup validator returned an invalid manifest")
+        backup_directory = runtime.local_root / backup_id
+        entries = sorted(os.listdir(backup_directory))
+        checksum_raw = read_bounded_file(
+            backup_directory / "manifest.sha256",
+            65,
+            "local manifest checksum",
+        )
+        try:
+            checksum_text = checksum_raw.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise OffsiteError("local manifest checksum is not ASCII") from exc
+        if re.fullmatch(r"[0-9a-f]{64}\n", checksum_text) is None:
+            raise OffsiteError("local manifest checksum has an invalid format")
+
+        pending_path = runtime.transactions / f"pending-{backup_id}"
+        receipt_path = runtime.receipts / f"{backup_id}.json"
+        if pending_path.exists() or pending_path.is_symlink():
+            raise OffsiteError("a transaction for the selected backup already exists")
+        if receipt_path.exists() or receipt_path.is_symlink():
+            receipt = validate_receipt(receipt_path, runtime.owner, config, backup_id)
+            receipt_source = require_dictionary(receipt["source"], "receipt source")
+            if receipt_source["manifest_sha256"] != checksum_text.strip():
+                raise OffsiteError("off-site receipt differs from the selected local backup")
+            return None, backup_id
+
+        staging_name = f".partial-{backup_id}-{uuid.uuid4().hex[:12]}"
+        staging_path = runtime.transactions / staging_name
+        os.mkdir(staging_path, mode=0o700)
+        staging_fd = check_owned_directory(
+            staging_path,
+            runtime.owner,
+            0o700,
+            "off-site staging directory",
+        )
+        try:
+            bundle_fd = os.open(
+                "bundle.age",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=staging_fd,
+            )
+            tar_names = [backup_id, *(f"{backup_id}/{name}" for name in entries)]
+            tar_command = [
+                str(runtime.tar),
+                "--create",
+                "--format=posix",
+                "--sort=name",
+                "--numeric-owner",
+                "--owner=0",
+                "--group=0",
+                "--mode=go=",
+                "--mtime=@0",
+                "--pax-option=delete=atime,delete=ctime",
+                "--no-recursion",
+                "--directory",
+                str(runtime.local_root),
+                "--",
+                *tar_names,
+            ]
+            age_command = [
+                str(runtime.age),
+                "--encrypt",
+                "--recipient",
+                require_string(config["age_recipient"], "age recipient"),
+            ]
+            environment = CLEAN_ENVIRONMENT.copy()
+            tar_process: subprocess.Popen[bytes] | None = None
+            age_process: subprocess.Popen[bytes] | None = None
+            try:
+                tar_process = subprocess.Popen(
+                    tar_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    env=environment,
+                )
+                assert tar_process.stdout is not None
+                age_process = subprocess.Popen(
+                    age_command,
+                    stdin=tar_process.stdout,
+                    stdout=bundle_fd,
+                    stderr=subprocess.DEVNULL,
+                    env=environment,
+                    preexec_fn=file_size_limit(MAX_BUNDLE_BYTES),
+                )
+                tar_process.stdout.close()
+                age_status = age_process.wait()
+                tar_status = tar_process.wait()
+                os.fsync(bundle_fd)
+            except Exception:
+                for process in (age_process, tar_process):
+                    if process is not None and process.poll() is None:
+                        process.kill()
+                        process.wait()
+                raise
+            finally:
+                os.close(bundle_fd)
+            if tar_status != 0 or age_status != 0:
+                raise OffsiteError("encrypted bundle creation failed")
+
+            cipher_sha256, checksum_sha256, cipher_size = sha256_file(
+                staging_path / "bundle.age"
+            )
+            transaction = {
+                "contract": TRANSACTION_CONTRACT,
+                "backup_id": backup_id,
+                "source": {
+                    "contract": LOCAL_BACKUP_CONTRACT,
+                    "manifest_sha256": checksum_text.strip(),
+                    "cross_database_snapshot_atomic": False,
+                },
+                "encryption": {
+                    "format": "age-v1",
+                    "recipient_sha256": recipient_digest(config),
+                },
+                "object": {
+                    "bucket": config["bucket"],
+                    "key": object_key(config, backup_id),
+                    "cipher_size": cipher_size,
+                    "cipher_sha256": cipher_sha256,
+                    "checksum_sha256": checksum_sha256,
+                },
+            }
+            transaction_raw = (
+                json.dumps(transaction, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            write_new_file(staging_fd, "transaction.json", transaction_raw)
+            os.fsync(staging_fd)
+        finally:
+            os.close(staging_fd)
+        os.rename(staging_path, pending_path)
+        transactions_fd = check_owned_directory(
+            runtime.transactions,
+            runtime.owner,
+            0o700,
+            "off-site transaction directory",
+        )
+        try:
+            os.fsync(transactions_fd)
+        finally:
+            os.close(transactions_fd)
+        staging_path = None
+        return pending_path, backup_id
+    except Exception:
+        if staging_path is not None and staging_path.exists() and not staging_path.is_symlink():
+            shutil.rmtree(staging_path)
+        raise
+    finally:
+        os.close(local_lock_fd)
+
+
+def load_standalone_transaction(
+    path: Path,
+    owner: int,
+    modes: set[int],
+    config: dict[str, object],
+) -> dict[str, object]:
+    check_owned_file(path, owner, modes, "off-site transaction manifest")
+    transaction = require_dictionary(
+        strict_json(
+            read_bounded_file(
+                path,
+                MAX_CONFIG_BYTES,
+                "off-site transaction manifest",
+            ),
+            "off-site transaction manifest",
+        ),
+        "off-site transaction manifest",
+    )
+    exact_keys(
+        transaction,
+        {"contract", "backup_id", "source", "encryption", "object"},
+        "off-site transaction manifest",
+    )
+    backup_id = require_string(transaction["backup_id"], "transaction backup identifier")
+    if transaction["contract"] != TRANSACTION_CONTRACT or BACKUP_ID_RE.fullmatch(backup_id) is None:
+        raise OffsiteError("off-site transaction identity is invalid")
+    source = require_dictionary(transaction["source"], "transaction source")
+    exact_keys(
+        source,
+        {"contract", "manifest_sha256", "cross_database_snapshot_atomic"},
+        "transaction source",
+    )
+    if (
+        source["contract"] != LOCAL_BACKUP_CONTRACT
+        or SHA256_RE.fullmatch(
+            require_string(source["manifest_sha256"], "source manifest digest")
+        )
+        is None
+        or source["cross_database_snapshot_atomic"] is not False
+    ):
+        raise OffsiteError("off-site transaction source contract is invalid")
+    encryption = require_dictionary(transaction["encryption"], "transaction encryption")
+    exact_keys(encryption, {"format", "recipient_sha256"}, "transaction encryption")
+    if encryption != {
+        "format": "age-v1",
+        "recipient_sha256": recipient_digest(config),
+    }:
+        raise OffsiteError("off-site transaction uses another encryption recipient")
+    object_contract = require_dictionary(transaction["object"], "transaction object")
+    exact_keys(
+        object_contract,
+        {
+            "bucket",
+            "key",
+            "cipher_size",
+            "cipher_sha256",
+            "checksum_sha256",
+        },
+        "transaction object",
+    )
+    checksum_sha256 = require_string(object_contract["checksum_sha256"], "S3 checksum")
+    try:
+        decoded_checksum = base64.b64decode(checksum_sha256, validate=True)
+    except ValueError as exc:
+        raise OffsiteError("transaction S3 checksum is not canonical base64") from exc
+    if (
+        object_contract["bucket"] != config["bucket"]
+        or object_contract["key"] != object_key(config, backup_id)
+        or SHA256_RE.fullmatch(
+            require_string(object_contract["cipher_sha256"], "cipher digest")
+        )
+        is None
+        or len(decoded_checksum) != 32
+        or base64.b64encode(decoded_checksum).decode("ascii") != checksum_sha256
+        or decoded_checksum.hex() != object_contract["cipher_sha256"]
+        or require_integer(object_contract["cipher_size"], "cipher size") <= 0
+        or require_integer(object_contract["cipher_size"], "cipher size") > MAX_BUNDLE_BYTES
+    ):
+        raise OffsiteError("off-site transaction object differs from current configuration")
+    return transaction
+
+
+def validate_transaction(
+    pending_path: Path,
+    owner: int,
+    config: dict[str, object],
+) -> tuple[dict[str, object], Path]:
+    directory_fd = check_owned_directory(
+        pending_path,
+        owner,
+        0o700,
+        "pending off-site transaction",
+    )
+    os.close(directory_fd)
+    if set(os.listdir(pending_path)) != {"bundle.age", "transaction.json"}:
+        raise OffsiteError("pending off-site transaction has unexpected entries")
+    check_owned_file(pending_path / "bundle.age", owner, {0o600}, "encrypted bundle")
+    transaction = load_standalone_transaction(
+        pending_path / "transaction.json",
+        owner,
+        {0o600},
+        config,
+    )
+    backup_id = require_string(transaction["backup_id"], "transaction backup identifier")
+    if pending_path.name != f"pending-{backup_id}":
+        raise OffsiteError("pending transaction identity is invalid")
+    object_contract = require_dictionary(transaction["object"], "transaction object")
+    cipher_sha256, checksum_sha256, cipher_size = sha256_file(pending_path / "bundle.age")
+    if (
+        object_contract["cipher_sha256"] != cipher_sha256
+        or object_contract["checksum_sha256"] != checksum_sha256
+        or object_contract["cipher_size"] != cipher_size
+    ):
+        raise OffsiteError("pending encrypted bundle does not match its transaction")
+    return transaction, pending_path / "bundle.age"
+
+
+def validate_receipt(
+    path: Path,
+    owner: int,
+    config: dict[str, object],
+    backup_id: str,
+    modes: set[int] | None = None,
+) -> dict[str, object]:
+    check_owned_file(path, owner, modes or {0o600}, "off-site upload receipt")
+    receipt = require_dictionary(
+        strict_json(
+            read_bounded_file(path, MAX_CONFIG_BYTES, "off-site upload receipt"),
+            "off-site upload receipt",
+        ),
+        "off-site upload receipt",
+    )
+    exact_keys(
+        receipt,
+        {"contract", "backup_id", "recorded_at", "source", "encryption", "object", "gates"},
+        "off-site upload receipt",
+    )
+    if (
+        receipt["contract"] != RECEIPT_CONTRACT
+        or receipt["backup_id"] != backup_id
+        or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+            require_string(receipt["recorded_at"], "receipt record time"),
+        )
+        is None
+        or receipt["gates"] != config["gates"]
+    ):
+        raise OffsiteError("off-site upload receipt identity or gates are invalid")
+    source = require_dictionary(receipt["source"], "receipt source")
+    exact_keys(source, {"contract", "manifest_sha256"}, "receipt source")
+    if (
+        source["contract"] != LOCAL_BACKUP_CONTRACT
+        or SHA256_RE.fullmatch(require_string(source["manifest_sha256"], "receipt manifest digest")) is None
+    ):
+        raise OffsiteError("off-site upload receipt source is invalid")
+    encryption = require_dictionary(receipt["encryption"], "receipt encryption")
+    exact_keys(encryption, {"format", "recipient_sha256"}, "receipt encryption")
+    if encryption != {
+        "format": "age-v1",
+        "recipient_sha256": recipient_digest(config),
+    }:
+        raise OffsiteError("off-site upload receipt uses another encryption recipient")
+    object_contract = require_dictionary(receipt["object"], "receipt object")
+    exact_keys(
+        object_contract,
+        {
+            "endpoint",
+            "bucket",
+            "key",
+            "version_id",
+            "cipher_size",
+            "cipher_sha256",
+            "checksum_sha256",
+        },
+        "receipt object",
+    )
+    receipt_checksum = require_string(object_contract["checksum_sha256"], "receipt S3 checksum")
+    try:
+        decoded_receipt_checksum = base64.b64decode(receipt_checksum, validate=True)
+    except ValueError as exc:
+        raise OffsiteError("off-site upload receipt checksum is not canonical base64") from exc
+    if (
+        object_contract["endpoint"] != config["endpoint"]
+        or object_contract["bucket"] != config["bucket"]
+        or object_contract["key"] != object_key(config, backup_id)
+        or VERSION_ID_RE.fullmatch(require_string(object_contract["version_id"], "object version")) is None
+        or object_contract["version_id"] == "null"
+        or require_integer(object_contract["cipher_size"], "receipt cipher size") <= 0
+        or require_integer(object_contract["cipher_size"], "receipt cipher size") > MAX_BUNDLE_BYTES
+        or SHA256_RE.fullmatch(require_string(object_contract["cipher_sha256"], "receipt cipher digest")) is None
+        or len(decoded_receipt_checksum) != 32
+        or base64.b64encode(decoded_receipt_checksum).decode("ascii") != receipt_checksum
+        or decoded_receipt_checksum.hex() != object_contract["cipher_sha256"]
+    ):
+        raise OffsiteError("off-site upload receipt object is invalid")
+    return receipt
+
+
+def repair_receipt_commits(
+    runtime: UploadRuntime,
+    config: dict[str, object],
+) -> None:
+    changed = False
+    for name in os.listdir(runtime.receipts):
+        if re.fullmatch(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}[.]json", name):
+            continue
+        match = re.fullmatch(
+            r"[.]([0-9]{8}T[0-9]{12}Z-[0-9a-f]{12})[.][0-9a-f]{12}[.]partial",
+            name,
+        )
+        if match is None:
+            raise OffsiteError("off-site receipt directory contains an unknown entry")
+        backup_id = match.group(1)
+        temporary_path = runtime.receipts / name
+        final_path = runtime.receipts / f"{backup_id}.json"
+        temporary_metadata = temporary_path.lstat()
+        if (
+            not stat.S_ISREG(temporary_metadata.st_mode)
+            or temporary_path.is_symlink()
+            or temporary_metadata.st_nlink not in {1, 2}
+            or temporary_metadata.st_uid != runtime.owner
+            or temporary_metadata.st_gid != os.getegid()
+            or stat.S_IMODE(temporary_metadata.st_mode) != 0o600
+        ):
+            raise OffsiteError("partial off-site upload receipt has unsafe metadata")
+        if final_path.exists() or final_path.is_symlink():
+            final_metadata = final_path.lstat()
+            if (
+                not stat.S_ISREG(final_metadata.st_mode)
+                or final_path.is_symlink()
+                or temporary_metadata.st_nlink != 2
+                or final_metadata.st_nlink != 2
+                or temporary_metadata.st_dev != final_metadata.st_dev
+                or temporary_metadata.st_ino != final_metadata.st_ino
+                or final_metadata.st_uid != runtime.owner
+                or final_metadata.st_gid != os.getegid()
+                or stat.S_IMODE(final_metadata.st_mode) != 0o600
+            ):
+                raise OffsiteError("partial receipt conflicts with its committed receipt")
+            os.unlink(temporary_path)
+            validate_receipt(final_path, runtime.owner, config, backup_id)
+            changed = True
+            continue
+        if temporary_metadata.st_nlink != 1:
+            raise OffsiteError("uncommitted partial receipt has an unexpected hard link")
+        try:
+            validate_receipt(
+                temporary_path,
+                runtime.owner,
+                config,
+                backup_id,
+            )
+        except OffsiteError:
+            os.unlink(temporary_path)
+            changed = True
+            continue
+        os.link(
+            temporary_path,
+            final_path,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_path)
+        validate_receipt(final_path, runtime.owner, config, backup_id)
+        changed = True
+    if changed:
+        receipts_fd = check_owned_directory(
+            runtime.receipts,
+            runtime.owner,
+            0o700,
+            "off-site receipt directory",
+        )
+        try:
+            os.fsync(receipts_fd)
+        finally:
+            os.close(receipts_fd)
+
+
+def expected_object_metadata(
+    backup_id: str,
+    transaction: dict[str, object],
+    config: dict[str, object],
+) -> dict[str, str]:
+    source = require_dictionary(transaction["source"], "transaction source")
+    object_contract = require_dictionary(transaction["object"], "transaction object")
+    return {
+        "contract": TRANSACTION_CONTRACT,
+        "backup-id": backup_id,
+        "cipher-sha256": require_string(object_contract["cipher_sha256"], "cipher digest"),
+        "manifest-sha256": require_string(source["manifest_sha256"], "source manifest digest"),
+        "recipient-sha256": recipient_digest(config),
+    }
+
+
+def expected_receipt_metadata(receipt: dict[str, object]) -> dict[str, str]:
+    backup_id = require_string(receipt["backup_id"], "receipt backup identifier")
+    source = require_dictionary(receipt["source"], "receipt source")
+    encryption = require_dictionary(receipt["encryption"], "receipt encryption")
+    object_contract = require_dictionary(receipt["object"], "receipt object")
+    return {
+        "contract": TRANSACTION_CONTRACT,
+        "backup-id": backup_id,
+        "cipher-sha256": require_string(object_contract["cipher_sha256"], "receipt cipher digest"),
+        "manifest-sha256": require_string(source["manifest_sha256"], "receipt manifest digest"),
+        "recipient-sha256": require_string(encryption["recipient_sha256"], "receipt recipient digest"),
+    }
+
+
+def build_receipt(
+    config: dict[str, object],
+    transaction: dict[str, object],
+    version_id: str,
+) -> dict[str, object]:
+    backup_id = require_string(transaction["backup_id"], "transaction backup identifier")
+    source = require_dictionary(transaction["source"], "transaction source")
+    object_contract = require_dictionary(transaction["object"], "transaction object")
+    recorded_at = (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    return {
+        "contract": RECEIPT_CONTRACT,
+        "backup_id": backup_id,
+        "recorded_at": recorded_at,
+        "source": {
+            "contract": LOCAL_BACKUP_CONTRACT,
+            "manifest_sha256": source["manifest_sha256"],
+        },
+        "encryption": {
+            "format": "age-v1",
+            "recipient_sha256": recipient_digest(config),
+        },
+        "object": {
+            "endpoint": config["endpoint"],
+            "bucket": config["bucket"],
+            "key": object_contract["key"],
+            "version_id": version_id,
+            "cipher_size": object_contract["cipher_size"],
+            "cipher_sha256": object_contract["cipher_sha256"],
+            "checksum_sha256": object_contract["checksum_sha256"],
+        },
+        "gates": config["gates"],
+    }
+
+
+def prove_receipt_matches_transaction(
+    receipt: dict[str, object],
+    transaction: dict[str, object],
+    config: dict[str, object],
+) -> None:
+    receipt_source = require_dictionary(receipt["source"], "receipt source")
+    receipt_encryption = require_dictionary(receipt["encryption"], "receipt encryption")
+    receipt_object = require_dictionary(receipt["object"], "receipt object")
+    source = require_dictionary(transaction["source"], "transaction source")
+    encryption = require_dictionary(transaction["encryption"], "transaction encryption")
+    object_contract = require_dictionary(transaction["object"], "transaction object")
+    if (
+        receipt_source["manifest_sha256"] != source["manifest_sha256"]
+        or receipt_encryption != encryption
+        or receipt_object["endpoint"] != config["endpoint"]
+        or receipt_object["bucket"] != object_contract["bucket"]
+        or receipt_object["key"] != object_contract["key"]
+        or receipt_object["cipher_size"] != object_contract["cipher_size"]
+        or receipt_object["cipher_sha256"] != object_contract["cipher_sha256"]
+        or receipt_object["checksum_sha256"] != object_contract["checksum_sha256"]
+    ):
+        raise OffsiteError("off-site receipt differs from the pending transaction")
+
+
+def pending_transactions(runtime: UploadRuntime) -> list[Path]:
+    result: list[Path] = []
+    for name in os.listdir(runtime.transactions):
+        match = re.fullmatch(r"pending-([0-9]{8}T[0-9]{12}Z-[0-9a-f]{12})", name)
+        if match is not None:
+            result.append(runtime.transactions / name)
+            continue
+        if name.startswith(".partial-"):
+            raise OffsiteError("an incomplete encrypted transaction requires operator review")
+        raise OffsiteError("off-site transaction directory contains an unknown entry")
+    return sorted(result)
+
+
+def remove_incomplete_transactions(
+    runtime: UploadRuntime,
+    config: dict[str, object],
+) -> None:
+    for name in os.listdir(runtime.transactions):
+        if not name.startswith(".partial-"):
+            continue
+        if re.fullmatch(
+            r"[.]partial-[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}-[0-9a-f]{12}",
+            name,
+        ) is None:
+            raise OffsiteError("off-site transaction directory contains an unknown partial entry")
+        path = runtime.transactions / name
+        directory_fd = check_owned_directory(
+            path,
+            runtime.owner,
+            0o700,
+            "incomplete off-site transaction",
+        )
+        os.close(directory_fd)
+        entries = set(os.listdir(path))
+        if not entries.issubset({"bundle.age", "transaction.json"}):
+            raise OffsiteError("incomplete off-site transaction has unexpected entries")
+        for entry in entries:
+            check_owned_file(
+                path / entry,
+                runtime.owner,
+                {0o600},
+                "incomplete off-site transaction file",
+            )
+        if entries == {"bundle.age", "transaction.json"}:
+            transaction = load_standalone_transaction(
+                path / "transaction.json",
+                runtime.owner,
+                {0o600},
+                config,
+            )
+            backup_id = require_string(
+                transaction["backup_id"],
+                "transaction backup identifier",
+            )
+            if not name.startswith(f".partial-{backup_id}-"):
+                raise OffsiteError("complete partial transaction identity is invalid")
+            object_contract = require_dictionary(
+                transaction["object"],
+                "transaction object",
+            )
+            cipher_sha256, checksum_sha256, cipher_size = sha256_file(
+                path / "bundle.age"
+            )
+            if (
+                object_contract["cipher_sha256"] != cipher_sha256
+                or object_contract["checksum_sha256"] != checksum_sha256
+                or object_contract["cipher_size"] != cipher_size
+            ):
+                raise OffsiteError("complete partial encrypted bundle is invalid")
+            pending_path = runtime.transactions / f"pending-{backup_id}"
+            if pending_path.exists() or pending_path.is_symlink():
+                raise OffsiteError("partial and pending transactions have the same identity")
+            os.rename(path, pending_path)
+        else:
+            shutil.rmtree(path)
+    transactions_fd = check_owned_directory(
+        runtime.transactions,
+        runtime.owner,
+        0o700,
+        "off-site transaction directory",
+    )
+    try:
+        os.fsync(transactions_fd)
+    finally:
+        os.close(transactions_fd)
+
+
+def upload_pending(
+    runtime: UploadRuntime,
+    config: dict[str, object],
+    pending_path: Path,
+) -> str:
+    transaction, bundle = validate_transaction(pending_path, runtime.owner, config)
+    backup_id = require_string(transaction["backup_id"], "transaction backup identifier")
+    object_contract = require_dictionary(transaction["object"], "transaction object")
+    receipt_path = runtime.receipts / f"{backup_id}.json"
+    if receipt_path.exists() or receipt_path.is_symlink():
+        receipt = validate_receipt(receipt_path, runtime.owner, config, backup_id)
+        prove_receipt_matches_transaction(receipt, transaction, config)
+        shutil.rmtree(pending_path)
+        transactions_fd = check_owned_directory(
+            runtime.transactions,
+            runtime.owner,
+            0o700,
+            "off-site transaction directory",
+        )
+        try:
+            os.fsync(transactions_fd)
+        finally:
+            os.close(transactions_fd)
+        return backup_id
+
+    metadata = ",".join(
+        f"{name}={value}"
+        for name, value in expected_object_metadata(backup_id, transaction, config).items()
+    )
+    command = [
+        str(runtime.aws),
+        "--no-cli-pager",
+        "--profile",
+        "default",
+        "--region",
+        require_string(config["region"], "S3 region"),
+        "--endpoint-url",
+        require_string(config["endpoint"], "S3 endpoint"),
+        "s3api",
+        "put-object",
+        "--bucket",
+        require_string(config["bucket"], "S3 bucket"),
+        "--key",
+        require_string(object_contract["key"], "S3 object key"),
+        "--body",
+        str(bundle),
+        "--content-type",
+        "application/vnd.age",
+        "--metadata",
+        metadata,
+        "--checksum-algorithm",
+        "SHA256",
+        "--checksum-sha256",
+        require_string(object_contract["checksum_sha256"], "S3 checksum"),
+        "--if-none-match",
+        "*",
+        "--cli-connect-timeout",
+        "30",
+        "--cli-read-timeout",
+        "900",
+        "--output",
+        "json",
+    ]
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=clean_environment(runtime.credentials, runtime.aws_config),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise OffsiteError(f"S3 immutable object upload failed with status {result.returncode}")
+    if len(result.stdout) > MAX_CAPTURE_BYTES:
+        raise OffsiteError("S3 upload response exceeds its size limit")
+    response = require_dictionary(strict_json(result.stdout, "S3 upload response"), "S3 upload response")
+    checksum = response.get("ChecksumSHA256")
+    version_id = response.get("VersionId")
+    if checksum != object_contract["checksum_sha256"]:
+        raise OffsiteError("S3 did not return the exact SHA-256 upload checksum")
+    if not isinstance(version_id, str) or VERSION_ID_RE.fullmatch(version_id) is None or version_id == "null":
+        raise OffsiteError("S3 did not return one versioned object identity")
+
+    receipt = build_receipt(config, transaction, version_id)
+    raw_receipt = (
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    receipts_fd = check_owned_directory(
+        runtime.receipts,
+        runtime.owner,
+        0o700,
+        "off-site receipt directory",
+    )
+    temporary_name = f".{backup_id}.{uuid.uuid4().hex[:12]}.partial"
+    try:
+        write_new_file(receipts_fd, temporary_name, raw_receipt)
+        os.link(
+            temporary_name,
+            f"{backup_id}.json",
+            src_dir_fd=receipts_fd,
+            dst_dir_fd=receipts_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(temporary_name, dir_fd=receipts_fd)
+        os.fsync(receipts_fd)
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=receipts_fd)
+        except FileNotFoundError:
+            pass
+        os.close(receipts_fd)
+    validate_receipt(receipt_path, runtime.owner, config, backup_id)
+    shutil.rmtree(pending_path)
+    transactions_fd = check_owned_directory(
+        runtime.transactions,
+        runtime.owner,
+        0o700,
+        "off-site transaction directory",
+    )
+    try:
+        os.fsync(transactions_fd)
+    finally:
+        os.close(transactions_fd)
+    return backup_id
+
+
+def upload(args: argparse.Namespace) -> str:
+    runtime = configured_upload_runtime(args)
+    for executable, label in (
+        (runtime.age, "age executable"),
+        (runtime.aws, "AWS CLI executable"),
+        (runtime.tar, "tar executable"),
+    ):
+        check_owned_file(
+            executable,
+            runtime.owner if runtime.owner != 0 else 0,
+            {0o500, 0o555, 0o700, 0o755},
+            label,
+        )
+        if not os.access(executable, os.X_OK):
+            raise OffsiteError(f"{label} is not executable")
+    for path, label in (
+        (runtime.local_root, "local backup root"),
+        (runtime.offsite_root, "off-site state root"),
+        (runtime.transactions, "off-site transaction directory"),
+        (runtime.receipts, "off-site receipt directory"),
+    ):
+        descriptor = check_owned_directory(path, runtime.owner, 0o700, label)
+        os.close(descriptor)
+    config = load_config(runtime.config_path, runtime.owner, {0o444})
+    validate_aws_config(runtime.aws_config, runtime.owner, {0o444}, config)
+    validate_credentials(runtime.credentials, runtime.owner)
+    offsite_lock_fd = acquire_lock(runtime.offsite_lock, runtime.owner, "off-site upload lock")
+    try:
+        remove_incomplete_transactions(runtime, config)
+        repair_receipt_commits(runtime, config)
+        pending = pending_transactions(runtime)
+        if len(pending) > 1:
+            raise OffsiteError("more than one pending off-site transaction exists")
+        selector = args.backup_id
+        if pending:
+            pending_id = pending[0].name.removeprefix("pending-")
+            if selector is not None and selector != pending_id:
+                raise OffsiteError("a different backup has a pending off-site transaction")
+            pending_path = pending[0]
+        else:
+            pending_path, backup_id = create_pending_transaction(runtime, config, selector)
+            if pending_path is None:
+                return backup_id
+        return upload_pending(runtime, config, pending_path)
+    finally:
+        os.close(offsite_lock_fd)
+
+
+def recovery_aws_config(path: Path, config: dict[str, object]) -> None:
+    content = expected_aws_config(config)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OffsiteError("cannot write the private AWS CLI configuration")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def decrypt_bundle(age: Path, identity: Path, cipher: Path, plaintext: Path) -> None:
+    descriptor = os.open(
+        plaintext,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        result = subprocess.run(
+            [str(age), "--decrypt", "--identity", str(identity), str(cipher)],
+            stdout=descriptor,
+            stderr=subprocess.DEVNULL,
+            env=CLEAN_ENVIRONMENT,
+            check=False,
+            preexec_fn=file_size_limit(cipher.stat().st_size),
+        )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if result.returncode != 0:
+        raise OffsiteError("age decryption failed")
+    size = plaintext.stat().st_size
+    if size <= 0 or size > MAX_BUNDLE_BYTES:
+        raise OffsiteError("decrypted archive size is outside its limit")
+
+
+def extract_recovered_backup(
+    archive: Path,
+    destination: Path,
+    backup_id: str,
+    owner: int,
+) -> Path:
+    backup_path = destination / backup_id
+    if backup_path.exists() or backup_path.is_symlink():
+        raise OffsiteError("recovery destination already contains the selected backup")
+    allowed_pattern = re.compile(
+        rf"^{re.escape(backup_id)}/(?:manifest[.]json|manifest[.]sha256|globals[.]sql|database-[0-9]+[.]dump)$"
+    )
+    try:
+        with tarfile.open(archive, mode="r:") as source:
+            members: list[tarfile.TarInfo] = []
+            for member in source:
+                members.append(member)
+                if len(members) > 132:
+                    raise OffsiteError(
+                        "decrypted archive member count is outside the contract"
+                    )
+            if len(members) < 3:
+                raise OffsiteError("decrypted archive member count is outside the contract")
+            names: set[str] = set()
+            total_size = 0
+            directory_count = 0
+            for member in members:
+                name = member.name.rstrip("/")
+                if name in names:
+                    raise OffsiteError("decrypted archive contains a duplicate member")
+                names.add(name)
+                if name == backup_id:
+                    if not member.isdir() or member.size != 0:
+                        raise OffsiteError("decrypted archive root is not one directory")
+                    directory_count += 1
+                    continue
+                if allowed_pattern.fullmatch(name) is None or not member.isfile():
+                    raise OffsiteError("decrypted archive contains an unsafe member")
+                if member.size <= 0:
+                    raise OffsiteError("decrypted archive contains an empty backup file")
+                target_name = name.removeprefix(f"{backup_id}/")
+                if target_name == "manifest.json" and member.size > MAX_MANIFEST_BYTES:
+                    raise OffsiteError("recovered manifest exceeds its size limit")
+                if target_name == "manifest.sha256" and member.size != 65:
+                    raise OffsiteError("recovered manifest checksum has an invalid size")
+                if target_name == "globals.sql" and member.size > MAX_GLOBALS_BYTES:
+                    raise OffsiteError("recovered globals dump exceeds its size limit")
+                total_size += member.size
+                if total_size > MAX_BUNDLE_BYTES:
+                    raise OffsiteError("decrypted archive contents exceed the size limit")
+            if directory_count != 1 or f"{backup_id}/manifest.json" not in names or f"{backup_id}/manifest.sha256" not in names:
+                raise OffsiteError("decrypted archive omits its exact backup root or manifest")
+
+            os.mkdir(backup_path, mode=0o700)
+            backup_fd = check_owned_directory(
+                backup_path,
+                owner,
+                0o700,
+                "recovered backup directory",
+            )
+            try:
+                for member in members:
+                    name = member.name.rstrip("/")
+                    if name == backup_id:
+                        continue
+                    source_file = source.extractfile(member)
+                    if source_file is None:
+                        raise OffsiteError("cannot read one recovered backup member")
+                    target_name = name.removeprefix(f"{backup_id}/")
+                    descriptor = os.open(
+                        target_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=backup_fd,
+                    )
+                    try:
+                        remaining = member.size
+                        while remaining:
+                            chunk = source_file.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise OffsiteError("recovered backup member ended early")
+                            view = memoryview(chunk)
+                            while view:
+                                written = os.write(descriptor, view)
+                                if written <= 0:
+                                    raise OffsiteError("cannot write one recovered backup member")
+                                view = view[written:]
+                            remaining -= len(chunk)
+                        if source_file.read(1):
+                            raise OffsiteError("recovered backup member exceeds its declared size")
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                        source_file.close()
+                os.fsync(backup_fd)
+            finally:
+                os.close(backup_fd)
+    except Exception as exc:
+        if backup_path.exists() and not backup_path.is_symlink():
+            try:
+                shutil.rmtree(backup_path)
+            except OSError as cleanup_exc:
+                raise OffsiteError(
+                    "invalid recovered backup could not be removed safely"
+                ) from cleanup_exc
+        if isinstance(exc, OffsiteError):
+            raise
+        raise OffsiteError("decrypted archive is invalid") from exc
+    destination_fd = check_owned_directory(destination, owner, 0o700, "recovery destination")
+    try:
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+    return backup_path
+
+
+def run_recovered_validation(args: argparse.Namespace, backup_id: str) -> None:
+    command = [
+        str(args.postgres_backup),
+        "--test-root",
+        str(args.destination),
+        "--docker",
+        str(args.docker),
+        "rehearse" if args.rehearse else "verify",
+        "--backup-id",
+        backup_id,
+    ]
+    environment = CLEAN_ENVIRONMENT.copy()
+    environment["VPS_POSTGRES_BACKUP_TESTING"] = "1"
+    result = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=environment,
+        check=False,
+    )
+    if result.returncode != 0:
+        operation = "restore rehearsal" if args.rehearse else "backup verification"
+        raise OffsiteError(f"recovered PostgreSQL {operation} failed")
+
+
+def write_approved_receipt(path: Path, owner: int, receipt: dict[str, object]) -> None:
+    parent_fd = check_owned_directory(path.parent, owner, 0o700, "approved receipt directory")
+    try:
+        if path.exists() or path.is_symlink():
+            raise OffsiteError("approved receipt output already exists")
+        raw = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        write_new_file(parent_fd, path.name, raw, mode=0o400)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def reconcile(args: argparse.Namespace) -> str:
+    if os.geteuid() == 0:
+        raise OffsiteError("off-host receipt reconciliation must not run as root")
+    for path in (
+        args.config,
+        args.credentials_file,
+        args.transaction,
+        args.work_root,
+        args.output_receipt,
+        args.aws,
+    ):
+        if not path.is_absolute():
+            raise OffsiteError("off-host receipt reconciliation requires absolute paths")
+    owner = os.geteuid()
+    config = load_config(args.config, owner, {0o400, 0o444, 0o600})
+    validate_credentials(args.credentials_file, owner)
+    for path, label in (
+        (args.work_root, "receipt reconciliation work root"),
+        (args.output_receipt.parent, "approved receipt directory"),
+    ):
+        descriptor = check_owned_directory(path, owner, 0o700, label)
+        os.close(descriptor)
+    metadata = args.aws.stat()
+    if not stat.S_ISREG(metadata.st_mode) or args.aws.is_symlink() or not os.access(args.aws, os.X_OK):
+        raise OffsiteError("AWS CLI executable is not one executable regular file")
+    transaction = load_standalone_transaction(
+        args.transaction,
+        owner,
+        {0o400, 0o600},
+        config,
+    )
+    backup_id = require_string(transaction["backup_id"], "transaction backup identifier")
+    if args.output_receipt.name != f"{backup_id}.json":
+        raise OffsiteError("approved receipt output name must equal the backup identifier")
+    object_contract = require_dictionary(transaction["object"], "transaction object")
+    temporary = args.work_root / f".reconcile-{backup_id}-{uuid.uuid4().hex[:12]}"
+    os.mkdir(temporary, mode=0o700)
+    cipher = temporary / "bundle.age"
+    aws_config = temporary / "aws-config"
+    recovery_aws_config(aws_config, config)
+    try:
+        command = [
+            str(args.aws),
+            "--no-cli-pager",
+            "--profile",
+            "default",
+            "--region",
+            require_string(config["region"], "S3 region"),
+            "--endpoint-url",
+            require_string(config["endpoint"], "S3 endpoint"),
+            "s3api",
+            "get-object",
+            "--bucket",
+            require_string(config["bucket"], "S3 bucket"),
+            "--key",
+            require_string(object_contract["key"], "S3 object key"),
+            "--checksum-mode",
+            "ENABLED",
+            "--cli-connect-timeout",
+            "30",
+            "--cli-read-timeout",
+            "900",
+            "--output",
+            "json",
+            str(cipher),
+        ]
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=clean_environment(args.credentials_file, aws_config),
+            check=False,
+            preexec_fn=file_size_limit(
+                require_integer(object_contract["cipher_size"], "cipher size")
+            ),
+        )
+        if result.returncode != 0:
+            raise OffsiteError(
+                f"S3 receipt reconciliation download failed with status {result.returncode}"
+            )
+        if len(result.stdout) > MAX_CAPTURE_BYTES:
+            raise OffsiteError("S3 receipt reconciliation response exceeds its size limit")
+        response = require_dictionary(
+            strict_json(result.stdout, "S3 receipt reconciliation response"),
+            "S3 receipt reconciliation response",
+        )
+        version_id = response.get("VersionId")
+        if (
+            not isinstance(version_id, str)
+            or VERSION_ID_RE.fullmatch(version_id) is None
+            or version_id == "null"
+        ):
+            raise OffsiteError("S3 receipt reconciliation omits a versioned object identity")
+        cipher_sha256, checksum_sha256, cipher_size = sha256_file(cipher)
+        if (
+            response.get("ChecksumSHA256") != object_contract["checksum_sha256"]
+            or checksum_sha256 != object_contract["checksum_sha256"]
+            or cipher_sha256 != object_contract["cipher_sha256"]
+            or cipher_size != object_contract["cipher_size"]
+        ):
+            raise OffsiteError("remote object differs from the pending encrypted transaction")
+        if response.get("Metadata") != expected_object_metadata(
+            backup_id,
+            transaction,
+            config,
+        ):
+            raise OffsiteError("remote object metadata differs from the pending transaction")
+        receipt = build_receipt(config, transaction, version_id)
+        write_approved_receipt(args.output_receipt, owner, receipt)
+        validate_receipt(
+            args.output_receipt,
+            owner,
+            config,
+            backup_id,
+            {0o400},
+        )
+    finally:
+        if temporary.exists() and not temporary.is_symlink():
+            shutil.rmtree(temporary)
+    return backup_id
+
+
+def recover(args: argparse.Namespace) -> str:
+    if os.geteuid() == 0:
+        raise OffsiteError("off-host recovery must not run as root")
+    for path in (
+        args.config,
+        args.approved_receipt,
+        args.credentials_file,
+        args.identity_file,
+        args.destination,
+        args.age,
+        args.aws,
+        args.postgres_backup,
+        args.docker,
+    ):
+        if not path.is_absolute():
+            raise OffsiteError("off-host recovery requires absolute paths")
+    owner = os.geteuid()
+    config = load_config(args.config, owner, {0o400, 0o444, 0o600})
+    validate_credentials(args.credentials_file, owner)
+    check_owned_file(args.identity_file, owner, {0o400, 0o600}, "age recovery identity")
+    destination_fd = check_owned_directory(
+        args.destination,
+        owner,
+        0o700,
+        "recovery destination",
+    )
+    os.close(destination_fd)
+    for executable, label in (
+        (args.age, "age executable"),
+        (args.aws, "AWS CLI executable"),
+        (args.postgres_backup, "local PostgreSQL backup validator"),
+        (args.docker, "Docker executable"),
+    ):
+        metadata = executable.stat()
+        if not stat.S_ISREG(metadata.st_mode) or executable.is_symlink() or not os.access(executable, os.X_OK):
+            raise OffsiteError(f"{label} is not one executable regular file")
+    backup_id = args.backup_id
+    if BACKUP_ID_RE.fullmatch(backup_id) is None:
+        raise OffsiteError("recovery backup identifier is invalid")
+    receipt = validate_receipt(
+        args.approved_receipt,
+        owner,
+        config,
+        backup_id,
+        {0o400, 0o600},
+    )
+    receipt_object = require_dictionary(receipt["object"], "receipt object")
+    receipt_source = require_dictionary(receipt["source"], "receipt source")
+    key = require_string(receipt_object["key"], "receipt object key")
+    version_id = require_string(receipt_object["version_id"], "receipt object version")
+    temporary = args.destination / f".recovery-{backup_id}-{uuid.uuid4().hex[:12]}"
+    backup_path = args.destination / backup_id
+    if backup_path.exists() or backup_path.is_symlink():
+        raise OffsiteError("recovery destination already contains the selected backup")
+    os.mkdir(temporary, mode=0o700)
+    cipher = temporary / "bundle.age"
+    archive = temporary / "bundle.tar"
+    aws_config = temporary / "aws-config"
+    recovery_aws_config(aws_config, config)
+    try:
+        command = [
+            str(args.aws),
+            "--no-cli-pager",
+            "--profile",
+            "default",
+            "--region",
+            require_string(config["region"], "S3 region"),
+            "--endpoint-url",
+            require_string(config["endpoint"], "S3 endpoint"),
+            "s3api",
+            "get-object",
+            "--bucket",
+            require_string(config["bucket"], "S3 bucket"),
+            "--key",
+            key,
+            "--version-id",
+            version_id,
+            "--checksum-mode",
+            "ENABLED",
+            "--cli-connect-timeout",
+            "30",
+            "--cli-read-timeout",
+            "900",
+            "--output",
+            "json",
+            str(cipher),
+        ]
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=clean_environment(args.credentials_file, aws_config),
+            check=False,
+            preexec_fn=file_size_limit(
+                require_integer(receipt_object["cipher_size"], "receipt cipher size")
+            ),
+        )
+        if result.returncode != 0:
+            raise OffsiteError(f"S3 recovery download failed with status {result.returncode}")
+        if len(result.stdout) > MAX_CAPTURE_BYTES:
+            raise OffsiteError("S3 recovery response exceeds its size limit")
+        response = require_dictionary(
+            strict_json(result.stdout, "S3 recovery response"),
+            "S3 recovery response",
+        )
+        expected_checksum = response.get("ChecksumSHA256")
+        response_version = response.get("VersionId")
+        response_metadata = response.get("Metadata")
+        observed_sha256, observed_checksum, cipher_size = sha256_file(cipher)
+        if (
+            expected_checksum != receipt_object["checksum_sha256"]
+            or observed_checksum != receipt_object["checksum_sha256"]
+            or observed_sha256 != receipt_object["cipher_sha256"]
+            or cipher_size != receipt_object["cipher_size"]
+        ):
+            raise OffsiteError("downloaded ciphertext differs from the approved receipt")
+        if response_version != version_id:
+            raise OffsiteError("S3 recovery returned another object version")
+        if response_metadata != expected_receipt_metadata(receipt):
+            raise OffsiteError("S3 recovery metadata differs from the approved receipt")
+        decrypt_bundle(args.age, args.identity_file, cipher, archive)
+        extract_recovered_backup(archive, args.destination, backup_id, owner)
+        try:
+            recovered_manifest_checksum = read_bounded_file(
+                backup_path / "manifest.sha256",
+                65,
+                "recovered manifest checksum",
+            )
+            try:
+                recovered_manifest_text = recovered_manifest_checksum.decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise OffsiteError("recovered manifest checksum is not ASCII") from exc
+            if recovered_manifest_text != f"{receipt_source['manifest_sha256']}\n":
+                raise OffsiteError("recovered source manifest differs from the approved receipt")
+            run_recovered_validation(args, backup_id)
+        except Exception:
+            if backup_path.exists() and not backup_path.is_symlink():
+                shutil.rmtree(backup_path)
+            raise
+    finally:
+        if temporary.exists() and not temporary.is_symlink():
+            shutil.rmtree(temporary)
+    return backup_id
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+
+    upload_parser = subparsers.add_parser("upload", help="encrypt and upload one local backup")
+    selector = upload_parser.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--latest", action="store_true")
+    selector.add_argument("--backup-id")
+    upload_parser.add_argument("--test-root", type=Path, help=argparse.SUPPRESS)
+    upload_parser.add_argument("--test-local-root", type=Path, help=argparse.SUPPRESS)
+    upload_parser.add_argument("--test-config", type=Path, help=argparse.SUPPRESS)
+    upload_parser.add_argument("--test-aws-config", type=Path, help=argparse.SUPPRESS)
+    upload_parser.add_argument("--test-credentials", type=Path, help=argparse.SUPPRESS)
+    upload_parser.add_argument("--test-local-script", type=Path, help=argparse.SUPPRESS)
+    upload_parser.add_argument("--test-age", type=Path, help=argparse.SUPPRESS)
+    upload_parser.add_argument("--test-aws", type=Path, help=argparse.SUPPRESS)
+    upload_parser.add_argument("--test-tar", type=Path, help=argparse.SUPPRESS)
+
+    reconcile_parser = subparsers.add_parser(
+        "reconcile",
+        help="rebuild an approved receipt off-host after an ambiguous put",
+    )
+    reconcile_parser.add_argument("--config", type=Path, required=True)
+    reconcile_parser.add_argument("--credentials-file", type=Path, required=True)
+    reconcile_parser.add_argument("--transaction", type=Path, required=True)
+    reconcile_parser.add_argument("--work-root", type=Path, required=True)
+    reconcile_parser.add_argument("--output-receipt", type=Path, required=True)
+    reconcile_parser.add_argument("--aws", type=Path, default=PRODUCTION_AWS)
+
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="download, decrypt, verify, and optionally rehearse one backup off-host",
+    )
+    recover_parser.add_argument("--config", type=Path, required=True)
+    recover_parser.add_argument("--approved-receipt", type=Path, required=True)
+    recover_parser.add_argument("--credentials-file", type=Path, required=True)
+    recover_parser.add_argument("--identity-file", type=Path, required=True)
+    recover_parser.add_argument("--destination", type=Path, required=True)
+    recover_parser.add_argument("--backup-id", required=True)
+    recover_parser.add_argument("--age", type=Path, default=PRODUCTION_AGE)
+    recover_parser.add_argument("--aws", type=Path, default=PRODUCTION_AWS)
+    recover_parser.add_argument("--postgres-backup", type=Path, required=True)
+    recover_parser.add_argument("--docker", type=Path, default=Path("/usr/bin/docker"))
+    recover_parser.add_argument("--rehearse", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    os.umask(0o077)
+    args = parse_args()
+    try:
+        if args.operation == "upload":
+            backup_id = upload(args)
+            print(
+                f"encrypted off-site PostgreSQL backup uploaded: {backup_id}; "
+                "server-checksum=sha256; versioned-object=true"
+            )
+        elif args.operation == "reconcile":
+            backup_id = reconcile(args)
+            print(
+                f"off-site PostgreSQL receipt reconciled and approved off-host: {backup_id}"
+            )
+        else:
+            backup_id = recover(args)
+            operation = "restore-rehearsed" if args.rehearse else "verified"
+            print(f"off-site PostgreSQL backup recovered and {operation}: {backup_id}")
+    except (OffsiteError, OSError, subprocess.SubprocessError) as exc:
+        return fail(str(exc))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -626,6 +626,13 @@ secrets. Les fichiers déchiffrés sont matérialisés sous `/etc/vps/secrets` a
 des permissions privées et ne sont jamais affichés par `compose config` dans
 les journaux partagés.
 
+The PostgreSQL off-site candidate uses another age identity with the same
+one-way boundary. Atlas receives only its public recipient and one S3
+`PutObject` identity. The private age identity and a separate S3 restore
+identity stay off Atlas. Bucket versioning, Object Lock, retention, and
+provider failure-domain independence remain external evidence gates. The
+candidate does not change the local plaintext backup or its restore rehearsal.
+
 Le dépôt `vps-infra` est public au démarrage : le VPS le récupère en HTTPS sans
 identité Git, ce qui supprime un secret de reconstruction. Cette visibilité
 n’autorise aucun inventaire réel, IP privée, nom d’utilisateur, secret ou

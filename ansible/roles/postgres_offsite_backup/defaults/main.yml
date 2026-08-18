@@ -1,0 +1,32 @@
+---
+vps_postgres_offsite_state: stopped
+vps_postgres_offsite_root: /srv/vps/backups/postgresql-offsite
+vps_postgres_offsite_script: /usr/local/libexec/vps/postgres-offsite-backup
+vps_postgres_offsite_service: vps-postgres-offsite-backup.service
+vps_postgres_offsite_timer: vps-postgres-offsite-backup.timer
+vps_postgres_offsite_config_root: /etc/vps/postgres-offsite
+vps_postgres_offsite_config: /etc/vps/postgres-offsite/config.json
+vps_postgres_offsite_aws_config: /etc/vps/postgres-offsite/aws-config
+vps_postgres_offsite_upload_credentials: >-
+  /etc/vps/secrets/postgres-offsite/upload.credentials
+vps_postgres_offsite_packages:
+  - age
+  - awscli
+  - python3
+  - tar
+
+# Supply these public values outside Git after the provider decision.
+vps_postgres_offsite_endpoint: ""
+vps_postgres_offsite_region: ""
+vps_postgres_offsite_bucket: ""
+vps_postgres_offsite_prefix: atlas/postgresql
+vps_postgres_offsite_addressing_style: path
+vps_postgres_offsite_age_recipient: ""
+
+# These assertions do not replace provider-side evidence. Keep them false until
+# the operator retains the matching proof outside Atlas.
+vps_postgres_offsite_bucket_object_lock_verified: false
+vps_postgres_offsite_bucket_versioning_verified: false
+vps_postgres_offsite_failure_domain_independence_reviewed: false
+vps_postgres_offsite_recovery_key_off_host_verified: false
+vps_postgres_offsite_restore_identity_separate_verified: false
