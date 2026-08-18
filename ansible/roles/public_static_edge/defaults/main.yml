@@ -35,9 +35,7 @@ vps_public_static_edge_domains:
   - nicolaspieper.com
   - www.nicolaspieper.com
   - pieper.fr
-  - www.pieper.fr
   - nicolas.pieper.fr
-  - www.nicolas.pieper.fr
   - papersempire.com
   - www.papersempire.com
   - parkventory.com
@@ -47,11 +45,7 @@ vps_public_static_edge_redirects:
     target: nicolaspieper.com
   - source: pieper.fr
     target: nicolaspieper.com
-  - source: www.pieper.fr
-    target: nicolaspieper.com
   - source: nicolas.pieper.fr
-    target: nicolaspieper.com
-  - source: www.nicolas.pieper.fr
     target: nicolaspieper.com
   - source: www.papersempire.com
     target: papersempire.com
@@ -62,11 +56,7 @@ vps_public_static_edge_direct_http_redirects:
     target: nicolaspieper.com
   - source: pieper.fr
     target: nicolaspieper.com
-  - source: www.pieper.fr
-    target: nicolaspieper.com
   - source: nicolas.pieper.fr
-    target: nicolaspieper.com
-  - source: www.nicolas.pieper.fr
     target: nicolaspieper.com
 vps_public_static_edge_pre_cutover_https_redirects:
   - source: www.nicolaspieper.com
@@ -83,9 +73,7 @@ vps_public_static_edge_dns_zones:
   - zone: pieper.fr
     names:
       - pieper.fr
-      - www.pieper.fr
       - nicolas.pieper.fr
-      - www.nicolas.pieper.fr
   - zone: papersempire.com
     names:
       - papersempire.com
