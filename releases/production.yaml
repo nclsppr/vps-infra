@@ -35,7 +35,7 @@
       "enabled": false,
       "type": "static",
       "source_repository": "nclsppr/papersempire",
-      "source_branch": "master",
+      "source_branch": "main",
       "published_ports": [],
       "blocked_by": [
         "protected-source-branch",

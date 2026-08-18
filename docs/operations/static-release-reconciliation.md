@@ -7,7 +7,7 @@ This runbook operates the automatic releases for these three static profiles:
 | Profile | Canonical branch | Mode |
 |---|---|---|
 | `personal` | `main` | `static-site` |
-| `papersempire` | `master` | `static-site` |
+| `papersempire` | `main` | `static-site` |
 | `parkventory` | `main` | `temporary-static-demo` |
 
 The workflow is `.github/workflows/deploy-static-releases.yml`. It is scheduled
@@ -29,7 +29,7 @@ A normal content release starts in the producer repository:
 | Profile | Producer procedure | Merge branch |
 |---|---|---|
 | `personal` | [Comment déployer sur Atlas](https://github.com/nclsppr/personal#comment-déployer-sur-atlas) | `main` |
-| `papersempire` | [Deploy to Atlas](https://github.com/nclsppr/papersempire#deploy-to-atlas) | `master` |
+| `papersempire` | [Deploy to Atlas](https://github.com/nclsppr/papersempire#deploy-to-atlas) | `main` |
 | `parkventory` | [Parkventory runbook](https://github.com/nclsppr/parkventory/blob/main/RUNBOOK.md) | `main` |
 
 Open a producer PR, wait for `Validate VPS release`, merge it, then require the

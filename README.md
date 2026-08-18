@@ -15,8 +15,8 @@ Pour livrer un changement de contenu sur Atlas, modifier le dépôt du site, pas
 `vps-infra` :
 
 1. ouvrir une PR vers `main` pour
-   [Personal](https://github.com/nclsppr/personal#comment-déployer-sur-atlas) ou
-   [Parkventory](https://github.com/nclsppr/parkventory), et vers `master` pour
+   [Personal](https://github.com/nclsppr/personal#comment-déployer-sur-atlas),
+   [Parkventory](https://github.com/nclsppr/parkventory) ou
    [Papers Empire](https://github.com/nclsppr/papersempire#deploy-to-atlas) ;
 2. attendre le check PR `Validate VPS release`, puis fusionner ;
 3. vérifier que le workflow producteur `VPS release` du SHA fusionné publie les

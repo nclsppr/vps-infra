@@ -98,7 +98,7 @@ jobs:
               ;;
             papersempire)
               source_remote='https://github.com/nclsppr/papersempire.git'
-              source_ref='refs/heads/master'
+              source_ref='refs/heads/main'
               site_repository='ghcr.io/nclsppr/papersempire/site'
               routes_repository='ghcr.io/nclsppr/papersempire/routes'
               ;;

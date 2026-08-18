@@ -60,7 +60,7 @@ applications:
     enabled: true
     type: static
     source_repository: nclsppr/papersempire
-    source_branch: master
+    source_branch: main
     published_ports: []
     blocked_by: []
     source_revision: <sha-git-complet>
@@ -383,8 +383,7 @@ Le futur workflow de promotion d’infrastructure ne devra jamais faire confianc
 au seul payload reçu. Avant déverrouillage, il devra vérifier :
 
 - que chaque révision de composant ou d’intégration existe dans le dépôt attendu
-  et appartient à la branche déclarée dans le manifeste (`main` pour Personal,
-  Parkventory et Surplasse ; `master` pour Papers Empire au moment de l’audit) ;
+  et appartient à la branche `main` déclarée dans le manifeste ;
 - que chaque digest existe dans le namespace attendu ;
 - que le label de révision de chaque digest correspond à sa propre révision ;
 - que l’attestation est valide lorsqu’elle est disponible ;
@@ -972,7 +971,7 @@ canonical-push job names consumed by the central resolver aligned with
 ### `papersempire`
 
 The assembled `site/`, route inventory, immutable OCI publication, attestation,
-and Atlas deployment are complete. Keep `master` protected and preserve the
+and Atlas deployment are complete. Keep `main` protected and preserve the
 canonical `papersempire.com` origin for browser state.
 
 ### `parkventory`
