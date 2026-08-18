@@ -529,8 +529,10 @@ credential bundle.
 The controller retains a complete raw API export, a canonical record snapshot,
 digest-bound expiring plans, and a durable per-write journal. It requires a
 TTL-only plan and a full old-TTL wait before the target plan. It verifies all
-authoritative servers and both fixed public recursive resolvers. A separate
-rollback plan restores the original A records. See
+authoritative servers and both fixed public recursive resolvers. Verification
+requires an explicit expected DNS RCODE and exact answer name and type, so an
+empty `SERVFAIL` or `REFUSED` response is never accepted as negative evidence.
+A separate rollback plan restores the original A records. See
 [`docs/operations/surplasse-dns-cutover.md`](../docs/operations/surplasse-dns-cutover.md).
 
 Run the local adversarial tests with:

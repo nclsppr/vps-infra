@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/surplasse-dns-cutover"
@@ -140,16 +141,25 @@ class FakeDns:
         self.api = api
         self.calls: list[tuple[str, str, str]] = []
         self.fail_recursive = False
+        self.response_overrides: dict[
+            tuple[str, str, str], object
+        ] = {}
 
     def query(self, server: str, name: str, field_type: str):
         self.calls.append((server, name, field_type))
+        override = self.response_overrides.get((server, name, field_type))
+        if override is not None:
+            return override
         if field_type == "NS":
             targets = [
                 str(record["target"])
                 for record in self.api.records
                 if record["fieldType"] == "NS" and record["subDomain"] == ""
             ] or ["dns101.ovh.net.", "ns101.ovh.net."]
-            return [DNS.DnsAnswer(name, 86400, "NS", target) for target in targets]
+            return DNS.DnsResponse(
+                "NOERROR",
+                tuple(DNS.DnsAnswer(name, 86400, "NS", target) for target in targets),
+            )
         if field_type == "SOA":
             targets = [
                 str(record["target"])
@@ -158,9 +168,9 @@ class FakeDns:
             ] or [
                 "dns101.ovh.net. tech.ovh.net. 2026081801 86400 3600 3600000 300"
             ]
-            return [DNS.DnsAnswer(name, 86400, "SOA", targets[0])]
-        if field_type != "A":
-            return []
+            return DNS.DnsResponse(
+                "NOERROR", (DNS.DnsAnswer(name, 86400, "SOA", targets[0]),)
+            )
         if name == DNS.ZONE:
             subdomain = ""
         elif name == f"www.{DNS.ZONE}":
@@ -170,21 +180,32 @@ class FakeDns:
         matches = [
             record
             for record in self.api.records
-            if record["fieldType"] == "A" and record["subDomain"] == subdomain
+            if record["fieldType"] == field_type
+            and record["subDomain"] == subdomain
         ]
         if not matches:
-            return []
-        target = str(matches[0]["target"])
-        if self.fail_recursive and server in DNS.RECURSIVE_RESOLVERS:
-            target = "192.0.2.1"
-        return [
-            DNS.DnsAnswer(
-                name,
-                int(matches[0]["ttl"]),
-                "A",
-                target,
+            name_exists = any(
+                record["subDomain"] == subdomain for record in self.api.records
             )
-        ]
+            return DNS.DnsResponse("NOERROR" if name_exists else "NXDOMAIN", ())
+        target = str(matches[0]["target"])
+        if (
+            field_type == "A"
+            and self.fail_recursive
+            and server in DNS.RECURSIVE_RESOLVERS
+        ):
+            target = "192.0.2.1"
+        return DNS.DnsResponse(
+            "NOERROR",
+            (
+                DNS.DnsAnswer(
+                    name,
+                    int(matches[0]["ttl"]),
+                    field_type,
+                    target,
+                ),
+            ),
+        )
 
 
 class Fixture:
@@ -438,6 +459,133 @@ class CutoverTests(unittest.TestCase):
             self.assertEqual(verified["status"], "verified")
             with self.assertRaisesRegex(DNS.CutoverError, "not eligible"):
                 fixture.controller.verify(str(plan["plan_id"]))
+
+    def test_dig_reader_requires_and_preserves_explicit_rcode(self) -> None:
+        reader = DNS.DigDnsReader(Path("/usr/bin/dig"))
+        for rcode in ("SERVFAIL", "REFUSED", "FORMERR"):
+            with self.subTest(rcode=rcode):
+                completed = DNS.subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=(
+                        ";; ->>HEADER<<- opcode: QUERY, "
+                        f"status: {rcode}, id: 12345\n"
+                    ).encode("ascii"),
+                    stderr=b"",
+                )
+                with mock.patch.object(
+                    DNS.subprocess, "run", return_value=completed
+                ) as run:
+                    response = reader.query("1.1.1.1", DNS.ZONE, "AAAA")
+                self.assertEqual(response.rcode, rcode)
+                self.assertEqual(response.answers, ())
+                self.assertIn("+comments", run.call_args.args[0])
+
+        parsed_cases = (
+            (
+                DNS.ZONE,
+                "A",
+                "NOERROR",
+                f"{DNS.ZONE}. 300 IN A {DNS.ATLAS_IPV4}\n",
+                (
+                    DNS.DnsAnswer(
+                        DNS.ZONE, DNS.CUTOVER_TTL, "A", DNS.ATLAS_IPV4
+                    ),
+                ),
+            ),
+            (DNS.ZONE, "AAAA", "NOERROR", "", ()),
+            (f"absent.{DNS.ZONE}", "A", "NXDOMAIN", "", ()),
+        )
+        for name, field_type, rcode, answer_text, expected_answers in parsed_cases:
+            with self.subTest(
+                name=name, field_type=field_type, rcode=rcode
+            ):
+                completed = DNS.subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=(
+                        ";; ->>HEADER<<- opcode: QUERY, "
+                        f"status: {rcode}, id: 12345\n{answer_text}"
+                    ).encode("ascii"),
+                    stderr=b"",
+                )
+                with mock.patch.object(
+                    DNS.subprocess, "run", return_value=completed
+                ):
+                    response = reader.query("1.1.1.1", name, field_type)
+                self.assertEqual(response.rcode, rcode)
+                self.assertEqual(response.answers, expected_answers)
+
+        completed = DNS.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"", stderr=b""
+        )
+        with mock.patch.object(DNS.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(DNS.CutoverError, "RCODE"):
+                reader.query("1.1.1.1", DNS.ZONE, "AAAA")
+
+    def test_every_ambiguous_dns_status_stays_applied_unverified(self) -> None:
+        cases = (
+            ("dns101.ovh.net", DNS.ZONE, "NS", "SERVFAIL"),
+            ("dns101.ovh.net", DNS.ZONE, "SOA", "REFUSED"),
+            (DNS.RECURSIVE_RESOLVERS[0], DNS.ZONE, "A", "REFUSED"),
+            (DNS.RECURSIVE_RESOLVERS[0], DNS.ZONE, "AAAA", "SERVFAIL"),
+            (DNS.RECURSIVE_RESOLVERS[0], DNS.ZONE, "CNAME", "FORMERR"),
+            (DNS.RECURSIVE_RESOLVERS[0], "probe", "A", "NOERROR"),
+        )
+        for server, name_template, field_type, rcode in cases:
+            with self.subTest(
+                server=server,
+                name=name_template,
+                field_type=field_type,
+                rcode=rcode,
+            ):
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = Fixture(Path(directory))
+                    plan = fixture.controller.plan()
+                    name = (
+                        f"cutover-{str(plan['plan_id'])[:16]}.{DNS.ZONE}"
+                        if name_template == "probe"
+                        else name_template
+                    )
+                    fixture.dns.response_overrides[
+                        (server, name, field_type)
+                    ] = DNS.DnsResponse(rcode, ())
+                    result = fixture.controller.apply(
+                        str(plan["plan_id"]), str(plan["plan_sha256"])
+                    )
+                    self.assertEqual(result["status"], "applied_unverified")
+                    observations = (
+                        result["dns_recursive"]
+                        if server in DNS.RECURSIVE_RESOLVERS
+                        else result["dns_authoritative"]
+                    )
+                    self.assertFalse(
+                        next(item for item in observations if item["server"] == server)[
+                            "verified"
+                        ]
+                    )
+
+    def test_dns_answers_must_match_the_exact_query_name_and_type(self) -> None:
+        cases = (
+            DNS.DnsAnswer(
+                f"other.{DNS.ZONE}", DNS.CUTOVER_TTL, "A", DNS.BASELINE_IPV4
+            ),
+            DNS.DnsAnswer(
+                DNS.ZONE, DNS.CUTOVER_TTL, "AAAA", DNS.BASELINE_IPV4
+            ),
+        )
+        for answer in cases:
+            with self.subTest(answer=answer):
+                with tempfile.TemporaryDirectory() as directory:
+                    fixture = Fixture(Path(directory))
+                    plan = fixture.controller.plan()
+                    fixture.dns.response_overrides[
+                        (DNS.RECURSIVE_RESOLVERS[0], DNS.ZONE, "A")
+                    ] = DNS.DnsResponse("NOERROR", (answer,))
+                    result = fixture.controller.apply(
+                        str(plan["plan_id"]), str(plan["plan_sha256"])
+                    )
+                    self.assertEqual(result["status"], "applied_unverified")
 
     def test_rollback_restores_canonical_snapshot_and_refuses_replay(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -80,9 +80,14 @@ After sequential writes, the controller requests one zone refresh, performs a
 complete API readback, captures another full export, and verifies every OVH
 authoritative name server. It then verifies `1.1.1.1` and `8.8.8.8`. It checks
 the apex, `www`, and a transaction-specific name below the wildcard for A,
-AAAA, and CNAME answers. An unresolved propagation result is
-`applied_unverified`. It permits one separate `verify` operation and never a
-second apply.
+AAAA, and CNAME answers. Every observation includes an explicit DNS RCODE and
+answers must match the exact queried name and type. NS, SOA, and positive A
+evidence require `NOERROR`. Negative evidence at a name that exists requires
+an empty `NOERROR` response, while the absent transaction-specific name
+requires an empty `NXDOMAIN` response. `SERVFAIL`, `REFUSED`, `FORMERR`, a
+missing RCODE, or any other ambiguity can never prove success. An unresolved
+propagation result is `applied_unverified`. It permits one separate `verify`
+operation and never a second apply.
 
 Rollback is another explicit, expiring, digest-bound plan. It is eligible only
 from an exact applied TTL or cutover state. It deletes only the Atlas wildcard

@@ -77,7 +77,11 @@ sudo -n -- /usr/local/libexec/vps/surplasse-dns-cutover apply \
 ```
 
 Do not add a target or TTL to apply. Require exact API readback and every
-authoritative and recursive DNS result. If the result is
+authoritative and recursive DNS result. Check the recorded RCODE for every
+query. Positive A, NS, and SOA evidence must be `NOERROR`. Empty AAAA and CNAME
+answers at an existing name must also be `NOERROR`; the absent transaction
+probe must be `NXDOMAIN`. Treat `SERVFAIL`, `REFUSED`, `FORMERR`, a missing
+RCODE, or a name or type mismatch as ambiguous. If the result is
 `applied_unverified`, do not run apply again. Run the one separate check:
 
 ```text

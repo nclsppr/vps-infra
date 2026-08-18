@@ -45,6 +45,11 @@ RECURSIVE_RESOLVERS = ("1.1.1.1", "8.8.8.8")
 PLAN_ID_RE = re.compile(r"[0-9a-f]{32}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 DNS_LABEL_RE = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\.?", re.ASCII)
+DIG_HEADER_RE = re.compile(
+    r";; ->>HEADER<<- opcode: QUERY, status: ([A-Z][A-Z0-9]*), id: [0-9]+",
+    re.ASCII,
+)
+DNS_RCODE_RE = re.compile(r"[A-Z][A-Z0-9]*", re.ASCII)
 MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_RECORDS = 10_000
 POLICY_CONTRACT = "surplasse-dns-cutover-policy"
@@ -760,15 +765,21 @@ class DnsAnswer:
     target: str
 
 
+@dataclasses.dataclass(frozen=True)
+class DnsResponse:
+    rcode: str
+    answers: tuple[DnsAnswer, ...]
+
+
 class DnsReader(Protocol):
-    def query(self, server: str, name: str, field_type: str) -> list[DnsAnswer]: ...
+    def query(self, server: str, name: str, field_type: str) -> DnsResponse: ...
 
 
 class DigDnsReader:
     def __init__(self, dig: Path):
         self.dig = dig
 
-    def query(self, server: str, name: str, field_type: str) -> list[DnsAnswer]:
+    def query(self, server: str, name: str, field_type: str) -> DnsResponse:
         if (
             field_type not in {"A", "AAAA", "CNAME", "NS", "SOA"}
             or DNS_LABEL_RE.fullmatch(name) is None
@@ -785,6 +796,7 @@ class DigDnsReader:
                     "+time=5",
                     "+tries=1",
                     "+noall",
+                    "+comments",
                     "+answer",
                     f"@{server}",
                     name,
@@ -800,8 +812,21 @@ class DigDnsReader:
             raise CutoverError("DNS verification command failed") from exc
         if result.returncode != 0 or result.stderr or len(result.stdout) > 131_072:
             raise CutoverError("DNS verification command returned an invalid result")
+        try:
+            lines = result.stdout.decode("ascii", errors="strict").splitlines()
+        except UnicodeDecodeError as exc:
+            raise CutoverError("DNS verification answer is malformed") from exc
+        statuses = [
+            match.group(1)
+            for line in lines
+            if (match := DIG_HEADER_RE.fullmatch(line)) is not None
+        ]
+        if len(statuses) != 1:
+            raise CutoverError("DNS verification result has no unique RCODE")
         answers: list[DnsAnswer] = []
-        for line in result.stdout.decode("ascii", errors="strict").splitlines():
+        for line in lines:
+            if not line or line.startswith(";"):
+                continue
             fields = line.split()
             if len(fields) < 5 or fields[2] != "IN" or not fields[1].isdigit():
                 raise CutoverError("DNS verification answer is malformed")
@@ -816,7 +841,9 @@ class DigDnsReader:
                     " ".join(fields[4:]).lower().rstrip("."),
                 )
             )
-        return answers
+        return exact_dns_response(
+            DnsResponse(statuses[0], tuple(answers)), name, field_type
+        )
 
 
 def _invalid_resolver_address(value: str) -> bool:
@@ -825,6 +852,35 @@ def _invalid_resolver_address(value: str) -> bool:
     except ValueError:
         return True
     return False
+
+
+def exact_dns_response(
+    value: Any, name: str, field_type: str
+) -> DnsResponse:
+    expected_name = name.lower().rstrip(".")
+    if (
+        not isinstance(value, DnsResponse)
+        or DNS_RCODE_RE.fullmatch(value.rcode) is None
+        or not isinstance(value.answers, tuple)
+    ):
+        raise CutoverError("DNS verification response has an invalid schema")
+    for answer in value.answers:
+        if (
+            not isinstance(answer, DnsAnswer)
+            or answer.name != expected_name
+            or answer.field_type != field_type
+            or not isinstance(answer.ttl, int)
+            or isinstance(answer.ttl, bool)
+            or answer.ttl < 0
+            or not isinstance(answer.target, str)
+            or not answer.target
+        ):
+            raise CutoverError(
+                "DNS verification response does not match the exact query name and type"
+            )
+    if value.rcode != "NOERROR" and value.answers:
+        raise CutoverError("DNS error response unexpectedly contains answers")
+    return value
 
 
 def validate_authority(value: Any) -> dict[str, Any]:
@@ -860,10 +916,18 @@ def capture_authority(reader: DnsReader) -> dict[str, Any]:
     observations: list[dict[str, Any]] = []
     for resolver in RECURSIVE_RESOLVERS:
         try:
-            ns_answers = reader.query(resolver, ZONE, "NS")
-            soa_answers = reader.query(resolver, ZONE, "SOA")
+            ns_response = exact_dns_response(
+                reader.query(resolver, ZONE, "NS"), ZONE, "NS"
+            )
+            soa_response = exact_dns_response(
+                reader.query(resolver, ZONE, "SOA"), ZONE, "SOA"
+            )
         except CutoverError as exc:
             raise CutoverError("cannot capture delegated NS and SOA state") from exc
+        if ns_response.rcode != "NOERROR" or soa_response.rcode != "NOERROR":
+            raise CutoverError("cannot capture delegated NS and SOA state")
+        ns_answers = ns_response.answers
+        soa_answers = soa_response.answers
         nameserver_values = sorted(
             {
                 answer.target.lower().rstrip(".")
@@ -938,13 +1002,19 @@ def verify_dns(
         for server in servers:
             server_verified = True
             checked: list[dict[str, Any]] = []
+            ns_response: DnsResponse | None = None
+            soa_response: DnsResponse | None = None
             try:
-                ns_answers = reader.query(server, ZONE, "NS")
-                soa_answers = reader.query(server, ZONE, "SOA")
+                ns_response = exact_dns_response(
+                    reader.query(server, ZONE, "NS"), ZONE, "NS"
+                )
+                soa_response = exact_dns_response(
+                    reader.query(server, ZONE, "SOA"), ZONE, "SOA"
+                )
             except CutoverError:
-                ns_answers = []
-                soa_answers = []
                 server_verified = False
+            ns_answers = ns_response.answers if ns_response is not None else ()
+            soa_answers = soa_response.answers if soa_response is not None else ()
             observed_nameservers = sorted(
                 {
                     answer.target.lower().rstrip(".")
@@ -958,7 +1028,11 @@ def verify_dns(
                 if answer.field_type == "SOA"
             }
             authority_verified = (
-                all(answer.field_type == "NS" for answer in ns_answers)
+                ns_response is not None
+                and soa_response is not None
+                and ns_response.rcode == "NOERROR"
+                and soa_response.rcode == "NOERROR"
+                and all(answer.field_type == "NS" for answer in ns_answers)
                 and all(answer.field_type == "SOA" for answer in soa_answers)
                 and observed_nameservers == expected_authority["nameservers"]
                 and observed_soa == {expected_authority["soa"]}
@@ -966,27 +1040,36 @@ def verify_dns(
             server_verified = server_verified and authority_verified
             for name, label in queries:
                 expected_record = expected[label]
-                answers: dict[str, list[DnsAnswer]] = {}
+                responses: dict[str, DnsResponse | None] = {}
                 for field_type in ("A", "AAAA", "CNAME"):
                     try:
-                        answers[field_type] = reader.query(server, name, field_type)
+                        responses[field_type] = exact_dns_response(
+                            reader.query(server, name, field_type), name, field_type
+                        )
                     except CutoverError:
-                        answers[field_type] = []
+                        responses[field_type] = None
                         server_verified = False
-                a_answers = [answer for answer in answers["A"] if answer.field_type == "A"]
-                forbidden = [
-                    answer
-                    for field_type in ("A", "AAAA", "CNAME")
-                    for answer in answers[field_type]
-                    if answer.field_type in FORBIDDEN_TYPES
-                ]
+                a_response = responses["A"]
+                a_answers = list(a_response.answers) if a_response is not None else []
+                expected_rcode = "NXDOMAIN" if expected_record is None else "NOERROR"
+                rcodes_verified = all(
+                    response is not None and response.rcode == expected_rcode
+                    for response in responses.values()
+                )
                 if expected_record is None:
-                    name_verified = not a_answers and not forbidden
+                    name_verified = rcodes_verified and all(
+                        response is not None and not response.answers
+                        for response in responses.values()
+                    )
                 else:
                     name_verified = (
-                        len(a_answers) == 1
+                        rcodes_verified
+                        and len(a_answers) == 1
                         and a_answers[0].target == expected_record["target"]
-                        and not forbidden
+                        and responses["AAAA"] is not None
+                        and not responses["AAAA"].answers
+                        and responses["CNAME"] is not None
+                        and not responses["CNAME"].answers
                     )
                     if scope == "authoritative":
                         name_verified = name_verified and a_answers[0].ttl == expected_record["ttl"]
@@ -996,16 +1079,36 @@ def verify_dns(
                         "name": name,
                         "verified": name_verified,
                         "a": [answer.target for answer in a_answers],
-                        "aaaa_count": len(answers["AAAA"]),
-                        "cname_count": len(answers["CNAME"]),
+                        "aaaa_count": (
+                            len(responses["AAAA"].answers)
+                            if responses["AAAA"] is not None
+                            else 0
+                        ),
+                        "cname_count": (
+                            len(responses["CNAME"].answers)
+                            if responses["CNAME"] is not None
+                            else 0
+                        ),
+                        "rcodes": {
+                            field_type: (
+                                response.rcode if response is not None else None
+                            )
+                            for field_type, response in responses.items()
+                        },
                     }
                 )
             destination.append(
                 {
                     "names": checked,
                     "ns": observed_nameservers,
+                    "ns_rcode": (
+                        ns_response.rcode if ns_response is not None else None
+                    ),
                     "server": server,
                     "soa": sorted(observed_soa),
+                    "soa_rcode": (
+                        soa_response.rcode if soa_response is not None else None
+                    ),
                     "verified": server_verified,
                 }
             )
