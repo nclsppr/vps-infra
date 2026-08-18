@@ -17,6 +17,9 @@
       - >-
         vps_deploy_application_gate_path ==
         '/usr/local/libexec/vps/deploy-application-live-gate'
+      - >-
+        vps_surplasse_dns_materializer_path ==
+        '/usr/local/libexec/vps/materialize-surplasse-dns-secrets'
       - vps_deploy_schema_root == '/usr/local/share/vps-infra/schemas'
       - vps_deploy_repository_dir == '/srv/vps/repository'
       - vps_deploy_repository_url == 'https://github.com/nclsppr/vps-infra.git'
@@ -56,6 +59,8 @@
          'parse-forced-command', 'plan-digests', 'reconcile',
          'validate-compose', 'validate-release', 'verify-github-evidence',
          'verify-state']
+      - >-
+        vps_deploy_root_helpers == ['materialize-surplasse-dns-secrets']
       - not (vps_live_apply_enabled | bool)
     fail_msg: "Le contrat du compte ou de la commande de déploiement a dérivé."
 
@@ -630,6 +635,28 @@
     label: "{{ item.item }}"
   when: not ansible_check_mode
 
+- name: Inspect root-only controller helper sources in the proven mirror
+  ansible.builtin.stat:
+    path: "{{ vps_deploy_repository_dir }}/scripts/{{ item }}"
+    follow: false
+  register: vps_deploy_source_root_helpers
+  loop: "{{ vps_deploy_root_helpers }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Refuse unsafe root-only controller helper sources
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+    fail_msg: "The root-only helper source {{ item.item }} is unsafe."
+  loop: "{{ vps_deploy_source_root_helpers.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
 - name: Inspect policy and schema sources in the proven mirror
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -665,6 +692,19 @@
     group: root
     mode: "0755"
   loop: "{{ vps_deploy_executables }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Install root-only controller helpers from the proven mirror
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/{{ item }}"
+    dest: "{{ vps_deploy_install_root }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0500"
+  loop: "{{ vps_deploy_root_helpers }}"
   loop_control:
     label: "{{ item }}"
   when: not ansible_check_mode
@@ -803,6 +843,7 @@
     - "{{ vps_deploy_static_gate_path }}"
     - "{{ vps_deploy_application_path }}"
     - "{{ vps_deploy_application_gate_path }}"
+    - "{{ vps_surplasse_dns_materializer_path }}"
     - "/etc/systemd/system/{{ vps_static_recovery_unit }}"
     - "/etc/systemd/system/{{ vps_application_recovery_unit }}"
     - "{{ vps_deploy_install_root }}/lib/release_policy.py"
@@ -849,6 +890,30 @@
       - not item.stat.woth
     fail_msg: "L'exécutable de confiance {{ item.item }} n'est pas protégé."
   loop: "{{ vps_deploy_installed_executables.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Inspect every installed root-only controller helper
+  ansible.builtin.stat:
+    path: "{{ vps_deploy_install_root }}/{{ item }}"
+  register: vps_deploy_installed_root_helpers
+  loop: "{{ vps_deploy_root_helpers }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Prove every root-only controller helper is protected
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.executable
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.mode == '0500'
+    fail_msg: "The root-only helper {{ item.item }} is not protected."
+  loop: "{{ vps_deploy_installed_root_helpers.results }}"
   loop_control:
     label: "{{ item.item }}"
   when: not ansible_check_mode

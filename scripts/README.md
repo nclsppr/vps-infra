@@ -18,6 +18,7 @@ without group or other write permission:
 - `/usr/local/libexec/vps/deploy-static`
 - `/usr/local/libexec/vps/deploy-static-live-gate`
 - `/usr/local/libexec/vps/forced-command`
+- `/usr/local/libexec/vps/materialize-surplasse-dns-secrets`
 - `/usr/local/libexec/vps/parse-forced-command`
 - `/usr/local/libexec/vps/plan-digests`
 - `/usr/local/libexec/vps/reconcile`
@@ -45,6 +46,39 @@ production refuse de continuer sans ce validateur.
 Le miroir autorisé est `/srv/vps/repository`, avec l'origine exacte
 `https://github.com/nclsppr/vps-infra.git`. Le contrôleur ne récupère que
 `refs/heads/main` et n'accepte depuis SSH que `deploy <sha40>`.
+
+## Surplasse DNS credential materializer
+
+`materialize-surplasse-dns-secrets` owns only the three OVH DNS-01 credential
+files under `/etc/vps/secrets/dns/surplasse`. It accepts two modes:
+
+```text
+materialize-surplasse-dns-secrets --install-from /absolute/root-only/directory
+materialize-surplasse-dns-secrets --check
+```
+
+The source directory must be `root:root 0700`. It must contain exactly
+`ovh-application-key`, `ovh-application-secret`, and `ovh-consumer-key` as
+`root:root 0400` or `root:root 0600` regular, single-linked files. Each value
+must be one newline-terminated bounded ASCII token. The application secret and
+consumer key must differ.
+
+Installation takes `/run/lock/vps-static.lock` before the private credential
+bundle lock. It stages and synchronizes all three `root:root 0400` files. It
+renames `surplasse-dns-credential-manifest.json` last as the transaction commit
+marker. The manifest contains only the contract version and SHA-256 values. A
+missing or stale manifest makes `--check` fail.
+
+An atomic host rename does not update a file that is already bind-mounted into
+a running container. A separate reviewed edge transaction must validate this
+manifest, recreate Caddy, and pass its probes before it reports a rotation as
+complete.
+
+`--check` is read-only and takes only the private bundle lock. A public-edge
+controller can call it while that controller owns the shared deployment lock.
+The helper rejects an incomplete tree, a staging remainder, and every unexpected
+entry. It does not remove or repair any pre-existing entry. It never calls the
+OVHcloud API, checks IAM scope, changes DNS, starts Caddy, or activates a route.
 
 ## Public static edge convergence
 
