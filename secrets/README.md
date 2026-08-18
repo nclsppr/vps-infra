@@ -69,11 +69,18 @@ limit this identity to `PutObject` for the exact PostgreSQL backup prefix. The
 identity must not read, list, overwrite, delete, change retention, or change a
 bucket policy.
 
+The three-line file ends with LF. `[DEFAULT]`, inherited values,
+interpolation, comments, blank lines, another section, another key, CRLF, or a
+different key order are invalid.
+
 Systemd copies the file into the service credential directory. The controller
 accepts only the canonical
 `/run/credentials/vps-postgres-offsite-backup.service` directory and an exact
 public AWS CLI configuration. It rejects a `credential_process`, another
-profile, or an extra directive.
+profile, or an extra directive. The service cannot create `AF_UNIX` sockets and
+its private mount namespace hides the original secret tree and the Docker and
+systemd control sockets. `LoadCredential` remains the only path from the
+protected source file to the process.
 
 The age public recipient is not a secret. Its private identity and the separate
 S3 restore credential never enter Atlas. Keep both on the trusted recovery host

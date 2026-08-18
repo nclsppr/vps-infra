@@ -140,6 +140,13 @@ It does not change or delete the local backup. It never sends a remote delete,
 copy, list, or get request. It writes no plaintext copy. The internal local
 manifest remains inside the encrypted object.
 
+The systemd service can create only IPv4 and IPv6 sockets. It cannot create an
+`AF_UNIX` socket, so it cannot open the Docker or systemd control sockets. Its
+mount namespace also hides `/etc/vps/secrets`, `/run/docker.sock`,
+`/var/run/docker.sock`, and `/run/systemd/private`. The systemd manager copies
+the one upload credential into the dedicated service credential directory
+before this sandbox is applied.
+
 ## Provider and recovery gates
 
 Do not set any gate to `true` from a product page or an assumption. Retain dated
@@ -208,6 +215,11 @@ aws_access_key_id = <upload-access-key>
 aws_secret_access_key = <upload-secret-key>
 ```
 
+The final line feed is mandatory. The controller rejects CRLF, comments, blank
+lines, `[DEFAULT]`, inherited defaults, interpolation expressions, another
+section, another key, or a different key order. This textual contract prevents
+the AWS parser from obtaining an identity that the controller did not inspect.
+
 Do not use temporary session credentials for the timer. Do not put a restore
 credential or an age private identity in this directory. The systemd unit uses
 `LoadCredential` and does not place the secret value in the unit or process
@@ -270,7 +282,10 @@ version identifier. It does not prove future retention or recoverability. Copy
 each new receipt to an operator-controlled evidence store, review its backup
 identifier, object key, version, checksums, recipient digest, and gates, then
 make the retained copy read-only. Recovery refuses to use an unapproved latest
-object or to infer a receipt from Atlas state.
+object or to infer a receipt from Atlas state. Receipt contract
+`vps-postgres-offsite-receipt-v2` uses `recorded_at` for the time when the
+controller wrote the receipt. It never claims to be the remote object upload
+time.
 
 Disable uploads without deleting local or remote data:
 
@@ -354,7 +369,9 @@ scripts/postgres-offsite-backup reconcile \
 The command downloads the current object for the unique key and compares its
 size, ciphertext digest, S3 checksum, and metadata with the pending
 transaction. It records the returned exact version in a new read-only approved
-receipt. It does not decrypt the object and does not modify S3.
+receipt. The receipt uses the reconciliation time as `recorded_at`; it does not
+invent an upload timestamp. The command does not decrypt the object and does
+not modify S3.
 
 After a separate review, securely install the exact approved receipt as
 `/srv/vps/backups/postgresql-offsite/receipts/<exact-backup-id>.json` on Atlas.

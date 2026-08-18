@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import configparser
 import datetime as dt
 import fcntl
 import hashlib
@@ -29,7 +28,7 @@ from urllib.parse import urlsplit
 EX_CONFIG = 78
 CONFIG_CONTRACT = "vps-postgres-offsite-config-v1"
 TRANSACTION_CONTRACT = "vps-postgres-offsite-transaction-v1"
-RECEIPT_CONTRACT = "vps-postgres-offsite-receipt-v1"
+RECEIPT_CONTRACT = "vps-postgres-offsite-receipt-v2"
 LOCAL_BACKUP_CONTRACT = "vps-postgres-logical-backup-v1"
 PRODUCTION_LOCAL_ROOT = Path("/srv/vps/backups/postgresql")
 PRODUCTION_OFFSITE_ROOT = Path("/srv/vps/backups/postgresql-offsite")
@@ -370,20 +369,35 @@ def validate_aws_config(
 def validate_credentials(path: Path, owner: int) -> None:
     check_owned_file(path, owner, {0o400, 0o600}, "S3 credential file")
     raw = read_bounded_file(path, 16 * 1024, "S3 credential file")
-    parser = configparser.ConfigParser(interpolation=None, strict=True)
-    parser.optionxform = str
     try:
-        parser.read_string(raw.decode("utf-8"))
-    except (UnicodeDecodeError, configparser.Error) as exc:
-        raise OffsiteError("S3 credential file is not strict UTF-8 INI") from exc
-    if parser.sections() != ["default"] or set(parser["default"]) != {
-        "aws_access_key_id",
-        "aws_secret_access_key",
-    }:
-        raise OffsiteError("S3 credential file must contain one exact upload identity")
-    for name in ("aws_access_key_id", "aws_secret_access_key"):
-        value = parser["default"][name]
-        if not 3 <= len(value) <= 512 or any(character.isspace() for character in value):
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OffsiteError("S3 credential file is not strict UTF-8") from exc
+    if "\r" in content or not content.endswith("\n"):
+        raise OffsiteError("S3 credential file differs from the exact upload identity format")
+    lines = content.splitlines()
+    prefixes = (
+        "aws_access_key_id = ",
+        "aws_secret_access_key = ",
+    )
+    if (
+        len(lines) != 3
+        or lines[0] != "[default]"
+        or not lines[1].startswith(prefixes[0])
+        or not lines[2].startswith(prefixes[1])
+    ):
+        raise OffsiteError("S3 credential file differs from the exact upload identity format")
+    values = (
+        lines[1].removeprefix(prefixes[0]),
+        lines[2].removeprefix(prefixes[1]),
+    )
+    for value in values:
+        if (
+            not 3 <= len(value) <= 512
+            or not value.isascii()
+            or any(not 0x21 <= ord(character) <= 0x7E for character in value)
+            or re.search(r"%[(][^)]{1,128}[)][A-Za-z]|[$][{][^}]{1,128}[}]", value)
+        ):
             raise OffsiteError("S3 credential file contains an invalid credential field")
 
 
@@ -867,7 +881,7 @@ def validate_receipt(
     )
     exact_keys(
         receipt,
-        {"contract", "backup_id", "uploaded_at", "source", "encryption", "object", "gates"},
+        {"contract", "backup_id", "recorded_at", "source", "encryption", "object", "gates"},
         "off-site upload receipt",
     )
     if (
@@ -875,7 +889,7 @@ def validate_receipt(
         or receipt["backup_id"] != backup_id
         or re.fullmatch(
             r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
-            require_string(receipt["uploaded_at"], "receipt upload time"),
+            require_string(receipt["recorded_at"], "receipt record time"),
         )
         is None
         or receipt["gates"] != config["gates"]
@@ -1048,7 +1062,7 @@ def build_receipt(
     backup_id = require_string(transaction["backup_id"], "transaction backup identifier")
     source = require_dictionary(transaction["source"], "transaction source")
     object_contract = require_dictionary(transaction["object"], "transaction object")
-    uploaded_at = (
+    recorded_at = (
         dt.datetime.now(dt.timezone.utc)
         .replace(microsecond=0)
         .isoformat()
@@ -1057,7 +1071,7 @@ def build_receipt(
     return {
         "contract": RECEIPT_CONTRACT,
         "backup_id": backup_id,
-        "uploaded_at": uploaded_at,
+        "recorded_at": recorded_at,
         "source": {
             "contract": LOCAL_BACKUP_CONTRACT,
             "manifest_sha256": source["manifest_sha256"],

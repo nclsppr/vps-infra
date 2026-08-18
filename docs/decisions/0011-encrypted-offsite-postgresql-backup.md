@@ -57,11 +57,15 @@ independent internal manifest. S3 `PutObject` is the only remote mutation.
    variable, or a command log.
 4. Atlas loads one S3 credential through systemd. The provider policy permits
    only `PutObject` in the exact backup prefix. It denies list, get, overwrite,
-   and delete operations. A separate restore identity stays off Atlas.
+   and delete operations. A separate restore identity stays off Atlas. The
+   service cannot create Unix sockets, and its mount namespace hides the
+   source secret tree plus the Docker and systemd control sockets. The copied
+   systemd credential remains accessible.
 5. The writer uses one unique key per local backup and `If-None-Match: *`. It
    requires the S3 response to return the exact SHA-256 object checksum and a
    non-null version identifier. It writes a local receipt only after these
-   checks pass.
+   checks pass. The receipt records when it was written as `recorded_at`; it
+   does not claim to know the remote upload time.
 6. The object store must enable versioning and Object Lock before the upload
    identity exists. The bucket supplies a default retention rule. The Atlas
    writer never requests, changes, or removes retention.
@@ -102,7 +106,8 @@ closed because the conditional put cannot overwrite the existing key. The
 operator then uses the separate restore identity to verify and recover that
 object. The off-host `reconcile` operation downloads the ambiguous object,
 compares it with a protected copy of the pending transaction, and creates an
-approved receipt. The operator can install that exact receipt on Atlas to
+approved receipt whose `recorded_at` value is the reconciliation time, not an
+invented upload time. The operator can install that exact receipt on Atlas to
 complete the local transaction. Granting read access to Atlas to hide this
 window is rejected.
 

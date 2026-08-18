@@ -424,6 +424,25 @@ else:
             1,
         )
 
+    def test_systemd_sandbox_hides_local_sockets_and_raw_secret_tree(self) -> None:
+        service = (
+            ROOT
+            / "ansible/roles/postgres_offsite_backup/templates/vps-postgres-offsite-backup.service.j2"
+        ).read_text(encoding="utf-8")
+        self.assertIn("RestrictAddressFamilies=AF_INET AF_INET6", service)
+        self.assertNotIn("AF_UNIX", service)
+        inaccessible = next(
+            line for line in service.splitlines() if line.startswith("InaccessiblePaths=")
+        )
+        for path in (
+            "/etc/vps/secrets",
+            "/run/docker.sock",
+            "/var/run/docker.sock",
+            "/run/systemd/private",
+        ):
+            self.assertIn(path, inaccessible)
+        self.assertIn("LoadCredential=upload:", service)
+
     def test_upload_is_encrypted_versioned_atomic_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self.make_runtime(Path(temporary))
@@ -441,6 +460,15 @@ else:
             self.assertEqual([path.name for path in receipts], [f"{BACKUP_ID}.json"])
             self.assertEqual(list((paths["offsite"] / "transactions").iterdir()), [])
             receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt["contract"],
+                "vps-postgres-offsite-receipt-v2",
+            )
+            self.assertRegex(
+                receipt["recorded_at"],
+                r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+            )
+            self.assertNotIn("uploaded_at", receipt)
             self.assertEqual(receipt["object"]["version_id"], "version-1")
             self.assertEqual(
                 receipt["object"]["cipher_sha256"],
@@ -571,6 +599,48 @@ else:
             self.assertIn("exact public contract", rejected.stderr)
             self.assertFalse((root / "aws.log").exists())
 
+    def test_credentials_reject_defaults_interpolation_and_extra_structure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.make_runtime(root)
+            candidates = {
+                "default inheritance": (
+                    "[DEFAULT]\n"
+                    "aws_access_key_id = inherited-access\n"
+                    "[default]\n"
+                    "aws_secret_access_key = inherited-secret\n"
+                ),
+                "basic interpolation": (
+                    "[default]\n"
+                    "aws_access_key_id = upload-access\n"
+                    "aws_secret_access_key = %(aws_access_key_id)s\n"
+                ),
+                "extended interpolation": (
+                    "[default]\n"
+                    "aws_access_key_id = upload-access\n"
+                    "aws_secret_access_key = ${default:aws_access_key_id}\n"
+                ),
+                "extra key": (
+                    "[default]\n"
+                    "aws_access_key_id = upload-access\n"
+                    "aws_secret_access_key = upload-secret\n"
+                    "aws_session_token = forbidden\n"
+                ),
+                "extra section": (
+                    "[default]\n"
+                    "aws_access_key_id = upload-access\n"
+                    "aws_secret_access_key = upload-secret\n"
+                    "[another]\n"
+                ),
+            }
+            for label, content in candidates.items():
+                with self.subTest(label=label):
+                    paths["credentials"].write_text(content, encoding="utf-8")
+                    rejected = self.run_upload(paths)
+                    self.assertEqual(rejected.returncode, 78)
+                    self.assertIn("credential file", rejected.stderr)
+            self.assertFalse((root / "aws.log").exists())
+
     def test_existing_local_backup_lock_stops_before_source_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -696,6 +766,15 @@ else:
             )
             self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
             self.assertEqual(stat.S_IMODE(approved_receipt.stat().st_mode), 0o400)
+            reconciled_receipt = json.loads(
+                approved_receipt.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                reconciled_receipt["contract"],
+                "vps-postgres-offsite-receipt-v2",
+            )
+            self.assertIn("recorded_at", reconciled_receipt)
+            self.assertNotIn("uploaded_at", reconciled_receipt)
             atlas_receipt = paths["offsite"] / "receipts" / f"{BACKUP_ID}.json"
             approved_raw = approved_receipt.read_bytes()
             mismatched = json.loads(approved_raw)
