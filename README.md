@@ -100,8 +100,8 @@ Le premier socle exécutable est livré :
 - immutable application-release admission plus repository-delivered Ansible
   wiring for a root-owned transactional Compose controller for Surplasse and
   Parkventory. The controller source verifies every component and integration
-  attestation and bundle. Atlas has converged revision
-  `da04a09bfa9788ae8127b63f9f3a6692bef2551b`: the root-owned
+  attestation and bundle. The 2026-08-18 rollout converged revision
+  `da04a09bfa9788ae8127b63f9f3a6692bef2551b` and proved that the root-owned
   `deploy-application` controller and its argument-free gate are installed, and
   `vps-application-recover.service` is loaded, inactive after a successful
   recovery (`Result=success`, `ExecMainStatus=0`). Both protected entries remain
@@ -109,7 +109,7 @@ Le premier socle exécutable est livré :
 
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
-controlled operator rollout now has this live state:
+controlled operator rollout recorded this live state:
 
 - the public static edge serves `nicolaspieper.com`, `papersempire.com`, and the
   static Parkventory demo over HTTPS;
@@ -184,9 +184,10 @@ Branch protection remains a separate external gate. The generic locked
 controller cannot call `apply-release`, which remains absent. The repository
 application controller has its own exact forced-command gate, shared static
 lock, transaction journal, quarantine, and boot recovery wiring. Revision
-`da04a09bfa9788ae8127b63f9f3a6692bef2551b` and its recovery unit are installed
-and proved healthy while idle, but both application entries remain disabled and
-no application release is active. Activation still requires a reviewed
+`da04a09bfa9788ae8127b63f9f3a6692bef2551b` and its recovery unit were installed
+and proved healthy while idle during the dated rollout. Both application
+entries remain disabled and no application release is active. Activation still
+requires a reviewed
 application entry, database, secrets, observability, edge route, network
 cutover, a dedicated workflow, and every blocker in ADR-0010.
 

@@ -610,7 +610,7 @@ inventory, transaction, and quarantine records below
 `/var/lib/vps-application`. It shares `/run/lock/vps-static.lock` with the
 static controller. After convergence, its boot recovery unit is ordered before
 the systemd-managed public edge, subject to the Docker restart bypass recorded
-by ADR-0010. Atlas converged revision
+by ADR-0010. The 2026-08-18 rollout converged revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b`; the application controller and
 root gate are installed, and its recovery service completed successfully before
 returning inactive. This is installation evidence only. An application cannot

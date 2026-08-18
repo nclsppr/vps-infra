@@ -83,12 +83,13 @@
     - name: Validate the one-use deployment key recovery nonce contract
       ansible.builtin.assert:
         that:
-          - vps_deploy_key_recovery_nonce is string
+          - (vps_deploy_key_recovery_nonce | default('')) is string
           - >-
-            vps_deploy_key_recovery_nonce == '' or
-            vps_deploy_key_recovery_nonce is match('^[0-9a-f]{64}$')
+            (vps_deploy_key_recovery_nonce | default('')) == '' or
+            (vps_deploy_key_recovery_nonce | default(''))
+            is match('^[0-9a-f]{64}$')
           - >-
-            vps_deploy_key_recovery_nonce == '' or
+            (vps_deploy_key_recovery_nonce | default('')) == '' or
             vps_deploy_authorized_keys | length == 1
         fail_msg: >-
           Le nonce de récupération deploy doit rester vide en fonctionnement

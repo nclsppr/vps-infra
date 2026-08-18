@@ -2624,6 +2624,22 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             preflight_parse["ansible.builtin.command"]["argv"],
             ["/usr/bin/ssh-keygen", "-l", "-E", "sha256", "-f", "/dev/stdin"],
         )
+        preflight_nonce = next(
+            task
+            for task in pre_tasks
+            if task["name"]
+            == "Validate the one-use deployment key recovery nonce contract"
+        )
+        nonce_contract = json.dumps(
+            preflight_nonce["ansible.builtin.assert"], sort_keys=True
+        )
+        self.assertIn("vps_deploy_key_recovery_nonce | default('')", nonce_contract)
+        deploy_defaults = yaml.safe_load(
+            (ROOT / "ansible/roles/deploy/defaults/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(deploy_defaults["vps_deploy_key_recovery_nonce"], "")
 
     def test_total_loss_recovery_uses_one_nonce_and_a_negative_auth_probe(
         self,
@@ -2665,6 +2681,23 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("+refs/heads/main:refs/remotes/origin/main", converge)
         self.assertIn("archive --format=tar \"$revision\"", converge)
         self.assertIn("cd \"$checkout\"", converge)
+        self.assertIn(
+            'isolated_inventory="$isolated_inventory_directory/hosts.yml"',
+            converge,
+        )
+        self.assertIn(
+            'isolated_inventory_group_vars="$isolated_inventory_directory/'
+            'group_vars/all.yml"',
+            converge,
+        )
+        self.assertIn(
+            '"$install_executable" -m 0600 -- "$inventory_source" '
+            '"$isolated_inventory"',
+            converge,
+        )
+        self.assertIn('--inventory "$isolated_inventory"', converge)
+        self.assertNotIn('--inventory "$inventory"', converge)
+        self.assertNotIn('--inventory "$inventory_source"', converge)
         self.assertIn('--extra-vars "vps_infra_revision=$revision"', converge)
         self.assertIn('"${ansible_playbook_options[@]}"', converge)
 
@@ -3012,6 +3045,9 @@ class SecurityBoundaryContractTests(unittest.TestCase):
 
             (root / "ansible/collections").mkdir(parents=True)
             (root / "ansible/playbooks").mkdir(parents=True)
+            (root / "ansible/inventories/production/group_vars").mkdir(
+                parents=True
+            )
             (root / "ansible/ansible.cfg").write_text("[defaults]\n", encoding="utf-8")
             (root / "ansible/collections/requirements.yml").write_text(
                 "collections: []\n",
@@ -3019,6 +3055,10 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             )
             (root / "ansible/playbooks/site.yml").write_text(
                 "---\n- hosts: all\n  gather_facts: false\n",
+                encoding="utf-8",
+            )
+            (root / "ansible/inventories/production/group_vars/all.yml").write_text(
+                "source_marker: remote-main\n",
                 encoding="utf-8",
             )
             for name in ("mise.toml", "mise.lock", "pyproject.toml", "uv.lock"):
@@ -3047,7 +3087,21 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             ).strip()
 
             (root / "marker.txt").write_text("divergent-worktree\n", encoding="utf-8")
-            subprocess.run(["git", "-C", root, "add", "marker.txt"], check=True)
+            (root / "ansible/inventories/production/group_vars/all.yml").write_text(
+                "source_marker: divergent-worktree\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    root,
+                    "add",
+                    "marker.txt",
+                    "ansible/inventories/production/group_vars/all.yml",
+                ],
+                check=True,
+            )
             subprocess.run(
                 [
                     "git",
@@ -3065,6 +3119,40 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 check=True,
             )
             divergent_sha = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            archived_private_inventory = (
+                root / "ansible/inventories/production/hosts.yml"
+            )
+            archived_private_inventory.write_text("all: {}\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    root,
+                    "add",
+                    "ansible/inventories/production/hosts.yml",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    root,
+                    "-c",
+                    "user.name=VPS tests",
+                    "-c",
+                    "user.email=vps-tests@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "invalid archived inventory",
+                ],
+                check=True,
+            )
+            archived_inventory_sha = subprocess.check_output(
                 ["git", "-C", root, "rev-parse", "HEAD"],
                 text=True,
             ).strip()
@@ -3106,6 +3194,8 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             fake_bin = support / "bin"
             fake_bin.mkdir(parents=True)
             log = support / "execution.log"
+            remote_revision_file = support / "remote-revision"
+            remote_revision_file.write_text(f"{remote_sha}\n", encoding="utf-8")
             galaxy_template = support / "ansible-galaxy"
             playbook_template = support / "ansible-playbook"
 
@@ -3115,7 +3205,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
 
             quoted_root = shlex.quote(str(root))
             quoted_log = shlex.quote(str(log))
-            quoted_remote_sha = shlex.quote(remote_sha)
+            quoted_remote_revision_file = shlex.quote(str(remote_revision_file))
             quoted_divergent_sha = shlex.quote(divergent_sha)
             real_git = shlex.quote(shutil.which("git") or "/usr/bin/git")
             fetch_signature = (
@@ -3136,7 +3226,9 @@ case " $* " in
       *) exit 91 ;;
     esac
     [ ! -e {quoted_root}/fail-fetch ] || exit 42
-    {real_git} -C {quoted_root} update-ref refs/remotes/origin/main {quoted_remote_sha}
+    IFS= read -r selected_remote_revision < {quoted_remote_revision_file}
+    {real_git} -C {quoted_root} update-ref \
+      refs/remotes/origin/main "$selected_remote_revision"
     exit 0
     ;;
   *" rev-parse "*"refs/remotes/origin/main"*)
@@ -3165,9 +3257,33 @@ set -eu
 [ -z "${{ANSIBLE_LIBRARY+x}}" ]
 [ -n "${{SSH_AUTH_SOCK+x}}" ]
 [ -d "$ANSIBLE_SSH_CONTROL_PATH_DIR" ]
+inventory_path=
+expect_inventory=false
+for argument in "$@"; do
+  if [ "$expect_inventory" = true ]; then
+    inventory_path=$argument
+    expect_inventory=false
+    continue
+  fi
+  [ "$argument" != --inventory ] || expect_inventory=true
+done
+[ "$expect_inventory" = false ]
+[ -n "$inventory_path" ]
+inventory_directory=$(CDPATH='' cd -- "$(dirname -- "$inventory_path")" && pwd -P)
+[ "$inventory_directory/$(basename -- "$inventory_path")" = \
+  "$PWD/inventories/production/hosts.yml" ]
+inventory_mode=$(stat -c '%a' "$inventory_path" 2>/dev/null || \
+  stat -f '%Lp' "$inventory_path")
+[ "$inventory_mode" = 600 ]
 IFS= read -r marker < ../marker.txt
+IFS= read -r inventory_marker < "$inventory_path"
+IFS= read -r group_vars_marker < inventories/production/group_vars/all.yml
 printf 'playbook_directory=%s\\n' "$PWD" >>{quoted_log}
 printf 'marker=%s\\n' "$marker" >>{quoted_log}
+printf 'inventory_path=%s\\n' "$inventory_path" >>{quoted_log}
+printf 'inventory_mode=%s\\n' "$inventory_mode" >>{quoted_log}
+printf 'inventory_marker=%s\\n' "$inventory_marker" >>{quoted_log}
+printf 'group_vars_marker=%s\\n' "$group_vars_marker" >>{quoted_log}
 printf 'control_path_dir=%s\\n' "$ANSIBLE_SSH_CONTROL_PATH_DIR" >>{quoted_log}
 printf 'ssh_auth_sock=%s\\n' "$SSH_AUTH_SOCK" >>{quoted_log}
 printf 'arguments=%s\\n' "$*" >>{quoted_log}
@@ -3209,6 +3325,11 @@ fi
             inventory = support / "hosts.yml"
             extra_vars = support / "keys.yml"
             inventory.write_text("all: {}\n", encoding="utf-8")
+            (support / "group_vars").mkdir()
+            (support / "group_vars/all.yml").write_text(
+                "source_marker: adjacent-external\n",
+                encoding="utf-8",
+            )
             extra_vars.write_text("vps_admin_authorized_keys: []\n", encoding="utf-8")
             environment = os.environ.copy()
             environment.update(
@@ -3258,6 +3379,17 @@ fi
             execution = log.read_text(encoding="utf-8")
             self.assertIn("marker=remote-main", execution)
             self.assertNotIn("divergent-worktree", execution)
+            self.assertNotIn("adjacent-external", execution)
+            self.assertNotIn(str(inventory), execution)
+            self.assertIn("inventory_marker=all: {}", execution)
+            self.assertIn("inventory_mode=600", execution)
+            self.assertIn("group_vars_marker=source_marker: remote-main", execution)
+            self.assertRegex(
+                execution,
+                r"(?m)^inventory_path=/(?:private/)?tmp/vps-c\.[A-Za-z0-9]+/"
+                r"checkout/ansible/"
+                r"inventories/production/hosts\.yml$",
+            )
             self.assertIn(
                 f"ssh_auth_sock={agent_socket_path.resolve()}",
                 execution,
@@ -3517,6 +3649,27 @@ fi
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             log.unlink()
+            remote_revision_file.write_text(
+                f"{archived_inventory_sha}\n", encoding="utf-8"
+            )
+            refused_archived_inventory = subprocess.run(
+                [converge],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(refused_archived_inventory.returncode, 78)
+            self.assertIn(
+                "origin/main archive unexpectedly contains the private inventory",
+                refused_archived_inventory.stderr,
+            )
+            self.assertNotIn("mise=", log.read_text(encoding="utf-8"))
+
+            log.unlink()
+            remote_revision_file.write_text(f"{remote_sha}\n", encoding="utf-8")
             (root / "fail-fetch").touch()
             failed_fetch = subprocess.run(
                 [converge],

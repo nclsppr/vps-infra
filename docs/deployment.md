@@ -131,8 +131,8 @@ applications:
 remplacée par une révision séparément auditée, **tout** `enabled: true` échoue,
 même avec des champs de preuve syntaxiquement complets. Le manifeste commité
 garde donc la plateforme et les quatre applications désactivées. Le marqueur
-hôte et l’applicateur générique `apply-release` restent absents. Le contrôleur
-Compose séparé est installé sur Atlas depuis la révision convergée
+hôte et l’applicateur générique `apply-release` restent absents. Le rollout du
+18 août 2026 a installé le contrôleur Compose séparé depuis la révision convergée
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b`. Les deux entrées restent
 `enabled: false` et sont refusées avant tout accès réseau ou runtime. Aucun
 workflow de déploiement applicatif n'invoque son gate root.
@@ -446,8 +446,8 @@ dedicated key and the same strict known-hosts model. It sends only the canonical
 `apply-release`. The repository application controller is designed to share
 the exact host lock `/run/lock/vps-static.lock` with this path; GitHub
 concurrency alone is not a sufficient exclusion boundary for operator-initiated
-commands. Atlas has converged the controller and argument-free gate from
-revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`, but no application workflow
+commands. The 2026-08-18 rollout converged the controller and argument-free gate
+from revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`, but no application workflow
 invokes them while both application entries are disabled.
 
 Le VPS n’héberge pas de runner GitHub Actions persistant. Un workflow arbitraire
