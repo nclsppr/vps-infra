@@ -1,0 +1,524 @@
+#!/usr/bin/python3 -I
+"""Validate or atomically install the private Surplasse pilot manifest."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import re
+import stat
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+EX_USAGE = 64
+EX_CONFIG = 78
+TARGET = Path("/etc/vps/applications/surplasse-pilot-bootstrap.json")
+LOCK_PATH = Path("/run/lock/vps-static.lock")
+MAXIMUM_BYTES = 16 * 1024
+LOCK_TIMEOUT_SECONDS = 30
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+PENDING_PREFIX = ".surplasse-pilot-bootstrap."
+PENDING_SUFFIX = ".pending"
+UUID_V4 = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+EMAIL = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,255}$")
+PHONE = re.compile(r"^\+[1-9][0-9]{7,14}$")
+SLUG = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+STRIPE_ACCOUNT = re.compile(r"^acct_[A-Za-z0-9]{8,64}$")
+RESERVED_SLUGS = frozenset(
+    {
+        "www",
+        "api",
+        "dashboard",
+        "docs",
+        "app",
+        "admin",
+        "local",
+        "mail",
+        "autoconfig",
+        "autodiscover",
+        "mta-sts",
+        "smtp",
+        "imap",
+        "pop",
+        "pop3",
+        "webmail",
+        "status",
+        "reports",
+        "grafana",
+    }
+)
+
+
+class ManifestError(RuntimeError):
+    """The pilot manifest or its protected path differs from policy."""
+
+
+class UsageParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(EX_USAGE)
+
+
+def reject_constant(_value: str) -> None:
+    raise ManifestError("manifest JSON contains a non-finite number")
+
+
+def reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ManifestError("manifest JSON contains a duplicate key")
+        result[key] = value
+    return result
+
+
+def exact_object(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ManifestError(f"{label} has an invalid shape")
+    return value
+
+
+def text(value: Any, minimum: int, maximum: int, label: str) -> str:
+    java_length = None
+    if isinstance(value, str):
+        try:
+            java_length = len(value.encode("utf-16-le")) // 2
+        except UnicodeEncodeError:
+            java_length = None
+    java_trimmed = value
+    if isinstance(value, str):
+        start = 0
+        end = len(value)
+        while start < end and ord(value[start]) <= 0x20:
+            start += 1
+        while end > start and ord(value[end - 1]) <= 0x20:
+            end -= 1
+        java_trimmed = value[start:end]
+    if (
+        not isinstance(value, str)
+        or java_length is None
+        or not minimum <= java_length <= maximum
+        or value != java_trimmed
+        or any(
+            ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+            for character in value
+        )
+    ):
+        raise ManifestError(f"{label} is invalid")
+    return value
+
+
+def entity(value: Any, label: str) -> dict[str, Any]:
+    item = exact_object(value, {"id", "name"}, label)
+    if not isinstance(item["id"], str) or UUID_V4.fullmatch(item["id"]) is None:
+        raise ManifestError(f"{label} identifier is invalid")
+    text(item["name"], 1, 160, f"{label} name")
+    return item
+
+
+def validate_document(value: Any) -> dict[str, Any]:
+    root = exact_object(
+        value,
+        {
+            "contract",
+            "schema",
+            "mode",
+            "restaurateur",
+            "establishment",
+            "menu",
+            "category",
+            "product",
+            "table",
+        },
+        "pilot manifest",
+    )
+    if (
+        root["contract"] != "surplasse.pilot-bootstrap"
+        or root["schema"] != 1
+        or isinstance(root["schema"], bool)
+        or root["mode"] != "testers"
+    ):
+        raise ManifestError("pilot manifest policy is invalid")
+    restaurateur = exact_object(
+        root["restaurateur"], {"id", "email", "full_name", "phone"}, "restaurateur"
+    )
+    establishment = exact_object(
+        root["establishment"],
+        {"id", "name", "slug", "address", "stripe_account_id"},
+        "establishment",
+    )
+    menu = entity(root["menu"], "menu")
+    category = entity(root["category"], "category")
+    product = exact_object(
+        root["product"],
+        {"id", "name", "description", "price_cents", "currency"},
+        "product",
+    )
+    table = exact_object(root["table"], {"id", "label"}, "table")
+    objects = (restaurateur, establishment, menu, category, product, table)
+    identifiers: list[str] = []
+    for label, item in zip(
+        ("restaurateur", "establishment", "menu", "category", "product", "table"),
+        objects,
+    ):
+        identifier = item.get("id")
+        if not isinstance(identifier, str) or UUID_V4.fullmatch(identifier) is None:
+            raise ManifestError(f"{label} identifier is invalid")
+        try:
+            parsed = uuid.UUID(identifier)
+        except ValueError as exc:
+            raise ManifestError(f"{label} identifier is invalid") from exc
+        if parsed.version != 4 or parsed.variant != uuid.RFC_4122:
+            raise ManifestError(f"{label} identifier is invalid")
+        identifiers.append(identifier)
+    if len(set(identifiers)) != 6:
+        raise ManifestError("pilot manifest identifiers are not unique")
+    email = text(restaurateur["email"], 3, 384, "restaurateur email")
+    if (
+        not email.isascii()
+        or any(not 0x21 <= ord(character) <= 0x7E for character in email)
+        or EMAIL.fullmatch(email) is None
+        or email != email.lower()
+    ):
+        raise ManifestError("restaurateur email is invalid")
+    text(restaurateur["full_name"], 1, 160, "restaurateur full name")
+    phone = restaurateur["phone"]
+    if phone is not None and (not isinstance(phone, str) or PHONE.fullmatch(phone) is None):
+        raise ManifestError("restaurateur phone is invalid")
+    text(establishment["name"], 1, 160, "establishment name")
+    slug = establishment["slug"]
+    if (
+        not isinstance(slug, str)
+        or SLUG.fullmatch(slug) is None
+        or slug in RESERVED_SLUGS
+    ):
+        raise ManifestError("establishment slug is invalid")
+    text(establishment["address"], 1, 500, "establishment address")
+    stripe_account = establishment["stripe_account_id"]
+    if not isinstance(stripe_account, str) or STRIPE_ACCOUNT.fullmatch(stripe_account) is None:
+        raise ManifestError("establishment Stripe account identifier is invalid")
+    text(product["name"], 1, 160, "product name")
+    description = product["description"]
+    if description is not None:
+        text(description, 1, 1000, "product description")
+    price = product["price_cents"]
+    if not isinstance(price, int) or isinstance(price, bool) or not 1 <= price <= 1_000_000:
+        raise ManifestError("product price is invalid")
+    if product["currency"] != "eur":
+        raise ManifestError("product currency is invalid")
+    text(table["label"], 1, 80, "table label")
+    return root
+
+
+def canonical_manifest(raw: bytes) -> bytes:
+    if not raw or len(raw) > MAXIMUM_BYTES or b"\0" in raw or b"\r" in raw:
+        raise ManifestError("manifest framing is invalid")
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=reject_duplicate,
+            parse_constant=reject_constant,
+        )
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise ManifestError("manifest is not strict UTF-8 JSON") from exc
+    validated = validate_document(value)
+    try:
+        canonical = (
+            json.dumps(
+                validated,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ManifestError("manifest contains invalid Unicode text") from exc
+    if len(canonical) > MAXIMUM_BYTES:
+        raise ManifestError("canonical manifest exceeds its size bound")
+    return canonical
+
+
+def validate_directory(path: Path, *, owner: int, group: int) -> int:
+    try:
+        descriptor = os.open(path, DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise ManifestError("cannot open the protected manifest directory") from exc
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != owner
+        or metadata.st_gid != group
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise ManifestError("protected manifest directory metadata is invalid")
+    return descriptor
+
+
+def read_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    owner: int,
+    group: int,
+    modes: frozenset[int],
+) -> tuple[bytes, os.stat_result]:
+    try:
+        descriptor = os.open(name, FILE_FLAGS, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ManifestError("cannot open the protected manifest file") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != owner
+            or before.st_gid != group
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) not in modes
+            or not 1 <= before.st_size <= MAXIMUM_BYTES
+        ):
+            raise ManifestError("protected manifest file metadata is invalid")
+        raw = os.read(descriptor, MAXIMUM_BYTES + 1)
+        after = os.fstat(descriptor)
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if len(raw) != before.st_size or identity(before) != identity(after):
+            raise ManifestError("protected manifest file changed while being read")
+        return raw, after
+    finally:
+        os.close(descriptor)
+
+
+def read_source(path: Path, *, owner: int, group: int) -> bytes:
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        raise ManifestError("manifest source must be an absolute file path")
+    parent_fd = validate_directory(path.parent, owner=owner, group=group)
+    try:
+        raw, opened = read_file_at(
+            parent_fd,
+            path.name,
+            owner=owner,
+            group=group,
+            modes=frozenset({0o400, 0o600}),
+        )
+        try:
+            visible = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ManifestError("manifest source changed while being read") from exc
+        if (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ManifestError("manifest source changed while being read")
+        return canonical_manifest(raw)
+    finally:
+        os.close(parent_fd)
+
+
+@contextlib.contextmanager
+def deployment_lock(path: Path, *, owner: int, group: int):
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise ManifestError("cannot open the shared deployment lock") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != owner
+            or metadata.st_gid != group
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ManifestError("shared deployment lock metadata is invalid")
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ManifestError("shared deployment lock timed out")
+                time.sleep(0.2)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def installed_manifest(directory_fd: int, *, owner: int, group: int) -> bytes:
+    raw, _metadata = read_file_at(
+        directory_fd,
+        TARGET.name,
+        owner=owner,
+        group=group,
+        modes=frozenset({0o440}),
+    )
+    canonical = canonical_manifest(raw)
+    if raw != canonical:
+        raise ManifestError("installed manifest is not canonical JSON")
+    return raw
+
+
+def cleanup_residue(directory_fd: int, *, owner: int, group: int) -> None:
+    for name in os.listdir(directory_fd):
+        if not (name.startswith(PENDING_PREFIX) and name.endswith(PENDING_SUFFIX)):
+            continue
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ManifestError("manifest staging residue changed") from exc
+        allowed_identity = (
+            (metadata.st_uid, metadata.st_gid, stat.S_IMODE(metadata.st_mode))
+            in {
+                (owner, os.getegid(), 0o600),
+                (owner, group, 0o600),
+                (owner, group, 0o440),
+            }
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not allowed_identity
+            or not 0 <= metadata.st_size <= MAXIMUM_BYTES
+        ):
+            raise ManifestError("manifest staging residue is unsafe")
+        os.unlink(name, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
+def install(
+    directory_fd: int,
+    raw: bytes,
+    *,
+    owner: int,
+    group: int,
+) -> None:
+    cleanup_residue(directory_fd, owner=owner, group=group)
+    try:
+        if installed_manifest(directory_fd, owner=owner, group=group) == raw:
+            return
+    except ManifestError:
+        try:
+            existing = os.stat(TARGET.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            # Never replace an unsafe or semantically invalid installed path.
+            installed_manifest(directory_fd, owner=owner, group=group)
+    pending = f"{PENDING_PREFIX}{os.getpid():x}{time.monotonic_ns():x}{PENDING_SUFFIX}"
+    descriptor = os.open(
+        pending,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise ManifestError("cannot write the staged manifest")
+            view = view[written:]
+        os.fchown(descriptor, owner, group)
+        os.fchmod(descriptor, 0o440)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        staged, _metadata = read_file_at(
+            directory_fd,
+            pending,
+            owner=owner,
+            group=group,
+            modes=frozenset({0o440}),
+        )
+        if staged != raw:
+            raise ManifestError("staged manifest readback differs")
+        os.replace(pending, TARGET.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        if installed_manifest(directory_fd, owner=owner, group=group) != raw:
+            raise ManifestError("installed manifest readback differs")
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pending, dir_fd=directory_fd)
+
+
+def paths(arguments: argparse.Namespace) -> tuple[Path, Path, int, int]:
+    if arguments.test_root is None and arguments.test_deployment_lock is None:
+        if os.geteuid() != 0 or os.getegid() != 0:
+            raise ManifestError("production manifest operation requires root")
+        return TARGET.parent, LOCK_PATH, 0, 10001
+    if (
+        os.geteuid() == 0
+        or os.environ.get("VPS_SURPLASSE_PILOT_TESTING") != "1"
+        or arguments.test_root is None
+        or arguments.test_deployment_lock is None
+    ):
+        raise ManifestError("test paths require the explicit unprivileged guard")
+    root = Path(arguments.test_root)
+    lock = Path(arguments.test_deployment_lock)
+    if not root.is_absolute() or not lock.is_absolute():
+        raise ManifestError("test paths must be absolute")
+    return root, lock, os.geteuid(), os.getegid()
+
+
+def build_parser() -> UsageParser:
+    parser = UsageParser(description=__doc__, allow_abbrev=False)
+    operation = parser.add_mutually_exclusive_group(required=True)
+    operation.add_argument("--check", action="store_true")
+    operation.add_argument("--install-from")
+    parser.add_argument("--test-root", help=argparse.SUPPRESS)
+    parser.add_argument("--test-deployment-lock", help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        arguments = build_parser().parse_args(argv)
+        root, lock_path, owner, group = paths(arguments)
+        source = (
+            None
+            if arguments.install_from is None
+            else read_source(Path(arguments.install_from), owner=owner, group=os.getegid())
+        )
+        with deployment_lock(lock_path, owner=owner, group=os.getegid()):
+            directory_fd = validate_directory(root, owner=owner, group=os.getegid())
+            try:
+                if source is None:
+                    installed_manifest(directory_fd, owner=owner, group=group)
+                else:
+                    install(directory_fd, source, owner=owner, group=group)
+            finally:
+                os.close(directory_fd)
+    except ManifestError as exc:
+        print(f"Surplasse pilot manifest operation refused: {exc}", file=sys.stderr)
+        return EX_CONFIG
+    except OSError:
+        print(
+            "Surplasse pilot manifest operation refused: bounded filesystem operation failed",
+            file=sys.stderr,
+        )
+        return EX_CONFIG
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

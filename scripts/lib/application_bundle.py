@@ -59,6 +59,9 @@ RFC3339_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
+SURPLASSE_PILOT_SCHEMA_CANONICAL_SHA256 = (
+    "sha256:d27c4895cb2508d7344930430c8beb7bb0339a2679879e4827064fe75e1fbf51"
+)
 
 SURPLASSE_PAYMENT_PROFILE: Mapping[str, object] = {
     "audience": "testers",
@@ -134,6 +137,7 @@ SURPLASSE_PATHS = tuple(
             "expected-images.json",
             "grafana/dashboards/surplasse-overview.json",
             "migrations.json",
+            "pilot-bootstrap.schema.json",
             "probes.json",
             "prometheus/rules.yml",
             "prometheus/targets.yml",
@@ -230,6 +234,10 @@ PROFILES: Mapping[str, BundleProfile] = {
             "docs": (),
             "migrator": ("surplasse_postgres_migrator_password",),
             "onboarding": (),
+            "pilot-bootstrap": (
+                "surplasse_postgres_runtime_password",
+                "surplasse_stripe_secret_key",
+            ),
         },
         credential_gid=10001,
         image_version_prefix="",
@@ -597,9 +605,37 @@ def _expected_contract(profile: BundleProfile, revision: str) -> dict[str, objec
                 },
                 "payment": dict(SURPLASSE_PAYMENT_PROFILE),
                 "route_owner": "compose",
+                "pilot_bootstrap": {
+                    "apply_command": "apply",
+                    "database_role": "surplasse_runtime",
+                    "entrypoint": "/opt/surplasse/scripts/backend-pilot-bootstrap.sh",
+                    "flyway_version": 14,
+                    "initial_order_intake_status": "paused",
+                    "manifest": {
+                        "container_path": "/run/surplasse/pilot-bootstrap.json",
+                        "group": 10001,
+                        "host_path": (
+                            "/etc/vps/applications/surplasse-pilot-bootstrap.json"
+                        ),
+                        "maximum_bytes": 16384,
+                        "mode": "0440",
+                        "owner": 0,
+                        "schema": "pilot-bootstrap.schema.json",
+                    },
+                    "networks": ["app_surplasse", "db_surplasse"],
+                    "payment_mode": "test",
+                    "profile": "pilot-bootstrap",
+                    "published_in_backend_image": True,
+                    "secrets": [
+                        "surplasse_postgres_runtime_password",
+                        "surplasse_stripe_secret_key",
+                    ],
+                    "status_command": "status",
+                },
                 "secrets": [
                     name.replace("_", "-") for name in profile.credential_files
                 ],
+                "transient_services": ["migrator", "pilot-bootstrap"],
             }
         )
     else:
@@ -634,9 +670,57 @@ def _validate_expected_images(
 ) -> None:
     value = _object(strict_json(raw, "expected image inventory", maximum=MAX_FILE_BYTES), "expected image inventory")
     expected_images = {**components, "migrator": components["backend"]}
+    if profile.application == "surplasse":
+        expected_images["pilot-bootstrap"] = components["backend"]
     expected = {"images": expected_images, "schema": 1, "source_revision": revision}
     if raw != canonical_json(value) or value != expected:
         _fail("expected image inventory", "does not match the release components")
+
+
+def _validate_pilot_bootstrap_schema(raw: bytes) -> None:
+    value = strict_json(
+        raw,
+        "pilot bootstrap schema",
+        maximum=16 * 1024,
+    )
+    if (
+        not isinstance(value, dict)
+        or content_digest(canonical_json(value))
+        != SURPLASSE_PILOT_SCHEMA_CANONICAL_SHA256
+    ):
+        _fail(
+            "pilot bootstrap schema",
+            "differs from the exact canonical policy",
+        )
+
+
+def _validate_surplasse_pilot_source_compose(raw: bytes) -> None:
+    try:
+        compose = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ApplicationBundleError(
+            "integration compose: pilot bootstrap source is not UTF-8"
+        ) from exc
+    marker = "\n  pilot-bootstrap:\n"
+    if compose.count(marker) != 1:
+        _fail("integration compose", "pilot bootstrap service is not unique")
+    block = compose.split(marker, 1)[1].split("\nnetworks:\n", 1)[0]
+    required_fragments = (
+        "    profiles:\n      - pilot-bootstrap\n",
+        "    entrypoint:\n      - /opt/surplasse/scripts/backend-pilot-bootstrap.sh\n",
+        "    image: ${SURPLASSE_BACKEND_IMAGE:?SURPLASSE_BACKEND_IMAGE is required}\n",
+        "      - type: bind\n"
+        "        source: /etc/vps/applications/surplasse-pilot-bootstrap.json\n"
+        "        target: /run/surplasse/pilot-bootstrap.json\n"
+        "        read_only: true\n"
+        "        bind:\n"
+        "          create_host_path: false\n",
+    )
+    if any(block.count(fragment) != 1 for fragment in required_fragments):
+        _fail(
+            "integration compose",
+            "pilot bootstrap source contract differs from the exact policy",
+        )
 
 
 def _validate_migrations(raw: bytes, profile: BundleProfile, revision: str) -> dict[str, Any]:
@@ -910,6 +994,8 @@ def validate_bundle(
             revision,
             component_references,
         )
+        _validate_pilot_bootstrap_schema(files["pilot-bootstrap.schema.json"])
+        _validate_surplasse_pilot_source_compose(files["compose.yaml"])
     compose = files["compose.yaml"].decode("utf-8")
     if not (
         compose.startswith(f"---\nname: {profile.application}\n")

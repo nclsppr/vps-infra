@@ -1,0 +1,8 @@
+---
+vps_surplasse_pilot_state: status
+vps_surplasse_pilot_materializer: >-
+  /usr/local/libexec/vps/materialize-surplasse-pilot-manifest
+vps_surplasse_pilot_controller: >-
+  /usr/local/libexec/vps/surplasse-pilot-bootstrap
+vps_surplasse_pilot_manifest: >-
+  /etc/vps/applications/surplasse-pilot-bootstrap.json

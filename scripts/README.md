@@ -20,10 +20,12 @@ without group or other write permission:
 - `/usr/local/libexec/vps/deploy-static-live-gate`
 - `/usr/local/libexec/vps/forced-command`
 - `/usr/local/libexec/vps/materialize-surplasse-dns-secrets`
+- `/usr/local/libexec/vps/materialize-surplasse-pilot-manifest`
 - `/usr/local/libexec/vps/parse-forced-command`
 - `/usr/local/libexec/vps/plan-digests`
 - `/usr/local/libexec/vps/reconcile`
 - `/usr/local/libexec/vps/surplasse-dns-cutover`
+- `/usr/local/libexec/vps/surplasse-pilot-bootstrap`
 - `/usr/local/libexec/vps/validate-compose`
 - `/usr/local/libexec/vps/validate-release`
 - `/usr/local/libexec/vps/verify-github-evidence`
@@ -81,6 +83,22 @@ controller can call it while that controller owns the shared deployment lock.
 The helper rejects an incomplete tree, a staging remainder, and every unexpected
 entry. It does not remove or repair any pre-existing entry. It never calls the
 OVHcloud API, checks IAM scope, changes DNS, starts Caddy, or activates a route.
+
+## Surplasse pilot bootstrap
+
+The root-only `materialize-surplasse-pilot-manifest` helper validates one
+private JSON document and installs it atomically as
+`/etc/vps/applications/surplasse-pilot-bootstrap.json`, `root:10001 0440`.
+Before any fetch, `converge` calls the local
+`stage-surplasse-pilot-manifest` fd copier. It accepts only a caller-owned,
+single-linked `0400` or `0600` regular file of 1 through 16384 bytes and copies
+it without reopening its path into the isolated `0700` home as `0600`.
+The root-only `surplasse-pilot-bootstrap` controller accepts only `status` or
+`apply`. It derives the active immutable Surplasse release from protected state
+and never accepts a digest target. A fresh empty status is required before one
+apply, and a separate status must resolve the durable `applied-unverified`
+state. Child output is bounded and discarded. See
+[`docs/operations/surplasse-pilot-bootstrap.md`](../docs/operations/surplasse-pilot-bootstrap.md).
 
 ## Public static edge convergence
 

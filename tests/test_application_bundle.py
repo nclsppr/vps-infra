@@ -69,21 +69,46 @@ def fixture_files(profile):
     raw: dict[str, bytes] = {}
     for path in profile.runtime_paths:
         raw[path] = f"fixture for {path}\n".encode()
-    raw["compose.yaml"] = (
-        f"---\nname: {profile.application}\nservices:\n  backend:\n"
-        f"    image: ${{{profile.application.upper()}_BACKEND_IMAGE}}\n"
-    ).encode()
+    if profile.application == "surplasse":
+        raw["compose.yaml"] = (
+            "---\nname: surplasse\nservices:\n"
+            "  backend:\n"
+            "    image: ${SURPLASSE_BACKEND_IMAGE}\n"
+            "  pilot-bootstrap:\n"
+            "    image: ${SURPLASSE_BACKEND_IMAGE:?SURPLASSE_BACKEND_IMAGE is required}\n"
+            "    profiles:\n"
+            "      - pilot-bootstrap\n"
+            "    entrypoint:\n"
+            "      - /opt/surplasse/scripts/backend-pilot-bootstrap.sh\n"
+            "    volumes:\n"
+            "      - type: bind\n"
+            "        source: /etc/vps/applications/surplasse-pilot-bootstrap.json\n"
+            "        target: /run/surplasse/pilot-bootstrap.json\n"
+            "        read_only: true\n"
+            "        bind:\n"
+            "          create_host_path: false\n"
+            "\nnetworks:\n"
+        ).encode()
+    else:
+        raw["compose.yaml"] = (
+            f"---\nname: {profile.application}\nservices:\n  backend:\n"
+            f"    image: ${{{profile.application.upper()}_BACKEND_IMAGE}}\n"
+        ).encode()
     raw["contract.json"] = BUNDLE.canonical_json(
         BUNDLE._expected_contract(profile, REVISION)
     )
     raw["migrations.json"] = BUNDLE.canonical_json(migrations)
     raw["probes.json"] = BUNDLE.canonical_json(probes)
     if profile.application == "surplasse":
+        raw["pilot-bootstrap.schema.json"] = (
+            ROOT / "schemas/surplasse-pilot-bootstrap.schema.json"
+        ).read_bytes()
         raw["expected-images.json"] = BUNDLE.canonical_json(
             {
                 "images": {
                     **component_references,
                     "migrator": component_references["backend"],
+                    "pilot-bootstrap": component_references["backend"],
                 },
                 "schema": 1,
                 "source_revision": REVISION,
@@ -365,6 +390,51 @@ class ApplicationBundleTests(unittest.TestCase):
                 ),
                 probe_inventory_digest=BUNDLE.content_digest(files["probes.json"]),
             )
+
+    def test_surplasse_pilot_schema_and_source_mount_are_exact(self):
+        profile = BUNDLE.PROFILES["surplasse"]
+        for label, mutate, error in (
+            (
+                "schema",
+                lambda files: files.__setitem__(
+                    "pilot-bootstrap.schema.json",
+                    files["pilot-bootstrap.schema.json"].replace(
+                        b'"maxLength": 160', b'"maxLength": 161', 1
+                    ),
+                ),
+                "canonical policy",
+            ),
+            (
+                "create-host-path",
+                lambda files: files.__setitem__(
+                    "compose.yaml",
+                    files["compose.yaml"].replace(
+                        b"          create_host_path: false\n", b"", 1
+                    ),
+                ),
+                "source contract",
+            ),
+        ):
+            with self.subTest(divergence=label):
+                files, component_references = fixture_files(profile)
+                mutate(files)
+                archive = build_archive(profile, files)
+                inventory = build_inventory(profile, files)
+                with self.assertRaisesRegex(BUNDLE.ApplicationBundleError, error):
+                    BUNDLE.validate_bundle(
+                        archive,
+                        inventory,
+                        profile=profile,
+                        revision=REVISION,
+                        created=CREATED,
+                        component_references=component_references,
+                        migration_inventory_digest=BUNDLE.content_digest(
+                            files["migrations.json"]
+                        ),
+                        probe_inventory_digest=BUNDLE.content_digest(
+                            files["probes.json"]
+                        ),
+                    )
 
     def test_component_index_and_config_are_revision_and_platform_bound(self):
         profile = BUNDLE.PROFILES["parkventory"]

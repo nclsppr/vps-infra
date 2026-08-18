@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://surplasse.com/schemas/pilot-bootstrap-v1.json",
+  "title": "Surplasse production tester pilot bootstrap",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema",
+    "mode",
+    "restaurateur",
+    "establishment",
+    "menu",
+    "category",
+    "product",
+    "table"
+  ],
+  "properties": {
+    "contract": {
+      "const": "surplasse.pilot-bootstrap"
+    },
+    "schema": {
+      "const": 1
+    },
+    "mode": {
+      "const": "testers"
+    },
+    "restaurateur": {
+      "$ref": "#/$defs/restaurateur"
+    },
+    "establishment": {
+      "$ref": "#/$defs/establishment"
+    },
+    "menu": {
+      "$ref": "#/$defs/namedEntity"
+    },
+    "category": {
+      "$ref": "#/$defs/namedEntity"
+    },
+    "product": {
+      "$ref": "#/$defs/product"
+    },
+    "table": {
+      "$ref": "#/$defs/table"
+    }
+  },
+  "$defs": {
+    "uuidV4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "namedEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      }
+    },
+    "restaurateur": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "email",
+        "full_name",
+        "phone"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 384
+        },
+        "full_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "phone": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^\\+[1-9][0-9]{7,14}$"
+        }
+      }
+    },
+    "establishment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "slug",
+        "address",
+        "stripe_account_id"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "address": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "stripe_account_id": {
+          "type": "string",
+          "pattern": "^acct_[A-Za-z0-9]{8,64}$"
+        }
+      }
+    },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "description",
+        "price_cents",
+        "currency"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "price_cents": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "currency": {
+          "const": "eur"
+        }
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        }
+      }
+    }
+  }
+}

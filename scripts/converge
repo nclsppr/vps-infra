@@ -20,6 +20,7 @@ fail() {
 
 ansible_playbook_options=()
 ansible_extra_options=()
+pilot_manifest_source=
 playbook=playbooks/site.yml
 case $# in
   0)
@@ -78,6 +79,19 @@ case $# in
         playbook=playbooks/surplasse.yml
         ansible_extra_options=(--extra-vars vps_surplasse_state=stopped)
         ;;
+      --materialize-surplasse-pilot)
+        playbook=playbooks/surplasse-pilot.yml
+        ansible_extra_options=(--extra-vars vps_surplasse_pilot_state=materialize)
+        pilot_manifest_source=${SURPLASSE_PILOT_MANIFEST:-}
+        ;;
+      --status-surplasse-pilot)
+        playbook=playbooks/surplasse-pilot.yml
+        ansible_extra_options=(--extra-vars vps_surplasse_pilot_state=status)
+        ;;
+      --apply-surplasse-pilot)
+        playbook=playbooks/surplasse-pilot.yml
+        ansible_extra_options=(--extra-vars vps_surplasse_pilot_state=apply)
+        ;;
       *)
         fail "unsupported deployment mode" "$EX_USAGE"
         ;;
@@ -111,8 +125,9 @@ mise_executable=$(resolve_executable mise)
 mktemp_executable=$(resolve_executable mktemp)
 env_executable=$(resolve_executable env)
 install_executable=$(resolve_executable install)
+python3_executable=$(resolve_executable python3)
 readonly git_executable tar_executable mise_executable mktemp_executable env_executable
-readonly install_executable
+readonly install_executable python3_executable
 
 inventory_source=${ANSIBLE_INVENTORY:-}
 extra_vars=${ANSIBLE_EXTRA_VARS:-}
@@ -120,9 +135,14 @@ extra_vars=${ANSIBLE_EXTRA_VARS:-}
   fail "ANSIBLE_INVENTORY must identify a regular local inventory file" "$EX_USAGE"
 [[ -n $extra_vars && -f $extra_vars && ! -L $extra_vars ]] || \
   fail "ANSIBLE_EXTRA_VARS must identify a regular local public-key variable file" "$EX_USAGE"
+if [[ $playbook == playbooks/surplasse-pilot.yml && \
+      ${ansible_extra_options[*]} == *vps_surplasse_pilot_state=materialize* ]]; then
+  [[ -n $pilot_manifest_source && $pilot_manifest_source == /* ]] || \
+    fail "SURPLASSE_PILOT_MANIFEST must identify one absolute private file" "$EX_USAGE"
+fi
 inventory_source=$(realpath -- "$inventory_source")
 extra_vars=$(realpath -- "$extra_vars")
-readonly inventory_source extra_vars
+readonly inventory_source extra_vars pilot_manifest_source
 
 ssh_auth_sock=${SSH_AUTH_SOCK:-}
 if [[ -n $ssh_auth_sock ]]; then
@@ -132,6 +152,33 @@ if [[ -n $ssh_auth_sock ]]; then
     fail "SSH_AUTH_SOCK must identify a caller-owned Unix socket" "$EX_CONFIG"
 fi
 readonly ssh_auth_sock
+
+temporary_root=$("$mktemp_executable" -d /tmp/vps-c.XXXXXXXX)
+readonly temporary_root
+checkout="$temporary_root/checkout"
+isolated_home="$temporary_root/home"
+control_path_dir="$temporary_root/cp"
+readonly checkout isolated_home control_path_dir
+
+cleanup() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [[ -d $temporary_root && $temporary_root != / ]]; then
+    rm -rf -- "$temporary_root"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -m 0700 -- "$checkout" "$isolated_home" "$control_path_dir"
+
+if [[ -n $pilot_manifest_source ]]; then
+  "$python3_executable" -I "$SCRIPT_DIR/stage-surplasse-pilot-manifest" \
+    "$pilot_manifest_source" "$isolated_home/pilot-manifest.json" || \
+    fail "SURPLASSE_PILOT_MANIFEST violates the private 16 KiB file policy" "$EX_USAGE"
+fi
 
 safe_git() {
   "$env_executable" -i \
@@ -164,12 +211,6 @@ revision=$(safe_git -C "$REPOSITORY_ROOT" rev-parse --verify \
 [[ $revision =~ ^[0-9a-f]{40}$ ]] || fail "origin/main did not resolve to a full lowercase Git SHA"
 readonly revision
 
-temporary_root=$("$mktemp_executable" -d /tmp/vps-c.XXXXXXXX)
-readonly temporary_root
-checkout="$temporary_root/checkout"
-isolated_home="$temporary_root/home"
-control_path_dir="$temporary_root/cp"
-readonly checkout isolated_home control_path_dir
 ansible_environment=(
   "HOME=$isolated_home"
   "PATH=$checkout/.venv/bin:$caller_path"
@@ -181,21 +222,12 @@ ansible_environment=(
 if [[ -n $ssh_auth_sock ]]; then
   ansible_environment+=("SSH_AUTH_SOCK=$ssh_auth_sock")
 fi
+if [[ -n $pilot_manifest_source ]]; then
+  ansible_environment+=(
+    "VPS_SURPLASSE_PILOT_MANIFEST_FILE=$isolated_home/pilot-manifest.json"
+  )
+fi
 readonly -a ansible_environment
-
-cleanup() {
-  local status=$?
-  trap - EXIT HUP INT TERM
-  if [[ -d $temporary_root && $temporary_root != / ]]; then
-    rm -rf -- "$temporary_root"
-  fi
-  exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-mkdir -m 0700 -- "$checkout" "$isolated_home" "$control_path_dir"
 
 safe_git -C "$REPOSITORY_ROOT" archive --format=tar "$revision" | \
   "$tar_executable" -xf - -C "$checkout"
