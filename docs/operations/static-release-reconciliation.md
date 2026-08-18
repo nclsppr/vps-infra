@@ -408,6 +408,7 @@ check_static_host() {
 check_static_host nicolaspieper.com nicolaspieper.com 0 || failures=$((failures + 1))
 check_static_host www.nicolaspieper.com nicolaspieper.com 1 || failures=$((failures + 1))
 check_static_host pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
+check_static_host www.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
 check_static_host nicolas.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
 check_static_host papersempire.com papersempire.com 0 || failures=$((failures + 1))
 check_static_host www.papersempire.com papersempire.com 1 || failures=$((failures + 1))
@@ -428,7 +429,7 @@ site block for those pending aliases. Probe their path-preserving HTTP redirects
 directly on Atlas instead:
 
 ```bash
-for host in pieper.fr nicolas.pieper.fr; do
+for host in pieper.fr www.pieper.fr nicolas.pieper.fr; do
   curl --disable --silent --show-error --output /dev/null \
     --dump-header - \
     --header "Host: ${host}" \

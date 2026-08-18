@@ -397,12 +397,12 @@ remaining full-stack rehearsal on a disposable VPS or VM.
 - [ ] export the complete current `pieper.fr` zone and record the previous web
       A, AAAA, and TTL values separately from the protected mail and DNSSEC
       records;
-- [ ] lower only the TTL values of `pieper.fr` and `nicolas.pieper.fr`, without
-      changing their targets;
+- [ ] lower only the TTL values of `pieper.fr`, `www.pieper.fr`, and
+      `nicolas.pieper.fr`, without changing their targets;
 - [ ] wait at least the previous web TTL after every authoritative server shows
       the lower TTL, before changing the edge state or any web target;
 - [ ] activate and probe the `precutover` edge state: keep every established
-      HTTPS site valid and expose the two pending `.fr` aliases only as direct
+      HTTPS site valid and expose the three pending `.fr` aliases only as direct
       Atlas HTTP `308` redirects;
 - [x] deploy and probe the three static releases before the DNS change;
 - [x] probe the new host with forced IPv4 resolution;
@@ -411,9 +411,9 @@ remaining full-stack rehearsal on a disposable VPS or VM.
 - [x] point the apex and `www` A records for `nicolaspieper.com`,
       `papersempire.com`, and `parkventory.com` to Atlas. Remove their previous
       AAAA records. Do not add an Atlas AAAA record before IPv6 edge proof;
-- [ ] point only the web A records for `pieper.fr` and `nicolas.pieper.fr` to
-      Atlas. Remove their previous AAAA records and preserve the complete mail
-      and DNSSEC state;
+- [ ] point only the web A records for `pieper.fr`, `www.pieper.fr`, and
+      `nicolas.pieper.fr` to Atlas. Remove their previous AAAA records and
+      preserve the complete mail and DNSSEC state;
 - [ ] run the bounded HTTPS activation immediately after the exact DNS answers
       are visible, and retain the `precutover` release plus the DNS export for
       rollback;
