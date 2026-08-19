@@ -4644,7 +4644,15 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(profile.canonical_domain, "parkventory.com")
         self.assertEqual(profile.redirect_domains, ("www.parkventory.com",))
-        self.assertEqual(profile.live_redirect_domains, ("www.parkventory.com",))
+        self.assertEqual(
+            profile.live_redirects,
+            (
+                MATERIALIZER.RedirectContract(
+                    "www.parkventory.com",
+                    expected_hsts=True,
+                ),
+            ),
+        )
         self.assertEqual(
             profile.site_repository,
             "ghcr.io/nclsppr/parkventory-static-site",
@@ -4665,24 +4673,68 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
             MATERIALIZER.PROFILES["personal"].redirect_domains,
             ("www.nicolaspieper.com", "nicolas.pieper.fr"),
         )
+        personal_live_redirects = MATERIALIZER.PROFILES["personal"].live_redirects
         self.assertEqual(
-            MATERIALIZER.PROFILES["personal"].live_redirect_domains,
-            ("www.nicolaspieper.com",),
+            personal_live_redirects,
+            (
+                MATERIALIZER.RedirectContract(
+                    "www.nicolaspieper.com",
+                    expected_hsts=False,
+                ),
+                MATERIALIZER.RedirectContract("pieper.fr", expected_hsts=False),
+                MATERIALIZER.RedirectContract(
+                    "www.pieper.fr",
+                    expected_hsts=False,
+                ),
+                MATERIALIZER.RedirectContract(
+                    "nicolas.pieper.fr",
+                    expected_hsts=False,
+                ),
+            ),
         )
         self.assertEqual(MATERIALIZER.PROFILES["papersempire"].redirect_domains, ())
         self.assertEqual(
-            MATERIALIZER.PROFILES["papersempire"].live_redirect_domains,
-            ("www.papersempire.com",),
+            MATERIALIZER.PROFILES["papersempire"].live_redirects,
+            (
+                MATERIALIZER.RedirectContract(
+                    "www.papersempire.com",
+                    expected_hsts=True,
+                ),
+            ),
         )
+        self.assertEqual(
+            MATERIALIZER.PROFILES["parkventory"].live_redirects,
+            (
+                MATERIALIZER.RedirectContract(
+                    "www.parkventory.com",
+                    expected_hsts=True,
+                ),
+            ),
+        )
+        edge_defaults = yaml.safe_load(
+            (
+                ROOT / "ansible/roles/public_static_edge/defaults/main.yml"
+            ).read_text(encoding="utf-8")
+        )
+        edge_redirects = edge_defaults["vps_public_static_edge_redirects"]
         for application, profile in MATERIALIZER.PROFILES.items():
+            expected_live_domains = tuple(
+                redirect["source"]
+                for redirect in edge_redirects
+                if redirect["target"] == profile.canonical_domain
+            )
+            self.assertEqual(
+                tuple(redirect.domain for redirect in profile.live_redirects),
+                expected_live_domains,
+            )
             route = (
                 ROOT
                 / "platform/public-static-edge/routes-activate"
                 / f"{application}.caddy"
             ).read_text(encoding="utf-8")
             self.assertIn(profile.canonical_domain, route)
-            for domain in profile.live_redirect_domains:
-                self.assertIn(domain, route)
+            for redirect in profile.live_redirects:
+                self.assertIn(redirect.domain, route)
         integration_route = (
             ROOT / "platform/caddy/routes/personal.caddy.disabled"
         ).read_text(encoding="utf-8")
@@ -4694,21 +4746,30 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
 
     def test_live_probe_requires_valid_tls_and_the_public_redirect_set(self) -> None:
         profile = MATERIALIZER.PROFILES["personal"]
-        inventory = MATERIALIZER.InventoryContract(1, "0" * 64, 0, 0, ())
-        with mock.patch.object(MATERIALIZER, "wait_for_probe") as wait, \
-            mock.patch.object(MATERIALIZER, "assert_release_http_contract") as contract:
-            MATERIALIZER.probe_live_release(
-                inventory,
-                profile,
-                Path("/var/tmp/test"),
-                30,
-            )
-        self.assertFalse(wait.call_args.kwargs["insecure"])
-        self.assertFalse(contract.call_args.kwargs["insecure"])
-        self.assertEqual(
-            contract.call_args.kwargs["redirect_domains"],
-            profile.live_redirect_domains,
-        )
+        inventory = probe_inventory()
+        for live_probe in (
+            MATERIALIZER.probe_live_release,
+            MATERIALIZER.probe_live_health,
+        ):
+            with self.subTest(live_probe=live_probe.__name__), mock.patch.object(
+                MATERIALIZER,
+                "wait_for_probe",
+            ) as wait, mock.patch.object(
+                MATERIALIZER,
+                "assert_release_http_contract",
+            ) as contract:
+                live_probe(
+                    inventory,
+                    profile,
+                    Path("/var/tmp/test"),
+                    30,
+                )
+                self.assertFalse(wait.call_args.kwargs["insecure"])
+                self.assertFalse(contract.call_args.kwargs["insecure"])
+                self.assertEqual(
+                    contract.call_args.kwargs["redirect_contracts"],
+                    profile.live_redirects,
+                )
         with mock.patch.object(
             MATERIALIZER.subprocess,
             "run",
@@ -4722,6 +4783,59 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
                 insecure=False,
             )
         self.assertEqual(run.call_args.args[0][1], "--disable")
+
+    def test_redirect_probes_preserve_each_hsts_contract(self) -> None:
+        inventory = probe_inventory()
+        for profile in MATERIALIZER.PROFILES.values():
+            with self.subTest(application=profile.application, phase="temporary"), \
+                mock.patch.object(MATERIALIZER, "assert_probe_response") as probe:
+                MATERIALIZER.assert_release_http_contract(
+                    profile,
+                    inventory,
+                    443,
+                    Path("/var/tmp/test"),
+                    MATERIALIZER.time.monotonic() + 30,
+                    insecure=False,
+                )
+                temporary_redirects = [
+                    call
+                    for call in probe.call_args_list
+                    if call.kwargs["expected_status"] == 308
+                ]
+                self.assertEqual(
+                    [
+                        (call.args[0], call.kwargs["expected_hsts"])
+                        for call in temporary_redirects
+                    ],
+                    [(domain, True) for domain in profile.redirect_domains],
+                )
+
+            with self.subTest(application=profile.application, phase="live"), \
+                mock.patch.object(MATERIALIZER, "assert_probe_response") as probe:
+                MATERIALIZER.assert_release_http_contract(
+                    profile,
+                    inventory,
+                    443,
+                    Path("/var/tmp/test"),
+                    MATERIALIZER.time.monotonic() + 30,
+                    insecure=False,
+                    redirect_contracts=profile.live_redirects,
+                )
+                live_redirects = [
+                    call
+                    for call in probe.call_args_list
+                    if call.kwargs["expected_status"] == 308
+                ]
+                self.assertEqual(
+                    [
+                        (call.args[0], call.kwargs["expected_hsts"])
+                        for call in live_redirects
+                    ],
+                    [
+                        (redirect.domain, redirect.expected_hsts)
+                        for redirect in profile.live_redirects
+                    ],
+                )
 
     def test_live_readiness_rejects_a_self_signed_certificate(self) -> None:
         openssl = shutil.which("openssl")
@@ -4926,6 +5040,61 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
                 "left a container behind",
             ):
                 MATERIALIZER.cleanup_probe_container("probe-test", {})
+
+    def test_probe_response_enforces_hsts_presence_and_absence(self) -> None:
+        common_headers = (
+            "x-content-type-options: nosniff\r\n"
+            "x-frame-options: SAMEORIGIN\r\n"
+            "referrer-policy: strict-origin-when-cross-origin\r\n"
+            "permissions-policy: camera=(), microphone=(), geolocation=()\r\n"
+            "location: https://example.com/probe?value=1\r\n"
+        )
+        hsts_header = (
+            "strict-transport-security: max-age=31536000; includeSubDomains\r\n"
+        )
+
+        def probe_response(headers: str, *, expected_hsts: bool) -> None:
+            def respond(command, *, environment, timeout=120):
+                response_path = Path(command[command.index("--output") + 1])
+                header_path = Path(command[command.index("--dump-header") + 1])
+                response_path.write_bytes(b"")
+                header_path.write_text(
+                    f"HTTP/2 308\r\n{headers}\r\n",
+                    encoding="latin-1",
+                )
+                return subprocess.CompletedProcess(command, 0, "308", "")
+
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory)
+                with mock.patch.object(
+                    MATERIALIZER,
+                    "run_checked",
+                    side_effect=respond,
+                ):
+                    MATERIALIZER.assert_probe_response(
+                        "www.example.com",
+                        443,
+                        "/probe?value=1",
+                        root,
+                        MATERIALIZER.time.monotonic() + 10,
+                        expected_status=308,
+                        expected_location="https://example.com/probe?value=1",
+                        expected_hsts=expected_hsts,
+                        insecure=False,
+                    )
+
+        probe_response(hsts_header + common_headers, expected_hsts=True)
+        probe_response(common_headers, expected_hsts=False)
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "omitted the required HSTS policy",
+        ):
+            probe_response(common_headers, expected_hsts=True)
+        with self.assertRaisesRegex(
+            MATERIALIZER.StaticDeploymentError,
+            "returned an unexpected HSTS policy",
+        ):
+            probe_response(hsts_header + common_headers, expected_hsts=False)
 
     def test_residual_probe_cleanup_is_batched_bounded_and_exact(self) -> None:
         identifier = "a" * 64

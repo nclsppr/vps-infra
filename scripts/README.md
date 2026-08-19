@@ -291,6 +291,10 @@ Before the symlink switch, the live form writes a durable transaction under
 on loopback port 443 without `--insecure`, so the normal public certificate
 chain and hostname must validate. It replays the route checksums, 404, cache and
 security headers, gzip, and the redirects actually served by the public edge.
+Each live redirect has an explicit HSTS expectation. Personal redirects must
+omit HSTS; this matches the public edge and preserves rollback for the `.fr`
+aliases. Papers Empire and Parkventory redirects must retain HSTS. Canonical
+site responses always require HSTS.
 Only a complete success persists the route inventory and replaces
 `/var/lib/vps-static/active/<application>.json`. Failure restores and fsyncs the
 previous target before rechecking the exact Caddy identity and source HEAD. It

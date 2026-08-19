@@ -424,6 +424,11 @@ Ansible runtime probe also requires a direct `308` from HTTP and HTTPS for a pat
 with a query. Both the DNS-routed and direct-Atlas probes must report the
 independently verified Atlas IPv4 as `remote_ip`.
 
+Canonical responses and the Papers Empire and Parkventory redirects require
+HSTS. The four Personal redirects require HSTS to be absent while retaining
+`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and
+`Permissions-Policy`, and they must not expose a `Server` header.
+
 Before the `.fr` DNS change, the pre-cutover edge intentionally has no HTTPS
 site block for those pending aliases. Probe their path-preserving HTTP redirects
 directly on Atlas instead:
