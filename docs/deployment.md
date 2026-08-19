@@ -536,7 +536,10 @@ redirects carried by the exact platform integration pinned in
 checkout. The live public edge separately verifies `www.nicolaspieper.com`,
 `pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr`. Each live alias must
 return one permanent redirect to `https://nicolaspieper.com` while preserving
-the request path and query.
+the request path and query. The live probe also requires the complete redirect
+security-header set without HSTS. This matches the public-edge redirect block
+and preserves rollback for the `.fr` aliases. Canonical Personal responses
+still require HSTS.
 
 ### Papers Empire
 

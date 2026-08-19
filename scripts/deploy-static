@@ -208,6 +208,12 @@ class StaticDeploymentError(ValueError):
 
 
 @dataclasses.dataclass(frozen=True)
+class RedirectContract:
+    domain: str
+    expected_hsts: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class StaticProfile:
     application: str
     source_repository: str
@@ -216,7 +222,7 @@ class StaticProfile:
     signer_workflow: str
     canonical_domain: str
     redirect_domains: tuple[str, ...]
-    live_redirect_domains: tuple[str, ...]
+    live_redirects: tuple[RedirectContract, ...]
     site_repository: str
     routes_repository: str
     max_archive_bytes: int
@@ -346,7 +352,12 @@ PROFILES = {
         signer_workflow="nclsppr/personal/.github/workflows/vps-release.yml",
         canonical_domain="nicolaspieper.com",
         redirect_domains=("www.nicolaspieper.com", "nicolas.pieper.fr"),
-        live_redirect_domains=("www.nicolaspieper.com",),
+        live_redirects=(
+            RedirectContract("www.nicolaspieper.com", expected_hsts=False),
+            RedirectContract("pieper.fr", expected_hsts=False),
+            RedirectContract("www.pieper.fr", expected_hsts=False),
+            RedirectContract("nicolas.pieper.fr", expected_hsts=False),
+        ),
         site_repository="ghcr.io/nclsppr/personal/site",
         routes_repository="ghcr.io/nclsppr/personal/routes",
         max_archive_bytes=50 * MIB,
@@ -367,7 +378,9 @@ PROFILES = {
         signer_workflow="nclsppr/papersempire/.github/workflows/vps-release.yml",
         canonical_domain="papersempire.com",
         redirect_domains=(),
-        live_redirect_domains=("www.papersempire.com",),
+        live_redirects=(
+            RedirectContract("www.papersempire.com", expected_hsts=True),
+        ),
         site_repository="ghcr.io/nclsppr/papersempire/site",
         routes_repository="ghcr.io/nclsppr/papersempire/routes",
         max_archive_bytes=75 * MIB,
@@ -388,7 +401,9 @@ PROFILES = {
         signer_workflow="nclsppr/parkventory/.github/workflows/vps-release.yml",
         canonical_domain="parkventory.com",
         redirect_domains=("www.parkventory.com",),
-        live_redirect_domains=("www.parkventory.com",),
+        live_redirects=(
+            RedirectContract("www.parkventory.com", expected_hsts=True),
+        ),
         site_repository="ghcr.io/nclsppr/parkventory-static-site",
         routes_repository="ghcr.io/nclsppr/parkventory-static-routes",
         max_archive_bytes=50 * MIB,
@@ -6467,6 +6482,7 @@ def assert_probe_response(
     expected_cache_control: str | None = None,
     accept_encoding: str | None = None,
     expected_content_encoding: str | None = None,
+    expected_hsts: bool = True,
     insecure: bool = True,
 ) -> None:
     response = work_directory / f"response-{secrets.token_hex(8)}"
@@ -6506,8 +6522,14 @@ def assert_probe_response(
         header_bytes = read_bounded_file(headers, 64 * 1024, "Caddy response headers")
         header_text = header_bytes.decode("latin-1")
         normalized_headers = header_text.lower()
+        hsts_header = (
+            "\r\nstrict-transport-security: max-age=31536000; includesubdomains\r\n"
+        )
+        if expected_hsts and hsts_header not in normalized_headers:
+            fail("production Caddy probe omitted the required HSTS policy")
+        if not expected_hsts and "\r\nstrict-transport-security:" in normalized_headers:
+            fail("production Caddy probe returned an unexpected HSTS policy")
         required_headers = (
-            "\r\nstrict-transport-security: max-age=31536000; includesubdomains\r\n",
             "\r\nx-content-type-options: nosniff\r\n",
             "\r\nx-frame-options: sameorigin\r\n",
             "\r\nreferrer-policy: strict-origin-when-cross-origin\r\n",
@@ -6544,7 +6566,7 @@ def assert_release_http_contract(
     deadline: float,
     *,
     insecure: bool,
-    redirect_domains: tuple[str, ...] | None = None,
+    redirect_contracts: tuple[RedirectContract, ...] | None = None,
 ) -> None:
     for item in inventory.files:
         if item.route.startswith("/assets/"):
@@ -6595,16 +6617,24 @@ def assert_release_http_contract(
         expected_content_encoding="gzip",
         insecure=insecure,
     )
-    redirects = profile.redirect_domains if redirect_domains is None else redirect_domains
-    for redirect_domain in redirects:
+    redirects = (
+        tuple(
+            RedirectContract(domain, expected_hsts=True)
+            for domain in profile.redirect_domains
+        )
+        if redirect_contracts is None
+        else redirect_contracts
+    )
+    for redirect in redirects:
         assert_probe_response(
-            redirect_domain,
+            redirect.domain,
             port,
             "/probe?value=1",
             work_directory,
             deadline,
             expected_status=308,
             expected_location=f"https://{profile.canonical_domain}/probe?value=1",
+            expected_hsts=redirect.expected_hsts,
             insecure=insecure,
         )
 
@@ -6630,7 +6660,7 @@ def probe_live_release(
         work_directory,
         probe_deadline,
         insecure=False,
-        redirect_domains=profile.live_redirect_domains,
+        redirect_contracts=profile.live_redirects,
     )
 
 
@@ -6685,7 +6715,7 @@ def probe_live_health(
         work_directory,
         probe_deadline,
         insecure=False,
-        redirect_domains=profile.live_redirect_domains,
+        redirect_contracts=profile.live_redirects,
     )
 
 
