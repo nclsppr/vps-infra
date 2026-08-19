@@ -690,6 +690,7 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
         ).read_text()
         tasks = (ROOT / "ansible/roles/public_static_edge/tasks/main.yml").read_text()
         self.assertIn("vps_public_static_edge_surplasse_recovery_unit", unit)
+        self.assertIn("--force-recreate", unit)
         self.assertIn("--recover", recovery)
         self.assertIn("--assert-base-switch-safe", tasks)
         self.assertLess(

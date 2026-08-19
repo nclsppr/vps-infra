@@ -1949,6 +1949,11 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             / "ansible/roles/public_static_edge/templates/vps-public-static-edge.service.j2"
         ).read_text(encoding="utf-8")
         self.assertIn("ExecStop=/usr/bin/docker compose", unit)
+        self.assertIn(
+            " up --detach --wait --no-build --force-recreate "
+            "--remove-orphans caddy",
+            unit,
+        )
         self.assertIn(" stop --timeout 30 caddy", unit)
         self.assertNotIn("--force-recreate", unit)
         self.assertIn(
