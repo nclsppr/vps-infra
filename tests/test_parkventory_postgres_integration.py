@@ -108,6 +108,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
         migrator_auth = "A" * 64
         runtime_auth = "B" * 64
         original_command = PROVISIONER.command
+        original_database_address = PROVISIONER.parkventory_database_address
 
         try:
             self.docker(docker, "network", "create", network)
@@ -179,6 +180,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
                 )
 
             PROVISIONER.command = local_command
+            PROVISIONER.parkventory_database_address = lambda container: "127.0.0.1"
             PROVISIONER.apply_database(
                 container,
                 migrator_auth,
@@ -929,6 +931,7 @@ DROP ROLE extension_hijacker;
             PROVISIONER.observe(container, require_rls=True)
         finally:
             PROVISIONER.command = original_command
+            PROVISIONER.parkventory_database_address = original_database_address
             self.docker(
                 docker or "docker",
                 "rm",
