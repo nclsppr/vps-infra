@@ -151,7 +151,7 @@ check-surplasse-public-edge-controller: ## Test the crash-safe Surplasse edge tr
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		tests/test_surplasse_public_edge_controller.py
 
-check-surplasse-dns-cutover-controller: ## Test the inactive Surplasse DNS cutover controller.
+check-surplasse-dns-cutover-controller: ## Test the Surplasse DNS cutover controller.
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		tests/test_surplasse_dns_cutover.py
 

@@ -1,5 +1,5 @@
 ---
-- name: Validate the inactive Surplasse DNS cutover controller contract
+- name: Validate the Surplasse DNS cutover controller contract
   ansible.builtin.assert:
     that:
       - >-
@@ -39,7 +39,7 @@
   loop_control:
     label: "{{ item.path }}"
 
-- name: Install the locked Surplasse DNS cutover policy
+- name: Install the ready Surplasse DNS cutover policy
   ansible.builtin.copy:
     src: "{{ playbook_dir }}/../../policies/surplasse-dns-cutover-v1.json"
     dest: "{{ vps_surplasse_dns_cutover_policy }}"
@@ -47,7 +47,7 @@
     group: root
     mode: "0444"
 
-- name: Install the inactive Surplasse DNS cutover controller
+- name: Install the Surplasse DNS cutover controller
   ansible.builtin.copy:
     src: "{{ playbook_dir }}/../../scripts/surplasse-dns-cutover"
     dest: "{{ vps_surplasse_dns_cutover_controller }}"

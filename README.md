@@ -280,6 +280,8 @@ Cette décision est détaillée dans
 - [ADR-0011 - Stripe test mode for the Surplasse tester production](docs/decisions/0011-surplasse-tester-stripe-mode.md)
 - [ADR-0012 - locked Surplasse DNS cutover controller](docs/decisions/0012-locked-surplasse-dns-cutover-controller.md)
 - [ADR-0013 - canonical Surplasse tester application admission](docs/decisions/0013-surplasse-tester-application-admission.md)
+- [ADR-0014 - bounded Surplasse pilot bootstrap](docs/decisions/0014-bounded-surplasse-pilot-bootstrap.md)
+- [ADR-0015 - ready Surplasse tester DNS cutover policy](docs/decisions/0015-surplasse-tester-dns-cutover-policy.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas

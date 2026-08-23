@@ -302,10 +302,12 @@ or replacing its retained static routes.
 
 The same public-edge playbook installs the separate
 `surplasse_dns_cutover` role. It creates only root-owned policy, state, and
-empty credential paths. The installed policy has `enabled: false` and
-`activation_policy: locked`, so installation cannot call OVHcloud or change a
-record. A future ready policy and the short-lived cutover identity require a
-separate review. The permanent Caddy identity remains in a different directory.
+empty credential paths. The installed policy has `enabled: true` and
+`activation_policy: ready`. This makes the explicit controller commands
+available, but the role does not execute them. Installation does not call
+OVHcloud or change a record. The controller refuses `plan` without the exact
+short-lived cutover identity. The permanent Caddy identity remains in a
+different directory.
 
 The internal platform remains necessary for the application stacks. Its later
 activation keeps Grafana on loopback and every database or metrics endpoint off

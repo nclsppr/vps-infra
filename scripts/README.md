@@ -549,13 +549,15 @@ Run its focused adversarial tests with:
 make check-surplasse-public-edge-controller
 ```
 
-## Locked Surplasse DNS cutover transaction
+## Ready Surplasse DNS cutover transaction
 
-`surplasse-dns-cutover` is a separate root-owned controller for the later
-`surplasse.com` IPv4 migration. Its versioned policy is disabled and locked.
-While locked, it does not open its dedicated OVHcloud credential directory or
-construct an API client. It never consumes the permanent Caddy DNS-01
-credential bundle.
+`surplasse-dns-cutover` is a separate root-owned controller for the explicit
+`surplasse.com` IPv4 migration. Its versioned policy is enabled and ready for
+the tester cutover. Installing the controller or running `doctor` does not open
+its dedicated OVHcloud credential directory, construct an API client, create a
+plan, or change DNS. The controller never consumes the permanent Caddy DNS-01
+credential bundle. `plan` requires the exact short-lived cutover identity, and
+no workflow invokes `plan` or `apply` automatically.
 
 The controller retains a complete raw API export, a canonical record snapshot,
 digest-bound expiring plans, and a durable per-write journal. It requires a

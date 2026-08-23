@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adversarial tests for the inactive Surplasse DNS cutover controller."""
+"""Adversarial tests for the Surplasse DNS cutover controller."""
 
 from __future__ import annotations
 
@@ -251,12 +251,12 @@ class Fixture:
 
 
 class CutoverTests(unittest.TestCase):
-    def test_dns_and_legacy_adapter_stay_locked_after_canonical_admission(self) -> None:
+    def test_dns_policy_is_ready_and_legacy_adapter_stays_locked(self) -> None:
         policy = json.loads(
             (ROOT / "policies/surplasse-dns-cutover-v1.json").read_text(encoding="utf-8")
         )
-        self.assertIs(policy["enabled"], False)
-        self.assertEqual(policy["activation_policy"], "locked")
+        self.assertIs(policy["enabled"], True)
+        self.assertEqual(policy["activation_policy"], "ready")
         adapter = json.loads(
             (ROOT / "applications/surplasse/adapter.json").read_text(encoding="utf-8")
         )
@@ -272,6 +272,47 @@ class CutoverTests(unittest.TestCase):
         self.assertIn("owner: root", tasks)
         self.assertIn('mode: "0444"', tasks)
         self.assertIn('mode: "0700"', tasks)
+        self.assertNotIn("ansible.builtin.command", tasks)
+        self.assertNotIn("ansible.builtin.shell", tasks)
+
+    def test_ready_policy_doctor_does_not_access_credentials_api_or_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials = root / "absent-credentials"
+            paths = DNS.RuntimePaths(
+                state_root=root / "absent-state",
+                deployment_lock=root / "absent.lock",
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+            )
+            controller = DNS.Controller(
+                paths,
+                DNS.Policy(True, "ready", credentials),
+            )
+            with (
+                mock.patch.object(
+                    DNS,
+                    "load_credentials",
+                    side_effect=AssertionError("doctor accessed credentials"),
+                ),
+                mock.patch.object(
+                    DNS,
+                    "OvhZoneApi",
+                    side_effect=AssertionError("doctor constructed an API client"),
+                ),
+            ):
+                self.assertEqual(
+                    controller.doctor(),
+                    {
+                        "activation_policy": "ready",
+                        "atlas_ipv4": DNS.ATLAS_IPV4,
+                        "enabled": True,
+                        "mutations_available": True,
+                        "zone": DNS.ZONE,
+                    },
+                )
+            self.assertFalse(credentials.exists())
+            self.assertFalse(paths.state_root.exists())
 
     def test_locked_policy_refuses_before_api_or_state_access(self) -> None:
         class TrapApi:
@@ -667,15 +708,21 @@ class CutoverTests(unittest.TestCase):
         document = json.loads(
             (ROOT / "policies/surplasse-dns-cutover-v1.json").read_text(encoding="utf-8")
         )
-        locked = DNS.validate_policy_document(document)
-        self.assertFalse(locked.enabled)
-        invalid = dict(document)
-        invalid["enabled"] = True
+        ready = DNS.validate_policy_document(document)
+        self.assertTrue(ready.enabled)
+        invalid_ready = dict(document)
+        invalid_ready["activation_policy"] = "locked"
         with self.assertRaises(DNS.CutoverError):
-            DNS.validate_policy_document(invalid)
-        ready = dict(invalid)
-        ready["activation_policy"] = "ready"
-        self.assertTrue(DNS.validate_policy_document(ready).enabled)
+            DNS.validate_policy_document(invalid_ready)
+        locked_document = dict(document)
+        locked_document["enabled"] = False
+        locked_document["activation_policy"] = "locked"
+        locked = DNS.validate_policy_document(locked_document)
+        self.assertFalse(locked.enabled)
+        invalid_locked = dict(locked_document)
+        invalid_locked["activation_policy"] = "ready"
+        with self.assertRaises(DNS.CutoverError):
+            DNS.validate_policy_document(invalid_locked)
         wrong_zone = dict(document)
         wrong_zone["zone"] = "example.com"
         with self.assertRaises(DNS.CutoverError):
