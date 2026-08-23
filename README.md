@@ -105,9 +105,19 @@ Le premier socle exécutable est livré :
   `deploy-application` controller and its argument-free gate are installed, and
   `vps-application-recover.service` is loaded, inactive after a successful
   recovery (`Result=success`, `ExecMainStatus=0`). ADR-0013 now enables only the
-  canonical Surplasse tester admission entry. Parkventory and Mon Florian
-  remain disabled and no application deployment workflow invokes the
-  controller.
+  canonical Surplasse tester admission entry. Parkventory remains disabled. Its
+  manual application workflow resolves no deployment matrix while that entry
+  is disabled and retains an independent protected-environment activation gate.
+  Mon Florian also remains disabled, and no workflow invokes its controller
+  path.
+
+[ADR-0015](docs/decisions/0015-parkventory-public-beta-readiness.md) prepares
+the inactive Parkventory public-beta boundary: exact PostgreSQL roles and
+network, OIDC admission, bounded logs, disabled monitoring candidates, live
+readiness rechecks, and digest-bound off-site restore evidence. The
+[Parkventory runbook](docs/operations/parkventory-postgresql.md) keeps every
+provider, credential, evidence digest, static-to-Compose handoff, and Atlas
+activation outside this repository-only change.
 
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
@@ -143,9 +153,9 @@ profiles were `ready`.
 This bounded rollout did not enable the legacy dynamic release manifest or
 invoke the Compose application controller. `releases/production.yaml` still
 keeps every dynamic application at `enabled: false`. The separate canonical
-contract now admits the Surplasse tester release, but no application workflow
-invokes it and repository admission alone creates no desired or active
-application release.
+contract now admits the Surplasse tester release. The manual Parkventory
+application workflow resolves no deployment matrix while Parkventory remains
+disabled, and repository admission alone creates no desired or active release.
 `parkventory.com` is a static demonstration only. `surplasse.com` keeps its
 previous DNS target and Atlas does not serve a Surplasse application.
 
@@ -188,8 +198,10 @@ application controller has its own exact forced-command gate, shared static
 lock, transaction journal, quarantine, and boot recovery wiring. Revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b` and its recovery unit were installed
 and proved healthy while idle during the dated rollout. Canonical Surplasse
-tester admission is enabled, Parkventory and Mon Florian remain disabled, and
-no application release is active. Surplasse activation still requires a deliberate operator
+tester admission is enabled, Parkventory remains disabled, and no application
+release is active. The Parkventory workflow is manual and inert in that state.
+Mon Florian also remains disabled. Surplasse activation still requires a
+deliberate operator
 command, database, secrets, observability, edge route, network cutover, and
 every retained runtime gate in ADR-0010.
 

@@ -96,6 +96,27 @@ def surplasse_operator_manifest(
     }
 
 
+def parkventory_logging():
+    return {
+        "driver": "local",
+        "options": {"max-file": "3", "max-size": "10m"},
+    }
+
+
+def parkventory_oidc_file_environment():
+    return {
+        "PARKVENTORY_OIDC_CLIENT_SECRET_FILE": (
+            "/run/secrets/parkventory_oidc_client_secret"
+        ),
+        "PARKVENTORY_OIDC_STATE_SECRET_FILE": (
+            "/run/secrets/parkventory_oidc_state_secret"
+        ),
+        "PARKVENTORY_OIDC_TOKEN_ENCRYPTION_SECRET_FILE": (
+            "/run/secrets/parkventory_oidc_token_encryption_secret"
+        ),
+    }
+
+
 def surplasse_pilot_service(profile):
     return {
         "entrypoint": ["/opt/surplasse/scripts/backend-pilot-bootstrap.sh"],
@@ -1116,13 +1137,19 @@ class ApplicationControllerTests(unittest.TestCase):
                     "environment": {
                         "PARKVENTORY_MIGRATION_ONLY": "false",
                         "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+                        **parkventory_oidc_file_environment(),
                     },
+                    "logging": parkventory_logging(),
                     "secrets": service_credentials["backend"],
                     "user": "10001:10001",
                 },
-                "frontend": {"secrets": service_credentials["frontend"]},
+                "frontend": {
+                    "logging": parkventory_logging(),
+                    "secrets": service_credentials["frontend"],
+                },
                 "migrator": {
                     "entrypoint": [profile.migration_runner],
+                    "logging": parkventory_logging(),
                     "secrets": service_credentials["migrator"],
                     "user": "10001:10001",
                 },
@@ -1163,9 +1190,12 @@ class ApplicationControllerTests(unittest.TestCase):
                 for service, sources in profile.service_credentials.items()
             }
         }
+        for service in rendered["services"].values():
+            service["logging"] = parkventory_logging()
         rendered["services"]["backend"]["environment"] = {
             "PARKVENTORY_MIGRATION_ONLY": "false",
             "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+            **parkventory_oidc_file_environment(),
         }
         rendered["services"]["migrator"]["entrypoint"] = [
             profile.migration_runner
@@ -1184,6 +1214,190 @@ class ApplicationControllerTests(unittest.TestCase):
             "least-privilege profile",
         ):
             CONTROLLER.validate_application_compose_semantics(profile, rendered)
+
+    def test_parkventory_runtime_configuration_binds_database_and_auth0_eu(self):
+        configuration = {
+            "PARKVENTORY_DB_MIGRATOR_USER": "parkventory_migrator",
+            "PARKVENTORY_DB_RUNTIME_USER": "parkventory_runtime",
+            "PARKVENTORY_JDBC_URL": (
+                "jdbc:postgresql://postgresql:5432/parkventory"
+            ),
+            "PARKVENTORY_OIDC_AUTH_SERVER_URL": (
+                "https://parkventory.eu.auth0.com/"
+            ),
+            "PARKVENTORY_OIDC_CLIENT_ID": "parkventory-client",
+            "PARKVENTORY_OIDC_ISSUER": "https://parkventory.eu.auth0.com/",
+            "PARKVENTORY_SMTP_PORT": "587",
+            "PARKVENTORY_WEB_BASE_URL": "https://parkventory.com",
+        }
+        CONTROLLER.validate_parkventory_runtime_configuration(configuration)
+        invalid_values = (
+            "http://identity.local/",
+            "https://parkventory.eu.auth0.com",
+            "https://parkventory.eu.auth0.com:invalid/",
+        )
+        for value in invalid_values:
+            with self.subTest(auth_server=value):
+                invalid = dict(configuration)
+                invalid["PARKVENTORY_OIDC_AUTH_SERVER_URL"] = value
+                with self.assertRaisesRegex(
+                    CONTROLLER.ApplicationDeploymentError,
+                    "Auth0 EU issuer",
+                ):
+                    CONTROLLER.validate_parkventory_runtime_configuration(invalid)
+
+    def test_parkventory_readiness_is_digest_bound_and_live_checked(self):
+        contract = CONTROLLER.load_production_contract(
+            ROOT / "releases/application-production.json"
+        )
+        current = next(
+            item for item in contract.applications if item.name == "parkventory"
+        )
+        evidence = CONTROLLER.canonical_json(
+            {
+                "contract": "vps-infra.parkventory-postgres-readiness.v1",
+                "proof": {"runtime_bypasses_rls": False},
+            }
+        )
+        now = CONTROLLER.dt.datetime.now(CONTROLLER.dt.timezone.utc).replace(
+            microsecond=0
+        )
+        timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        offsite_evidence = CONTROLLER.canonical_json(
+            {
+                "backup_id": "20260823T120000000000Z-012345abcdef",
+                "contract": (
+                    "vps-infra.parkventory-offsite-backup-readiness.v1"
+                ),
+                "database": "parkventory",
+                "provider_gates": {
+                    "bucket_object_lock_verified": True,
+                    "bucket_versioning_verified": True,
+                    "failure_domain_independence_reviewed": True,
+                    "recovery_key_off_host_verified": True,
+                    "restore_identity_separate_verified": True,
+                },
+                "restore_rehearsal": {
+                    "completed_at": timestamp,
+                    "evidence_sha256": "sha256:" + "c" * 64,
+                    "performed_off_atlas": True,
+                    "rehearsed": True,
+                    "source_manifest_sha256": "sha256:" + "d" * 64,
+                },
+                "upload_receipt": {
+                    "age_recipient_sha256": "sha256:" + "e" * 64,
+                    "contract": "vps-postgres-offsite-receipt-v2",
+                    "receipt_sha256": "sha256:" + "f" * 64,
+                    "recorded_at": timestamp,
+                    "source_manifest_sha256": "sha256:" + "d" * 64,
+                },
+            }
+        )
+        policy = CONTROLLER.dataclasses.replace(
+            current,
+            enabled=True,
+            readiness_evidence={
+                "postgres": {
+                    "contract": "vps-infra.parkventory-postgres-readiness.v1",
+                    "path": str(CONTROLLER.PARKVENTORY_POSTGRES_READINESS),
+                    "sha256": CONTROLLER.content_digest(evidence),
+                },
+                "encrypted_offsite_backup": {
+                    "contract": (
+                        "vps-infra.parkventory-offsite-backup-readiness.v1"
+                    ),
+                    "path": str(CONTROLLER.PARKVENTORY_OFFSITE_READINESS),
+                    "sha256": CONTROLLER.content_digest(offsite_evidence),
+                },
+            },
+        )
+        completed = subprocess.CompletedProcess(
+            [str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR), "--check"],
+            0,
+            '{"changed":false,"mode":"check","ready":true}\n',
+            "",
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file") as protected,
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_bounded_file",
+                side_effect=[evidence, offsite_evidence],
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "_run_bounded",
+                return_value=completed,
+            ) as live_check,
+        ):
+            CONTROLLER.validate_parkventory_readiness(policy)
+        self.assertEqual(protected.call_count, 3)
+        live_check.assert_called_once_with(
+            [str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR), "--check"],
+            environment=CONTROLLER.safe_environment(Path("/root")),
+            timeout=120,
+            maximum_stdout=4096,
+        )
+
+        rejected = CONTROLLER.dataclasses.replace(
+            policy,
+            readiness_evidence={
+                "postgres": {
+                    **policy.readiness_evidence["postgres"],
+                    "sha256": "sha256:" + "f" * 64,
+                },
+                "encrypted_offsite_backup": policy.readiness_evidence[
+                    "encrypted_offsite_backup"
+                ],
+            },
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_bounded_file",
+                return_value=evidence,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "differs from admission",
+            ):
+                CONTROLLER.validate_parkventory_readiness(rejected)
+
+    def test_parkventory_postmigration_reconciliation_uses_mutating_mode(self):
+        completed = subprocess.CompletedProcess(
+            [
+                str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR),
+                "--reconcile-application-schema",
+            ],
+            0,
+            (
+                '{"changed":true,"mode":"reconcile-application-schema",'
+                '"ready":true}\n'
+            ),
+            "",
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(
+                CONTROLLER,
+                "_run_bounded",
+                return_value=completed,
+            ) as reconcile,
+        ):
+            CONTROLLER.validate_parkventory_postgres_live(
+                reconcile_application_schema=True
+            )
+        reconcile.assert_called_once_with(
+            [
+                str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR),
+                "--reconcile-application-schema",
+            ],
+            environment=CONTROLLER.safe_environment(Path("/root")),
+            timeout=120,
+            maximum_stdout=4096,
+        )
 
     def test_surplasse_pilot_service_contract_is_exact(self):
         profile = CONTROLLER.PROFILES["surplasse"]
@@ -1852,6 +2066,63 @@ class ApplicationControllerTests(unittest.TestCase):
             timeout=900,
         )
 
+    def test_stop_runtime_proves_every_project_service_is_absent(self):
+        candidate = state("parkventory")
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(
+            CONTROLLER,
+            "_compose_for_state",
+            side_effect=(completed, completed),
+        ) as compose:
+            CONTROLLER.stop_runtime(candidate)
+        self.assertEqual(
+            compose.call_args_list,
+            [
+                mock.call(
+                    candidate,
+                    ["down", "--remove-orphans", "--timeout", "30"],
+                    timeout=120,
+                    validate_policy=False,
+                ),
+                mock.call(
+                    candidate,
+                    ["ps", "--all", "--quiet", "backend", "frontend"],
+                    timeout=30,
+                    validate_policy=False,
+                ),
+            ],
+        )
+
+    def test_parkventory_database_containment_attempts_both_boundaries(self):
+        candidate = state("parkventory")
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=None,
+            previous_target=None,
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="postgres-unverified",
+        )
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "stop_runtime",
+                side_effect=CONTROLLER.ApplicationDeploymentError(
+                    "runtime still present"
+                ),
+            ) as stop,
+            mock.patch.object(
+                CONTROLLER,
+                "remove_migration_container",
+            ) as migrator,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "runtime still present",
+            ):
+                CONTROLLER.contain_parkventory_untrusted_database(transaction)
+        stop.assert_called_once_with(candidate)
+        migrator.assert_called_once_with(candidate)
+
     def test_recovery_stops_only_the_exact_journaled_migrator(self):
         candidate = state()
         container_id = "c" * 64
@@ -2050,6 +2321,195 @@ class ApplicationControllerTests(unittest.TestCase):
         start.assert_called_once_with(candidate, precommit=True)
         committed_transaction = commit.call_args.args[0]
         self.assertEqual(committed_transaction.phase, "probed")
+
+    def test_parkventory_rechecks_exact_access_after_migration(self):
+        candidate = state("parkventory")
+        events: list[str] = []
+        transactions: list[CONTROLLER.ApplicationTransaction] = []
+        with (
+            mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
+            mock.patch.object(
+                CONTROLLER,
+                "prepare_transaction",
+                return_value=(True, None),
+            ),
+            mock.patch.object(CONTROLLER, "current_target", return_value=None),
+            mock.patch.object(
+                CONTROLLER,
+                "write_transaction",
+                side_effect=lambda transaction: transactions.append(transaction),
+            ),
+            mock.patch.object(CONTROLLER, "pull_and_verify_images"),
+            mock.patch.object(CONTROLLER, "validate_public_edge_cutover"),
+            mock.patch.object(
+                CONTROLLER,
+                "run_migration",
+                side_effect=lambda _state: events.append("migration"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_parkventory_postgres_live",
+                side_effect=lambda *, reconcile_application_schema: events.append(
+                    f"postgres-proof-{reconcile_application_schema}"
+                ),
+            ) as postgres,
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_offsite_before_runtime",
+                side_effect=lambda: events.append("offsite-proof"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "start_runtime",
+                side_effect=lambda _state, *, precommit: events.append(
+                    f"runtime-{precommit}"
+                ),
+            ),
+            mock.patch.object(CONTROLLER, "probe_runtime"),
+            mock.patch.object(CONTROLLER, "assert_exact_source_head"),
+            mock.patch.object(
+                CONTROLLER,
+                "commit_probed_candidate",
+                side_effect=lambda _transaction: events.append("commit"),
+            ),
+        ):
+            CONTROLLER.activate_candidate(candidate, Path("/unused"))
+        self.assertEqual(
+            events,
+            [
+                "migration",
+                "postgres-proof-True",
+                "offsite-proof",
+                "runtime-True",
+                "offsite-proof",
+                "commit",
+            ],
+        )
+        postgres.assert_called_once_with(reconcile_application_schema=True)
+        self.assertEqual(
+            [transaction.phase for transaction in transactions],
+            [
+                "prepared",
+                "migration-running",
+                "postgres-unverified",
+                "migrated",
+                "started",
+            ],
+        )
+
+    def test_parkventory_postgres_rejection_recovers_from_unverified_phase(self):
+        candidate = state("parkventory")
+        previous = state(
+            "parkventory",
+            revision=PREVIOUS_REVISION,
+            digest=PREVIOUS_DIGEST,
+        )
+        transactions: list[CONTROLLER.ApplicationTransaction] = []
+        with (
+            mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
+            mock.patch.object(
+                CONTROLLER,
+                "prepare_transaction",
+                return_value=(True, previous),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "current_target",
+                return_value=CONTROLLER.release_target(previous),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_transaction",
+                side_effect=lambda transaction: transactions.append(transaction),
+            ),
+            mock.patch.object(CONTROLLER, "pull_and_verify_images"),
+            mock.patch.object(CONTROLLER, "validate_public_edge_cutover"),
+            mock.patch.object(CONTROLLER, "run_migration"),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_parkventory_postgres_live",
+                side_effect=CONTROLLER.ApplicationDeploymentError(
+                    "PostgreSQL proof rejected"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_transaction",
+                side_effect=lambda _application: transactions[-1],
+            ),
+            mock.patch.object(CONTROLLER, "recover_application") as recover,
+            mock.patch.object(CONTROLLER, "start_runtime") as start,
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_offsite_before_runtime",
+            ) as offsite,
+            mock.patch.object(CONTROLLER, "commit_probed_candidate") as commit,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "PostgreSQL proof rejected",
+            ):
+                CONTROLLER.activate_candidate(candidate, Path("/unused"))
+        self.assertEqual(
+            [transaction.phase for transaction in transactions],
+            ["prepared", "migration-running", "postgres-unverified"],
+        )
+        recover.assert_called_once_with("parkventory")
+        start.assert_not_called()
+        offsite.assert_not_called()
+        commit.assert_not_called()
+
+    def test_parkventory_offsite_expiry_after_probes_blocks_runtime_commit(self):
+        candidate = state("parkventory")
+        transactions: list[CONTROLLER.ApplicationTransaction] = []
+        with (
+            mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
+            mock.patch.object(
+                CONTROLLER,
+                "prepare_transaction",
+                return_value=(True, None),
+            ),
+            mock.patch.object(CONTROLLER, "current_target", return_value=None),
+            mock.patch.object(
+                CONTROLLER,
+                "write_transaction",
+                side_effect=lambda transaction: transactions.append(transaction),
+            ),
+            mock.patch.object(CONTROLLER, "pull_and_verify_images"),
+            mock.patch.object(CONTROLLER, "validate_public_edge_cutover"),
+            mock.patch.object(CONTROLLER, "run_migration"),
+            mock.patch.object(CONTROLLER, "validate_parkventory_postgres_live"),
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_offsite_before_runtime",
+                side_effect=(
+                    None,
+                    CONTROLLER.ApplicationDeploymentError(
+                        "off-site proof expired before commit"
+                    ),
+                ),
+            ) as offsite,
+            mock.patch.object(CONTROLLER, "start_runtime") as start,
+            mock.patch.object(CONTROLLER, "probe_runtime"),
+            mock.patch.object(CONTROLLER, "assert_exact_source_head"),
+            mock.patch.object(
+                CONTROLLER,
+                "read_transaction",
+                side_effect=lambda _application: transactions[-1],
+            ),
+            mock.patch.object(CONTROLLER, "recover_application") as recover,
+            mock.patch.object(CONTROLLER, "commit_probed_candidate") as commit,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "off-site proof expired before commit",
+            ):
+                CONTROLLER.activate_candidate(candidate, Path("/unused"))
+        self.assertEqual(offsite.call_count, 2)
+        start.assert_called_once_with(candidate, precommit=True)
+        self.assertEqual(transactions[-1].phase, "probe-rejected")
+        recover.assert_called_once_with("parkventory")
+        commit.assert_not_called()
 
     def test_restart_promotion_preserves_exact_container_identities(self):
         candidate = state("parkventory")
@@ -2324,6 +2784,68 @@ class ApplicationControllerTests(unittest.TestCase):
         remove.assert_called_once()
         switch.assert_not_called()
 
+    def test_parkventory_partial_commit_revalidates_offsite_before_promotion(self):
+        candidate = state("parkventory")
+        previous = state(
+            "parkventory",
+            revision=PREVIOUS_REVISION,
+            digest=PREVIOUS_DIGEST,
+        )
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=previous,
+            previous_target=CONTROLLER.release_target(previous),
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="probed",
+        )
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "read_transaction",
+                return_value=transaction,
+            ),
+            mock.patch.object(CONTROLLER, "remove_migration_container"),
+            mock.patch.object(CONTROLLER, "read_state", return_value=candidate),
+            mock.patch.object(
+                CONTROLLER,
+                "current_target",
+                return_value=CONTROLLER.release_target(candidate),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "static_parkventory_owner_present",
+                return_value=False,
+            ),
+            mock.patch.object(CONTROLLER, "validate_materialized_release"),
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_offsite_before_runtime",
+                side_effect=CONTROLLER.ApplicationDeploymentError(
+                    "off-site proof expired before recovery promotion"
+                ),
+            ) as offsite,
+            mock.patch.object(CONTROLLER, "restore_previous") as restore,
+            mock.patch.object(CONTROLLER, "start_runtime") as start,
+            mock.patch.object(
+                CONTROLLER,
+                "promote_runtime_restart_policy",
+            ) as promote,
+            mock.patch.object(CONTROLLER, "write_state") as quarantine,
+            mock.patch.object(CONTROLLER, "remove_state") as remove,
+        ):
+            CONTROLLER.recover_application("parkventory")
+        offsite.assert_called_once_with()
+        restore.assert_called_once_with(transaction)
+        start.assert_not_called()
+        promote.assert_not_called()
+        self.assertEqual(quarantine.call_args.args[0], CONTROLLER.QUARANTINE_ROOT)
+        self.assertEqual(quarantine.call_args.args[2], candidate)
+        remove.assert_called_once_with(
+            CONTROLLER.TRANSACTION_ROOT,
+            "parkventory.json",
+            "application transaction",
+        )
+
     def test_recovery_refuses_an_active_tuple_from_an_unprobed_phase(self):
         candidate = state()
         transaction = CONTROLLER.ApplicationTransaction(
@@ -2361,6 +2883,117 @@ class ApplicationControllerTests(unittest.TestCase):
         start.assert_not_called()
         promote.assert_not_called()
         remove.assert_not_called()
+
+    def test_parkventory_unverified_database_never_restarts_previous_runtime(self):
+        candidate = state("parkventory")
+        previous = state(
+            "parkventory",
+            revision=PREVIOUS_REVISION,
+            digest=PREVIOUS_DIGEST,
+        )
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=previous,
+            previous_target=CONTROLLER.release_target(previous),
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="postgres-unverified",
+        )
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "read_transaction",
+                return_value=transaction,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "contain_parkventory_untrusted_database",
+            ) as contain,
+            mock.patch.object(CONTROLLER, "read_state", return_value=previous),
+            mock.patch.object(
+                CONTROLLER,
+                "current_target",
+                return_value=CONTROLLER.release_target(previous),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "static_parkventory_owner_present",
+                return_value=False,
+            ),
+            mock.patch.object(CONTROLLER, "restore_previous") as restore,
+            mock.patch.object(CONTROLLER, "start_runtime") as start,
+            mock.patch.object(CONTROLLER, "write_state") as quarantine,
+            mock.patch.object(CONTROLLER, "remove_state") as remove,
+        ):
+            CONTROLLER.recover_application("parkventory")
+        contain.assert_called_once_with(transaction)
+        restore.assert_not_called()
+        start.assert_not_called()
+        self.assertEqual(quarantine.call_args.args[0], CONTROLLER.QUARANTINE_ROOT)
+        self.assertEqual(quarantine.call_args.args[2], candidate)
+        remove.assert_called_once_with(
+            CONTROLLER.TRANSACTION_ROOT,
+            "parkventory.json",
+            "application transaction",
+        )
+
+    def test_parkventory_probed_recovery_rejects_expired_offsite_proof(self):
+        candidate = state("parkventory")
+        previous = state(
+            "parkventory",
+            revision=PREVIOUS_REVISION,
+            digest=PREVIOUS_DIGEST,
+        )
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=previous,
+            previous_target=CONTROLLER.release_target(previous),
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="probed",
+        )
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "read_transaction",
+                return_value=transaction,
+            ),
+            mock.patch.object(CONTROLLER, "remove_migration_container"),
+            mock.patch.object(CONTROLLER, "read_state", return_value=previous),
+            mock.patch.object(
+                CONTROLLER,
+                "current_target",
+                return_value=CONTROLLER.release_target(previous),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "static_parkventory_owner_present",
+                return_value=False,
+            ),
+            mock.patch.object(CONTROLLER, "validate_materialized_release"),
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_offsite_before_runtime",
+                side_effect=CONTROLLER.ApplicationDeploymentError(
+                    "off-site proof is stale"
+                ),
+            ) as offsite,
+            mock.patch.object(CONTROLLER, "restore_previous") as restore,
+            mock.patch.object(CONTROLLER, "start_runtime") as start,
+            mock.patch.object(CONTROLLER, "switch_current") as switch,
+            mock.patch.object(CONTROLLER, "write_state") as quarantine,
+            mock.patch.object(CONTROLLER, "remove_state") as remove,
+        ):
+            CONTROLLER.recover_application("parkventory")
+        offsite.assert_called_once_with()
+        restore.assert_called_once_with(transaction)
+        start.assert_not_called()
+        switch.assert_not_called()
+        self.assertEqual(quarantine.call_args.args[0], CONTROLLER.QUARANTINE_ROOT)
+        self.assertEqual(quarantine.call_args.args[2], candidate)
+        remove.assert_called_once_with(
+            CONTROLLER.TRANSACTION_ROOT,
+            "parkventory.json",
+            "application transaction",
+        )
 
     def test_recovery_rolls_back_and_quarantines_started_candidate(self):
         candidate = state()

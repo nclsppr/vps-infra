@@ -143,6 +143,27 @@ def manifest_response(raw):
 
 
 class AdmissionResolverTests(unittest.TestCase):
+    def test_main_can_scope_resolution_to_parkventory(self):
+        contract = RESOLVER.load_production_contract(
+            ROOT / "releases/application-production.json",
+            ROOT / "releases/static-production.json",
+        )
+        with (
+            mock.patch.object(
+                RESOLVER,
+                "load_production_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(RESOLVER, "BoundedHttpClient", return_value=object()),
+            mock.patch.object(RESOLVER, "resolve_all", return_value=[]) as resolve,
+        ):
+            self.assertEqual(RESOLVER.main(["--application", "parkventory"]), 0)
+        scoped_contract = resolve.call_args.args[0]
+        self.assertEqual(
+            tuple(item.name for item in scoped_contract.applications),
+            ("parkventory",),
+        )
+
     @classmethod
     def setUpClass(cls):
         cls.contract = RESOLVER.load_production_contract(

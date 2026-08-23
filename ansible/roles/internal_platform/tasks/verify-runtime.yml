@@ -167,6 +167,11 @@
         item.item.item != 'postgresql' or
         ('postgresql' in
          (((item.stdout | from_json) | first).NetworkSettings.Networks[
+           'db_parkventory'].Aliases | default([])))
+      - >-
+        item.item.item != 'postgresql' or
+        ('postgresql' in
+         (((item.stdout | from_json) | first).NetworkSettings.Networks[
            'db_surplasse'].Aliases | default([])))
       - >-
         item.item.item == 'grafana' or

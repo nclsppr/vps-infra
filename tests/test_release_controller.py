@@ -831,7 +831,7 @@ def platform_document(*, include_grafana: bool = True) -> dict:
     del include_grafana
     postgresql = hardened_service(
         image("ghcr.io/nclsppr/vps-infra/postgres"),
-        {"db_monitoring", "db_surplasse"},
+        {"db_monitoring", "db_parkventory", "db_surplasse"},
         user="70:70",
     )
     postgresql["secrets"] = [
@@ -1917,14 +1917,59 @@ class ComposePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(COMPOSE_POLICY.ComposePolicyError, "source and target keys"):
             validate_platform_document(document)
 
-    def test_platform_postgresql_requires_the_durable_surplasse_database_network(self) -> None:
+    def test_platform_postgresql_requires_both_durable_application_database_networks(self) -> None:
         document = platform_document()
         del document["services"]["postgresql"]["networks"]["db_surplasse"]
         with self.assertRaisesRegex(
             COMPOSE_POLICY.ComposePolicyError,
-            "expected db_monitoring, db_surplasse",
+            "expected db_monitoring, db_parkventory, db_surplasse",
         ):
             validate_platform_document(document)
+
+    def test_parkventory_monitoring_candidate_is_exact_and_inactive(self) -> None:
+        document = platform_document()
+        document["networks"]["app_parkventory"] = {
+            "external": True,
+            "name": "app_parkventory",
+        }
+        document["services"]["prometheus"]["networks"]["app_parkventory"] = {}
+        by_target = {
+            volume["target"]: volume
+            for volume in document["services"]["prometheus"]["volumes"]
+        }
+        for target, contract in (
+            COMPOSE_POLICY.PARKVENTORY_MONITORING_PROMETHEUS_VOLUMES.items()
+        ):
+            by_target[target]["source"] = contract[1]
+
+        COMPOSE_POLICY.validate_compose(
+            "vps-platform",
+            document,
+            repository_root=Path("/repo"),
+            structural_only=True,
+            parkventory_monitoring_candidate=True,
+        )
+        with self.assertRaisesRegex(
+            COMPOSE_POLICY.ComposePolicyError,
+            "services.prometheus.networks: expected ops",
+        ):
+            validate_platform_document(document)
+
+        changed = copy.deepcopy(document)
+        changed["services"]["prometheus"]["volumes"][0]["source"] = (
+            "/srv/vps/runtime/unreviewed/prometheus.yml"
+        )
+        with self.assertRaisesRegex(
+            COMPOSE_POLICY.ComposePolicyError,
+            "expected exact bind source",
+        ):
+            COMPOSE_POLICY.validate_compose(
+                "vps-platform",
+                changed,
+                repository_root=Path("/repo"),
+                structural_only=True,
+                parkventory_monitoring_candidate=True,
+            )
 
 
 class PublicSafetyTests(unittest.TestCase):

@@ -1,0 +1,6 @@
+- targets:
+    - parkventory-backend:8080
+  labels:
+    __metrics_path__: /q/metrics
+    application: parkventory
+    environment: production

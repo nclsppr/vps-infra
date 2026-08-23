@@ -1,0 +1,30 @@
+---
+services:
+  prometheus:
+    volumes:
+      - type: bind
+        source: /srv/vps/runtime/parkventory/integration/prometheus/prometheus.yml
+        target: /etc/prometheus/prometheus.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/vps/runtime/parkventory/integration/prometheus/targets
+        target: /etc/prometheus/targets
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/vps/runtime/parkventory/integration/prometheus/rules
+        target: /etc/prometheus/rules
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      ops: {}
+      app_parkventory: {}
+
+networks:
+  app_parkventory:
+    external: true
+    name: app_parkventory

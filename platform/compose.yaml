@@ -109,6 +109,9 @@ services:
       db_surplasse:
         aliases:
           - postgresql
+      db_parkventory:
+        aliases:
+          - postgresql
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -336,6 +339,9 @@ networks:
   db_surplasse:
     external: true
     name: db_surplasse
+  db_parkventory:
+    external: true
+    name: db_parkventory
 
 volumes:
   caddy_data:

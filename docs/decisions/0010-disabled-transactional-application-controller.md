@@ -100,6 +100,8 @@ transaction with these phases:
 
 - `prepared`: candidate and exact previous state are journaled;
 - `migration-running`: the dedicated one-shot `migrator` is running;
+- `postgres-unverified`: the Parkventory migration completed but its exact
+  PostgreSQL access proof has not succeeded;
 - `migrated`: the migration command completed;
 - `started`: the exact runtime services are up and healthy in Compose;
 - `probe-rejected`: activation failed after a potentially mutating phase;
@@ -110,6 +112,9 @@ Only a `probed` candidate can become the atomic `current` link and active state.
 A candidate source must descend from the active source before activation.
 The delivered recovery code can restore the previous Compose runtime and
 quarantine the complete immutable candidate fingerprint after migration starts.
+Parkventory is the strict exception. Recovery from `migration-running` or
+`postgres-unverified` stops all Parkventory runtime containers and does not
+restart the previous runtime against an untrusted database.
 This path is not authorized for production while migration compatibility is
 only an assertion. Before either entry can be enabled, an attested invariant
 must prove that the previous runtime is compatible with the changed schema, or

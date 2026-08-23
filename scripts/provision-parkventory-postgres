@@ -1,0 +1,2107 @@
+#!/usr/bin/env python3
+"""Provision or verify the isolated Parkventory PostgreSQL boundary."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+EX_CONFIG = 78
+CONTRACT_PATH = Path("/usr/local/share/vps-infra/contracts/parkventory-postgres.json")
+CREDENTIAL_ROOT = Path("/etc/vps/secrets/parkventory")
+EVIDENCE_PATH = Path("/var/lib/vps-readiness/parkventory/postgres.json")
+CREDENTIAL_RE = re.compile(rb"[A-Za-z0-9_-]{64}\n")
+POSTGRES_IMAGE_RE = re.compile(
+    r"^ghcr\.io/nclsppr/vps-infra/postgres:[A-Za-z0-9_.-]+@sha256:[0-9a-f]{64}$"
+)
+MAX_FILE_BYTES = 64 * 1024
+
+
+def rls_policy(
+    table: str,
+    name: str,
+    command: str,
+    using: str | None,
+    with_check: str | None,
+) -> dict[str, object]:
+    return {
+        "table": table,
+        "name": name,
+        "command": command,
+        "permissive": True,
+        "roles": ["PUBLIC"],
+        "using": using,
+        "with_check": with_check,
+    }
+
+
+TENANT_EXPRESSION = "(organization_id = app_current_organization_id())"
+EXPECTED_RLS_TABLES: list[dict[str, object]] = [
+    {"table": "admin_claim", "enabled": True, "forced": True},
+    {"table": "app_session", "enabled": True, "forced": True},
+    {"table": "audit_event", "enabled": True, "forced": True},
+    {"table": "availability_offer", "enabled": True, "forced": True},
+    {"table": "idempotency_record", "enabled": True, "forced": True},
+    {"table": "invitation", "enabled": True, "forced": True},
+    {"table": "magic_link_request", "enabled": True, "forced": True},
+    {"table": "membership", "enabled": True, "forced": True},
+    {"table": "organization", "enabled": True, "forced": True},
+    {"table": "organization_domain", "enabled": True, "forced": True},
+    {"table": "outbox_dispatch", "enabled": False, "forced": False},
+    {"table": "outbox_event", "enabled": True, "forced": True},
+    {"table": "parking_site", "enabled": True, "forced": True},
+    {"table": "parking_spot", "enabled": True, "forced": True},
+    {"table": "reservation", "enabled": True, "forced": True},
+    {"table": "spot_assignment", "enabled": True, "forced": True},
+    {"table": "user_account", "enabled": True, "forced": True},
+    {"table": "user_email", "enabled": True, "forced": True},
+]
+EXPECTED_RLS_POLICIES: list[dict[str, object]] = [
+    rls_policy(
+        "admin_claim",
+        "admin_claim_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "app_session",
+        "app_session_create",
+        "INSERT",
+        None,
+        "((organization_id = app_current_organization_id()) AND "
+        "(user_account_id = app_current_identity_user_id()))",
+    ),
+    rls_policy(
+        "app_session",
+        "app_session_read",
+        "SELECT",
+        "((token_hash)::text = app_current_session_hash())",
+        None,
+    ),
+    rls_policy(
+        "app_session",
+        "app_session_revoke",
+        "UPDATE",
+        "((token_hash)::text = app_current_session_hash())",
+        "((token_hash)::text = app_current_session_hash())",
+    ),
+    rls_policy(
+        "audit_event",
+        "audit_event_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "availability_offer",
+        "availability_offer_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "idempotency_record",
+        "idempotency_record_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "invitation",
+        "invitation_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "invitation",
+        "invitation_verified_bootstrap",
+        "SELECT",
+        "((normalized_email = app_current_verified_email()) AND "
+        "(status = 'PENDING'::text) AND (expires_at > now()))",
+        None,
+    ),
+    rls_policy(
+        "magic_link_request",
+        "magic_link_request_consume",
+        "UPDATE",
+        "((token_hash)::text = app_current_magic_link_hash())",
+        "((token_hash)::text = app_current_magic_link_hash())",
+    ),
+    rls_policy(
+        "magic_link_request",
+        "magic_link_request_create",
+        "INSERT",
+        None,
+        "(normalized_email = app_current_requested_email())",
+    ),
+    rls_policy(
+        "magic_link_request",
+        "magic_link_request_invalidate",
+        "UPDATE",
+        "(normalized_email = app_current_requested_email())",
+        "(normalized_email = app_current_requested_email())",
+    ),
+    rls_policy(
+        "magic_link_request",
+        "magic_link_request_read",
+        "SELECT",
+        "((normalized_email = app_current_requested_email()) OR "
+        "((token_hash)::text = app_current_magic_link_hash()))",
+        None,
+    ),
+    rls_policy(
+        "membership",
+        "membership_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "organization",
+        "organization_tenant_isolation",
+        "ALL",
+        "(id = app_current_organization_id())",
+        "(id = app_current_organization_id())",
+    ),
+    rls_policy(
+        "organization_domain",
+        "organization_domain_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "organization_domain",
+        "organization_domain_verified_bootstrap",
+        "SELECT",
+        "((normalized_domain = app_current_verified_domain()) AND "
+        "(status = ANY (ARRAY['CLAIMED'::text, 'VERIFIED'::text])))",
+        None,
+    ),
+    rls_policy(
+        "outbox_event",
+        "outbox_event_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "parking_site",
+        "parking_site_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "parking_spot",
+        "parking_spot_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "reservation",
+        "reservation_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "spot_assignment",
+        "spot_assignment_tenant_isolation",
+        "ALL",
+        TENANT_EXPRESSION,
+        TENANT_EXPRESSION,
+    ),
+    rls_policy(
+        "user_account",
+        "user_account_identity_isolation",
+        "ALL",
+        "((id = app_current_identity_user_id()) OR (EXISTS ( SELECT 1\n"
+        "   FROM membership\n"
+        "  WHERE ((membership.user_account_id = user_account.id) AND "
+        "(membership.organization_id = app_current_organization_id())))))",
+        "(id = app_current_identity_user_id())",
+    ),
+    rls_policy(
+        "user_email",
+        "user_email_identity_isolation",
+        "ALL",
+        "((normalized_email = app_current_verified_email()) OR "
+        "(user_account_id = app_current_identity_user_id()) OR "
+        "(EXISTS ( SELECT 1\n"
+        "   FROM membership\n"
+        "  WHERE ((membership.user_account_id = user_email.user_account_id) "
+        "AND (membership.organization_id = "
+        "app_current_organization_id())))))",
+        "((normalized_email = app_current_verified_email()) AND "
+        "(user_account_id = app_current_identity_user_id()))",
+    ),
+]
+EXPECTED_RLS_HELPERS: list[dict[str, object]] = [
+    {
+        "name": "app_current_identity_user_id",
+        "arguments": "",
+        "result": "uuid",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": False,
+        "leakproof": False,
+        "strict": False,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": (
+            "sha256:4fb6b06f51d8bb29e1a63442a4841f4f6c35b2e4796b4dddbc4927eac5bcaf0d"
+        ),
+    },
+    {
+        "name": "app_current_magic_link_hash",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": False,
+        "leakproof": False,
+        "strict": False,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": (
+            "sha256:6f181717e75e485bccdf2dd0f095e6fec037c29a9077aa3cea27adeef148e41b"
+        ),
+    },
+    {
+        "name": "app_current_organization_id",
+        "arguments": "",
+        "result": "uuid",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": False,
+        "leakproof": False,
+        "strict": False,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": (
+            "sha256:b5ebd110c387203c5d50397a161a0a00df05e8018d1b8258c935f7b44ff00b50"
+        ),
+    },
+    {
+        "name": "app_current_requested_email",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": False,
+        "leakproof": False,
+        "strict": False,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": (
+            "sha256:3d7a8501edae571f5cf17f8dcf095f5024a280618e06575bef0cecfd450d3047"
+        ),
+    },
+    {
+        "name": "app_current_session_hash",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": False,
+        "leakproof": False,
+        "strict": False,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": (
+            "sha256:06a50bba6e729c8448bacac15fd63785b90a68c95e107804d7ec518ebeda6f89"
+        ),
+    },
+    {
+        "name": "app_current_verified_domain",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": False,
+        "leakproof": False,
+        "strict": False,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": (
+            "sha256:6ae179542fc06b95da0cad50c958a0c77f076d477ede80b6b2e85c6b29b272b1"
+        ),
+    },
+    {
+        "name": "app_current_verified_email",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": False,
+        "leakproof": False,
+        "strict": False,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": (
+            "sha256:33f9ebf2bd828befe652852c30c33dd37bca66b4c311971265e1407866963c0c"
+        ),
+    },
+]
+EXPECTED_RUNTIME_TABLE_PRIVILEGES = [
+    {
+        "table": str(table["table"]),
+        "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"],
+    }
+    for table in EXPECTED_RLS_TABLES
+]
+EXPECTED_RUNTIME_FUNCTION_PRIVILEGES = [
+    {
+        "name": str(helper["name"]),
+        "arguments": "",
+        "privileges": ["EXECUTE"],
+    }
+    for helper in EXPECTED_RLS_HELPERS
+]
+EXPECTED_RUNTIME_ACCESS: dict[str, object] = {
+    "tables": EXPECTED_RUNTIME_TABLE_PRIVILEGES,
+    "sequences": [],
+    "functions": EXPECTED_RUNTIME_FUNCTION_PRIVILEGES,
+    "types": [],
+}
+EXPECTED_PUBLIC_EXTENSIONS: list[dict[str, object]] = [
+    {
+        "name": "btree_gist",
+        "version": "1.7",
+        "schema": "public",
+        "owner": "parkventory_owner",
+        "member_owner": "platform_admin",
+        "all_members": {
+            "count": 264,
+            "identity_sha256": (
+                "sha256:52b11efe87483725ab571138cf124124deca29c45d114472055e358b2382aa17"
+            ),
+        },
+        "routine_members": {
+            "count": 188,
+            "identity_sha256": (
+                "sha256:40dbd8d5fc3f5340d65f078738049ccdc9249a8d63fc2cbb06a470982602142e"
+            ),
+        },
+        "type_members": {
+            "count": 6,
+            "identity_sha256": (
+                "sha256:8866390c21998f6e60995a60fd3edf5fc8ebc480b76b5701628ed4dbf5e86828"
+            ),
+        },
+    },
+    {
+        "name": "plpgsql",
+        "version": "1.0",
+        "schema": "pg_catalog",
+        "owner": "platform_admin",
+        "member_owner": "platform_admin",
+        "all_members": {
+            "count": 4,
+            "identity_sha256": (
+                "sha256:9daaf0961466e69fdc380fd1c0066b4fa6b37cc60b25fae14ac54b1f26e4a9f8"
+            ),
+        },
+        "routine_members": {
+            "count": 3,
+            "identity_sha256": (
+                "sha256:2872282c187c13d718ea00e72335763abd665dc0f377e0efaa66bebc1362f885"
+            ),
+        },
+        "type_members": {
+            "count": 0,
+            "identity_sha256": (
+                "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+            ),
+        },
+    },
+]
+EXPECTED_RLS: dict[str, object] = {
+    "extensions": EXPECTED_PUBLIC_EXTENSIONS,
+    "tables": EXPECTED_RLS_TABLES,
+    "policies": EXPECTED_RLS_POLICIES,
+    "helpers": EXPECTED_RLS_HELPERS,
+    "runtime_access": EXPECTED_RUNTIME_ACCESS,
+}
+
+
+EXPECTED_CONTRACT: dict[str, object] = {
+    "schema": 1,
+    "contract": "vps-infra.parkventory-postgres.v1",
+    "postgres": {
+        "project": "vps-platform",
+        "service": "postgresql",
+        "image": (
+            "ghcr.io/nclsppr/vps-infra/postgres:"
+            "sha-e45dc731d1db291a2b14d7db46eb95d90a06750c@"
+            "sha256:f26c37a44c6d2286fe6794a2bc7d18c23907c8bdb9ffc3e0890e07be713d6095"
+        ),
+        "major": 17,
+        "version": "17.10",
+    },
+    "database": {
+        "name": "parkventory",
+        "owner": "parkventory_owner",
+        "schema": "public",
+        "encoding": "UTF8",
+    },
+    "roles": {
+        "migrator": "parkventory_migrator",
+        "runtime": "parkventory_runtime",
+    },
+    "row_level_security": EXPECTED_RLS,
+    "network": {
+        "name": "db_parkventory",
+        "subnet": "172.30.21.0/24",
+        "internal": True,
+        "published_postgres_port": False,
+        "tls": False,
+    },
+    "secrets": {
+        "migrator": (
+            "/etc/vps/secrets/parkventory/"
+            "parkventory-postgres-migrator-password"
+        ),
+        "runtime": (
+            "/etc/vps/secrets/parkventory/"
+            "parkventory-postgres-runtime-password"
+        ),
+        "uid": 0,
+        "gid": 10001,
+        "mode": "0440",
+    },
+    "readiness": {
+        "contract": "vps-infra.parkventory-postgres-readiness.v1",
+        "path": "/var/lib/vps-readiness/parkventory/postgres.json",
+    },
+}
+
+
+class ProvisionError(RuntimeError):
+    """The live database boundary differs from the reviewed contract."""
+
+
+def fail(message: str) -> int:
+    print(f"Parkventory PostgreSQL provisioning refused: {message}", file=sys.stderr)
+    return EX_CONFIG
+
+
+def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProvisionError(f"JSON contains duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def canonical_json(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+
+
+def load_contract(path: Path) -> tuple[dict[str, object], str]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ProvisionError(f"cannot read PostgreSQL contract {path}: {exc}") from exc
+    if not 1 <= len(raw) <= MAX_FILE_BYTES:
+        raise ProvisionError("PostgreSQL contract size is outside the limit")
+    try:
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda item: (_ for _ in ()).throw(
+                ProvisionError(f"JSON constant {item!r} is forbidden")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProvisionError("PostgreSQL contract is not strict UTF-8 JSON") from exc
+    if value != EXPECTED_CONTRACT:
+        raise ProvisionError("PostgreSQL contract differs from the reviewed 17.10 boundary")
+    return value, f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def command(
+    arguments: list[str],
+    *,
+    input_text: str | None = None,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    command_environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}
+    if environment is not None:
+        command_environment.update(environment)
+    try:
+        return subprocess.run(
+            arguments,
+            input=input_text,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=command_environment,
+            timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProvisionError(f"cannot execute bounded command {arguments[0]}") from exc
+
+
+def docker_json(arguments: list[str], label: str) -> Any:
+    result = command(["/usr/bin/docker", *arguments])
+    if result.returncode != 0:
+        raise ProvisionError(f"cannot inspect {label}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProvisionError(f"Docker returned invalid JSON for {label}") from exc
+
+
+def resolve_postgres(contract: dict[str, object], *, require_network: bool) -> tuple[str, str]:
+    postgres = contract["postgres"]
+    network = contract["network"]
+    assert isinstance(postgres, dict) and isinstance(network, dict)
+    result = command(
+        [
+            "/usr/bin/docker",
+            "ps",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={postgres['project']}",
+            "--filter",
+            f"label=com.docker.compose.service={postgres['service']}",
+        ]
+    )
+    containers = [line for line in result.stdout.splitlines() if line]
+    if result.returncode != 0 or len(containers) != 1:
+        raise ProvisionError("expected exactly one running shared PostgreSQL container")
+    container = containers[0]
+    inspected = docker_json(["inspect", container], "shared PostgreSQL")
+    if not isinstance(inspected, list) or len(inspected) != 1:
+        raise ProvisionError("shared PostgreSQL inspection is incomplete")
+    state = inspected[0]
+    labels = state.get("Config", {}).get("Labels", {})
+    networks = state.get("NetworkSettings", {}).get("Networks", {})
+    ports = state.get("NetworkSettings", {}).get("Ports", {})
+    image = state.get("Config", {}).get("Image")
+    parkventory_network = (
+        networks.get(network["name"], {}) if isinstance(networks, dict) else {}
+    )
+    if (
+        labels.get("com.docker.compose.project") != postgres["project"]
+        or labels.get("com.docker.compose.service") != postgres["service"]
+        or state.get("State", {}).get("Health", {}).get("Status") != "healthy"
+        or not isinstance(image, str)
+        or POSTGRES_IMAGE_RE.fullmatch(image) is None
+        or image != postgres["image"]
+        or not isinstance(ports, dict)
+        or any(
+            bindings is not None and bindings != [] for bindings in ports.values()
+        )
+        or (
+            require_network
+            and (
+                not isinstance(parkventory_network, dict)
+                or "postgresql" not in parkventory_network.get("Aliases", [])
+            )
+        )
+    ):
+        raise ProvisionError("shared PostgreSQL differs from the healthy immutable boundary")
+    network_state = docker_json(["network", "inspect", str(network["name"])], "database network")
+    if not isinstance(network_state, list) or len(network_state) != 1:
+        raise ProvisionError("database network inspection is incomplete")
+    candidate = network_state[0]
+    subnets = [item.get("Subnet") for item in candidate.get("IPAM", {}).get("Config", [])]
+    if (
+        candidate.get("Name") != network["name"]
+        or candidate.get("Driver") != "bridge"
+        or candidate.get("Internal") is not True
+        or subnets != [network["subnet"]]
+        or candidate.get("Labels", {}).get("com.nclsppr.vps-infra.managed") != "true"
+    ):
+        raise ProvisionError("db_parkventory differs from the managed private network")
+    return container, image
+
+
+def read_password(path: Path) -> tuple[str, str]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise ProvisionError(f"cannot open protected password {path.name}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 10001
+            or stat.S_IMODE(metadata.st_mode) != 0o440
+        ):
+            raise ProvisionError(f"password {path.name} has unsafe metadata")
+        content = os.read(descriptor, 130)
+        if CREDENTIAL_RE.fullmatch(content) is None:
+            raise ProvisionError(f"password {path.name} has an invalid format")
+        return content[:-1].decode("ascii"), f"sha256:{hashlib.sha256(content).hexdigest()}"
+    finally:
+        os.close(descriptor)
+
+
+def sql_literal(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]{64}", value) is None:
+        raise ProvisionError("a password left the validated character set")
+    return "'" + value + "'"
+
+
+def psql(container: str, database: str, sql: str) -> str:
+    result = command(
+        [
+            "/usr/bin/docker",
+            "exec",
+            "--interactive",
+            container,
+            "psql",
+            "--no-password",
+            "--username",
+            "platform_admin",
+            "--dbname",
+            database,
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--quiet",
+        ],
+        input_text=sql,
+    )
+    if result.returncode != 0:
+        raise ProvisionError("PostgreSQL rejected the bounded operation")
+    return result.stdout.strip()
+
+
+def credential_probe(
+    container: str,
+    role: str,
+    role_auth: str,
+) -> subprocess.CompletedProcess[str]:
+    if role not in {"parkventory_migrator", "parkventory_runtime"}:
+        raise ProvisionError("credential verification role is outside the allowlist")
+    if re.fullmatch(r"[A-Za-z0-9_-]{64}", role_auth) is None:
+        raise ProvisionError("credential verification password is invalid")
+    return command(
+        [
+            "/usr/bin/docker",
+            "exec",
+            "--env",
+            "PGPASSWORD",
+            "--env",
+            "PGCONNECT_TIMEOUT=5",
+            container,
+            "psql",
+            "--no-password",
+            "--host",
+            "postgresql",
+            "--username",
+            role,
+            "--dbname",
+            "parkventory",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--quiet",
+            "--command",
+            "SELECT concat_ws('|', session_user, current_user, current_database());",
+        ],
+        environment={"PGPASSWORD": role_auth},
+    )
+
+
+def verify_database_credentials(
+    container: str,
+    migrator_auth: str,
+    runtime_auth: str,
+) -> None:
+    expected_identities = (
+        (
+            "parkventory_migrator",
+            migrator_auth,
+            "parkventory_migrator|parkventory_owner|parkventory\n",
+        ),
+        (
+            "parkventory_runtime",
+            runtime_auth,
+            "parkventory_runtime|parkventory_runtime|parkventory\n",
+        ),
+    )
+    for role, role_auth, expected_identity in expected_identities:
+        accepted = credential_probe(container, role, role_auth)
+        if (
+            accepted.returncode != 0
+            or accepted.stdout != expected_identity
+            or accepted.stderr
+        ):
+            raise ProvisionError(
+                f"PostgreSQL rejected the protected {role} credential"
+            )
+        replacement = "A" if role_auth[0] != "A" else "B"
+        rejected = credential_probe(container, role, replacement + role_auth[1:])
+        if rejected.returncode == 0:
+            raise ProvisionError(
+                f"PostgreSQL network authentication does not enforce the {role} credential"
+            )
+
+
+def apply_database(container: str, migrator_password: str, runtime_password: str) -> None:
+    cluster_sql = f"""
+BEGIN;
+DO $provision$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'parkventory_owner') THEN
+    CREATE ROLE parkventory_owner NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'parkventory_migrator') THEN
+    CREATE ROLE parkventory_migrator LOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'parkventory_runtime') THEN
+    CREATE ROLE parkventory_runtime LOGIN;
+  END IF;
+END
+$provision$;
+ALTER ROLE parkventory_owner NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1 PASSWORD NULL;
+ALTER ROLE parkventory_migrator LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD {sql_literal(migrator_password)} VALID UNTIL 'infinity';
+ALTER ROLE parkventory_runtime LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 20 PASSWORD {sql_literal(runtime_password)} VALID UNTIL 'infinity';
+DO $memberships$
+DECLARE
+  edge record;
+BEGIN
+  FOR edge IN
+    SELECT parent.rolname AS parent_name, member.rolname AS member_name
+    FROM pg_auth_members membership
+    JOIN pg_roles parent ON parent.oid = membership.roleid
+    JOIN pg_roles member ON member.oid = membership.member
+    WHERE (
+      parent.rolname IN ('parkventory_owner', 'parkventory_migrator', 'parkventory_runtime')
+      OR member.rolname IN ('parkventory_owner', 'parkventory_migrator', 'parkventory_runtime')
+    )
+      AND NOT (
+        parent.rolname = 'parkventory_owner'
+        AND member.rolname = 'parkventory_migrator'
+      )
+  LOOP
+    EXECUTE format('REVOKE %I FROM %I', edge.parent_name, edge.member_name);
+  END LOOP;
+END
+$memberships$;
+GRANT parkventory_owner TO parkventory_migrator
+  WITH ADMIN FALSE, INHERIT FALSE, SET TRUE;
+COMMIT;
+SELECT 'CREATE DATABASE parkventory OWNER parkventory_owner TEMPLATE template0 ENCODING ''UTF8'''
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'parkventory')\\gexec
+REVOKE ALL PRIVILEGES ON DATABASE parkventory FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON DATABASE parkventory FROM parkventory_migrator, parkventory_runtime;
+DO $database_acl$
+DECLARE
+  unexpected_role text;
+BEGIN
+  FOR unexpected_role IN
+    SELECT DISTINCT role.rolname
+    FROM pg_database database
+    CROSS JOIN LATERAL aclexplode(database.datacl) acl
+    JOIN pg_roles role ON role.oid = acl.grantee
+    WHERE database.datname = 'parkventory'
+      AND role.rolname NOT IN (
+        'parkventory_owner', 'parkventory_migrator', 'parkventory_runtime'
+      )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON DATABASE parkventory FROM %I',
+      unexpected_role
+    );
+  END LOOP;
+END
+$database_acl$;
+GRANT CONNECT ON DATABASE parkventory TO parkventory_migrator, parkventory_runtime;
+ALTER DATABASE parkventory OWNER TO parkventory_owner;
+ALTER ROLE parkventory_owner RESET ALL;
+ALTER ROLE parkventory_migrator RESET ALL;
+ALTER ROLE parkventory_runtime RESET ALL;
+ALTER DATABASE parkventory RESET ALL;
+ALTER ROLE parkventory_owner IN DATABASE parkventory RESET ALL;
+ALTER ROLE parkventory_migrator IN DATABASE parkventory RESET ALL;
+ALTER ROLE parkventory_runtime IN DATABASE parkventory RESET ALL;
+ALTER ROLE parkventory_migrator IN DATABASE parkventory SET ROLE TO parkventory_owner;
+ALTER ROLE parkventory_migrator IN DATABASE parkventory SET search_path TO public;
+ALTER ROLE parkventory_runtime IN DATABASE parkventory SET search_path TO public;
+"""
+    psql(container, "postgres", cluster_sql)
+    database_sql = """
+BEGIN;
+ALTER SCHEMA public OWNER TO parkventory_owner;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM parkventory_migrator, parkventory_runtime;
+DO $object_acl$
+DECLARE
+  candidate record;
+  column_acl record;
+  role_name text;
+BEGIN
+  FOR role_name IN
+    SELECT rolname
+    FROM pg_roles
+    WHERE rolname NOT IN ('parkventory_owner', 'parkventory_runtime')
+  LOOP
+    EXECUTE format('REVOKE ALL ON SCHEMA public FROM %I', role_name);
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM %I',
+      role_name
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM %I',
+      role_name
+    );
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM %I',
+      role_name
+    );
+  END LOOP;
+  FOR candidate IN
+    SELECT namespace.nspname, type.typname
+    FROM pg_type type
+    JOIN pg_namespace namespace ON namespace.oid = type.typnamespace
+    LEFT JOIN pg_depend extension_dependency
+      ON extension_dependency.classid = 'pg_type'::regclass
+     AND extension_dependency.objid = type.oid
+     AND extension_dependency.objsubid = 0
+     AND extension_dependency.refclassid = 'pg_extension'::regclass
+     AND extension_dependency.deptype = 'e'
+    WHERE namespace.nspname = 'public'
+      AND type.typisdefined
+      AND type.typelem = 0
+      AND (
+        type.typtype <> 'c'
+        OR EXISTS (
+          SELECT 1 FROM pg_class composite
+          WHERE composite.oid = type.typrelid AND composite.relkind = 'c'
+        )
+      )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM PUBLIC',
+      candidate.nspname,
+      candidate.typname
+    );
+    FOR role_name IN
+      SELECT rolname
+      FROM pg_roles
+      WHERE rolname NOT IN ('parkventory_owner', 'parkventory_runtime')
+    LOOP
+      EXECUTE format(
+        'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM %I',
+        candidate.nspname,
+        candidate.typname,
+        role_name
+      );
+    END LOOP;
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM parkventory_runtime',
+      candidate.nspname,
+      candidate.typname
+    );
+  END LOOP;
+  FOR column_acl IN
+    SELECT DISTINCT
+      namespace.nspname,
+      relation.relname,
+      attribute.attname,
+      acl.grantee,
+      grantee.rolname AS grantee_name
+    FROM pg_attribute attribute
+    JOIN pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    CROSS JOIN LATERAL aclexplode(attribute.attacl) acl
+    LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
+    WHERE namespace.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+  LOOP
+    IF column_acl.grantee = 0 THEN
+      EXECUTE format(
+        'REVOKE ALL PRIVILEGES (%I) ON TABLE %I.%I FROM PUBLIC',
+        column_acl.attname,
+        column_acl.nspname,
+        column_acl.relname
+      );
+    ELSE
+      EXECUTE format(
+        'REVOKE ALL PRIVILEGES (%I) ON TABLE %I.%I FROM %I',
+        column_acl.attname,
+        column_acl.nspname,
+        column_acl.relname,
+        column_acl.grantee_name
+      );
+    END IF;
+  END LOOP;
+END
+$object_acl$;
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM PUBLIC, parkventory_runtime;
+REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC, parkventory_runtime;
+REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, parkventory_runtime;
+GRANT USAGE ON SCHEMA public TO parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner REVOKE ALL ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner REVOKE ALL ON SEQUENCES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner REVOKE ALL ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner REVOKE ALL ON TYPES FROM PUBLIC;
+DO $global_default_acl$
+DECLARE
+  role_name text;
+BEGIN
+  FOR role_name IN
+    SELECT rolname
+    FROM pg_roles
+    WHERE rolname != 'parkventory_owner'
+  LOOP
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner REVOKE ALL ON TABLES FROM %I',
+      role_name
+    );
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner REVOKE ALL ON SEQUENCES FROM %I',
+      role_name
+    );
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner REVOKE ALL ON FUNCTIONS FROM %I',
+      role_name
+    );
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner REVOKE ALL ON TYPES FROM %I',
+      role_name
+    );
+  END LOOP;
+END
+$global_default_acl$;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TABLES FROM parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON SEQUENCES FROM parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TYPES FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TYPES FROM parkventory_runtime;
+DO $default_acl$
+DECLARE
+  role_name text;
+BEGIN
+  FOR role_name IN
+    SELECT rolname
+    FROM pg_roles
+    WHERE rolname NOT IN ('parkventory_owner', 'parkventory_runtime')
+  LOOP
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TABLES FROM %I',
+      role_name
+    );
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON SEQUENCES FROM %I',
+      role_name
+    );
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM %I',
+      role_name
+    );
+    EXECUTE format(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public REVOKE ALL ON TYPES FROM %I',
+      role_name
+    );
+  END LOOP;
+END
+$default_acl$;
+COMMIT;
+"""
+    psql(container, "parkventory", database_sql)
+
+
+def proof_sql() -> str:
+    privilege_array = """
+      SELECT COALESCE(json_agg(privilege_type ORDER BY privilege_type), '[]'::json)
+      FROM pg_default_acl d
+      CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+      WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = 'parkventory_owner')
+        AND d.defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+        AND d.defaclobjtype = {object_type}
+        AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = 'parkventory_runtime')
+    """
+    fields = (
+            "'server_version_num', current_setting('server_version_num')::integer",
+            "'owner_can_login', (SELECT rolcanlogin FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_inherits', (SELECT rolinherit FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_is_superuser', (SELECT rolsuper FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_can_create_database', (SELECT rolcreatedb FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_can_create_role', (SELECT rolcreaterole FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_can_replicate', (SELECT rolreplication FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_bypasses_rls', (SELECT rolbypassrls FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_connection_limit', (SELECT rolconnlimit FROM pg_roles WHERE rolname='parkventory_owner')",
+            "'owner_memberships', (SELECT COALESCE(json_agg(json_build_object('role',parent.rolname,'admin_option',membership.admin_option,'inherit_option',membership.inherit_option,'set_option',membership.set_option) ORDER BY parent.rolname),'[]'::json) FROM pg_auth_members membership JOIN pg_roles member ON membership.member=member.oid JOIN pg_roles parent ON membership.roleid=parent.oid WHERE member.rolname='parkventory_owner')",
+            "'owner_members', (SELECT COALESCE(json_agg(json_build_object('member',member.rolname,'admin_option',membership.admin_option,'inherit_option',membership.inherit_option,'set_option',membership.set_option) ORDER BY member.rolname),'[]'::json) FROM pg_auth_members membership JOIN pg_roles member ON membership.member=member.oid JOIN pg_roles parent ON membership.roleid=parent.oid WHERE parent.rolname='parkventory_owner')",
+            "'migrator_can_login', (SELECT rolcanlogin FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_inherits', (SELECT rolinherit FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_is_superuser', (SELECT rolsuper FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_can_create_database', (SELECT rolcreatedb FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_can_create_role', (SELECT rolcreaterole FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_can_replicate', (SELECT rolreplication FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_bypasses_rls', (SELECT rolbypassrls FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_connection_limit', (SELECT rolconnlimit FROM pg_roles WHERE rolname='parkventory_migrator')",
+            "'migrator_memberships', (SELECT COALESCE(json_agg(json_build_object('role',parent.rolname,'admin_option',membership.admin_option,'inherit_option',membership.inherit_option,'set_option',membership.set_option) ORDER BY parent.rolname),'[]'::json) FROM pg_auth_members membership JOIN pg_roles member ON membership.member=member.oid JOIN pg_roles parent ON membership.roleid=parent.oid WHERE member.rolname='parkventory_migrator')",
+            "'migrator_members', (SELECT COALESCE(json_agg(json_build_object('member',member.rolname,'admin_option',membership.admin_option,'inherit_option',membership.inherit_option,'set_option',membership.set_option) ORDER BY member.rolname),'[]'::json) FROM pg_auth_members membership JOIN pg_roles member ON membership.member=member.oid JOIN pg_roles parent ON membership.roleid=parent.oid WHERE parent.rolname='parkventory_migrator')",
+            "'runtime_can_login', (SELECT rolcanlogin FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_inherits', (SELECT rolinherit FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_is_superuser', (SELECT rolsuper FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_can_create_database', (SELECT rolcreatedb FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_can_create_role', (SELECT rolcreaterole FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_can_replicate', (SELECT rolreplication FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_bypasses_rls', (SELECT rolbypassrls FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_connection_limit', (SELECT rolconnlimit FROM pg_roles WHERE rolname='parkventory_runtime')",
+            "'runtime_memberships', (SELECT COALESCE(json_agg(json_build_object('role',parent.rolname,'admin_option',membership.admin_option,'inherit_option',membership.inherit_option,'set_option',membership.set_option) ORDER BY parent.rolname),'[]'::json) FROM pg_auth_members membership JOIN pg_roles member ON membership.member=member.oid JOIN pg_roles parent ON membership.roleid=parent.oid WHERE member.rolname='parkventory_runtime')",
+            "'runtime_members', (SELECT COALESCE(json_agg(json_build_object('member',member.rolname,'admin_option',membership.admin_option,'inherit_option',membership.inherit_option,'set_option',membership.set_option) ORDER BY member.rolname),'[]'::json) FROM pg_auth_members membership JOIN pg_roles member ON membership.member=member.oid JOIN pg_roles parent ON membership.roleid=parent.oid WHERE parent.rolname='parkventory_runtime')",
+            "'database_owner', (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='parkventory')",
+            "'database_encoding', (SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='parkventory')",
+            "'public_can_connect', EXISTS (SELECT 1 FROM pg_database d CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) a WHERE d.datname='parkventory' AND a.grantee=0 AND a.privilege_type='CONNECT')",
+            "'public_can_temp', EXISTS (SELECT 1 FROM pg_database d CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) a WHERE d.datname='parkventory' AND a.grantee=0 AND a.privilege_type='TEMPORARY')",
+            "'public_can_create_database_objects', EXISTS (SELECT 1 FROM pg_database d CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) a WHERE d.datname='parkventory' AND a.grantee=0 AND a.privilege_type='CREATE')",
+            "'migrator_can_connect', has_database_privilege('parkventory_migrator','parkventory','CONNECT')",
+            "'migrator_can_create_database_objects', has_database_privilege('parkventory_migrator','parkventory','CREATE')",
+            "'migrator_can_temp', has_database_privilege('parkventory_migrator','parkventory','TEMPORARY')",
+            "'runtime_can_connect', has_database_privilege('parkventory_runtime','parkventory','CONNECT')",
+            "'runtime_can_create_database_objects', has_database_privilege('parkventory_runtime','parkventory','CREATE')",
+            "'runtime_can_temp', has_database_privilege('parkventory_runtime','parkventory','TEMPORARY')",
+            "'unexpected_database_grantee', EXISTS (SELECT 1 FROM pg_database d CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) a WHERE d.datname='parkventory' AND a.grantee NOT IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')))",
+            "'schema_owner', (SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='public')",
+            "'public_can_use_schema', EXISTS (SELECT 1 FROM pg_namespace n CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname='public' AND a.grantee=0 AND a.privilege_type='USAGE')",
+            "'public_can_create_schema', EXISTS (SELECT 1 FROM pg_namespace n CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname='public' AND a.grantee=0 AND a.privilege_type='CREATE')",
+            "'runtime_can_use_schema', has_schema_privilege('parkventory_runtime','public','USAGE')",
+            "'runtime_can_create_schema', has_schema_privilege('parkventory_runtime','public','CREATE')",
+            "'unexpected_schema_grantee', EXISTS (SELECT 1 FROM pg_namespace n CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname='public' AND a.grantee NOT IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')))",
+            "'unexpected_application_schema', EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname<>'public' AND n.nspname<>'information_schema' AND left(n.nspname,3)<>'pg_')",
+            "'migrator_is_owner_member', pg_has_role('parkventory_migrator','parkventory_owner','MEMBER')",
+            "'runtime_has_owner_membership', pg_has_role('parkventory_runtime','parkventory_owner','MEMBER')",
+            "'migrator_settings', (SELECT COALESCE(array_agg(setting ORDER BY setting),'{}'::text[]) = ARRAY['role=parkventory_owner','search_path=public']::text[] FROM pg_db_role_setting s CROSS JOIN LATERAL unnest(s.setconfig) setting WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory'))",
+            "'runtime_settings', (SELECT COALESCE(array_agg(setting ORDER BY setting),'{}'::text[]) = ARRAY['search_path=public']::text[] FROM pg_db_role_setting s CROSS JOIN LATERAL unnest(s.setconfig) setting WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory'))",
+            (
+                "'unexpected_role_settings', EXISTS ("
+                "SELECT 1 FROM pg_db_role_setting s WHERE "
+                "(s.setrole=0 AND s.setdatabase IN "
+                "(0,(SELECT oid FROM pg_database WHERE datname='parkventory'))) OR "
+                "(s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') "
+                "AND s.setdatabase IN "
+                "(0,(SELECT oid FROM pg_database WHERE datname='parkventory'))) OR "
+                "(s.setrole IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator'),"
+                "(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')) "
+                "AND s.setdatabase=0)"
+                ")"
+            ),
+            "'default_table_privileges', (" + privilege_array.format(object_type="'r'") + ")",
+            "'default_sequence_privileges', (" + privilege_array.format(object_type="'S'") + ")",
+            "'default_function_privileges', (" + privilege_array.format(object_type="'f'") + ")",
+            "'default_type_privileges', (" + privilege_array.format(object_type="'T'") + ")",
+            "'unexpected_default_grantee', EXISTS (SELECT 1 FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE d.defaclrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') AND d.defaclnamespace=(SELECT oid FROM pg_namespace WHERE nspname='public') AND a.grantee NOT IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')))",
+            "'global_default_public_grantee', EXISTS (SELECT 1 FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE d.defaclrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') AND d.defaclnamespace=0 AND a.grantee=0)",
+            "'global_default_runtime_grantee', EXISTS (SELECT 1 FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE d.defaclrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') AND d.defaclnamespace=0 AND a.grantee=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime'))",
+            "'unexpected_global_default_grantee', EXISTS (SELECT 1 FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE d.defaclrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') AND d.defaclnamespace=0 AND a.grantee<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'))",
+            "'unexpected_default_scope', EXISTS (SELECT 1 FROM pg_default_acl d WHERE d.defaclrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') AND d.defaclnamespace NOT IN (0,(SELECT oid FROM pg_namespace WHERE nspname='public')))",
+            "'all_relations_owned', NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') AND c.relowner<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'))",
+            "'unexpected_relation_grantee', EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault(CASE WHEN c.relkind='S' THEN 'S'::\"char\" ELSE 'r'::\"char\" END,c.relowner))) a WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') AND a.grantee NOT IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')))",
+            "'column_acl_present', EXISTS (SELECT 1 FROM pg_attribute attribute JOIN pg_class relation ON relation.oid=attribute.attrelid JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace CROSS JOIN LATERAL aclexplode(attribute.attacl) acl WHERE namespace.nspname='public' AND relation.relkind IN ('r','p','v','m','f') AND attribute.attnum>0 AND NOT attribute.attisdropped)",
+            "'runtime_relation_privileges_bounded', NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f') AND c.relname NOT IN ('admin_claim','app_session','audit_event','availability_offer','idempotency_record','invitation','magic_link_request','membership','organization','organization_domain','outbox_dispatch','outbox_event','parking_site','parking_spot','reservation','spot_assignment','user_account','user_email') AND (has_table_privilege('parkventory_runtime',c.oid,'SELECT') OR has_table_privilege('parkventory_runtime',c.oid,'INSERT') OR has_table_privilege('parkventory_runtime',c.oid,'UPDATE') OR has_table_privilege('parkventory_runtime',c.oid,'DELETE') OR has_table_privilege('parkventory_runtime',c.oid,'TRUNCATE') OR has_table_privilege('parkventory_runtime',c.oid,'REFERENCES') OR has_table_privilege('parkventory_runtime',c.oid,'TRIGGER') OR has_table_privilege('parkventory_runtime',c.oid,'MAINTAIN')))",
+            "'runtime_sequence_privileges_bounded', NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='S' AND (has_sequence_privilege('parkventory_runtime',c.oid,'USAGE') OR has_sequence_privilege('parkventory_runtime',c.oid,'SELECT') OR has_sequence_privilege('parkventory_runtime',c.oid,'UPDATE')))",
+            "'routine_ownership_bounded', NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace LEFT JOIN pg_depend extension_dependency ON extension_dependency.classid='pg_proc'::regclass AND extension_dependency.objid=p.oid AND extension_dependency.objsubid=0 AND extension_dependency.refclassid='pg_extension'::regclass AND extension_dependency.deptype='e' LEFT JOIN pg_extension extension ON extension.oid=extension_dependency.refobjid LEFT JOIN pg_namespace extension_namespace ON extension_namespace.oid=extension.extnamespace WHERE n.nspname='public' AND ((extension.oid IS NULL AND p.proowner<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner')) OR (extension.oid IS NOT NULL AND (extension.extname<>'btree_gist' OR extension.extversion<>'1.7' OR extension_namespace.nspname<>'public' OR extension.extowner<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') OR p.proowner<>(SELECT oid FROM pg_roles WHERE rolname='platform_admin')))))",
+            "'unexpected_routine_grantee', EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace LEFT JOIN pg_depend extension_dependency ON extension_dependency.classid='pg_proc'::regclass AND extension_dependency.objid=p.oid AND extension_dependency.objsubid=0 AND extension_dependency.refclassid='pg_extension'::regclass AND extension_dependency.deptype='e' CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) a WHERE n.nspname='public' AND NOT (a.grantee=p.proowner OR (extension_dependency.objid IS NULL AND p.proowner=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') AND p.proname IN ('app_current_identity_user_id','app_current_magic_link_hash','app_current_organization_id','app_current_requested_email','app_current_session_hash','app_current_verified_domain','app_current_verified_email') AND pg_get_function_identity_arguments(p.oid)='' AND a.grantee=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime'))))",
+            "'runtime_routine_privileges_bounded', NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND NOT (p.proname IN ('app_current_identity_user_id','app_current_magic_link_hash','app_current_organization_id','app_current_requested_email','app_current_session_hash','app_current_verified_domain','app_current_verified_email') AND pg_get_function_identity_arguments(p.oid)='') AND has_function_privilege('parkventory_runtime',p.oid,'EXECUTE'))",
+            "'type_ownership_bounded', NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace LEFT JOIN pg_depend extension_dependency ON extension_dependency.classid='pg_type'::regclass AND extension_dependency.objid=t.oid AND extension_dependency.objsubid=0 AND extension_dependency.refclassid='pg_extension'::regclass AND extension_dependency.deptype='e' LEFT JOIN pg_extension extension ON extension.oid=extension_dependency.refobjid LEFT JOIN pg_namespace extension_namespace ON extension_namespace.oid=extension.extnamespace WHERE n.nspname='public' AND t.typisdefined AND t.typelem=0 AND (t.typtype<>'c' OR EXISTS (SELECT 1 FROM pg_class composite WHERE composite.oid=t.typrelid AND composite.relkind='c')) AND ((extension.oid IS NULL AND t.typowner<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner')) OR (extension.oid IS NOT NULL AND (extension.extname<>'btree_gist' OR extension.extversion<>'1.7' OR extension_namespace.nspname<>'public' OR extension.extowner<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') OR t.typowner<>(SELECT oid FROM pg_roles WHERE rolname='platform_admin')))))",
+            "'unexpected_type_grantee', EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace LEFT JOIN pg_depend extension_dependency ON extension_dependency.classid='pg_type'::regclass AND extension_dependency.objid=t.oid AND extension_dependency.objsubid=0 AND extension_dependency.refclassid='pg_extension'::regclass AND extension_dependency.deptype='e' CROSS JOIN LATERAL aclexplode(COALESCE(t.typacl,acldefault('T',t.typowner))) a WHERE n.nspname='public' AND t.typisdefined AND t.typelem=0 AND (t.typtype<>'c' OR EXISTS (SELECT 1 FROM pg_class composite WHERE composite.oid=t.typrelid AND composite.relkind='c')) AND a.grantee<>t.typowner)",
+            "'runtime_type_privileges_bounded', NOT EXISTS (SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public' AND t.typisdefined AND t.typelem=0 AND (t.typtype<>'c' OR EXISTS (SELECT 1 FROM pg_class composite WHERE composite.oid=t.typrelid AND composite.relkind='c')) AND has_type_privilege('parkventory_runtime',t.oid,'USAGE'))"
+    )
+    chunks = (
+        fields[index : index + 40]
+        for index in range(0, len(fields), 40)
+    )
+    return "SELECT (" + " || ".join(
+        "jsonb_build_object(" + ",".join(chunk) + ")" for chunk in chunks
+    ) + ")::json;"
+
+
+def rls_proof_sql() -> str:
+    return """
+SELECT jsonb_build_object(
+  'extensions', COALESCE((
+    SELECT jsonb_agg(
+      jsonb_build_object(
+        'name', extension.extname,
+        'version', extension.extversion,
+        'schema', namespace.nspname,
+        'owner', pg_get_userbyid(extension.extowner),
+        'member_owner', (
+          SELECT CASE
+            WHEN count(DISTINCT member.owner_name) = 1
+              THEN min(member.owner_name)
+            ELSE NULL
+          END
+          FROM (
+            SELECT pg_get_userbyid(routine.proowner) AS owner_name
+            FROM pg_proc routine
+            JOIN pg_depend dependency
+              ON dependency.classid = 'pg_proc'::regclass
+             AND dependency.objid = routine.oid
+             AND dependency.objsubid = 0
+             AND dependency.refclassid = 'pg_extension'::regclass
+             AND dependency.refobjid = extension.oid
+             AND dependency.deptype = 'e'
+            UNION ALL
+            SELECT pg_get_userbyid(type.typowner) AS owner_name
+            FROM pg_type type
+            JOIN pg_depend dependency
+              ON dependency.classid = 'pg_type'::regclass
+             AND dependency.objid = type.oid
+             AND dependency.objsubid = 0
+             AND dependency.refclassid = 'pg_extension'::regclass
+             AND dependency.refobjid = extension.oid
+             AND dependency.deptype = 'e'
+            WHERE type.typisdefined
+              AND type.typelem = 0
+          ) member
+        ),
+        'all_members', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'catalog', dependency.classid::regclass::text,
+              'type', identity.type,
+              'schema', identity.schema,
+              'name', identity.name,
+              'identity', identity.identity,
+              'subobject', dependency.objsubid
+            )
+            ORDER BY dependency.classid::regclass::text,
+              identity.type,
+              identity.schema,
+              identity.name,
+              identity.identity,
+              dependency.objsubid
+          )
+          FROM pg_depend dependency
+          CROSS JOIN LATERAL pg_identify_object(
+            dependency.classid,
+            dependency.objid,
+            dependency.objsubid
+          ) identity
+          WHERE dependency.refclassid = 'pg_extension'::regclass
+            AND dependency.refobjid = extension.oid
+            AND dependency.deptype = 'e'
+        ), '[]'::jsonb),
+        'routine_members', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'name', routine.proname,
+              'schema', routine_namespace.nspname,
+              'arguments', pg_get_function_identity_arguments(routine.oid),
+              'kind', routine.prokind,
+              'owner', pg_get_userbyid(routine.proowner)
+            )
+            ORDER BY routine.proname,
+              pg_get_function_identity_arguments(routine.oid),
+              routine.prokind
+          )
+          FROM pg_proc routine
+          JOIN pg_namespace routine_namespace
+            ON routine_namespace.oid = routine.pronamespace
+          JOIN pg_depend dependency
+            ON dependency.classid = 'pg_proc'::regclass
+           AND dependency.objid = routine.oid
+           AND dependency.objsubid = 0
+           AND dependency.refclassid = 'pg_extension'::regclass
+           AND dependency.refobjid = extension.oid
+           AND dependency.deptype = 'e'
+        ), '[]'::jsonb),
+        'type_members', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'name', type.typname,
+              'schema', type_namespace.nspname,
+              'kind', type.typtype,
+              'category', type.typcategory,
+              'owner', pg_get_userbyid(type.typowner)
+            )
+            ORDER BY type.typname
+          )
+          FROM pg_type type
+          JOIN pg_namespace type_namespace
+            ON type_namespace.oid = type.typnamespace
+          JOIN pg_depend dependency
+            ON dependency.classid = 'pg_type'::regclass
+           AND dependency.objid = type.oid
+           AND dependency.objsubid = 0
+           AND dependency.refclassid = 'pg_extension'::regclass
+           AND dependency.refobjid = extension.oid
+           AND dependency.deptype = 'e'
+          WHERE type.typisdefined
+            AND type.typelem = 0
+        ), '[]'::jsonb)
+      )
+      ORDER BY extension.extname
+    )
+    FROM pg_extension extension
+    JOIN pg_namespace namespace ON namespace.oid = extension.extnamespace
+  ), '[]'::jsonb),
+  'tables', COALESCE((
+    SELECT jsonb_agg(
+      jsonb_build_object(
+        'table', relation.relname,
+        'enabled', relation.relrowsecurity,
+        'forced', relation.relforcerowsecurity
+      )
+      ORDER BY relation.relname
+    )
+    FROM pg_class relation
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'public'
+      AND relation.relkind IN ('r', 'p')
+      AND relation.relname <> 'flyway_schema_history'
+  ), '[]'::jsonb),
+  'policies', COALESCE((
+    SELECT jsonb_agg(
+      jsonb_build_object(
+        'table', relation.relname,
+        'name', policy.polname,
+        'command', CASE policy.polcmd
+          WHEN '*' THEN 'ALL'
+          WHEN 'r' THEN 'SELECT'
+          WHEN 'a' THEN 'INSERT'
+          WHEN 'w' THEN 'UPDATE'
+          WHEN 'd' THEN 'DELETE'
+        END,
+        'permissive', policy.polpermissive,
+        'roles', (
+          SELECT jsonb_agg(role_name ORDER BY role_name)
+          FROM (
+            SELECT CASE
+              WHEN role_oid = 0 THEN 'PUBLIC'
+              ELSE pg_get_userbyid(role_oid)
+            END AS role_name
+            FROM unnest(policy.polroles) role_oid
+          ) policy_roles
+        ),
+        'using', pg_get_expr(policy.polqual, policy.polrelid),
+        'with_check', pg_get_expr(policy.polwithcheck, policy.polrelid)
+      )
+      ORDER BY relation.relname, policy.polname
+    )
+    FROM pg_policy policy
+    JOIN pg_class relation ON relation.oid = policy.polrelid
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'public'
+  ), '[]'::jsonb),
+  'helpers', COALESCE((
+    SELECT jsonb_agg(
+      jsonb_build_object(
+        'name', routine.proname,
+        'arguments', pg_get_function_identity_arguments(routine.oid),
+        'result', pg_get_function_result(routine.oid),
+        'language', language.lanname,
+        'volatility', CASE routine.provolatile
+          WHEN 'i' THEN 'IMMUTABLE'
+          WHEN 's' THEN 'STABLE'
+          WHEN 'v' THEN 'VOLATILE'
+        END,
+        'parallel', CASE routine.proparallel
+          WHEN 's' THEN 'SAFE'
+          WHEN 'r' THEN 'RESTRICTED'
+          WHEN 'u' THEN 'UNSAFE'
+        END,
+        'security_definer', routine.prosecdef,
+        'leakproof', routine.proleakproof,
+        'strict', routine.proisstrict,
+        'configuration', COALESCE(to_jsonb(routine.proconfig), '[]'::jsonb),
+        'definition', pg_get_functiondef(routine.oid)
+      )
+      ORDER BY routine.proname
+    )
+    FROM pg_proc routine
+    JOIN pg_namespace namespace ON namespace.oid = routine.pronamespace
+    JOIN pg_language language ON language.oid = routine.prolang
+    WHERE namespace.nspname = 'public'
+      AND routine.proname LIKE 'app_current_%'
+  ), '[]'::jsonb),
+  'runtime_access', jsonb_build_object(
+    'tables', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'table', access.relname,
+          'privileges', access.privileges
+        )
+        ORDER BY access.relname
+      )
+      FROM (
+        SELECT relation.relname, (
+          SELECT jsonb_agg(candidate.privilege ORDER BY candidate.privilege)
+          FROM (VALUES
+            ('DELETE'), ('DELETE WITH GRANT OPTION'),
+            ('INSERT'), ('INSERT WITH GRANT OPTION'),
+            ('MAINTAIN'), ('MAINTAIN WITH GRANT OPTION'),
+            ('REFERENCES'), ('REFERENCES WITH GRANT OPTION'),
+            ('SELECT'), ('SELECT WITH GRANT OPTION'),
+            ('TRIGGER'), ('TRIGGER WITH GRANT OPTION'),
+            ('TRUNCATE'), ('TRUNCATE WITH GRANT OPTION'),
+            ('UPDATE'), ('UPDATE WITH GRANT OPTION')
+          ) candidate(privilege)
+          WHERE has_table_privilege(
+            'parkventory_runtime', relation.oid, candidate.privilege
+          )
+        ) AS privileges
+        FROM pg_class relation
+        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'public'
+          AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      ) access
+      WHERE access.privileges IS NOT NULL
+    ), '[]'::jsonb),
+    'sequences', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'sequence', access.relname,
+          'privileges', access.privileges
+        )
+        ORDER BY access.relname
+      )
+      FROM (
+        SELECT relation.relname, (
+          SELECT jsonb_agg(candidate.privilege ORDER BY candidate.privilege)
+          FROM (VALUES
+            ('SELECT'), ('SELECT WITH GRANT OPTION'),
+            ('UPDATE'), ('UPDATE WITH GRANT OPTION'),
+            ('USAGE'), ('USAGE WITH GRANT OPTION')
+          ) candidate(privilege)
+          WHERE has_sequence_privilege(
+            'parkventory_runtime', relation.oid, candidate.privilege
+          )
+        ) AS privileges
+        FROM pg_class relation
+        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'public'
+          AND relation.relkind = 'S'
+      ) access
+      WHERE access.privileges IS NOT NULL
+    ), '[]'::jsonb),
+    'functions', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'name', access.proname,
+          'arguments', access.arguments,
+          'privileges', access.privileges
+        )
+        ORDER BY access.proname, access.arguments
+      )
+      FROM (
+        SELECT
+          routine.proname,
+          pg_get_function_identity_arguments(routine.oid) AS arguments,
+          (
+            SELECT jsonb_agg(candidate.privilege ORDER BY candidate.privilege)
+            FROM (VALUES
+              ('EXECUTE'), ('EXECUTE WITH GRANT OPTION')
+            ) candidate(privilege)
+            WHERE has_function_privilege(
+              'parkventory_runtime', routine.oid, candidate.privilege
+            )
+          ) AS privileges
+        FROM pg_proc routine
+        JOIN pg_namespace namespace ON namespace.oid = routine.pronamespace
+        WHERE namespace.nspname = 'public'
+      ) access
+      WHERE access.privileges IS NOT NULL
+    ), '[]'::jsonb),
+    'types', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'type', access.typname,
+          'privileges', access.privileges
+        )
+        ORDER BY access.typname
+      )
+      FROM (
+        SELECT type.typname, (
+          SELECT jsonb_agg(candidate.privilege ORDER BY candidate.privilege)
+          FROM (VALUES
+            ('USAGE'), ('USAGE WITH GRANT OPTION')
+          ) candidate(privilege)
+          WHERE has_type_privilege(
+            'parkventory_runtime', type.oid, candidate.privilege
+          )
+        ) AS privileges
+        FROM pg_type type
+        JOIN pg_namespace namespace ON namespace.oid = type.typnamespace
+        LEFT JOIN pg_depend extension_dependency
+          ON extension_dependency.classid = 'pg_type'::regclass
+         AND extension_dependency.objid = type.oid
+         AND extension_dependency.objsubid = 0
+         AND extension_dependency.refclassid = 'pg_extension'::regclass
+         AND extension_dependency.deptype = 'e'
+        WHERE namespace.nspname = 'public'
+          AND type.typisdefined
+          AND type.typelem = 0
+          AND (
+            type.typtype <> 'c'
+            OR EXISTS (
+              SELECT 1 FROM pg_class composite
+              WHERE composite.oid = type.typrelid
+                AND composite.relkind = 'c'
+            )
+          )
+      ) access
+      WHERE access.privileges IS NOT NULL
+    ), '[]'::jsonb)
+  )
+)::json;
+"""
+
+
+EXPECTED_PROOF = {
+    "server_version_num": 170010,
+    "owner_can_login": False,
+    "owner_inherits": False,
+    "owner_is_superuser": False,
+    "owner_can_create_database": False,
+    "owner_can_create_role": False,
+    "owner_can_replicate": False,
+    "owner_bypasses_rls": False,
+    "owner_connection_limit": -1,
+    "owner_memberships": [],
+    "owner_members": [
+        {
+            "member": "parkventory_migrator",
+            "admin_option": False,
+            "inherit_option": False,
+            "set_option": True,
+        }
+    ],
+    "migrator_can_login": True,
+    "migrator_inherits": False,
+    "migrator_is_superuser": False,
+    "migrator_can_create_database": False,
+    "migrator_can_create_role": False,
+    "migrator_can_replicate": False,
+    "migrator_bypasses_rls": False,
+    "migrator_connection_limit": 4,
+    "migrator_memberships": [
+        {
+            "role": "parkventory_owner",
+            "admin_option": False,
+            "inherit_option": False,
+            "set_option": True,
+        }
+    ],
+    "migrator_members": [],
+    "runtime_can_login": True,
+    "runtime_inherits": False,
+    "runtime_is_superuser": False,
+    "runtime_can_create_database": False,
+    "runtime_can_create_role": False,
+    "runtime_can_replicate": False,
+    "runtime_bypasses_rls": False,
+    "runtime_connection_limit": 20,
+    "runtime_memberships": [],
+    "runtime_members": [],
+    "database_owner": "parkventory_owner",
+    "database_encoding": "UTF8",
+    "public_can_connect": False,
+    "public_can_temp": False,
+    "public_can_create_database_objects": False,
+    "migrator_can_connect": True,
+    "migrator_can_create_database_objects": False,
+    "migrator_can_temp": False,
+    "runtime_can_connect": True,
+    "runtime_can_create_database_objects": False,
+    "runtime_can_temp": False,
+    "unexpected_database_grantee": False,
+    "schema_owner": "parkventory_owner",
+    "public_can_use_schema": False,
+    "public_can_create_schema": False,
+    "runtime_can_use_schema": True,
+    "runtime_can_create_schema": False,
+    "unexpected_schema_grantee": False,
+    "unexpected_application_schema": False,
+    "migrator_is_owner_member": True,
+    "runtime_has_owner_membership": False,
+    "migrator_settings": True,
+    "runtime_settings": True,
+    "unexpected_role_settings": False,
+    "default_table_privileges": [],
+    "default_sequence_privileges": [],
+    "default_function_privileges": [],
+    "default_type_privileges": [],
+    "unexpected_default_grantee": False,
+    "global_default_public_grantee": False,
+    "global_default_runtime_grantee": False,
+    "unexpected_global_default_grantee": False,
+    "unexpected_default_scope": False,
+    "all_relations_owned": True,
+    "unexpected_relation_grantee": False,
+    "column_acl_present": False,
+    "runtime_relation_privileges_bounded": True,
+    "runtime_sequence_privileges_bounded": True,
+    "routine_ownership_bounded": True,
+    "unexpected_routine_grantee": False,
+    "runtime_routine_privileges_bounded": True,
+    "type_ownership_bounded": True,
+    "unexpected_type_grantee": False,
+    "runtime_type_privileges_bounded": True,
+}
+
+
+def fingerprint_rls_helpers(proof: object) -> object:
+    if not isinstance(proof, dict) or not isinstance(proof.get("helpers"), list):
+        return None
+    for helper in proof["helpers"]:
+        if not isinstance(helper, dict) or "definition_sha256" in helper:
+            return None
+        definition = helper.pop("definition", None)
+        if not isinstance(definition, str):
+            return None
+        helper["definition_sha256"] = (
+            "sha256:" + hashlib.sha256(definition.encode("utf-8")).hexdigest()
+        )
+    return proof
+
+
+def fingerprint_extension_members(proof: object) -> object:
+    if not isinstance(proof, dict) or not isinstance(proof.get("extensions"), list):
+        return None
+    for extension in proof["extensions"]:
+        if not isinstance(extension, dict):
+            return None
+        for key in ("all_members", "routine_members", "type_members"):
+            members = extension.get(key)
+            if not isinstance(members, list):
+                return None
+            extension[key] = {
+                "count": len(members),
+                "identity_sha256": (
+                    "sha256:" + hashlib.sha256(canonical_json(members)).hexdigest()
+                ),
+            }
+    return proof
+
+
+def observe_rls(
+    container: str, *, require_runtime_access: bool
+) -> dict[str, object]:
+    raw = psql(container, "parkventory", rls_proof_sql())
+    try:
+        parsed = json.loads(raw, object_pairs_hook=unique_object)
+    except json.JSONDecodeError as exc:
+        raise ProvisionError(
+            "PostgreSQL returned invalid row-level security JSON"
+        ) from exc
+    proof = fingerprint_rls_helpers(parsed)
+    proof = fingerprint_extension_members(proof)
+    if not isinstance(proof, dict):
+        raise ProvisionError(
+            "row-level security helper evidence is incomplete"
+        )
+    runtime_access = proof.pop("runtime_access", None)
+    expected_catalog = {
+        key: value
+        for key, value in EXPECTED_RLS.items()
+        if key != "runtime_access"
+    }
+    if proof != expected_catalog:
+        raise ProvisionError(
+            "application extension, row-level security tables, policies, or "
+            "helpers differ from the application contract"
+        )
+    if require_runtime_access and runtime_access != EXPECTED_RUNTIME_ACCESS:
+        raise ProvisionError(
+            "runtime database access differs from the application allowlist"
+        )
+    proof["runtime_access"] = runtime_access
+    return proof
+
+
+def application_schema_present(container: str) -> bool:
+    raw = psql(
+        container,
+        "parkventory",
+        """
+SELECT (
+  EXISTS (
+    SELECT 1
+    FROM pg_class relation
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+      AND relation.relname <> 'flyway_schema_history'
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM pg_policy policy
+    JOIN pg_class relation ON relation.oid = policy.polrelid
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'public'
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM pg_proc routine
+    JOIN pg_namespace namespace ON namespace.oid = routine.pronamespace
+    WHERE namespace.nspname = 'public'
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM pg_type type
+    JOIN pg_namespace namespace ON namespace.oid = type.typnamespace
+    WHERE namespace.nspname = 'public'
+      AND type.typisdefined
+      AND type.typelem = 0
+      AND (
+        type.typtype <> 'c'
+        OR EXISTS (
+          SELECT 1 FROM pg_class composite
+          WHERE composite.oid = type.typrelid
+            AND composite.relkind = 'c'
+        )
+      )
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM pg_extension extension
+    JOIN pg_namespace namespace ON namespace.oid = extension.extnamespace
+    WHERE namespace.nspname = 'public'
+  )
+)::text;
+""",
+    )
+    if raw not in {"true", "false"}:
+        raise ProvisionError("PostgreSQL returned invalid schema presence proof")
+    return raw == "true"
+
+
+def read_database_proof(container: str) -> dict[str, object]:
+    raw = psql(container, "parkventory", proof_sql())
+    try:
+        proof = json.loads(raw, object_pairs_hook=unique_object)
+    except json.JSONDecodeError as exc:
+        raise ProvisionError("PostgreSQL returned invalid readiness JSON") from exc
+    if not isinstance(proof, dict):
+        raise ProvisionError("PostgreSQL readiness proof is incomplete")
+    return proof
+
+
+def reconcile_application_acl(container: str) -> bool:
+    before = observe_rls(container, require_runtime_access=False)
+    database_proof = read_database_proof(container)
+    changed = (
+        before["runtime_access"] != EXPECTED_RUNTIME_ACCESS
+        or database_proof != EXPECTED_PROOF
+    )
+    if not changed:
+        return False
+    table_allowlist = ", ".join(
+        f"public.{table['table']}" for table in EXPECTED_RLS_TABLES
+    )
+    function_allowlist = ", ".join(
+        f"public.{helper['name']}()" for helper in EXPECTED_RLS_HELPERS
+    )
+    sql = f"""
+BEGIN;
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public
+  FROM PUBLIC, parkventory_runtime;
+REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public
+  FROM PUBLIC, parkventory_runtime;
+REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public
+  FROM PUBLIC, parkventory_runtime;
+DO $column_acl$
+DECLARE
+  candidate record;
+BEGIN
+  FOR candidate IN
+    SELECT
+      namespace.nspname,
+      relation.relname,
+      attribute.attname,
+      acl.grantee,
+      grantee.rolname AS grantee_name
+    FROM pg_attribute attribute
+    JOIN pg_class relation ON relation.oid = attribute.attrelid
+    JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+    CROSS JOIN LATERAL aclexplode(attribute.attacl) acl
+    LEFT JOIN pg_roles grantee ON grantee.oid = acl.grantee
+    WHERE namespace.nspname = 'public'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+  LOOP
+    IF candidate.grantee = 0 THEN
+      EXECUTE format(
+        'REVOKE ALL PRIVILEGES (%I) ON TABLE %I.%I FROM PUBLIC',
+        candidate.attname,
+        candidate.nspname,
+        candidate.relname
+      );
+    ELSE
+      EXECUTE format(
+        'REVOKE ALL PRIVILEGES (%I) ON TABLE %I.%I FROM %I',
+        candidate.attname,
+        candidate.nspname,
+        candidate.relname,
+        candidate.grantee_name
+      );
+    END IF;
+  END LOOP;
+END
+$column_acl$;
+DO $type_acl$
+DECLARE
+  candidate record;
+BEGIN
+  FOR candidate IN
+    SELECT namespace.nspname, type.typname
+    FROM pg_type type
+    JOIN pg_namespace namespace ON namespace.oid = type.typnamespace
+    LEFT JOIN pg_depend extension_dependency
+      ON extension_dependency.classid = 'pg_type'::regclass
+     AND extension_dependency.objid = type.oid
+     AND extension_dependency.objsubid = 0
+     AND extension_dependency.refclassid = 'pg_extension'::regclass
+     AND extension_dependency.deptype = 'e'
+    WHERE namespace.nspname = 'public'
+      AND type.typisdefined
+      AND type.typelem = 0
+      AND (
+        type.typtype <> 'c'
+        OR EXISTS (
+          SELECT 1 FROM pg_class composite
+          WHERE composite.oid = type.typrelid
+            AND composite.relkind = 'c'
+        )
+      )
+  LOOP
+    EXECUTE format(
+      'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM PUBLIC, parkventory_runtime',
+      candidate.nspname,
+      candidate.typname
+    );
+  END LOOP;
+END
+$type_acl$;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner
+  REVOKE ALL ON TABLES FROM PUBLIC, parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner
+  REVOKE ALL ON SEQUENCES FROM PUBLIC, parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner
+  REVOKE ALL ON FUNCTIONS FROM PUBLIC, parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner
+  REVOKE ALL ON TYPES FROM PUBLIC, parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public
+  REVOKE ALL ON TABLES FROM PUBLIC, parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public
+  REVOKE ALL ON SEQUENCES FROM PUBLIC, parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public
+  REVOKE ALL ON FUNCTIONS FROM PUBLIC, parkventory_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public
+  REVOKE ALL ON TYPES FROM PUBLIC, parkventory_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {table_allowlist}
+  TO parkventory_runtime;
+GRANT EXECUTE ON FUNCTION {function_allowlist}
+  TO parkventory_runtime;
+COMMIT;
+"""
+    psql(container, "parkventory", sql)
+    observe(container, require_rls=True)
+    return True
+
+
+def observe(
+    container: str, *, require_rls: bool = False
+) -> dict[str, object]:
+    proof = read_database_proof(container)
+    if proof != EXPECTED_PROOF:
+        raise ProvisionError("effective database roles or default privileges differ from the contract")
+    if require_rls:
+        observe_rls(container, require_runtime_access=True)
+    return proof
+
+
+def check_database(
+    container: str, *, require_rls: bool = False
+) -> dict[str, object]:
+    schema_present = application_schema_present(container)
+    return observe(
+        container,
+        require_rls=require_rls or schema_present,
+    )
+
+
+def evidence_document(
+    contract_digest: str,
+    image: str,
+    proof: dict[str, object],
+    credential_digests: dict[str, str],
+) -> bytes:
+    return canonical_json(
+        {
+            "contract": "vps-infra.parkventory-postgres-readiness.v1",
+            "database_contract_sha256": contract_digest,
+            "postgres_image": image,
+            "proof": proof,
+            "secret_files": {
+                "migrator": {
+                    "path": str(CREDENTIAL_ROOT / "parkventory-postgres-migrator-password"),
+                    "sha256": credential_digests["migrator"],
+                    "uid": 0,
+                    "gid": 10001,
+                    "mode": "0440",
+                },
+                "runtime": {
+                    "path": str(CREDENTIAL_ROOT / "parkventory-postgres-runtime-password"),
+                    "sha256": credential_digests["runtime"],
+                    "uid": 0,
+                    "gid": 10001,
+                    "mode": "0440",
+                },
+            },
+            "transport": {
+                "network": "db_parkventory",
+                "subnet": "172.30.21.0/24",
+                "internal": True,
+                "postgres_attached": True,
+                "published_postgres_port": False,
+                "tls": False,
+            },
+            "validity": {
+                "requires_live_check": True,
+                "requires_postgres_network_attachment": True,
+            },
+        }
+    )
+
+
+def require_evidence(expected: bytes) -> None:
+    try:
+        descriptor = os.open(EVIDENCE_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise ProvisionError("PostgreSQL readiness evidence is missing or unsafe") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or metadata.st_size != len(expected)
+        ):
+            raise ProvisionError("PostgreSQL readiness evidence has unsafe metadata")
+        if os.read(descriptor, MAX_FILE_BYTES + 1) != expected:
+            raise ProvisionError("PostgreSQL readiness evidence is stale")
+    finally:
+        os.close(descriptor)
+
+
+def require_safe_evidence_target() -> None:
+    try:
+        metadata = EVIDENCE_PATH.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ProvisionError("cannot inspect PostgreSQL readiness evidence") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o400
+        or not 1 <= metadata.st_size <= MAX_FILE_BYTES
+    ):
+        raise ProvisionError("PostgreSQL readiness evidence target is unsafe")
+
+
+def write_evidence(content: bytes) -> None:
+    for path in (Path("/var/lib/vps-readiness"), EVIDENCE_PATH.parent):
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        metadata = path.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ProvisionError(f"readiness directory {path} is unsafe")
+    require_safe_evidence_target()
+    temporary = EVIDENCE_PATH.parent / f".postgres.{secrets.token_hex(16)}.pending"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o400,
+    )
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o400)
+        written = 0
+        while written < len(content):
+            written += os.write(descriptor, content[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, EVIDENCE_PATH)
+        directory = os.open(EVIDENCE_PATH.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--apply", dest="mode", action="store_const", const="apply")
+    modes.add_argument("--check", dest="mode", action="store_const", const="check")
+    modes.add_argument("--dry-run", dest="mode", action="store_const", const="dry-run")
+    modes.add_argument(
+        "--reconcile-application-schema",
+        dest="mode",
+        action="store_const",
+        const="reconcile-application-schema",
+    )
+    parser.set_defaults(mode="check")
+    parser.add_argument("--validate-contract", action="store_true")
+    parser.add_argument("--require-rls", action="store_true")
+    parser.add_argument("--embedded-contract", action="store_true")
+    parser.add_argument("--contract", type=Path, default=CONTRACT_PATH)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_args()
+    try:
+        embedded_contract = getattr(arguments, "embedded_contract", False)
+        if embedded_contract:
+            if arguments.mode != "dry-run" or arguments.contract != CONTRACT_PATH:
+                raise ProvisionError(
+                    "the embedded contract is restricted to the source dry-run"
+                )
+            contract = EXPECTED_CONTRACT
+            contract_digest = (
+                "sha256:" + hashlib.sha256(canonical_json(contract)).hexdigest()
+            )
+        else:
+            contract, contract_digest = load_contract(arguments.contract)
+        if arguments.validate_contract:
+            print(f"Parkventory PostgreSQL contract valid: {arguments.contract}")
+            return 0
+        if arguments.require_rls and arguments.mode != "check":
+            raise ProvisionError("row-level security proof is check-only")
+        if os.geteuid() != 0 or arguments.contract != CONTRACT_PATH:
+            raise ProvisionError("live PostgreSQL verification requires root and the fixed contract")
+        container, image = resolve_postgres(
+            contract,
+            require_network=arguments.mode
+            in {"apply", "check", "reconcile-application-schema"},
+        )
+        if arguments.mode == "dry-run":
+            print(canonical_json({"changed": True, "mode": "dry-run", "ready": False}).decode(), end="")
+            return 0
+        migrator, migrator_digest = read_password(
+            CREDENTIAL_ROOT / "parkventory-postgres-migrator-password"
+        )
+        runtime, runtime_digest = read_password(
+            CREDENTIAL_ROOT / "parkventory-postgres-runtime-password"
+        )
+        if migrator == runtime:
+            raise ProvisionError("migrator and runtime passwords must be distinct")
+        credential_digests = {
+            "migrator": migrator_digest,
+            "runtime": runtime_digest,
+        }
+        changed = False
+        if arguments.mode == "apply":
+            require_safe_evidence_target()
+            try:
+                proof = observe(container)
+                verify_database_credentials(container, migrator, runtime)
+                evidence = evidence_document(
+                    contract_digest, image, proof, credential_digests
+                )
+                require_evidence(evidence)
+            except ProvisionError:
+                apply_database(container, migrator, runtime)
+                changed = True
+            schema_present = application_schema_present(container)
+            if schema_present:
+                changed = reconcile_application_acl(container) or changed
+            proof = observe(container, require_rls=schema_present)
+            verify_database_credentials(container, migrator, runtime)
+            evidence = evidence_document(
+                contract_digest, image, proof, credential_digests
+            )
+            if changed:
+                write_evidence(evidence)
+            else:
+                require_evidence(evidence)
+        elif arguments.mode == "reconcile-application-schema":
+            verify_database_credentials(container, migrator, runtime)
+            if not application_schema_present(container):
+                raise ProvisionError(
+                    "application schema is absent after migration"
+                )
+            changed = reconcile_application_acl(container)
+            proof = observe(container, require_rls=True)
+            verify_database_credentials(container, migrator, runtime)
+            evidence = evidence_document(
+                contract_digest, image, proof, credential_digests
+            )
+            require_evidence(evidence)
+        else:
+            proof = check_database(
+                container,
+                require_rls=arguments.require_rls,
+            )
+            verify_database_credentials(container, migrator, runtime)
+            evidence = evidence_document(
+                contract_digest, image, proof, credential_digests
+            )
+            require_evidence(evidence)
+    except ProvisionError as exc:
+        return fail(str(exc))
+    print(
+        canonical_json(
+            {"changed": changed, "mode": arguments.mode, "ready": True}
+        ).decode(),
+        end="",
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

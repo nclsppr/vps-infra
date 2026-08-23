@@ -5,8 +5,9 @@ static controller is converged and its bounded transactional activation path is
 operational. The generic controller remains locked. The Compose application
 controller and recovery wiring are converged and proved healthy while idle on
 Atlas. The canonical contract admits only the Surplasse tester release.
-Parkventory and the legacy Compose entries remain disabled, no application
-workflow invokes the gate, and no live Surplasse activation is proved.
+Parkventory and the legacy Compose entries remain disabled. Parkventory's
+manual application workflow resolves no deployment matrix in that state, and
+no live Surplasse activation is proved.
 
 ## Installation contract
 
@@ -323,8 +324,9 @@ convergence of repository revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root-owned
 `deploy-application` executable and argument-free gate are present. The
 repository now enables only the canonical Surplasse tester admission entry.
-Parkventory and Mon Florian remain disabled, and no application workflow
-invokes either gate.
+Parkventory remains disabled. Its manual workflow resolves no deployment matrix
+and retains an independent protected-environment activation gate.
+Mon Florian also remains disabled and has no workflow invoking its gate.
 
 `deploy-application` consumes only the immutable
 `ghcr.io/nclsppr/<application>/application-release@sha256:<digest>` selected by
@@ -382,11 +384,15 @@ recreates Caddy, proves the new runtime identity, and recovers the previous
 edge release. It does not install DNS credentials and does not change DNS.
 Those external operations remain separate reviewed prerequisites.
 
-Activation journals `prepared`, `migration-running`, `migrated`, `started`,
-`probe-rejected`, and `probed`. Only `probed` can become active. Recovery restores
-the previous Compose runtime and quarantines a candidate that reached a
-potentially mutating phase. SQL migrations themselves are not reversible; they
-must remain compatible with both the current and previous runtime images.
+Activation journals `prepared`, `migration-running`, `postgres-unverified`,
+`migrated`, `started`, `probe-rejected`, and `probed`. Only Parkventory uses
+`postgres-unverified`. Only `probed` can become active. Recovery normally
+restores the previous Compose runtime and quarantines a candidate that reached a
+potentially mutating phase. Parkventory recovery from `migration-running` or
+`postgres-unverified` instead stops and proves the absence of every runtime
+container. It never starts the previous runtime against that untrusted database.
+SQL migrations themselves are not reversible; they must remain compatible with
+both the current and previous runtime images.
 
 The controller does not yet verify an attested backward-compatibility invariant
 for that post-migration restore. The first Surplasse tester activation has no

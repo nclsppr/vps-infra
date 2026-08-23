@@ -79,6 +79,19 @@ case $# in
         playbook=playbooks/surplasse.yml
         ansible_extra_options=(--extra-vars vps_surplasse_state=stopped)
         ;;
+      --plan-parkventory-postgres)
+        playbook=playbooks/parkventory-postgres.yml
+        ansible_playbook_options=(--check --diff)
+        ansible_extra_options=(--extra-vars vps_parkventory_postgres_state=dry-run)
+        ;;
+      --verify-parkventory-postgres)
+        playbook=playbooks/parkventory-postgres.yml
+        ansible_extra_options=(--extra-vars vps_parkventory_postgres_state=check)
+        ;;
+      --prepare-parkventory-postgres)
+        playbook=playbooks/parkventory-postgres.yml
+        ansible_extra_options=(--extra-vars vps_parkventory_postgres_state=prepare)
+        ;;
       --materialize-surplasse-pilot)
         playbook=playbooks/surplasse-pilot.yml
         ansible_extra_options=(--extra-vars vps_surplasse_pilot_state=materialize)

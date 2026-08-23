@@ -108,6 +108,13 @@ def fixture_files(profile):
     raw["contract.json"] = BUNDLE.canonical_json(
         BUNDLE._expected_contract(profile, REVISION)
     )
+    if profile.application == "parkventory":
+        raw["prometheus/rules.yml"] = BUNDLE.PARKVENTORY_PROMETHEUS_RULES
+        raw["prometheus/targets.json"] = json.dumps(
+            BUNDLE.PARKVENTORY_PROMETHEUS_TARGETS,
+            ensure_ascii=True,
+            indent=2,
+        ).encode("ascii") + b"\n"
     raw["migrations.json"] = BUNDLE.canonical_json(migrations)
     raw["probes.json"] = BUNDLE.canonical_json(probes)
     if "expected-images.json" in profile.runtime_paths:
@@ -304,6 +311,12 @@ class ApplicationBundleTests(unittest.TestCase):
                 migration_inventory_digest="sha256:" + "f" * 64,
                 probe_inventory_digest=BUNDLE.content_digest(files["probes.json"]),
             )
+
+    def test_parkventory_bundle_alert_fires_when_the_target_is_absent(self):
+        self.assertIn(
+            b'or absent(up{application="parkventory"})',
+            BUNDLE.PARKVENTORY_PROMETHEUS_RULES,
+        )
 
     def test_archive_rejects_links_even_when_inventory_names_are_valid(self):
         profile = BUNDLE.PROFILES["surplasse"]

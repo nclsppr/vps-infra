@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import copy
 import contextlib
 import dataclasses
@@ -81,6 +82,12 @@ STATIC = _load_static_runtime()
 
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+PARKVENTORY_BACKUP_ID_RE = re.compile(
+    r"^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}$"
+)
+PARKVENTORY_EVIDENCE_TIME_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
 STATE_NAME_RE = re.compile(r"^[a-z0-9-]+(?:-[0-9a-f]{64})?\.json$")
 CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 CONFIG_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
@@ -103,6 +110,13 @@ CREDENTIAL_ROOT = Path("/etc/vps/secrets")
 STATIC_ACTIVE_STATE_ROOT = Path("/var/lib/vps-static/active")
 STATIC_TRANSACTION_ROOT = Path("/var/lib/vps-static/transactions")
 STATIC_PARKVENTORY_CURRENT = Path("/srv/www/parkventory/current")
+PARKVENTORY_POSTGRES_READINESS = Path(
+    "/var/lib/vps-readiness/parkventory/postgres.json"
+)
+PARKVENTORY_POSTGRES_VALIDATOR = SCRIPT_DIRECTORY / "provision-parkventory-postgres"
+PARKVENTORY_OFFSITE_READINESS = Path(
+    "/var/lib/vps-readiness/parkventory/offsite-backup.json"
+)
 PUBLIC_EDGE_RUNTIME_ROOT = Path("/srv/vps/runtime/public-static-edge")
 PUBLIC_EDGE_CONTAINER = "vps-public-static-edge-caddy-1"
 SURPLASSE_PUBLIC_EDGE_NETWORK = "app_surplasse"
@@ -204,11 +218,16 @@ TRANSACTION_PHASES = frozenset(
     {
         "prepared",
         "migration-running",
+        "postgres-unverified",
         "migrated",
         "started",
         "probe-rejected",
         "probed",
     }
+)
+
+PARKVENTORY_UNTRUSTED_DATABASE_PHASES = frozenset(
+    {"migration-running", "postgres-unverified"}
 )
 
 
@@ -529,6 +548,228 @@ def validate_runtime() -> None:
         )
 
 
+def _parkventory_evidence_time(value: object, label: str) -> dt.datetime:
+    if (
+        not isinstance(value, str)
+        or PARKVENTORY_EVIDENCE_TIME_RE.fullmatch(value) is None
+    ):
+        fail(f"Parkventory {label} time is invalid")
+    return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=dt.timezone.utc
+    )
+
+
+def validate_parkventory_postgres_live(
+    *, reconcile_application_schema: bool = False
+) -> None:
+    require_protected_file(
+        PARKVENTORY_POSTGRES_VALIDATOR,
+        "Parkventory PostgreSQL live validator",
+        allowed_modes=frozenset({0o500}),
+        maximum_size=2 * 1024 * 1024,
+    )
+    mode = "reconcile-application-schema" if reconcile_application_schema else "check"
+    command = [str(PARKVENTORY_POSTGRES_VALIDATOR), f"--{mode}"]
+    result = _run_bounded(
+        command,
+        environment=safe_environment(Path("/root")),
+        timeout=120,
+        maximum_stdout=4096,
+    )
+    accepted = {
+        canonical_json({"changed": changed, "mode": mode, "ready": True})
+        for changed in ({False, True} if reconcile_application_schema else {False})
+    }
+    if result.stdout.encode("utf-8") not in accepted or result.stderr:
+        fail("Parkventory PostgreSQL live proof returned an unexpected result")
+
+
+def validate_parkventory_readiness(policy: ApplicationPolicy) -> None:
+    if policy.name != "parkventory":
+        return
+    readiness = policy.readiness_evidence
+    if not isinstance(readiness, Mapping):
+        fail("Parkventory PostgreSQL readiness evidence is absent")
+    postgres = readiness.get("postgres")
+    if not isinstance(postgres, Mapping):
+        fail("Parkventory PostgreSQL readiness evidence is invalid")
+    digest = postgres.get("sha256")
+    if (
+        postgres.get("contract")
+        != "vps-infra.parkventory-postgres-readiness.v1"
+        or postgres.get("path") != str(PARKVENTORY_POSTGRES_READINESS)
+        or not isinstance(digest, str)
+        or SHA256_RE.fullmatch(digest) is None
+    ):
+        fail("Parkventory PostgreSQL readiness binding is incomplete")
+    require_protected_file(
+        PARKVENTORY_POSTGRES_READINESS,
+        "Parkventory PostgreSQL readiness evidence",
+        allowed_modes=frozenset({0o400}),
+        maximum_size=MAX_STATE_BYTES,
+    )
+    raw = STATIC.read_bounded_file(
+        PARKVENTORY_POSTGRES_READINESS,
+        MAX_STATE_BYTES,
+        "Parkventory PostgreSQL readiness evidence",
+    )
+    value = strict_json(
+        raw,
+        "Parkventory PostgreSQL readiness evidence",
+        maximum=MAX_STATE_BYTES,
+    )
+    if (
+        raw != canonical_json(value)
+        or content_digest(raw) != digest
+        or not isinstance(value, dict)
+        or value.get("contract")
+        != "vps-infra.parkventory-postgres-readiness.v1"
+    ):
+        fail("Parkventory PostgreSQL readiness evidence differs from admission")
+    validate_parkventory_postgres_live()
+
+    validate_parkventory_offsite_readiness(policy)
+
+
+def validate_parkventory_offsite_readiness(policy: ApplicationPolicy) -> None:
+    if policy.name != "parkventory":
+        return
+    readiness = policy.readiness_evidence
+    if not isinstance(readiness, Mapping):
+        fail("Parkventory encrypted off-site backup evidence is absent")
+
+    offsite = readiness.get("encrypted_offsite_backup")
+    if not isinstance(offsite, Mapping):
+        fail("Parkventory encrypted off-site backup evidence is absent")
+    offsite_digest = offsite.get("sha256")
+    if (
+        offsite.get("contract")
+        != "vps-infra.parkventory-offsite-backup-readiness.v1"
+        or offsite.get("path") != str(PARKVENTORY_OFFSITE_READINESS)
+        or not isinstance(offsite_digest, str)
+        or SHA256_RE.fullmatch(offsite_digest) is None
+    ):
+        fail("Parkventory encrypted off-site backup binding is incomplete")
+    require_protected_file(
+        PARKVENTORY_OFFSITE_READINESS,
+        "Parkventory encrypted off-site backup evidence",
+        allowed_modes=frozenset({0o400}),
+        maximum_size=MAX_STATE_BYTES,
+    )
+    offsite_raw = STATIC.read_bounded_file(
+        PARKVENTORY_OFFSITE_READINESS,
+        MAX_STATE_BYTES,
+        "Parkventory encrypted off-site backup evidence",
+    )
+    document = strict_json(
+        offsite_raw,
+        "Parkventory encrypted off-site backup evidence",
+        maximum=MAX_STATE_BYTES,
+    )
+    if (
+        offsite_raw != canonical_json(document)
+        or content_digest(offsite_raw) != offsite_digest
+        or not isinstance(document, dict)
+        or set(document)
+        != {
+            "backup_id",
+            "contract",
+            "database",
+            "provider_gates",
+            "restore_rehearsal",
+            "upload_receipt",
+        }
+        or document.get("contract")
+        != "vps-infra.parkventory-offsite-backup-readiness.v1"
+        or document.get("database") != "parkventory"
+        or not isinstance(document.get("backup_id"), str)
+        or PARKVENTORY_BACKUP_ID_RE.fullmatch(document["backup_id"]) is None
+    ):
+        fail("Parkventory encrypted off-site backup evidence differs from policy")
+    upload = document.get("upload_receipt")
+    restore = document.get("restore_rehearsal")
+    gates = document.get("provider_gates")
+    expected_gates = {
+        "bucket_object_lock_verified": True,
+        "bucket_versioning_verified": True,
+        "failure_domain_independence_reviewed": True,
+        "recovery_key_off_host_verified": True,
+        "restore_identity_separate_verified": True,
+    }
+    if (
+        not isinstance(upload, dict)
+        or set(upload)
+        != {
+            "age_recipient_sha256",
+            "contract",
+            "receipt_sha256",
+            "recorded_at",
+            "source_manifest_sha256",
+        }
+        or upload.get("contract") != "vps-postgres-offsite-receipt-v2"
+        or any(
+            not isinstance(upload.get(key), str)
+            or SHA256_RE.fullmatch(upload[key]) is None
+            for key in (
+                "age_recipient_sha256",
+                "receipt_sha256",
+                "source_manifest_sha256",
+            )
+        )
+        or not isinstance(restore, dict)
+        or set(restore)
+        != {
+            "completed_at",
+            "evidence_sha256",
+            "performed_off_atlas",
+            "rehearsed",
+            "source_manifest_sha256",
+        }
+        or restore.get("performed_off_atlas") is not True
+        or restore.get("rehearsed") is not True
+        or not isinstance(restore.get("evidence_sha256"), str)
+        or SHA256_RE.fullmatch(restore["evidence_sha256"]) is None
+        or restore.get("source_manifest_sha256")
+        != upload.get("source_manifest_sha256")
+        or gates != expected_gates
+    ):
+        fail("Parkventory encrypted off-site backup proof is incomplete")
+    recorded_at = _parkventory_evidence_time(
+        upload.get("recorded_at"),
+        "off-site upload receipt",
+    )
+    restored_at = _parkventory_evidence_time(
+        restore.get("completed_at"),
+        "off-host restore rehearsal",
+    )
+    now = dt.datetime.now(dt.timezone.utc)
+    if (
+        recorded_at > now + dt.timedelta(minutes=5)
+        or now - recorded_at > dt.timedelta(hours=36)
+        or restored_at > now + dt.timedelta(minutes=5)
+        or now - restored_at > dt.timedelta(days=31)
+        or restored_at < recorded_at - dt.timedelta(minutes=5)
+    ):
+        fail("Parkventory encrypted off-site backup proof is stale")
+
+
+def current_parkventory_policy() -> ApplicationPolicy:
+    contract = load_production_contract(
+        APPLICATION_PRODUCTION_CONTRACT,
+        STATIC_PRODUCTION_CONTRACT,
+    )
+    policy = next(
+        item for item in contract.applications if item.name == "parkventory"
+    )
+    if not policy.enabled:
+        fail("Parkventory is disabled by the protected production contract")
+    return policy
+
+
+def revalidate_parkventory_offsite_before_runtime() -> None:
+    validate_parkventory_offsite_readiness(current_parkventory_policy())
+
+
 def validate_recovery_state_runtime() -> None:
     """Validate only what is needed to prove that no transaction exists."""
     if os.geteuid() != 0 or os.getegid() != 0:
@@ -629,7 +870,48 @@ def runtime_configuration(profile: BundleProfile) -> dict[str, str]:
         result[key] = value
     if tuple(sorted(result)) != tuple(sorted(profile.runtime_configuration_keys)):
         fail(f"{profile.application} runtime configuration key allowlist differs")
+    if profile.application == "parkventory":
+        validate_parkventory_runtime_configuration(result)
     return result
+
+
+def validate_parkventory_runtime_configuration(
+    configuration: Mapping[str, str],
+) -> None:
+    expected = {
+        "PARKVENTORY_DB_MIGRATOR_USER": "parkventory_migrator",
+        "PARKVENTORY_DB_RUNTIME_USER": "parkventory_runtime",
+        "PARKVENTORY_JDBC_URL": "jdbc:postgresql://postgresql:5432/parkventory",
+        "PARKVENTORY_WEB_BASE_URL": "https://parkventory.com",
+    }
+    for key, value in expected.items():
+        if configuration.get(key) != value:
+            fail(f"Parkventory runtime configuration {key} differs from policy")
+    auth_server = configuration.get("PARKVENTORY_OIDC_AUTH_SERVER_URL", "")
+    issuer = configuration.get("PARKVENTORY_OIDC_ISSUER", "")
+    try:
+        parsed = urlsplit(auth_server)
+        port = parsed.port
+    except ValueError:
+        fail("Parkventory OIDC configuration must use one exact Auth0 EU issuer")
+    if (
+        parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or port not in {None, 443}
+        or parsed.path != "/"
+        or parsed.query
+        or parsed.fragment
+        or parsed.hostname is None
+        or not parsed.hostname.endswith(".eu.auth0.com")
+        or issuer != auth_server
+    ):
+        fail("Parkventory OIDC configuration must use one exact Auth0 EU issuer")
+    client_id = configuration.get("PARKVENTORY_OIDC_CLIENT_ID", "")
+    if re.fullmatch(r"[A-Za-z0-9_-]{8,128}", client_id) is None:
+        fail("Parkventory OIDC client identifier is invalid")
+    if configuration.get("PARKVENTORY_SMTP_PORT") not in {"465", "587"}:
+        fail("Parkventory SMTP port must use a TLS-capable submission port")
 
 
 def validate_runtime_configuration_snapshot(
@@ -983,6 +1265,8 @@ def materialized_runtime_configuration(
     ):
         fail("materialized runtime configuration differs from its profile")
     result = dict(value)
+    if profile.application == "parkventory":
+        validate_parkventory_runtime_configuration(result)
     environment_path = release / "runtime.env"
     require_protected_file(
         environment_path,
@@ -1340,6 +1624,23 @@ def validate_application_compose_semantics(
         "PARKVENTORY_MIGRATION_ONLY"
     ) != "false":
         fail("rendered Parkventory backend can enter migration-only mode")
+    if profile.application == "parkventory":
+        expected_oidc_files = {
+            "PARKVENTORY_OIDC_CLIENT_SECRET_FILE": (
+                "/run/secrets/parkventory_oidc_client_secret"
+            ),
+            "PARKVENTORY_OIDC_STATE_SECRET_FILE": (
+                "/run/secrets/parkventory_oidc_state_secret"
+            ),
+            "PARKVENTORY_OIDC_TOKEN_ENCRYPTION_SECRET_FILE": (
+                "/run/secrets/parkventory_oidc_token_encryption_secret"
+            ),
+        }
+        if any(
+            environment.get(key) != value
+            for key, value in expected_oidc_files.items()
+        ):
+            fail("rendered Parkventory OIDC secret files differ from policy")
     expected_services = set(profile.component_repositories)
     if profile.migration_strategy == "dedicated":
         expected_services.add("migrator")
@@ -1389,6 +1690,16 @@ def validate_application_compose_semantics(
                 f"rendered Compose service {service_name} user cannot read its "
                 "file-backed secrets"
             )
+        if profile.application == "parkventory":
+            expected_logging = {
+                "driver": "local",
+                "options": {"max-file": "3", "max-size": "10m"},
+            }
+            if service.get("logging") != expected_logging:
+                fail(
+                    f"rendered Compose service {service_name} logging differs from "
+                    "the bounded local retention policy"
+                )
     if profile.application == "surplasse":
         validate_surplasse_pilot_compose(rendered)
 
@@ -2386,6 +2697,18 @@ def start_runtime(state: ApplicationState, *, precommit: bool = False) -> None:
     )
 
 
+def require_runtime_containers_absent(state: ApplicationState) -> None:
+    services = sorted(PROFILES[state.application].component_repositories)
+    result = _compose_for_state(
+        state,
+        ["ps", "--all", "--quiet", *services],
+        timeout=30,
+        validate_policy=False,
+    )
+    if result.stdout or result.stderr:
+        fail("application runtime containers did not reach exact absence")
+
+
 def stop_runtime(state: ApplicationState) -> None:
     _compose_for_state(
         state,
@@ -2393,6 +2716,7 @@ def stop_runtime(state: ApplicationState) -> None:
         timeout=120,
         validate_policy=False,
     )
+    require_runtime_containers_absent(state)
 
 
 def _probe_http(
@@ -2825,6 +3149,51 @@ def restore_previous(transaction: ApplicationTransaction) -> None:
         )
 
 
+def rollback_and_quarantine_candidate(
+    transaction: ApplicationTransaction,
+) -> None:
+    application = transaction.candidate.application
+    restore_previous(transaction)
+    write_state(
+        QUARANTINE_ROOT,
+        quarantine_name(transaction.candidate),
+        transaction.candidate,
+        "quarantined application state",
+    )
+    remove_state(
+        TRANSACTION_ROOT,
+        f"{application}.json",
+        "application transaction",
+    )
+
+
+def contain_parkventory_untrusted_database(
+    transaction: ApplicationTransaction,
+) -> None:
+    if (
+        transaction.candidate.application != "parkventory"
+        or transaction.phase not in PARKVENTORY_UNTRUSTED_DATABASE_PHASES
+    ):
+        fail("Parkventory database containment received an invalid transaction")
+    failures: list[str] = []
+    for label, action in (
+        ("runtime stop", lambda: stop_runtime(transaction.candidate)),
+        (
+            "migration container removal",
+            lambda: remove_migration_container(transaction.candidate),
+        ),
+    ):
+        try:
+            action()
+        except BaseException as exc:
+            failures.append(f"{label}: {exc}")
+    if failures:
+        fail(
+            "Parkventory database containment did not reach a safe state: "
+            + "; ".join(failures)
+        )
+
+
 def application_tuple_is_active(transaction: ApplicationTransaction) -> bool:
     application = transaction.candidate.application
     app_root = APPLICATION_ROOT / application
@@ -2844,7 +3213,13 @@ def recover_application(application: str) -> None:
     transaction = read_transaction(application)
     if transaction is None:
         return
-    if transaction.phase != "prepared":
+    untrusted_parkventory_database = (
+        application == "parkventory"
+        and transaction.phase in PARKVENTORY_UNTRUSTED_DATABASE_PHASES
+    )
+    if untrusted_parkventory_database:
+        contain_parkventory_untrusted_database(transaction)
+    elif transaction.phase != "prepared":
         remove_migration_container(transaction.candidate)
     else:
         require_migration_container_absent(transaction.candidate)
@@ -2864,14 +3239,35 @@ def recover_application(application: str) -> None:
             or transaction.previous_target is not None
         ):
             fail("Parkventory static and Compose recovery ownership overlap")
-        if transaction.phase != "prepared":
+        if transaction.phase != "prepared" and not untrusted_parkventory_database:
             restore_previous(transaction)
+        if transaction.phase != "prepared":
             write_state(
                 QUARANTINE_ROOT,
                 quarantine_name(transaction.candidate),
                 transaction.candidate,
                 "quarantined application state",
             )
+        remove_state(
+            TRANSACTION_ROOT,
+            f"{application}.json",
+            "application transaction",
+        )
+        return
+    if untrusted_parkventory_database:
+        if (
+            active != transaction.previous_state
+            or target != transaction.previous_target
+        ):
+            fail(
+                "untrusted Parkventory database transaction changed the active tuple"
+            )
+        write_state(
+            QUARANTINE_ROOT,
+            quarantine_name(transaction.candidate),
+            transaction.candidate,
+            "quarantined application state",
+        )
         remove_state(
             TRANSACTION_ROOT,
             f"{application}.json",
@@ -2894,6 +3290,12 @@ def recover_application(application: str) -> None:
             state_release(transaction.candidate),
             transaction.candidate,
         )
+        if application == "parkventory":
+            try:
+                revalidate_parkventory_offsite_before_runtime()
+            except BaseException:
+                rollback_and_quarantine_candidate(transaction)
+                return
         start_runtime(transaction.candidate, precommit=True)
         promote_runtime_restart_policy(transaction.candidate)
         remove_state(
@@ -2906,6 +3308,12 @@ def recover_application(application: str) -> None:
         validate_materialized_release(
             state_release(transaction.candidate), transaction.candidate
         )
+        if application == "parkventory":
+            try:
+                revalidate_parkventory_offsite_before_runtime()
+            except BaseException:
+                rollback_and_quarantine_candidate(transaction)
+                return
         start_runtime(transaction.candidate, precommit=True)
         switch_current(app_root / "current", transaction.expected_target, releases)
         write_state(
@@ -3012,13 +3420,26 @@ def activate_candidate(state: ApplicationState, work: Path) -> None:
             )
             write_transaction(transaction)
             run_migration(state)
+            if application == "parkventory":
+                transaction = dataclasses.replace(
+                    transaction,
+                    phase="postgres-unverified",
+                )
+                write_transaction(transaction)
+                validate_parkventory_postgres_live(
+                    reconcile_application_schema=True
+                )
             transaction = dataclasses.replace(transaction, phase="migrated")
             write_transaction(transaction)
+            if application == "parkventory":
+                revalidate_parkventory_offsite_before_runtime()
         start_runtime(state, precommit=True)
         transaction = dataclasses.replace(transaction, phase="started")
         write_transaction(transaction)
         probe_runtime(state, work)
         assert_exact_source_head(PROFILES[application], state.source_revision)
+        if application == "parkventory":
+            revalidate_parkventory_offsite_before_runtime()
     except BaseException as activation_error:
         try:
             current = read_transaction(application)
@@ -3094,6 +3515,8 @@ def deploy(
     with deployment_lock():
         cleanup_application_filesystem_residue(application)
         STATIC.refuse_isolated_worker_residue_locked()
+        if application == "parkventory":
+            validate_parkventory_readiness(policy)
         if activate_live:
             assert_exact_source_head(profile, source_revision)
         temporary_root = deployment_temporary_root(application, activate_live)

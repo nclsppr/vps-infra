@@ -20,7 +20,7 @@
          'postgresql', 'prometheus']
       - >-
         vps_internal_platform_network_contract ==
-        {'postgresql': ['db_monitoring', 'db_surplasse'],
+        {'postgresql': ['db_monitoring', 'db_parkventory', 'db_surplasse'],
          'prometheus': ['ops'],
          'grafana': ['ops'], 'node-exporter': ['ops'],
          'postgres-exporter': ['db_monitoring', 'ops']}
@@ -158,6 +158,7 @@
       loop:
         - ops
         - db_monitoring
+        - db_parkventory
         - db_surplasse
 
     - name: Require the managed internal Docker networks
@@ -180,6 +181,11 @@
             (((item.stdout | from_json) | first).Internal | bool and
              ((item.stdout | from_json) | first).IPAM.Config |
              map(attribute='Subnet') | list == ['172.30.31.0/24'])
+          - >-
+            item.item != 'db_parkventory' or
+            (((item.stdout | from_json) | first).Internal | bool and
+             ((item.stdout | from_json) | first).IPAM.Config |
+             map(attribute='Subnet') | list == ['172.30.21.0/24'])
           - >-
             item.item != 'db_surplasse' or
             (((item.stdout | from_json) | first).Internal | bool and

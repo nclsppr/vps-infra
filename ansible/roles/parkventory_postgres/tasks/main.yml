@@ -1,0 +1,422 @@
+---
+- name: Validate the fixed Parkventory PostgreSQL contract
+  ansible.builtin.assert:
+    that:
+      - vps_parkventory_postgres_state in ['check', 'dry-run', 'prepare']
+      - >-
+        vps_parkventory_postgres_contract ==
+        '/usr/local/share/vps-infra/contracts/parkventory-postgres.json'
+      - >-
+        vps_parkventory_postgres_network ==
+        {'name': 'db_parkventory', 'subnet': '172.30.21.0/24',
+         'internal': true}
+      - >-
+        vps_parkventory_postgres_helpers | sort ==
+        ['materialize-parkventory-secrets',
+         'provision-parkventory-postgres']
+      - >-
+        not (
+          lookup(
+            'ansible.builtin.file',
+            playbook_dir ~ '/../../releases/application-production.json'
+          ) | from_json
+        ).applications.parkventory.enabled
+      - >-
+        (
+          lookup(
+            'ansible.builtin.file',
+            playbook_dir ~ '/../../releases/static-production.json'
+          ) | from_json
+        ).applications.parkventory.enabled
+      - >-
+        (
+          lookup(
+            'ansible.builtin.file',
+            playbook_dir ~ '/../../releases/application-production.json'
+          ) | from_json
+        ).applications.parkventory.readiness_evidence[
+          'encrypted_offsite_backup'
+        ].sha256 == none
+    fail_msg: >-
+      Parkventory database preparation requires the static owner to remain
+      active, the Compose contract to remain disabled, and encrypted off-site
+      backup evidence to remain explicitly unbound.
+
+- name: Create protected helper and contract directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: /usr/local/libexec/vps
+      mode: "0755"
+    - path: /usr/local/share/vps-infra/contracts
+      mode: "0755"
+  when: >-
+    vps_parkventory_postgres_state == 'prepare' or
+    (vps_parkventory_postgres_state == 'dry-run' and ansible_check_mode)
+
+- name: Install the exact Parkventory PostgreSQL contract
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../applications/parkventory/postgres.json"
+    dest: "{{ vps_parkventory_postgres_contract }}"
+    owner: root
+    group: root
+    mode: "0444"
+  when: >-
+    vps_parkventory_postgres_state == 'prepare' or
+    (vps_parkventory_postgres_state == 'dry-run' and ansible_check_mode)
+
+- name: Install the root-only Parkventory database helpers
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../scripts/{{ item }}"
+    dest: "/usr/local/libexec/vps/{{ item }}"
+    owner: root
+    group: root
+    mode: "0500"
+  loop: "{{ vps_parkventory_postgres_helpers }}"
+  when: >-
+    vps_parkventory_postgres_state == 'prepare' or
+    (vps_parkventory_postgres_state == 'dry-run' and ansible_check_mode)
+
+- name: Inspect protected Parkventory artifact directories without changing them
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+  loop:
+    - path: /usr/local/libexec/vps
+      mode: "0755"
+    - path: /usr/local/share/vps-infra/contracts
+      mode: "0755"
+  register: vps_parkventory_postgres_directory_inspections
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Prove protected Parkventory artifact directories without changing them
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isdir
+      - not item.stat.islnk
+      - item.stat.pw_name == 'root'
+      - item.stat.gr_name == 'root'
+      - item.stat.mode == item.item.mode
+    fail_msg: >-
+      Installed Parkventory artifact directory metadata differs from the
+      reviewed source contract.
+  loop: "{{ vps_parkventory_postgres_directory_inspections.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Inspect the installed Parkventory PostgreSQL contract without changing it
+  ansible.builtin.stat:
+    path: "{{ vps_parkventory_postgres_contract }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: vps_parkventory_postgres_contract_inspection
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Prove the installed Parkventory PostgreSQL contract without changing it
+  ansible.builtin.assert:
+    that:
+      - vps_parkventory_postgres_contract_inspection.stat.exists
+      - vps_parkventory_postgres_contract_inspection.stat.isreg
+      - not vps_parkventory_postgres_contract_inspection.stat.islnk
+      - vps_parkventory_postgres_contract_inspection.stat.nlink == 1
+      - vps_parkventory_postgres_contract_inspection.stat.pw_name == 'root'
+      - vps_parkventory_postgres_contract_inspection.stat.gr_name == 'root'
+      - vps_parkventory_postgres_contract_inspection.stat.mode == '0444'
+      - >-
+        vps_parkventory_postgres_contract_inspection.stat.checksum ==
+        (lookup(
+          'ansible.builtin.file',
+          playbook_dir ~ '/../../applications/parkventory/postgres.json',
+          rstrip=false
+        ) | hash('sha256'))
+    fail_msg: >-
+      Installed Parkventory PostgreSQL contract bytes or metadata differ from
+      the reviewed source.
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Inspect installed Parkventory database helpers without changing them
+  ansible.builtin.stat:
+    path: "/usr/local/libexec/vps/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ vps_parkventory_postgres_helpers }}"
+  register: vps_parkventory_postgres_helper_inspections
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Prove installed Parkventory database helpers without changing them
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - item.stat.nlink == 1
+      - item.stat.pw_name == 'root'
+      - item.stat.gr_name == 'root'
+      - item.stat.mode == '0500'
+      - >-
+        item.stat.checksum ==
+        (lookup(
+          'ansible.builtin.file',
+          playbook_dir ~ '/../../scripts/' ~ item.item,
+          rstrip=false
+        ) | hash('sha256'))
+    fail_msg: >-
+      Installed Parkventory database helper bytes or metadata differ from the
+      reviewed source.
+  loop: "{{ vps_parkventory_postgres_helper_inspections.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Read the internal platform and Docker service state
+  ansible.builtin.service_facts:
+
+- name: Require the healthy internal platform before database inspection
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.services['docker.service'].state == 'running'
+      - ansible_facts.services['vps-internal-platform.service'].state == 'running'
+      - ansible_facts.services['vps-internal-platform.service'].status == 'enabled'
+    fail_msg: Start and verify the shared internal platform first.
+
+- name: Inspect the exact private Parkventory database network
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/docker
+      - network
+      - inspect
+      - db_parkventory
+  register: vps_parkventory_postgres_network_inspection
+  changed_when: false
+  check_mode: false
+
+- name: Prove the private Parkventory database network
+  ansible.builtin.assert:
+    that:
+      - >-
+        ((vps_parkventory_postgres_network_inspection.stdout | from_json) |
+         first).Name == 'db_parkventory'
+      - >-
+        ((vps_parkventory_postgres_network_inspection.stdout | from_json) |
+         first).Driver == 'bridge'
+      - >-
+        ((vps_parkventory_postgres_network_inspection.stdout | from_json) |
+         first).Internal | bool
+      - >-
+        ((vps_parkventory_postgres_network_inspection.stdout | from_json) |
+         first).IPAM.Config | map(attribute='Subnet') | list ==
+        ['172.30.21.0/24']
+      - >-
+        ((vps_parkventory_postgres_network_inspection.stdout | from_json) |
+         first).Labels['com.nclsppr.vps-infra.managed'] | default('') ==
+        'true'
+    fail_msg: db_parkventory differs from the managed private network.
+
+- name: Run the non-mutating Parkventory secret plan
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/vps/materialize-parkventory-secrets
+      - --dry-run
+  changed_when: false
+  no_log: true
+  when:
+    - vps_parkventory_postgres_state == 'dry-run'
+    - not ansible_check_mode
+
+- name: Run the reviewed-source Parkventory secret plan in check mode
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../scripts/materialize-parkventory-secrets', rstrip=false) }}"
+      - materialize-parkventory-secrets
+      - --dry-run
+  check_mode: false
+  changed_when: false
+  no_log: true
+  when:
+    - vps_parkventory_postgres_state == 'dry-run'
+    - ansible_check_mode
+
+- name: Run the non-mutating Parkventory PostgreSQL plan
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/vps/provision-parkventory-postgres
+      - --dry-run
+  changed_when: false
+  when:
+    - vps_parkventory_postgres_state == 'dry-run'
+    - not ansible_check_mode
+
+- name: Run the reviewed-source Parkventory PostgreSQL plan in check mode
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../scripts/provision-parkventory-postgres', rstrip=false) }}"
+      - provision-parkventory-postgres
+      - --dry-run
+      - --embedded-contract
+  check_mode: false
+  changed_when: false
+  when:
+    - vps_parkventory_postgres_state == 'dry-run'
+    - ansible_check_mode
+
+- name: Verify the existing Parkventory database secrets
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/vps/materialize-parkventory-secrets
+      - --check
+  changed_when: false
+  no_log: true
+  when: vps_parkventory_postgres_state == 'check'
+
+- name: Verify the existing Parkventory PostgreSQL readiness evidence
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/vps/provision-parkventory-postgres
+      - --check
+  changed_when: false
+  when: vps_parkventory_postgres_state == 'check'
+
+- name: Prepare only the Parkventory database boundary
+  when:
+    - vps_parkventory_postgres_state == 'prepare'
+    - not ansible_check_mode
+  block:
+    - name: Create only missing Parkventory database passwords
+      ansible.builtin.command:
+        argv:
+          - /usr/local/libexec/vps/materialize-parkventory-secrets
+          - --apply
+      register: vps_parkventory_secret_materialization
+      changed_when: >-
+        (vps_parkventory_secret_materialization.stdout | from_json).changed |
+        bool
+      no_log: true
+
+    - name: Resolve the healthy shared PostgreSQL container
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - ps
+          - --quiet
+          - --filter
+          - label=com.docker.compose.project=vps-platform
+          - --filter
+          - label=com.docker.compose.service=postgresql
+      register: vps_parkventory_postgres_container
+      changed_when: false
+
+    - name: Require exactly one shared PostgreSQL container
+      ansible.builtin.assert:
+        that:
+          - vps_parkventory_postgres_container.stdout_lines | length == 1
+        fail_msg: The shared PostgreSQL container boundary is ambiguous.
+
+    - name: Inspect the current shared PostgreSQL networks
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - inspect
+          - "{{ vps_parkventory_postgres_container.stdout }}"
+      register: vps_parkventory_postgres_before
+      changed_when: false
+
+    - name: Remember whether PostgreSQL already joined db_parkventory
+      ansible.builtin.set_fact:
+        vps_parkventory_postgres_network_was_present: >-
+          {{ 'db_parkventory' in
+             (((vps_parkventory_postgres_before.stdout | from_json) |
+               first).NetworkSettings.Networks.keys() | list) }}
+
+    - name: Provision through one temporary private network attachment
+      block:
+        - name: Attach PostgreSQL temporarily to db_parkventory
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - network
+              - connect
+              - --alias
+              - postgresql
+              - db_parkventory
+              - "{{ vps_parkventory_postgres_container.stdout }}"
+          changed_when: true
+          when: not vps_parkventory_postgres_network_was_present
+
+        - name: Apply and prove the isolated Parkventory database contract
+          ansible.builtin.command:
+            argv:
+              - /usr/local/libexec/vps/provision-parkventory-postgres
+              - --apply
+          register: vps_parkventory_postgres_apply
+          changed_when: >-
+            (vps_parkventory_postgres_apply.stdout | from_json).changed | bool
+          no_log: true
+
+      always:
+        - name: Remove the temporary PostgreSQL network attachment
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - network
+              - disconnect
+              - db_parkventory
+              - "{{ vps_parkventory_postgres_container.stdout }}"
+          changed_when: true
+          failed_when: false
+          when: not vps_parkventory_postgres_network_was_present
+
+        - name: Inspect PostgreSQL after private network cleanup
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/docker
+              - inspect
+              - "{{ vps_parkventory_postgres_container.stdout }}"
+          register: vps_parkventory_postgres_after
+          changed_when: false
+
+        - name: Prove preparation restored the prior network state
+          ansible.builtin.assert:
+            that:
+              - >-
+                ('db_parkventory' in
+                 (((vps_parkventory_postgres_after.stdout | from_json) |
+                   first).NetworkSettings.Networks.keys() | list)) ==
+                (vps_parkventory_postgres_network_was_present | bool)
+            fail_msg: >-
+              The temporary PostgreSQL attachment was not restored to its
+              prior state.
+
+- name: Report the non-activating database result
+  ansible.builtin.debug:
+    msg: >-
+      The Parkventory PostgreSQL 17.10 database boundary was
+      {{ vps_parkventory_postgres_state }}. The Compose contract remains
+      disabled. No application container, Caddy route, DNS record, or static
+      ownership state changed. Readiness requires PostgreSQL to remain attached
+      to db_parkventory, so a temporary preparation attachment is not current
+      readiness after cleanup. Encrypted off-site backup evidence is still a
+      separate activation blocker.
