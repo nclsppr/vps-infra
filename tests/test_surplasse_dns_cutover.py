@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adversarial tests for the inactive Surplasse DNS cutover controller."""
+"""Adversarial tests for the Surplasse DNS cutover controller."""
 
 from __future__ import annotations
 
@@ -31,6 +31,56 @@ def load_controller():
 
 
 DNS = load_controller()
+
+
+class HttpResponse:
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.headers: dict[str, str] = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, limit: int) -> bytes:
+        return self.payload[:limit]
+
+
+class ScriptedOpener:
+    def __init__(self, *responses: bytes | BaseException):
+        self.responses = list(responses)
+        self.requests = []
+
+    def open(self, request, timeout: int):
+        self.requests.append((request, timeout))
+        if not self.responses:
+            raise AssertionError("unexpected OVH request")
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return HttpResponse(response)
+
+
+def atlas_wildcard_record(record_id: int | None = None) -> dict[str, object]:
+    record: dict[str, object] = {
+        "fieldType": "A",
+        "subDomain": "*",
+        "target": DNS.ATLAS_IPV4,
+        "ttl": DNS.CUTOVER_TTL,
+    }
+    if record_id is not None:
+        record["id"] = record_id
+    return record
+
+
+def ovh_api(opener: object) -> object:
+    return DNS.OvhZoneApi(
+        DNS.OvhCredentials("A" * 16, "B" * 16, "C" * 16),
+        now=lambda: 2_000_000_000,
+        opener=opener,
+    )
 
 
 def baseline_records() -> list[dict[str, object]]:
@@ -251,12 +301,12 @@ class Fixture:
 
 
 class CutoverTests(unittest.TestCase):
-    def test_dns_and_legacy_adapter_stay_locked_after_canonical_admission(self) -> None:
+    def test_dns_policy_is_ready_and_legacy_adapter_stays_locked(self) -> None:
         policy = json.loads(
             (ROOT / "policies/surplasse-dns-cutover-v1.json").read_text(encoding="utf-8")
         )
-        self.assertIs(policy["enabled"], False)
-        self.assertEqual(policy["activation_policy"], "locked")
+        self.assertIs(policy["enabled"], True)
+        self.assertEqual(policy["activation_policy"], "ready")
         adapter = json.loads(
             (ROOT / "applications/surplasse/adapter.json").read_text(encoding="utf-8")
         )
@@ -272,6 +322,47 @@ class CutoverTests(unittest.TestCase):
         self.assertIn("owner: root", tasks)
         self.assertIn('mode: "0444"', tasks)
         self.assertIn('mode: "0700"', tasks)
+        self.assertNotIn("ansible.builtin.command", tasks)
+        self.assertNotIn("ansible.builtin.shell", tasks)
+
+    def test_ready_policy_doctor_does_not_access_credentials_api_or_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            credentials = root / "absent-credentials"
+            paths = DNS.RuntimePaths(
+                state_root=root / "absent-state",
+                deployment_lock=root / "absent.lock",
+                expected_uid=os.getuid(),
+                expected_gid=os.getgid(),
+            )
+            controller = DNS.Controller(
+                paths,
+                DNS.Policy(True, "ready", credentials),
+            )
+            with (
+                mock.patch.object(
+                    DNS,
+                    "load_credentials",
+                    side_effect=AssertionError("doctor accessed credentials"),
+                ),
+                mock.patch.object(
+                    DNS,
+                    "OvhZoneApi",
+                    side_effect=AssertionError("doctor constructed an API client"),
+                ),
+            ):
+                self.assertEqual(
+                    controller.doctor(),
+                    {
+                        "activation_policy": "ready",
+                        "atlas_ipv4": DNS.ATLAS_IPV4,
+                        "enabled": True,
+                        "mutations_available": True,
+                        "zone": DNS.ZONE,
+                    },
+                )
+            self.assertFalse(credentials.exists())
+            self.assertFalse(paths.state_root.exists())
 
     def test_locked_policy_refuses_before_api_or_state_access(self) -> None:
         class TrapApi:
@@ -667,15 +758,21 @@ class CutoverTests(unittest.TestCase):
         document = json.loads(
             (ROOT / "policies/surplasse-dns-cutover-v1.json").read_text(encoding="utf-8")
         )
-        locked = DNS.validate_policy_document(document)
-        self.assertFalse(locked.enabled)
-        invalid = dict(document)
-        invalid["enabled"] = True
+        ready = DNS.validate_policy_document(document)
+        self.assertTrue(ready.enabled)
+        invalid_ready = dict(document)
+        invalid_ready["activation_policy"] = "locked"
         with self.assertRaises(DNS.CutoverError):
-            DNS.validate_policy_document(invalid)
-        ready = dict(invalid)
-        ready["activation_policy"] = "ready"
-        self.assertTrue(DNS.validate_policy_document(ready).enabled)
+            DNS.validate_policy_document(invalid_ready)
+        locked_document = dict(document)
+        locked_document["enabled"] = False
+        locked_document["activation_policy"] = "locked"
+        locked = DNS.validate_policy_document(locked_document)
+        self.assertFalse(locked.enabled)
+        invalid_locked = dict(locked_document)
+        invalid_locked["activation_policy"] = "ready"
+        with self.assertRaises(DNS.CutoverError):
+            DNS.validate_policy_document(invalid_locked)
         wrong_zone = dict(document)
         wrong_zone["zone"] = "example.com"
         with self.assertRaises(DNS.CutoverError):
@@ -741,6 +838,82 @@ class CutoverTests(unittest.TestCase):
         )
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertNotRegex(source, r"(?m)^\s*(?:import|from)\s+ovh\b")
+
+    def test_ovh_post_record_accepts_a_complete_record_without_readback(self) -> None:
+        candidate = atlas_wildcard_record()
+        response = atlas_wildcard_record(101)
+        opener = ScriptedOpener(DNS.canonical_bytes(response))
+        api = ovh_api(opener)
+        self.assertEqual(api.post_record(candidate), response)
+        self.assertEqual(len(opener.requests), 1)
+        self.assertEqual(opener.requests[0][0].get_method(), "POST")
+
+    def test_ovh_post_record_reads_and_validates_a_created_record_id(self) -> None:
+        candidate = atlas_wildcard_record()
+        created = atlas_wildcard_record(101)
+        opener = ScriptedOpener(
+            b"101",
+            DNS.canonical_bytes(created),
+        )
+        self.assertEqual(ovh_api(opener).post_record(candidate), created)
+        self.assertEqual(opener.responses, [])
+        self.assertEqual(
+            [
+                (request.get_method(), request.full_url)
+                for request, _ in opener.requests
+            ],
+            [
+                ("POST", "https://eu.api.ovh.com/1.0/domain/zone/surplasse.com/record"),
+                (
+                    "GET",
+                    "https://eu.api.ovh.com/1.0/domain/zone/surplasse.com/record/101",
+                ),
+            ],
+        )
+        self.assertEqual(
+            opener.requests[0][0].data,
+            DNS.canonical_bytes(candidate).rstrip(b"\n"),
+        )
+        self.assertIsNone(opener.requests[1][0].data)
+
+    def test_ovh_post_record_rejects_an_invalid_response_without_get(self) -> None:
+        cases = (
+            (b"{}", "record lacks a required member"),
+            (b"null", "record identifier is invalid"),
+            (b"true", "record identifier is invalid"),
+            (b"0", "record identifier is invalid"),
+            (b"-1", "record identifier is invalid"),
+            (b'"101"', "record identifier is invalid"),
+        )
+        for payload, message in cases:
+            with self.subTest(payload=payload):
+                opener = ScriptedOpener(payload)
+                with self.assertRaisesRegex(DNS.CutoverError, message):
+                    ovh_api(opener).post_record(atlas_wildcard_record())
+                self.assertEqual(len(opener.requests), 1)
+                self.assertEqual(opener.requests[0][0].get_method(), "POST")
+
+    def test_ovh_post_record_rejects_an_invalid_get_readback(self) -> None:
+        cases = (
+            (
+                DNS.canonical_bytes(atlas_wildcard_record(102)),
+                "identifier differs from the requested identifier",
+            ),
+            (b"{}", "record lacks a required member"),
+            (OSError("readback failed"), "OVH API request failed"),
+        )
+        for second_response, message in cases:
+            with self.subTest(message=message):
+                opener = ScriptedOpener(b"101", second_response)
+                with self.assertRaisesRegex(DNS.CutoverError, message):
+                    ovh_api(opener).post_record(atlas_wildcard_record())
+                self.assertEqual(
+                    [request.get_method() for request, _ in opener.requests],
+                    ["POST", "GET"],
+                )
+                self.assertTrue(
+                    opener.requests[1][0].full_url.endswith("/record/101")
+                )
 
 
 if __name__ == "__main__":

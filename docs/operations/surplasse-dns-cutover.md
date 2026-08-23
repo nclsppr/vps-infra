@@ -2,11 +2,11 @@
 
 ## Current state
 
-The controller is installed as a locked candidate. It performs no OVHcloud
-request in this revision. Canonical application admission is enabled, but the
-DNS policy remains independent and locked. This runbook defines the future
-operator sequence. It is not an activation instruction for the current
-revision.
+The versioned policy is enabled and ready for the tester cutover. Merging or
+installing this policy does not read a credential, call OVHcloud, create a plan,
+or change DNS. No workflow invokes the controller. Every operation remains an
+explicit root command. Policy readiness is an authorization boundary. It is
+not proof of credentials, application health, TLS health, or DNS cutover.
 
 Run the read-only policy check:
 
@@ -14,9 +14,9 @@ Run the read-only policy check:
 sudo -n -- /usr/local/libexec/vps/surplasse-dns-cutover doctor --json
 ```
 
-Require the DNS policy values `enabled: false`, `activation_policy: locked`, and
-`mutations_available: false` until a separate reviewed activation change is
-ready.
+Require the DNS policy values `enabled: true`, `activation_policy: ready`, and
+`mutations_available: true`. The last value reports policy authorization only.
+It does not inspect the credential directory or contact OVHcloud.
 
 ## Identity boundary
 
@@ -40,9 +40,9 @@ an argument, environment variable, prompt, log, chat, issue, or repository.
 These files are not the permanent Caddy DNS-01 credential bundle at
 `/etc/vps/secrets/dns/surplasse`.
 
-## Preconditions for a future ready revision
+## Preconditions for the first plan
 
-Before policy activation, prove all these conditions:
+Before the first `plan`, prove all these conditions:
 
 1. The apex and `www` A records are each exactly `213.186.33.5` with TTL 3600.
 2. The wildcard A record is absent.
@@ -56,8 +56,9 @@ Before policy activation, prove all these conditions:
 6. Do not publish an AAAA record. The Atlas IPv6 public edge is not verified.
 7. Record the exact rollback owner, time window, and alert channel.
 
-The policy activation must be a separately reviewed repository revision. Do
-not edit the installed policy on Atlas.
+The ready policy is a reviewed repository revision. Do not edit the installed
+policy on Atlas. Do not run `plan` until every precondition is true. Create and
+install the short-lived cutover identity only for the approved operator window.
 
 ## Phase 1: lower TTL
 
@@ -66,6 +67,10 @@ Create one plan:
 ```text
 sudo -n -- /usr/local/libexec/vps/surplasse-dns-cutover plan --json
 ```
+
+This command reads the dedicated short-lived identity and calls only the
+reviewed OVHcloud read routes before it writes a local plan. It fails closed if
+the credential inventory is absent or invalid. It does not change DNS.
 
 Review the complete two-record diff, plan identifier, SHA-256, snapshot
 SHA-256, expiry, and non-atomicity warning. Confirm the exact plan only:

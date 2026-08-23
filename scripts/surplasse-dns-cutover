@@ -588,7 +588,11 @@ class OvhZoneApi:
                 "ttl": candidate["ttl"],
             },
         )
-        return validate_record(created)
+        if isinstance(created, dict):
+            return validate_record(created)
+        created_id = validate_record_id(created)
+        created = self.request("GET", f"{self.zone_path}/record/{created_id}")
+        return validate_record(created, expected_id=created_id)
 
     def delete_record(self, record_id: int) -> None:
         validate_record_id(record_id)
