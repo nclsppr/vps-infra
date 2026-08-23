@@ -399,7 +399,7 @@ def status(active: Any, profile: Any, environment: Mapping[str, str], digest: st
         write_pilot_state(state_value(active, digest, phase, confirmed_until=expiration))
         if phase == "ambiguous-empty":
             fail("pilot apply outcome remains ambiguous; replay is refused")
-        print("Surplasse pilot status: exact Flyway V14 database is empty.")
+        print("Surplasse pilot status: exact Flyway V15 database is empty.")
         return 3
     fail("pilot status returned an unapproved result")
 
