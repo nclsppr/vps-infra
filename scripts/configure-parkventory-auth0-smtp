@@ -1,0 +1,301 @@
+#!/usr/bin/python3 -I
+
+"""Configure the exact Parkventory SMTP provider in the Auth0 EU tenant."""
+
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import re
+import ssl
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+EXIT_USAGE = 64
+EXIT_RUNTIME = 70
+EXIT_CONFIG = 78
+PROVIDER_ENV = Path("applications/parkventory/provider.env")
+MAX_PROVIDER_ENV_BYTES = 16 * 1024
+MAX_RESPONSE_BYTES = 64 * 1024
+REQUEST_TIMEOUT_SECONDS = 20
+SMTP_USERNAME_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.ASCII,
+)
+OPAQUE_SECRET_RE = re.compile(r"[\x21-\x7e]{16,512}", re.ASCII)
+TOKEN_RE = re.compile(r"[\x21-\x7e]{32,8192}", re.ASCII)
+EXPECTED_PROVIDER_VALUES = {
+    "PARKVENTORY_OIDC_AUTH_SERVER_URL": "https://pieper.eu.auth0.com/",
+    "PARKVENTORY_OIDC_CLIENT_ID": "BVDpIAxZVZWQhPlziqsQCExYjVeil4YY",
+    "PARKVENTORY_SMTP_FROM": "no-reply@parkventory.com",
+    "PARKVENTORY_SMTP_HOST": "smtp.tem.scaleway.com",
+    "PARKVENTORY_SMTP_PORT": "587",
+}
+EXPECTED_DEFAULT_CLIENT = (
+    "XtyJ6DUNbXNoGnysWWcqY2XfBlq9GakA",
+    "Default App",
+)
+GET_CLIENTS_PATH = (
+    "/api/v2/clients?fields=client_id,name&include_fields=true&"
+    "page=0&per_page=3&include_totals=true"
+)
+GET_PROVIDER_PATH = (
+    "/api/v2/emails/provider?"
+    "fields=name,enabled,default_from_address,credentials,settings&"
+    "include_fields=true"
+)
+
+
+class Auth0ProviderError(RuntimeError):
+    """The Auth0 SMTP provider differs from the Parkventory contract."""
+
+
+def fail(message: str, exit_code: int) -> None:
+    print(f"Parkventory Auth0 SMTP configuration: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def read_provider_env(path: Path = PROVIDER_ENV) -> dict[str, str]:
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise Auth0ProviderError("cannot read the versioned provider contract") from exc
+    if (
+        not content
+        or len(content) > MAX_PROVIDER_ENV_BYTES
+        or not content.endswith(b"\n")
+        or b"\r" in content
+        or b"\0" in content
+    ):
+        raise Auth0ProviderError("the versioned provider contract framing is invalid")
+    try:
+        lines = content.decode("ascii").splitlines()
+    except UnicodeDecodeError as exc:
+        raise Auth0ProviderError("the versioned provider contract is not ASCII") from exc
+    values: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or not key or not value or key in values:
+            raise Auth0ProviderError("the versioned provider contract has an invalid record")
+        values[key] = value
+    for key, expected in EXPECTED_PROVIDER_VALUES.items():
+        if values.get(key) != expected:
+            raise Auth0ProviderError("the versioned provider contract differs")
+    return values
+
+
+def read_secret_environment() -> tuple[str, str, str]:
+    bearer_value = os.environ.pop("AUTH0_MANAGEMENT_TOKEN", "")
+    username = os.environ.pop("PARKVENTORY_SMTP_USERNAME", "")
+    smtp_value = os.environ.pop("PARKVENTORY_SMTP_PASSWORD", "")
+    if TOKEN_RE.fullmatch(bearer_value) is None:
+        raise Auth0ProviderError("the Auth0 management token format is invalid")
+    if SMTP_USERNAME_RE.fullmatch(username) is None:
+        raise Auth0ProviderError("the SMTP username format is invalid")
+    if OPAQUE_SECRET_RE.fullmatch(smtp_value) is None:
+        raise Auth0ProviderError("the SMTP password format is invalid")
+    return bearer_value, username, smtp_value
+
+
+def request(
+    host: str,
+    bearer_value: str,
+    method: str,
+    path: str,
+    body: bytes | None,
+) -> tuple[int, object | None]:
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {bearer_value}",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    connection = http.client.HTTPSConnection(
+        host,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        context=ssl.create_default_context(),
+    )
+    try:
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        content = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(content) > MAX_RESPONSE_BYTES:
+            raise Auth0ProviderError("the Auth0 response exceeds the limit")
+        if not content:
+            document = None
+        else:
+            try:
+                document = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise Auth0ProviderError("the Auth0 response is not valid JSON") from exc
+        return response.status, document
+    finally:
+        connection.close()
+
+
+def provider_body(values: dict[str, str], username: str, smtp_value: str) -> bytes:
+    document = {
+        "credentials": {
+            "smtp_host": values["PARKVENTORY_SMTP_HOST"],
+            "smtp_pass": smtp_value,
+            "smtp_port": int(values["PARKVENTORY_SMTP_PORT"]),
+            "smtp_user": username,
+        },
+        "default_from_address": values["PARKVENTORY_SMTP_FROM"],
+        "enabled": True,
+        "name": "smtp",
+        "settings": {},
+    }
+    return json.dumps(document, sort_keys=True, separators=(",", ":")).encode(
+        "ascii"
+    )
+
+
+def verify_tenant_clients(document: object, values: dict[str, str]) -> None:
+    if not isinstance(document, dict):
+        raise Auth0ProviderError("the Auth0 client inventory response is invalid")
+    clients = document.get("clients")
+    numeric_contract = {
+        "length": 2,
+        "limit": 3,
+        "start": 0,
+        "total": 2,
+    }
+    if not isinstance(clients, list) or len(clients) != 2:
+        raise Auth0ProviderError("the Auth0 tenant is not dedicated to Parkventory")
+    if any(
+        type(document.get(key)) is not int or document.get(key) != expected
+        for key, expected in numeric_contract.items()
+    ):
+        raise Auth0ProviderError("the Auth0 client inventory is not bounded")
+    identities: set[tuple[str, str]] = set()
+    for client in clients:
+        if not isinstance(client, dict) or set(client) != {"client_id", "name"}:
+            raise Auth0ProviderError("the Auth0 client inventory shape is invalid")
+        client_id = client.get("client_id")
+        name = client.get("name")
+        if not isinstance(client_id, str) or not isinstance(name, str):
+            raise Auth0ProviderError("the Auth0 client inventory shape is invalid")
+        identities.add((client_id, name))
+    expected = {
+        EXPECTED_DEFAULT_CLIENT,
+        (values["PARKVENTORY_OIDC_CLIENT_ID"], "Parkventory"),
+    }
+    if identities != expected:
+        raise Auth0ProviderError("the Auth0 tenant is not dedicated to Parkventory")
+
+
+def verify_existing_provider(
+    document: object, values: dict[str, str], username: str
+) -> None:
+    if not isinstance(document, dict):
+        raise Auth0ProviderError("the existing Auth0 email provider is invalid")
+    credentials = document.get("credentials")
+    expected_credentials = {
+        "smtp_host": values["PARKVENTORY_SMTP_HOST"],
+        "smtp_port": int(values["PARKVENTORY_SMTP_PORT"]),
+        "smtp_user": username,
+    }
+    if (
+        document.get("name") != "smtp"
+        or type(document.get("enabled")) is not bool
+        or document.get("default_from_address")
+        != values["PARKVENTORY_SMTP_FROM"]
+        or credentials != expected_credentials
+        or document.get("settings") != {}
+    ):
+        raise Auth0ProviderError(
+            "the existing Auth0 email provider is foreign or differs"
+        )
+
+
+def verify_provider(document: object, values: dict[str, str], username: str) -> None:
+    if not isinstance(document, dict):
+        raise Auth0ProviderError("the Auth0 email provider response shape is invalid")
+    credentials = document.get("credentials")
+    if not isinstance(credentials, dict):
+        raise Auth0ProviderError("the Auth0 SMTP credential metadata is absent")
+    if (
+        document.get("name") != "smtp"
+        or document.get("enabled") is not True
+        or document.get("default_from_address") != values["PARKVENTORY_SMTP_FROM"]
+        or credentials.get("smtp_host") != values["PARKVENTORY_SMTP_HOST"]
+        or credentials.get("smtp_port") != int(values["PARKVENTORY_SMTP_PORT"])
+        or credentials.get("smtp_user") != username
+        or document.get("settings", {}) != {}
+    ):
+        raise Auth0ProviderError("the Auth0 SMTP provider differs after configuration")
+
+
+def configure() -> None:
+    values = read_provider_env()
+    bearer_value, username, smtp_value = read_secret_environment()
+    issuer = urlsplit(values["PARKVENTORY_OIDC_AUTH_SERVER_URL"])
+    if (
+        issuer.scheme != "https"
+        or issuer.hostname != "pieper.eu.auth0.com"
+        or issuer.path != "/"
+        or issuer.query
+        or issuer.fragment
+        or issuer.port not in {None, 443}
+    ):
+        raise Auth0ProviderError("the Auth0 tenant origin differs")
+    assert issuer.hostname is not None
+    client_status, client_document = request(
+        issuer.hostname, bearer_value, "GET", GET_CLIENTS_PATH, None
+    )
+    if client_status != 200:
+        raise Auth0ProviderError("Auth0 refused the bounded client inventory query")
+    verify_tenant_clients(client_document, values)
+    status, existing_document = request(
+        issuer.hostname, bearer_value, "GET", GET_PROVIDER_PATH, None
+    )
+    body = provider_body(values, username, smtp_value)
+    if status == 404:
+        mutation_status, _ = request(
+            issuer.hostname,
+            bearer_value,
+            "POST",
+            "/api/v2/emails/provider",
+            body,
+        )
+        if mutation_status != 201:
+            raise Auth0ProviderError("Auth0 refused SMTP provider creation")
+    elif status == 200:
+        verify_existing_provider(existing_document, values, username)
+        mutation_status, _ = request(
+            issuer.hostname,
+            bearer_value,
+            "PATCH",
+            "/api/v2/emails/provider",
+            body,
+        )
+        if mutation_status != 200:
+            raise Auth0ProviderError("Auth0 refused SMTP provider update")
+    else:
+        raise Auth0ProviderError("Auth0 refused the initial email provider query")
+    final_status, final_document = request(
+        issuer.hostname, bearer_value, "GET", GET_PROVIDER_PATH, None
+    )
+    if final_status != 200:
+        raise Auth0ProviderError("Auth0 refused the final email provider query")
+    verify_provider(final_document, values, username)
+
+
+def main() -> None:
+    if len(sys.argv) != 1:
+        fail("arguments are forbidden", EXIT_USAGE)
+    try:
+        configure()
+    except Auth0ProviderError as exc:
+        fail(str(exc), EXIT_CONFIG)
+    except (OSError, http.client.HTTPException):
+        fail("the Auth0 Management API request failed", EXIT_RUNTIME)
+    print("Parkventory Auth0 SMTP provider is configured.")
+
+
+if __name__ == "__main__":
+    main()

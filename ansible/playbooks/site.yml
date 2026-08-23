@@ -23,6 +23,11 @@
           - vps_deploy_authorized_keys is not mapping
           - vps_deploy_authorized_keys | length > 0
           - vps_deploy_authorized_keys | length <= 4
+          - (vps_parkventory_provider_ingress_authorized_key | default('')) is string
+          - >-
+            (vps_deploy_authorized_keys | length) +
+            (1 if (vps_parkventory_provider_ingress_authorized_key |
+             default('')) | length > 0 else 0) <= 4
           - >-
             vps_deploy_authorized_keys | unique | length ==
             vps_deploy_authorized_keys | length
@@ -45,12 +50,38 @@
       loop_control:
         label: "clé deploy déclarée"
 
+    - name: Validate the Parkventory provider ingress key before any role
+      ansible.builtin.assert:
+        that:
+          - >-
+            (vps_parkventory_provider_ingress_authorized_key | default(''))
+            | length <= 16384
+          - >-
+            '\n' not in
+            (vps_parkventory_provider_ingress_authorized_key | default(''))
+          - >-
+            '\r' not in
+            (vps_parkventory_provider_ingress_authorized_key | default(''))
+          - >-
+            (vps_parkventory_provider_ingress_authorized_key | default('')) ==
+            '' or (vps_parkventory_provider_ingress_authorized_key |
+            default('')) is
+            match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
+        fail_msg: >-
+          The temporary Parkventory provider ingress public key is invalid.
+      no_log: true
+
     - name: Normalize desired deployment key identities before any role
       ansible.builtin.set_fact:
         site_deploy_key_identities: >-
           {{
             vps_deploy_authorized_keys | map('trim') |
             map('regex_replace', '^([^ ]+ [^ ]+)(?: .*)?$', '\1') | list
+          }}
+        site_parkventory_provider_ingress_key_identity: >-
+          {{
+            (vps_parkventory_provider_ingress_authorized_key | default('')) |
+            trim | regex_replace('^([^ ]+ [^ ]+)(?: .*)?$', '\1')
           }}
 
     - name: Refuse duplicate deployment key identities before any role
@@ -59,6 +90,10 @@
           - >-
             site_deploy_key_identities | unique | length ==
             site_deploy_key_identities | length
+          - >-
+            (vps_parkventory_provider_ingress_authorized_key | default('')) |
+            length == 0 or site_parkventory_provider_ingress_key_identity not in
+            site_deploy_key_identities
         fail_msg: >-
           Refus de converger deux déclarations de la même clé deploy avec des
           commentaires différents.
@@ -79,6 +114,25 @@
       loop: "{{ vps_deploy_authorized_keys }}"
       loop_control:
         label: "clé deploy déclarée"
+
+    - name: Cryptographically parse the provider ingress key before any role
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/ssh-keygen
+          - -l
+          - -E
+          - sha256
+          - -f
+          - /dev/stdin
+        stdin: >-
+          {{ vps_parkventory_provider_ingress_authorized_key | default('') }}
+        stdin_add_newline: true
+      check_mode: false
+      changed_when: false
+      when: >-
+        (vps_parkventory_provider_ingress_authorized_key | default('')) |
+        length > 0
+      no_log: true
 
     - name: Validate the one-use deployment key recovery nonce contract
       ansible.builtin.assert:

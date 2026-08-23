@@ -16,6 +16,9 @@ vps_ssh_port: 22
 # key is not a secret. The automation must not create one.
 vps_admin_authorized_keys: []
 vps_deploy_authorized_keys: []
+# Temporary bootstrap key. Keep it distinct from every deploy key. Set it back
+# to an empty string and converge after provider ingress succeeds.
+vps_parkventory_provider_ingress_authorized_key: ""
 # Break-glass only. A non-empty 64-character nonce authorizes one replacement
 # without overlap and is consumed on Atlas. Normal convergence keeps this empty.
 vps_deploy_key_recovery_nonce: ""

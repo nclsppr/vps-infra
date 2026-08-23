@@ -1,0 +1,508 @@
+#!/usr/bin/python3 -I
+
+"""Materialize the exact Parkventory provider bundle from protected stdin."""
+
+from __future__ import annotations
+
+import json
+import fcntl
+import os
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+EXIT_USAGE = 64
+EXIT_CONFIG = 78
+MAX_INPUT_BYTES = 2048
+MAX_PROVIDER_ENV_BYTES = 16 * 1024
+MAX_REVISION_BYTES = 41
+INPUT_TIMEOUT_SECONDS = 5
+HELPER_TIMEOUT_SECONDS = 60
+GIT_TIMEOUT_SECONDS = 10
+LOCK_TIMEOUT_SECONDS = 30
+DEPLOYMENT_LOCK_PATH = Path("/run/lock/vps-static.lock")
+RUNTIME_DIRECTORY_ENV = "VPS_PARKVENTORY_PROVIDER_RUNTIME_DIRECTORY"
+CONTROLLER_REVISION_PATH = Path("/usr/local/share/vps-infra/controller-revision")
+CONVERGED_REVISION_PATH = Path(
+    "/usr/local/share/vps-infra/parkventory-provider-ingress-revision"
+)
+REPOSITORY_PATH = Path("/srv/vps/repository")
+VERSIONED_PROVIDER_ENV = Path(
+    "/srv/vps/repository/applications/parkventory/provider.env"
+)
+SMTP_MATERIALIZER = Path("/usr/local/libexec/vps/materialize-smtp-secrets")
+PROVIDER_MATERIALIZER = Path(
+    "/usr/local/libexec/vps/materialize-parkventory-provider-secrets"
+)
+SAFE_ENVIRONMENT = {
+    "HOME": "/root",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+}
+PAYLOAD_KEYS = frozenset(
+    {
+        "INFRA_REVISION",
+        "PARKVENTORY_OIDC_CLIENT_SECRET",
+        "PARKVENTORY_SMTP_PASSWORD",
+        "PARKVENTORY_SMTP_USERNAME",
+    }
+)
+SMTP_USERNAME_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.ASCII,
+)
+OPAQUE_SECRET_RE = re.compile(r"[\x21-\x7e]{16,512}", re.ASCII)
+OIDC_SECRET_RE = re.compile(r"[\x21-\x7e]{32,512}", re.ASCII)
+REVISION_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+RUNTIME_RE = re.compile(
+    r"/run/vps-parkventory-provider-ingress-[0-9a-f]{24}", re.ASCII
+)
+PARKVENTORY_ACTIVE_PATHS = (
+    Path("/var/lib/vps-application/active/parkventory.json"),
+    Path("/srv/applications/parkventory/current"),
+)
+TRANSACTION_DIRECTORIES = (
+    Path("/var/lib/vps-application/transactions"),
+    Path("/var/lib/vps-application/handoffs"),
+    Path("/var/lib/vps-static/transactions"),
+)
+TRANSACTION_FILES = (
+    Path("/var/lib/vps-public-edge-parkventory/base-transaction.json"),
+)
+
+
+class WorkerError(RuntimeError):
+    """The protected provider operation cannot run safely."""
+
+
+def fail(message: str, exit_code: int = EXIT_CONFIG) -> None:
+    print(f"Parkventory provider ingress worker: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def _read_timed_out(_signum: int, _frame: object) -> None:
+    raise WorkerError("timed out waiting for a complete request")
+
+
+def read_payload() -> bytes:
+    if any(os.isatty(descriptor) for descriptor in (0, 1, 2)):
+        raise WorkerError("terminal input or output is forbidden")
+    previous_handler = signal.signal(signal.SIGALRM, _read_timed_out)
+    signal.alarm(INPUT_TIMEOUT_SECONDS)
+    try:
+        payload = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    except OSError as exc:
+        raise WorkerError("could not read the request") from exc
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+    if len(payload) > MAX_INPUT_BYTES:
+        raise WorkerError("request exceeds the input limit")
+    return payload
+
+
+def parse_payload(payload: bytes) -> dict[str, str]:
+    if not payload or len(payload) > MAX_INPUT_BYTES:
+        raise WorkerError("request size is invalid")
+    if not payload.endswith(b"\n") or payload.count(b"\n") != 1:
+        raise WorkerError("request must end at exactly one newline")
+    if b"\r" in payload or b"\0" in payload:
+        raise WorkerError("request framing is invalid")
+    try:
+        document = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WorkerError("request is not canonical ASCII JSON") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document) != PAYLOAD_KEYS
+        or any(not isinstance(value, str) for value in document.values())
+    ):
+        raise WorkerError("request key allowlist differs")
+    canonical = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    if payload != canonical:
+        raise WorkerError("request JSON is not canonical")
+    if SMTP_USERNAME_RE.fullmatch(document["PARKVENTORY_SMTP_USERNAME"]) is None:
+        raise WorkerError("SMTP username format is invalid")
+    if REVISION_RE.fullmatch(document["INFRA_REVISION"]) is None:
+        raise WorkerError("infrastructure revision format is invalid")
+    if OPAQUE_SECRET_RE.fullmatch(document["PARKVENTORY_SMTP_PASSWORD"]) is None:
+        raise WorkerError("SMTP password format is invalid")
+    if OIDC_SECRET_RE.fullmatch(document["PARKVENTORY_OIDC_CLIENT_SECRET"]) is None:
+        raise WorkerError("OIDC client secret format is invalid")
+    return document
+
+
+def require_root_directory(path: Path, label: str, mode: int = 0o700) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise WorkerError(f"cannot inspect {label}") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != mode
+    ):
+        raise WorkerError(f"{label} has unsafe metadata")
+
+
+def runtime_directory(configured: str | None) -> Path:
+    if configured is None or RUNTIME_RE.fullmatch(configured) is None:
+        raise WorkerError("the transient runtime directory is invalid")
+    path = Path(configured)
+    require_root_directory(path, "transient runtime directory")
+    return path
+
+
+def path_exists_without_follow(path: Path, label: str) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise WorkerError(f"cannot inspect {label}") from exc
+    return True
+
+
+def refuse_transactions() -> None:
+    for path in PARKVENTORY_ACTIVE_PATHS:
+        if path_exists_without_follow(path, "Parkventory active state"):
+            raise WorkerError("Parkventory is active")
+    for directory in TRANSACTION_DIRECTORIES:
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise WorkerError("cannot inspect transaction state") from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise WorkerError("transaction state has unsafe metadata")
+        try:
+            if any(directory.iterdir()):
+                raise WorkerError("a deployment transaction or handoff is present")
+        except OSError as exc:
+            raise WorkerError("cannot inspect transaction state") from exc
+    for path in TRANSACTION_FILES:
+        if path_exists_without_follow(path, "deployment transaction"):
+            raise WorkerError("a deployment transaction or handoff is present")
+
+
+def acquire_deployment_lock(
+    path: Path = DEPLOYMENT_LOCK_PATH,
+    *,
+    timeout_seconds: float = LOCK_TIMEOUT_SECONDS,
+    owner: int = 0,
+    group: int = 0,
+) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise WorkerError("cannot open the shared deployment lock") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != owner
+            or metadata.st_gid != group
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise WorkerError("the shared deployment lock has unsafe metadata")
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return descriptor
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise WorkerError("the shared deployment lock is busy")
+                time.sleep(0.05)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def read_versioned_provider_env(path: Path = VERSIONED_PROVIDER_ENV) -> bytes:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise WorkerError("cannot open the versioned Parkventory provider contract") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) not in {0o444, 0o644}
+            or not 1 <= metadata.st_size <= MAX_PROVIDER_ENV_BYTES
+        ):
+            raise WorkerError("the versioned Parkventory provider contract is unsafe")
+        content = os.read(descriptor, MAX_PROVIDER_ENV_BYTES + 1)
+        if len(content) != metadata.st_size:
+            raise WorkerError("the versioned Parkventory provider contract changed")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def read_controller_revision(path: Path = CONTROLLER_REVISION_PATH) -> str:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise WorkerError("cannot open the installed controller revision") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o444
+            or metadata.st_size != MAX_REVISION_BYTES
+        ):
+            raise WorkerError("the installed controller revision is unsafe")
+        content = os.read(descriptor, MAX_REVISION_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    try:
+        revision = content.decode("ascii").removesuffix("\n")
+    except UnicodeDecodeError as exc:
+        raise WorkerError("the installed controller revision is invalid") from exc
+    if content != (revision + "\n").encode("ascii") or REVISION_RE.fullmatch(
+        revision
+    ) is None:
+        raise WorkerError("the installed controller revision is invalid")
+    return revision
+
+
+def run_repository_git(arguments: list[str], maximum: int, label: str) -> bytes:
+    environment = dict(SAFE_ENVIRONMENT)
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    try:
+        result = subprocess.run(
+            ["/usr/bin/git", "-C", str(REPOSITORY_PATH), *arguments],
+            check=False,
+            close_fds=True,
+            env=environment,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkerError(f"could not read {label}") from exc
+    if result.returncode != 0 or not 1 <= len(result.stdout) <= maximum:
+        raise WorkerError(f"could not read {label}")
+    return result.stdout
+
+
+def read_repository_contract() -> tuple[str, bytes]:
+    require_root_directory(REPOSITORY_PATH, "converged infrastructure repository")
+    head = run_repository_git(
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        MAX_REVISION_BYTES,
+        "the converged infrastructure HEAD",
+    )
+    try:
+        revision = head.decode("ascii").removesuffix("\n")
+    except UnicodeDecodeError as exc:
+        raise WorkerError("the converged infrastructure HEAD is invalid") from exc
+    if head != (revision + "\n").encode("ascii") or REVISION_RE.fullmatch(
+        revision
+    ) is None:
+        raise WorkerError("the converged infrastructure HEAD is invalid")
+    contract = run_repository_git(
+        ["show", "HEAD:applications/parkventory/provider.env"],
+        MAX_PROVIDER_ENV_BYTES,
+        "the Parkventory provider contract at infrastructure HEAD",
+    )
+    return revision, contract
+
+
+def verify_converged_contract(requested_revision: str, provider_env: bytes) -> None:
+    controller_revision = read_controller_revision()
+    ingress_revision = read_controller_revision(CONVERGED_REVISION_PATH)
+    repository_revision, repository_contract = read_repository_contract()
+    if (
+        requested_revision != controller_revision
+        or requested_revision != ingress_revision
+        or requested_revision != repository_revision
+    ):
+        raise WorkerError("the requested infrastructure revision is not converged")
+    if repository_contract != provider_env:
+        raise WorkerError(
+            "the converged Parkventory provider contract differs from repository HEAD"
+        )
+
+
+def write_private_file(directory: Path, name: str, content: bytes) -> None:
+    descriptor = os.open(
+        directory / name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise WorkerError("could not stage a protected provider source")
+            view = view[written:]
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def stage_sources(
+    root: Path, document: dict[str, str], provider_env: bytes
+) -> tuple[Path, Path]:
+    smtp_source = root / "smtp"
+    provider_source = root / "provider"
+    for directory in (smtp_source, provider_source):
+        directory.mkdir(mode=0o700)
+        require_root_directory(directory, "transient provider source")
+    write_private_file(
+        smtp_source,
+        "parkventory-smtp-username",
+        (document["PARKVENTORY_SMTP_USERNAME"] + "\n").encode("ascii"),
+    )
+    write_private_file(
+        smtp_source,
+        "parkventory-smtp-password",
+        (document["PARKVENTORY_SMTP_PASSWORD"] + "\n").encode("ascii"),
+    )
+    write_private_file(
+        provider_source,
+        "parkventory-oidc-client-secret",
+        (document["PARKVENTORY_OIDC_CLIENT_SECRET"] + "\n").encode("ascii"),
+    )
+    write_private_file(provider_source, "parkventory.env", provider_env)
+    return smtp_source, provider_source
+
+
+def run_helper(command: list[str], label: str, lock_descriptor: int) -> None:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            close_fds=True,
+            pass_fds=(lock_descriptor,),
+            env=SAFE_ENVIRONMENT,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=HELPER_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkerError(f"{label} could not run") from exc
+    if result.returncode != 0:
+        raise WorkerError(f"{label} refused its input")
+
+
+def execute_materialization(
+    smtp_source: Path, provider_source: Path, lock_descriptor: int
+) -> None:
+    commands = (
+        (
+            [str(PROVIDER_MATERIALIZER), "--validate-source", str(provider_source)],
+            "Parkventory provider validation",
+        ),
+        (
+            [
+                str(SMTP_MATERIALIZER),
+                "--product",
+                "parkventory",
+                "--registry-generation",
+                "1",
+                "--install-from",
+                str(smtp_source),
+                "--deployment-lock-held-fd",
+                str(lock_descriptor),
+            ],
+            "Parkventory SMTP installation",
+        ),
+        (
+            [
+                str(PROVIDER_MATERIALIZER),
+                "--install-from",
+                str(provider_source),
+                "--deployment-lock-held-fd",
+                str(lock_descriptor),
+            ],
+            "Parkventory provider installation",
+        ),
+        (
+            [
+                str(SMTP_MATERIALIZER),
+                "--product",
+                "parkventory",
+                "--registry-generation",
+                "1",
+                "--check",
+            ],
+            "Parkventory SMTP check",
+        ),
+        (
+            [str(PROVIDER_MATERIALIZER), "--check"],
+            "Parkventory provider check",
+        ),
+    )
+    for command, label in commands:
+        refuse_transactions()
+        run_helper(command, label, lock_descriptor)
+    refuse_transactions()
+
+
+def main() -> None:
+    if len(sys.argv) != 1:
+        fail("arguments are forbidden", EXIT_USAGE)
+    if os.geteuid() != 0:
+        fail("effective root is required", EXIT_USAGE)
+    configured_runtime = os.environ.get(RUNTIME_DIRECTORY_ENV)
+    os.environ.clear()
+    os.environ.update(SAFE_ENVIRONMENT)
+    os.umask(0o077)
+    source_root: Path | None = None
+    lock_descriptor: int | None = None
+    try:
+        root = runtime_directory(configured_runtime)
+        lock_descriptor = acquire_deployment_lock()
+        refuse_transactions()
+        document = parse_payload(read_payload())
+        provider_env = read_versioned_provider_env()
+        verify_converged_contract(document["INFRA_REVISION"], provider_env)
+        source_root = root
+        smtp_source, provider_source = stage_sources(root, document, provider_env)
+        execute_materialization(smtp_source, provider_source, lock_descriptor)
+    except (OSError, WorkerError) as exc:
+        fail(str(exc))
+    finally:
+        if source_root is not None:
+            for name in ("smtp", "provider"):
+                shutil.rmtree(source_root / name, ignore_errors=True)
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+    print("Parkventory provider materialization is valid.")
+
+
+if __name__ == "__main__":
+    main()

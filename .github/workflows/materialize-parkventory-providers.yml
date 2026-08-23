@@ -1,0 +1,165 @@
+---
+name: Materialize Parkventory providers
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-vps
+  cancel-in-progress: false
+
+jobs:
+  materialize:
+    name: Materialize Parkventory provider inputs
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: application-production
+    steps:
+      - name: Check out the provider contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Refuse provider changes while application deployment is enabled
+        shell: bash
+        env:
+          VPS_APPLICATION_DEPLOY_ENABLED: ${{ vars.VPS_APPLICATION_DEPLOY_ENABLED }}
+        run: |
+          set -Eeuo pipefail
+          test "${VPS_APPLICATION_DEPLOY_ENABLED}" = 'false'
+
+      - name: Prove the exact provider contract checkout
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ ${GITHUB_SHA} =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git diff --quiet -- applications/parkventory/provider.env
+          git diff --cached --quiet -- applications/parkventory/provider.env
+
+      - name: Materialize and check the Parkventory provider bundle on Atlas
+        shell: bash
+        env:
+          INFRA_REVISION: ${{ github.sha }}
+          PARKVENTORY_OIDC_CLIENT_SECRET: ${{ secrets.PARKVENTORY_OIDC_CLIENT_SECRET }}
+          PARKVENTORY_SMTP_USERNAME: ${{ secrets.PARKVENTORY_SMTP_USERNAME }}
+          PARKVENTORY_SMTP_PASSWORD: ${{ secrets.PARKVENTORY_SMTP_PASSWORD }}
+          VPS_APPLICATION_HOST: ${{ secrets.VPS_APPLICATION_HOST }}
+          VPS_APPLICATION_DEPLOY_USER: ${{ vars.VPS_APPLICATION_DEPLOY_USER }}
+          VPS_APPLICATION_DEPLOY_PORT: ${{ vars.VPS_APPLICATION_DEPLOY_PORT }}
+          VPS_PARKVENTORY_PROVIDER_INGRESS_SSH_PRIVATE_KEY: ${{ secrets.VPS_PARKVENTORY_PROVIDER_INGRESS_SSH_PRIVATE_KEY }}
+          VPS_APPLICATION_KNOWN_HOSTS: ${{ secrets.VPS_APPLICATION_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+
+          [[ ${VPS_APPLICATION_DEPLOY_USER} =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+          [[ ${VPS_APPLICATION_HOST} =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]]
+          [[ ${VPS_APPLICATION_DEPLOY_PORT} =~ ^[0-9]{1,5}$ ]]
+          (( 10#${VPS_APPLICATION_DEPLOY_PORT} >= 1 ))
+          (( 10#${VPS_APPLICATION_DEPLOY_PORT} <= 65535 ))
+          [[ ${INFRA_REVISION} =~ ^[0-9a-f]{40}$ ]]
+          test "${INFRA_REVISION}" = "${GITHUB_SHA}"
+          test -n "${VPS_PARKVENTORY_PROVIDER_INGRESS_SSH_PRIVATE_KEY}"
+          test -n "${VPS_APPLICATION_KNOWN_HOSTS}"
+          (( ${#VPS_PARKVENTORY_PROVIDER_INGRESS_SSH_PRIVATE_KEY} <= 65536 ))
+          (( ${#VPS_APPLICATION_KNOWN_HOSTS} <= 65536 ))
+
+          private_root="${RUNNER_TEMP}/parkventory-provider-ingress"
+          payload_path="${private_root}/payload.json"
+          key_path="${private_root}/key"
+          known_hosts_path="${private_root}/known_hosts"
+          install -d -m 0700 "${private_root}"
+          cleanup() {
+            rm -f -- "${payload_path}" "${key_path}" "${known_hosts_path}"
+          }
+          trap cleanup EXIT HUP INT TERM
+
+          python3 - "${payload_path}" <<'PYTHON'
+          import json
+          import os
+          import re
+          import sys
+
+          infra_revision = os.environ["INFRA_REVISION"]
+          username = os.environ["PARKVENTORY_SMTP_USERNAME"]
+          smtp_value = os.environ["PARKVENTORY_SMTP_PASSWORD"]
+          oidc_value = os.environ["PARKVENTORY_OIDC_CLIENT_SECRET"]
+          if re.fullmatch(
+              r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+              username,
+          ) is None:
+              raise SystemExit("Parkventory SMTP username format is invalid")
+          if re.fullmatch(r"[\x21-\x7e]{16,512}", smtp_value) is None:
+              raise SystemExit("Parkventory SMTP password format is invalid")
+          if re.fullmatch(r"[\x21-\x7e]{32,512}", oidc_value) is None:
+              raise SystemExit("Parkventory OIDC client secret format is invalid")
+          payload = {
+              "INFRA_REVISION": infra_revision,
+              "PARKVENTORY_OIDC_CLIENT_SECRET": oidc_value,
+              "PARKVENTORY_SMTP_PASSWORD": smtp_value,
+              "PARKVENTORY_SMTP_USERNAME": username,
+          }
+          encoded = (
+              json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+          ).encode("ascii")
+          if len(encoded) > 2048:
+              raise SystemExit("Parkventory provider payload exceeds the limit")
+          descriptor = os.open(
+              sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+          )
+          with os.fdopen(descriptor, "wb") as target:
+              target.write(encoded)
+              target.flush()
+              os.fsync(target.fileno())
+          PYTHON
+
+          printf '%s\n' \
+            "${VPS_PARKVENTORY_PROVIDER_INGRESS_SSH_PRIVATE_KEY}" > "${key_path}"
+          printf '%s\n' "${VPS_APPLICATION_KNOWN_HOSTS}" > "${known_hosts_path}"
+          chmod 0600 "${payload_path}" "${key_path}" "${known_hosts_path}"
+          unset INFRA_REVISION PARKVENTORY_OIDC_CLIENT_SECRET \
+            PARKVENTORY_SMTP_PASSWORD PARKVENTORY_SMTP_USERNAME \
+            VPS_PARKVENTORY_PROVIDER_INGRESS_SSH_PRIVATE_KEY \
+            VPS_APPLICATION_KNOWN_HOSTS
+
+          /usr/bin/env -i \
+            HOME="${HOME}" \
+            LANG=C \
+            LC_ALL=C \
+            PATH=/usr/local/bin:/usr/bin:/bin \
+            /usr/bin/ssh \
+              -i "${key_path}" \
+              -p "${VPS_APPLICATION_DEPLOY_PORT}" \
+              -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              -o ConnectionAttempts=2 \
+              -o IdentitiesOnly=yes \
+              -o LogLevel=ERROR \
+              -o ServerAliveCountMax=3 \
+              -o ServerAliveInterval=30 \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="${known_hosts_path}" \
+              "${VPS_APPLICATION_DEPLOY_USER}@${VPS_APPLICATION_HOST}" \
+              materialize-parkventory-providers-v1 < "${payload_path}"
+
+          printf '%s\n' \
+            'Atlas accepted the Parkventory provider bundle and both checks passed.' \
+            >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Configure the Auth0 SMTP provider after Atlas validation
+        shell: bash
+        env:
+          AUTH0_MANAGEMENT_TOKEN: ${{ secrets.AUTH0_MANAGEMENT_TOKEN }}
+          PARKVENTORY_SMTP_USERNAME: ${{ secrets.PARKVENTORY_SMTP_USERNAME }}
+          PARKVENTORY_SMTP_PASSWORD: ${{ secrets.PARKVENTORY_SMTP_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git diff --quiet -- applications/parkventory/provider.env
+          ./scripts/configure-parkventory-auth0-smtp

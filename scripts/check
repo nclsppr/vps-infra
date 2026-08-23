@@ -46,6 +46,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     "$SCRIPT_DIR/deploy" \
     "$SCRIPT_DIR/doctor" \
     "$SCRIPT_DIR/forced-command" \
+    "$SCRIPT_DIR/materialize-parkventory-providers-ssh-gate" \
     "$SCRIPT_DIR/parse-forced-command" \
     "$REPOSITORY_ROOT/tests/run"
 else
