@@ -312,6 +312,12 @@ class ApplicationBundleTests(unittest.TestCase):
                 probe_inventory_digest=BUNDLE.content_digest(files["probes.json"]),
             )
 
+    def test_parkventory_bundle_alert_fires_when_the_target_is_absent(self):
+        self.assertIn(
+            b'or absent(up{application="parkventory"})',
+            BUNDLE.PARKVENTORY_PROMETHEUS_RULES,
+        )
+
     def test_archive_rejects_links_even_when_inventory_names_are_valid(self):
         profile = BUNDLE.PROFILES["surplasse"]
         files, component_references = fixture_files(profile)

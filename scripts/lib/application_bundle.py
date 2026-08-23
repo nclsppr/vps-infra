@@ -368,7 +368,9 @@ PARKVENTORY_PROMETHEUS_RULES = b"""groups:
   - name: parkventory
     rules:
       - alert: ParkventoryBackendUnavailable
-        expr: up{application=\"parkventory\"} != 1
+        expr: >-
+          up{application=\"parkventory\"} != 1
+          or absent(up{application=\"parkventory\"})
         for: 5m
         labels:
           severity: critical
