@@ -70,14 +70,14 @@ Scaleway's documented products that support resource-level conditions. This
 repository therefore infers that a project-scoped key can send from any
 verified TEM domain in the project.
 
-Surplasse has a strict full-bundle materializer. Parkventory now has a separate
-strict provider-bundle materializer. Mon Florian has planned registry entries
-but no runtime SMTP contract. Parkventory provider state remains `planned`
-until a separate audit verifies the credential set on Atlas.
+`materialize-smtp-secrets` owns the three exact SMTP credential sets and writes
+a registry generation marker. Surplasse and Parkventory declare runtime paths.
+Mon Florian is storage-only and has no SMTP runtime consumer. The separate
+Parkventory provider-bundle helper owns its Auth0 input and public runtime
+configuration. It must not rotate the SMTP files.
 
-Repository admission and tester-order authorization do not prove this email
-channel. The credentials remain `planned`, and technical activation remains
-incomplete.
+Repository admission, credential creation, and tester-order authorization do
+not prove this email channel. Technical activation remains incomplete.
 
 ## Provider review
 
@@ -124,22 +124,34 @@ does not require an inbound mailbox.
 
 ## Materialize the credentials
 
-Create the `surplasse-prod-smtp` IAM application, policy, and API key. Grant
-only `TransactionalEmailEmailSmtpCreate` in project `Pieper Atlas`. Transfer
-the Project ID and Secret Key through the private channel defined by the
-[adapter input contract](../../applications/surplasse/README.md#operator-input-contract).
-Do not put either value in a contract, command, log, issue, or pull request. Do
-not transfer or store the Access Key for SMTP. Revoke an exposed value before
-use.
+Create the three declared IAM applications, policies, and API keys. Grant only
+`TransactionalEmailEmailSmtpCreate` in project `Pieper Atlas`. Store the values
+in the protected GitHub `application-production` environment under these
+names:
+
+- `SURPLASSE_SMTP_USERNAME` and `SURPLASSE_SMTP_PASSWORD`;
+- `PARKVENTORY_SMTP_USERNAME` and `PARKVENTORY_SMTP_PASSWORD`;
+- `MONFLORIAN_SMTP_USERNAME` and `MONFLORIAN_SMTP_PASSWORD`.
+
+The username values are the shared Project ID. Each password is the dedicated
+Secret Key. Do not put either value in a contract, command argument, log,
+issue, or pull request. Do not transfer or store the Access Key for SMTP.
+Revoke an exposed value before use.
 
 Update `secrets/registry.json` in two separate steps. First, review the planned
-contract and target generation before materialization. The current Surplasse
-materializer has no non-secret generation marker. A read-only metadata check
-can set `host_state` to `materialized`, but `generation` must stay `0` and
-`generation_binding` must stay `unlinked`. Do not use `runtime-loaded`. A later
-materializer change must publish the marker last with the exact file set and
-add a read-only marker check before any generation can advance. Never add a
-value-derived hash to Git.
+contract and target generation before materialization. Run the exact product
+profile at generation `1`:
+
+```text
+materialize-smtp-secrets --product surplasse --registry-generation 1 --install-from /absolute/root-only/directory
+materialize-smtp-secrets --product parkventory --registry-generation 1 --install-from /absolute/root-only/directory
+materialize-smtp-secrets --product monflorian --registry-generation 1 --install-from /absolute/root-only/directory
+```
+
+Run each profile again with `--check` instead of `--install-from`. Advance the
+registry to generation `1` only after the read-only check verifies the exact
+marker and file metadata. Do not use `runtime-loaded` without separate consumer
+proof. Never add a value-derived hash to Git.
 
 The materializer input must use port `587`. Its FQDN must equal the reviewed
 public provider contract. The rendered adapter requires

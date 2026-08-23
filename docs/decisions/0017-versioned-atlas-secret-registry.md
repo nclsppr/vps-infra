@@ -13,7 +13,8 @@ platform helper generates four local values. The Surplasse helper manages its
 database and operator files. A separate helper manages the permanent OVH DNS
 identity. Ansible can copy the Mon Florian OpenAI key from a private source.
 Parkventory has one materializer for its two PostgreSQL passwords and two local
-OIDC secrets. A separate materializer imports its three provider inputs.
+OIDC secrets. A separate materializer imports its Auth0 client secret. The SMTP
+materializer owns the two provider mail inputs.
 
 These contracts are distributed across documentation, Ansible, Python helpers,
 Compose files, and tests. Git did not contain one complete inventory. Git also
@@ -76,16 +77,17 @@ while an authorized operation is pending.
 
 ## Baseline observation
 
-The read-only audit on 23 August 2026 found exactly six materialized files:
+The read-only audit on 23 August 2026 at 17:25 UTC found exactly nine
+materialized registered files:
 
 - four platform secrets;
-- the Surplasse PostgreSQL migrator password;
-- the Surplasse PostgreSQL runtime password.
+- two Surplasse PostgreSQL passwords;
+- two Parkventory PostgreSQL passwords;
+- the Mon Florian OpenAI key.
 
-No other registered file was present. All six materialized files have
-generation `0` and binding `unlinked` because no current materializer writes a
-generation marker. No entry had runtime-loaded evidence. All Scaleway
-Transactional Email entries were absent.
+No other registered file was present. All nine materialized files have
+generation `0` and binding `unlinked`. No entry had runtime-loaded evidence.
+All Scaleway Transactional Email entries were absent.
 
 The three files for the temporary Surplasse OVH cutover identity were absent.
 Their provider state is revoked. They have no marker-bound host generation and
@@ -109,11 +111,11 @@ Three keys in one project separate storage, rotation, and revocation. The IAM
 permission remains project-scoped, so this design does not enforce strict
 per-domain isolation. Separate Scaleway projects are not required for the MVP.
 
-The registry declares these credential sets as planned or required, but absent.
-It contains no project ID or key. Surplasse has an existing SMTP file contract.
-Parkventory has a bounded SMTP materializer. Mon Florian has neither an
-admitted SMTP runtime contract nor a materializer. Do not claim TEM readiness
-until a provider audit verifies the installed Parkventory credential set.
+The registry declares these credential sets as planned or required. It contains
+no project ID or key. `materialize-smtp-secrets` installs one exact set and its
+generation marker per product. Surplasse and Parkventory have runtime paths.
+Mon Florian remains storage-only. Do not claim TEM runtime readiness from file
+materialization.
 
 Scaleway TEM sends transactional mail only. OVH MX records and published DKIM
 records are separate. Receiving mail at an address such as
@@ -128,10 +130,11 @@ recover the value.
 
 The repository has no SOPS payload, no `.sops.yaml` policy, and no proved age
 recovery identity. The registry therefore declares `value_recovery_state` as
-`not-configured`. Keep provider values in an approved external store. The six
-materialized generated values also need external recovery before a fresh-host
-restore can be claimed. Database backups can retain role credentials that do
-not match newly generated files.
+`partial`. The SMTP values exist in the protected GitHub
+`application-production` environment. Other materialized values still need
+external recovery before a complete fresh-host restore can be claimed.
+Database backups can retain role credentials that do not match newly generated
+files.
 
 A later decision may add encrypted SOPS files after it proves the public age
 recipient, external private-key recovery, rights separation, and a complete
@@ -147,7 +150,8 @@ implemented control.
   registry generation and do not provide the required binding.
 - The Parkventory materializers write the required generation markers for the
   exact four-file generated set and three-file provider set. The Mon Florian
-  materializer writes singleton markers for its two closed identifiers. The
+  materializer writes singleton markers for its two closed identifiers, and
+  `materialize-smtp-secrets` writes markers for its three credential sets. The
   registry stays `unlinked` until a read-only Atlas audit verifies each marker.
 - A planned entry does not authorize provider provisioning or host mutation.
 - A materialized entry does not authorize application activation.

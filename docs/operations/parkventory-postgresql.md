@@ -125,14 +125,12 @@ the following credentials outside Git as `root:10001 0440` files:
 ```
 
 `prepare-parkventory-postgres` generates the state and token-encryption files
-on Atlas. A separate helper installs the Auth0 client secret, SMTP username,
-SMTP password, and public runtime configuration from one private source
-directory. The directory must be `root:root 0700` and contain exactly:
+on Atlas. A separate helper installs the Auth0 client secret and public runtime
+configuration from one private source directory. The directory must be
+`root:root 0700` and contain exactly:
 
 ```text
 parkventory-oidc-client-secret
-parkventory-smtp-password
-parkventory-smtp-username
 parkventory.env
 ```
 
@@ -146,12 +144,12 @@ sudo /usr/local/libexec/vps/materialize-parkventory-provider-secrets \
 sudo /usr/local/libexec/vps/materialize-parkventory-provider-secrets --check
 ```
 
-The install takes the shared deployment lock. It installs the three provider
-files as `root:10001 0440` and `parkventory.env` as `root:root 0600`. It
+The install takes the shared deployment lock. It installs the Auth0 client
+secret as `root:10001 0440` and `parkventory.env` as `root:root 0600`. It
 publishes the root-only generation marker last. The marker names the exact
-three registered provider inputs and target generation 1. It contains no
-value, digest, or source path. A committed marker blocks rotation until a
-reviewed registry change authorizes a new target generation.
+registered Auth0 input and target generation 1. It contains no value, digest,
+or source path. A committed marker blocks rotation until a reviewed registry
+change authorizes a new target generation.
 
 The runtime configuration fixes both database users, the private JDBC URL,
 Scaleway TEM at port 587, sender `no-reply@parkventory.com`, and public URL

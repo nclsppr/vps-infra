@@ -641,15 +641,17 @@ runtime-loaded states. A metadata audit can mark a file materialized, but only
 a non-secret marker written by the bounded materializer can bind that file set
 to a generation. The Parkventory materializers write markers for their two
 exact sets. The Mon Florian helper writes singleton markers for its two closed
-identifiers. Other materializers do not. A materialized file is not runtime
-proof.
+identifiers, and `materialize-smtp-secrets` writes markers for its three exact
+credential sets. Other materializers remain unlinked. A materialized file is
+not runtime proof.
 
 The repository has no SOPS payload, no `.sops.yaml` policy, and no proved age
 recovery identity. SOPS recovery remains blocked. Until a later reviewed change
 proves that recovery path, required values stay in an approved external secret
-store. The registry reports value recovery as `not-configured`. Decrypted
-values remain under `/etc/vps/secrets` and never enter Git or shared Compose
-output. See
+store. The registry reports value recovery as `partial`. The protected GitHub
+environment stores the SMTP inputs, but other registered values do not all
+have a verified restore path. Decrypted values remain under
+`/etc/vps/secrets` and never enter Git or shared Compose output. See
 [ADR-0017](decisions/0017-versioned-atlas-secret-registry.md) and the
 [secret contract](../secrets/README.md).
 

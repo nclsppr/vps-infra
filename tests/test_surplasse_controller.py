@@ -36,6 +36,10 @@ APPLICATION_CREDENTIAL_NAMES = {
     "surplasse-stripe-payment-webhook-secret",
     "surplasse-stripe-secret-key",
 }
+APPLICATION_OPERATOR_CREDENTIAL_NAMES = APPLICATION_CREDENTIAL_NAMES - {
+    "surplasse-smtp-password",
+    "surplasse-smtp-username",
+}
 
 
 def load_script(name: str, path: Path):
@@ -127,9 +131,6 @@ class SurplasseControllerTests(unittest.TestCase):
             "surplasse-jwt-jwks": jwks,
             "surplasse-jwt-private-key": signing_material,
             "surplasse-jwt-key-id": key_id.encode("ascii") + b"\n",
-            "surplasse-smtp-host": b"smtp.example.invalid\n",
-            "surplasse-smtp-password": b"smtp-password-for-test-only\n",
-            "surplasse-smtp-username": b"surplasse-test\n",
             "surplasse-stripe-account-webhook-secret": stripe_webhook_secret(
                 "account-webhook"
             ),
@@ -264,6 +265,20 @@ class SurplasseControllerTests(unittest.TestCase):
             root = Path(directory)
             protected_root = root / "target"
             protected_root.mkdir(mode=0o700)
+            external_smtp = {
+                "surplasse-smtp-generation.json": b"external marker\n",
+                "surplasse-smtp-host": b"smtp.tem.scaleway.com\n",
+                "surplasse-smtp-password": b"external-smtp-password\n",
+                "surplasse-smtp-username": b"11111111-2222-4333-8444-555555555555\n",
+            }
+            for name, value in external_smtp.items():
+                path = protected_root / name
+                path.write_bytes(value)
+                path.chmod(0o440 if name.endswith(("-password", "-username")) else 0o400)
+            external_before = {
+                name: ((protected_root / name).read_bytes(), (protected_root / name).stat().st_ino)
+                for name in external_smtp
+            }
             values = self.write_operator_bundle(root / "source")
             environment = os.environ.copy()
             environment["VPS_SURPLASSE_SECRET_TESTING"] = "1"
@@ -278,28 +293,30 @@ class SurplasseControllerTests(unittest.TestCase):
                 command, check=False, capture_output=True, text=True, env=environment
             )
             self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(
+                external_before,
+                {
+                    name: (
+                        (protected_root / name).read_bytes(),
+                        (protected_root / name).stat().st_ino,
+                    )
+                    for name in external_smtp
+                },
+            )
             combined_output = (first.stdout + first.stderr).encode("utf-8")
             for value in values.values():
                 self.assertNotIn(value.strip(), combined_output)
             for name, value in values.items():
                 path = protected_root / name
                 self.assertEqual(path.read_bytes(), value)
-                expected_mode = (
-                    0o400
-                    if name
-                    in {
-                        "surplasse-jwt-key-id",
-                        "surplasse-smtp-host",
-                    }
-                    else 0o440
-                )
+                expected_mode = 0o400 if name == "surplasse-jwt-key-id" else 0o440
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
                 self.assertEqual(path.stat().st_nlink, 1)
             runtime_path = root / "applications" / RUNTIME_CONFIG_NAME
             self.assertEqual(
                 runtime_path.read_bytes(),
                 b"SURPLASSE_AUTH_JWT_KEY_ID=atlas-2026-08\n"
-                b"SURPLASSE_SMTP_HOST=smtp.example.invalid\n",
+                b"SURPLASSE_SMTP_HOST=smtp.tem.scaleway.com\n",
             )
             self.assertEqual(stat.S_IMODE(runtime_path.stat().st_mode), 0o600)
             self.assertEqual(runtime_path.stat().st_nlink, 1)
@@ -307,7 +324,7 @@ class SurplasseControllerTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="ascii"))
             self.assertEqual(manifest["contract"], "surplasse-operator-bundle")
             self.assertEqual(manifest["payment_mode"], "test")
-            self.assertEqual(manifest["version"], 3)
+            self.assertEqual(manifest["version"], 4)
             self.assertEqual(
                 manifest["sha256"],
                 {
@@ -426,9 +443,9 @@ class SurplasseControllerTests(unittest.TestCase):
             source_b = root / "source-b"
             self.write_operator_bundle(source_a)
             self.write_operator_bundle(source_b)
-            rotated_smtp_input = source_b / "surplasse-smtp-password"
-            rotated_smtp_input.write_bytes(b"rotation-must-not-be-applied\n")
-            rotated_smtp_input.chmod(0o600)
+            rotated_key = source_b / "surplasse-stripe-secret-key"
+            rotated_key.write_bytes(stripe_restricted_test_key("blocked-rotation"))
+            rotated_key.chmod(0o600)
             install = self.run_secret_helper(
                 protected_root, "--install-operator-from", str(source_a)
             )
@@ -496,7 +513,7 @@ class SurplasseControllerTests(unittest.TestCase):
                     {OPERATOR_LOCK},
                 )
 
-    def test_uppercase_smtp_host_is_rejected_before_runtime_publication(self) -> None:
+    def test_legacy_smtp_source_entry_is_rejected_before_materialization(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("the helper intentionally forbids root test mode")
         with tempfile.TemporaryDirectory() as directory:
@@ -506,7 +523,7 @@ class SurplasseControllerTests(unittest.TestCase):
             source = root / "source"
             self.write_operator_bundle(source)
             smtp_host = source / "surplasse-smtp-host"
-            smtp_host.write_bytes(b"SMTP.example.invalid\n")
+            smtp_host.write_bytes(b"smtp.tem.scaleway.com\n")
             smtp_host.chmod(0o600)
 
             result = self.run_secret_helper(
@@ -514,7 +531,7 @@ class SurplasseControllerTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 78)
-            self.assertIn("lowercase DNS name", result.stderr)
+            self.assertIn("unexpected entry", result.stderr)
             self.assertFalse((root / "applications" / RUNTIME_CONFIG_NAME).exists())
             self.assertEqual(
                 {path.name for path in protected_root.iterdir()},
@@ -592,11 +609,15 @@ class SurplasseControllerTests(unittest.TestCase):
             self.write_operator_bundle(source_a)
             values_b = self.write_operator_bundle(source_b)
             changes = {
-                "surplasse-smtp-password": b"rotated-smtp-password\n",
                 "surplasse-stripe-secret-key": stripe_restricted_test_key(
                     "rotated-operator-bundle"
                 ),
-                "surplasse-smtp-host": b"relay.example.invalid\n",
+                "surplasse-stripe-account-webhook-secret": stripe_webhook_secret(
+                    "rotated-account-webhook"
+                ),
+                "surplasse-stripe-payment-webhook-secret": stripe_webhook_secret(
+                    "rotated-payment-webhook"
+                ),
             }
             values_b.update(changes)
             for name, value in changes.items():
@@ -623,7 +644,7 @@ class SurplasseControllerTests(unittest.TestCase):
             )
             runtime_pending.write_bytes(
                 b"SURPLASSE_AUTH_JWT_KEY_ID=atlas-2026-08\n"
-                b"SURPLASSE_SMTP_HOST=relay.example.invalid\n"
+                b"SURPLASSE_SMTP_HOST=smtp.tem.scaleway.com\n"
             )
             runtime_pending.chmod(0o600)
             os.replace(runtime_pending, runtime_path)
@@ -660,7 +681,7 @@ class SurplasseControllerTests(unittest.TestCase):
             self.assertEqual(
                 runtime_path.read_bytes(),
                 b"SURPLASSE_AUTH_JWT_KEY_ID=atlas-2026-08\n"
-                b"SURPLASSE_SMTP_HOST=relay.example.invalid\n",
+                b"SURPLASSE_SMTP_HOST=smtp.tem.scaleway.com\n",
             )
 
     def test_missing_and_malformed_operator_manifest_are_rejected(self) -> None:
@@ -725,7 +746,7 @@ class SurplasseControllerTests(unittest.TestCase):
                     os.mkfifo(manifest, mode=0o400)
                 elif unsafe_kind == "symlink":
                     manifest.unlink()
-                    manifest.symlink_to(protected_root / "surplasse-smtp-host")
+                    manifest.symlink_to(protected_root / "surplasse-jwt-key-id")
                 elif unsafe_kind == "hardlink":
                     os.link(manifest, root / "external-manifest-link")
                 else:
@@ -821,9 +842,11 @@ class SurplasseControllerTests(unittest.TestCase):
                 source_b = root / "source-b"
                 values_a = self.write_operator_bundle(source_a)
                 self.write_operator_bundle(source_b)
-                rotated_smtp_input = source_b / "surplasse-smtp-password"
-                rotated_smtp_input.write_bytes(b"blocked-runtime-rotation\n")
-                rotated_smtp_input.chmod(0o600)
+                rotated_key = source_b / "surplasse-stripe-secret-key"
+                rotated_key.write_bytes(
+                    stripe_restricted_test_key("blocked-runtime-rotation")
+                )
+                rotated_key.chmod(0o600)
                 install = self.run_secret_helper(
                     protected_root, "--install-operator-from", str(source_a)
                 )
@@ -837,7 +860,7 @@ class SurplasseControllerTests(unittest.TestCase):
                     os.mkfifo(runtime_path, mode=0o600)
                 elif unsafe_kind == "symlink":
                     runtime_path.unlink()
-                    runtime_path.symlink_to(protected_root / "surplasse-smtp-host")
+                    runtime_path.symlink_to(protected_root / "surplasse-jwt-key-id")
                 elif unsafe_kind == "hardlink":
                     os.link(runtime_path, root / "external-runtime-link")
                 else:
@@ -890,8 +913,8 @@ class SurplasseControllerTests(unittest.TestCase):
 
             source_b = root / "source-b"
             self.write_operator_bundle(source_b)
-            rotated_value = b"blocked-rotation-password\n"
-            rotated_path = source_b / "surplasse-smtp-password"
+            rotated_value = stripe_restricted_test_key("blocked-pending-rotation")
+            rotated_path = source_b / "surplasse-stripe-secret-key"
             rotated_path.write_bytes(rotated_value)
             rotated_path.chmod(0o600)
             before = {
@@ -913,7 +936,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 },
             )
             self.assertNotEqual(
-                (protected_root / "surplasse-smtp-password").read_bytes(),
+                (protected_root / "surplasse-stripe-secret-key").read_bytes(),
                 rotated_value,
             )
 
@@ -929,14 +952,15 @@ class SurplasseControllerTests(unittest.TestCase):
             values_a = self.write_operator_bundle(source_a)
             values_b = self.write_operator_bundle(source_b)
             changes = {
-                "surplasse-smtp-password": b"concurrent-smtp-password\n",
                 "surplasse-stripe-account-webhook-secret": stripe_webhook_secret(
                     "concurrent-account-webhook"
+                ),
+                "surplasse-stripe-payment-webhook-secret": stripe_webhook_secret(
+                    "concurrent-payment-webhook"
                 ),
                 "surplasse-stripe-secret-key": stripe_restricted_test_key(
                     "concurrent-operator-bundle"
                 ),
-                "surplasse-smtp-host": b"smtp-b.example.invalid\n",
             }
             values_b.update(changes)
             for name, value in changes.items():
@@ -977,9 +1001,7 @@ class SurplasseControllerTests(unittest.TestCase):
                 (root / "applications" / RUNTIME_CONFIG_NAME).read_bytes(),
                 b"SURPLASSE_AUTH_JWT_KEY_ID="
                 + installed["surplasse-jwt-key-id"][:-1]
-                + b"\nSURPLASSE_SMTP_HOST="
-                + installed["surplasse-smtp-host"][:-1]
-                + b"\n",
+                + b"\nSURPLASSE_SMTP_HOST=smtp.tem.scaleway.com\n",
             )
             validation = self.run_secret_helper(protected_root, "--operator-only")
             self.assertEqual(validation.returncode, 0, validation.stderr)
@@ -1159,9 +1181,6 @@ class SurplasseControllerTests(unittest.TestCase):
                 "surplasse-jwt-jwks",
                 "surplasse-jwt-key-id",
                 "surplasse-jwt-private-key",
-                "surplasse-smtp-host",
-                "surplasse-smtp-password",
-                "surplasse-smtp-username",
                 "surplasse-stripe-account-webhook-secret",
                 "surplasse-stripe-payment-webhook-secret",
                 "surplasse-stripe-secret-key",

@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -76,7 +77,7 @@ def state(
 def surplasse_operator_manifest(
     *,
     payment_mode: str = "test",
-    version: int = 3,
+    version: int = 4,
     digests: dict[str, str] | None = None,
 ) -> dict[str, object]:
     return {
@@ -254,6 +255,151 @@ class ApplicationControllerTests(unittest.TestCase):
             CONTROLLER.LOCK_PATH,
             Path("/run/lock/vps-static.lock"),
         )
+
+    def test_smtp_input_commit_uses_the_generation_marker_helper(self):
+        for application in ("parkventory", "surplasse"):
+            completed = subprocess.CompletedProcess(
+                [],
+                0,
+                f"{application} SMTP credential generation 1 is valid\n",
+                "",
+            )
+            with (
+                self.subTest(application=application),
+                mock.patch.object(
+                    CONTROLLER,
+                    "require_protected_file",
+                ) as protected,
+                mock.patch.object(
+                    CONTROLLER,
+                    "_run_bounded",
+                    return_value=completed,
+                ) as bounded,
+            ):
+                CONTROLLER.validate_smtp_input_commit(application)
+            protected.assert_called_once_with(
+                CONTROLLER.SMTP_INPUT_VALIDATOR_PATH,
+                "SMTP input validator",
+                allowed_modes=frozenset({0o500}),
+                maximum_size=2 * 1024 * 1024,
+            )
+            bounded.assert_called_once_with(
+                [
+                    str(CONTROLLER.SMTP_INPUT_VALIDATOR_PATH),
+                    "--product",
+                    application,
+                    "--registry-generation",
+                    "1",
+                    "--check",
+                ],
+                environment=CONTROLLER.safe_environment(
+                    CONTROLLER.RUNTIME_CONFIG_ROOT
+                ),
+                timeout=45,
+                maximum_stdout=1024,
+            )
+
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file") as protected,
+            mock.patch.object(CONTROLLER, "_run_bounded") as bounded,
+        ):
+            CONTROLLER.validate_smtp_input_commit("monflorian")
+        protected.assert_not_called()
+        bounded.assert_not_called()
+
+    def test_smtp_marker_failures_stop_consumers_under_lock_before_release_work(self):
+        failures = (
+            "SMTP credential set is absent",
+            "SMTP credential set is incomplete",
+            "SMTP generation marker differs from the contract",
+        )
+        for application in ("parkventory", "surplasse"):
+            for diagnostic in failures:
+                with self.subTest(application=application, diagnostic=diagnostic):
+                    contract = types.SimpleNamespace(
+                        applications=(
+                            types.SimpleNamespace(name=application, enabled=True),
+                        )
+                    )
+                    lock_state = {"held": False}
+
+                    @contextlib.contextmanager
+                    def locked():
+                        self.assertFalse(lock_state["held"])
+                        lock_state["held"] = True
+                        try:
+                            yield
+                        finally:
+                            lock_state["held"] = False
+
+                    def rejected_check(command, **_kwargs):
+                        self.assertTrue(lock_state["held"])
+                        self.assertEqual(
+                            command,
+                            [
+                                str(CONTROLLER.SMTP_INPUT_VALIDATOR_PATH),
+                                "--product",
+                                application,
+                                "--registry-generation",
+                                "1",
+                                "--check",
+                            ],
+                        )
+                        return subprocess.CompletedProcess(
+                            command,
+                            78,
+                            "",
+                            f"SMTP credential operation refused: {diagnostic}\n",
+                        )
+
+                    release_reference = (
+                        f"ghcr.io/nclsppr/{application}/application-release@{DIGEST}"
+                    )
+                    with (
+                        mock.patch.object(CONTROLLER, "require_protected_file"),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "load_production_contract",
+                            return_value=contract,
+                        ),
+                        mock.patch.object(CONTROLLER, "validate_runtime"),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "deployment_lock",
+                            side_effect=locked,
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "_run_bounded_status",
+                            side_effect=rejected_check,
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "cleanup_application_filesystem_residue",
+                        ) as cleanup,
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "refuse_isolated_worker_residue_locked",
+                        ) as residue,
+                        mock.patch.object(
+                            CONTROLLER,
+                            "fetch_and_validate_candidate",
+                        ) as fetch,
+                        self.assertRaisesRegex(
+                            CONTROLLER.ApplicationDeploymentError,
+                            re.escape(diagnostic),
+                        ),
+                    ):
+                        CONTROLLER.deploy(
+                            application,
+                            REVISION,
+                            release_reference,
+                            activate_live=False,
+                        )
+                    self.assertFalse(lock_state["held"])
+                    cleanup.assert_not_called()
+                    residue.assert_not_called()
+                    fetch.assert_not_called()
 
     def test_application_runtime_reestablishes_shared_worker_preconditions(self):
         with (
@@ -1775,7 +1921,7 @@ class ApplicationControllerTests(unittest.TestCase):
     def test_surplasse_input_commit_rejects_manifest_policy_and_digest_drift(self):
         invalid_manifests = {
             "live": surplasse_operator_manifest(payment_mode="live"),
-            "old-version": surplasse_operator_manifest(version=2),
+            "old-version": surplasse_operator_manifest(version=3),
             "missing-field": {
                 key: value
                 for key, value in surplasse_operator_manifest().items()
@@ -1860,7 +2006,7 @@ class ApplicationControllerTests(unittest.TestCase):
                 "adapter": tester_payment,
                 "bundle": tester_payment,
                 "compose": "false",
-                "manifest": surplasse_operator_manifest(version=2),
+                "manifest": surplasse_operator_manifest(version=3),
                 "error": "manifest policy",
             },
         }

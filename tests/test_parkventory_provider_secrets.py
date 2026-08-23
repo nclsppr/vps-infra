@@ -38,10 +38,6 @@ PROVIDER_VALUES = {
     "parkventory-oidc-client-secret": (
         b"auth0-provider-client-value-0123456789abcdef\n"
     ),
-    "parkventory-smtp-password": (
-        b"scaleway-provider-password-0123456789abcdef\n"
-    ),
-    "parkventory-smtp-username": b"project-id-test-0123456789abcdef\n",
 }
 
 
@@ -117,6 +113,19 @@ class ParkventoryProviderMaterializerTests(unittest.TestCase):
             unrelated.write_bytes(b"local-generated-value\n")
             unrelated.chmod(0o440)
             unrelated_before = (unrelated.read_bytes(), unrelated.stat().st_ino)
+            external_smtp = {
+                "parkventory-smtp-generation.json": b"external marker\n",
+                "parkventory-smtp-password": b"external-smtp-password\n",
+                "parkventory-smtp-username": b"11111111-2222-4333-8444-555555555555\n",
+            }
+            for name, value in external_smtp.items():
+                path = target / name
+                path.write_bytes(value)
+                path.chmod(0o400 if name.endswith(".json") else 0o440)
+            external_before = {
+                name: ((target / name).read_bytes(), (target / name).stat().st_ino)
+                for name in external_smtp
+            }
             lock = root / "deployment.lock"
 
             validated = self.run_helper(
@@ -142,6 +151,13 @@ class ParkventoryProviderMaterializerTests(unittest.TestCase):
                 (unrelated.read_bytes(), unrelated.stat().st_ino),
                 unrelated_before,
             )
+            self.assertEqual(
+                external_before,
+                {
+                    name: ((target / name).read_bytes(), (target / name).stat().st_ino)
+                    for name in external_smtp
+                },
+            )
             runtime_path = runtime / "parkventory.env"
             self.assertEqual(runtime_path.read_bytes(), runtime_configuration())
             self.assertEqual(stat.S_IMODE(runtime_path.stat().st_mode), 0o600)
@@ -156,14 +172,6 @@ class ParkventoryProviderMaterializerTests(unittest.TestCase):
                     {
                         "file": "parkventory-oidc-client-secret",
                         "id": "parkventory.oidc-client-secret",
-                    },
-                    {
-                        "file": "parkventory-smtp-password",
-                        "id": "parkventory.smtp-password",
-                    },
-                    {
-                        "file": "parkventory-smtp-username",
-                        "id": "parkventory.smtp-username",
                     },
                 ],
             )
@@ -238,10 +246,10 @@ class ParkventoryProviderMaterializerTests(unittest.TestCase):
                 target, runtime, lock, "--install-from", str(source)
             )
             self.assertEqual(first.returncode, 0, first.stderr)
-            installed = (target / "parkventory-smtp-password").read_bytes()
-            replacement = b"scaleway-provider-password-fedcba9876543210\n"
-            (source / "parkventory-smtp-password").write_bytes(replacement)
-            (source / "parkventory-smtp-password").chmod(0o600)
+            installed = (target / "parkventory-oidc-client-secret").read_bytes()
+            replacement = b"auth0-provider-client-value-fedcba9876543210\n"
+            (source / "parkventory-oidc-client-secret").write_bytes(replacement)
+            (source / "parkventory-oidc-client-secret").chmod(0o600)
 
             refused = self.run_helper(
                 target, runtime, lock, "--install-from", str(source)
@@ -250,7 +258,7 @@ class ParkventoryProviderMaterializerTests(unittest.TestCase):
             self.assertEqual(refused.returncode, 78)
             self.assertIn("new target generation", refused.stderr)
             self.assertEqual(
-                (target / "parkventory-smtp-password").read_bytes(), installed
+                (target / "parkventory-oidc-client-secret").read_bytes(), installed
             )
 
     def test_killed_install_recovers_only_expected_pending_files(self) -> None:
@@ -365,17 +373,17 @@ module.main()
                 if case == "malformed-name":
                     residue = (
                         target
-                        / ".parkventory-smtp-password.deadbeef.pending"
+                        / ".parkventory-oidc-client-secret.deadbeef.pending"
                     )
                     residue.write_bytes(b"staging residue\n")
                     residue.chmod(0o600)
                 else:
                     residue = (
                         target
-                        / ".parkventory-smtp-password.0123456789abcdef01234567.pending"
+                        / ".parkventory-oidc-client-secret.0123456789abcdef01234567.pending"
                     )
                     if case == "symlink":
-                        residue.symlink_to(source / "parkventory-smtp-password")
+                        residue.symlink_to(source / "parkventory-oidc-client-secret")
                     else:
                         residue.write_bytes(b"staging residue\n")
                         residue.chmod(0o644)

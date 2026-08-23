@@ -49,29 +49,37 @@ only public contract identifiers, the exact registered secret identifiers, and
 the target generation. A read-only audit must verify that marker before Git can
 set `generation_binding` to `materializer-marker` and advance `generation`.
 The two Parkventory materializers write separate markers for the four generated
-files and the three provider files. The `materialize-monflorian-secret` helper
-writes singleton markers for its two closed identifiers. Other root-only
-manifests bind files through private content digests, but they do not contain a
-registry generation. They do not satisfy this requirement.
+files and the Auth0 client secret. The `materialize-monflorian-secret` helper
+writes singleton markers for its two closed identifiers.
+`materialize-smtp-secrets` writes one marker for each of the three SMTP
+credential sets. Other root-only manifests bind files through private content
+digests, but they do not contain a registry generation. They do not satisfy
+this requirement.
 
 `observed_at` and `controller_revision` bind the registry to one audit. A Git
 commit preserves that reviewed observation. It is not permanent proof of the
 current host state.
 
 `value_recovery_state` describes the recovery system for the complete registry.
-The baseline value is `not-configured`. Do not claim fresh-host secret recovery
-until this field is `verified` and a restore exercise supports that state.
+The current value is `partial`. The six SMTP variables exist in the protected
+GitHub `application-production` environment. Other registered values do not all
+have a verified external restore path. Do not claim complete fresh-host secret
+recovery until this field is `verified` and a restore exercise supports that
+state.
 
 ## Baseline audit
 
-The read-only Atlas audit on 23 August 2026 found exactly six materialized
-files:
+The read-only Atlas audit on 23 August 2026 at 17:25 UTC found exactly nine
+materialized registered files:
 
 - the four platform files under `/etc/vps/secrets/platform`;
 - `surplasse-postgres-migrator-password`;
-- `surplasse-postgres-runtime-password`.
+- `surplasse-postgres-runtime-password`;
+- `parkventory-postgres-migrator-password`;
+- `parkventory-postgres-runtime-password`;
+- `monflorian-openai-api-key`.
 
-The audit found no other registered file. The six files have generation `0`
+The audit found no other registered file. The nine files have generation `0`
 and binding `unlinked` because the materializers did not write a generation
 marker. No entry has runtime-loaded evidence. All Scaleway Transactional Email
 credentials are absent. The registry records their intended contracts only.
@@ -170,16 +178,18 @@ Keep this long-lived identity separate from a temporary DNS cutover identity.
 ## Surplasse application inputs
 
 The Surplasse preparation controller generates separate migrator and runtime
-database passwords. Its helper also validates the complete nine-file operator
-bundle. Seven supplied values and the two generated database passwords are
+database passwords. Its application helper validates a six-file operator
+bundle. Five supplied values and the two generated database passwords are
 application-readable files under `/etc/vps/secrets/surplasse`. The JWT key ID
-and SMTP host remain controller-only inputs. The helper publishes their public
-runtime form in `/etc/vps/applications/surplasse.env`.
+is a controller-only input. The helper publishes the key ID and fixed SMTP host
+in `/etc/vps/applications/surplasse.env`.
 
-The complete contract, validation, lock order, and local manifest rules are in
+The complete application contract, validation, lock order, and local manifest
+rules are in
 [`applications/surplasse/README.md`](../applications/surplasse/README.md).
-The helper does not support a partial SMTP-only install. Runtime rotation is not
-implemented.
+`materialize-smtp-secrets` owns the SMTP host, username, password, and registry
+generation marker. The full Surplasse bundle helper must not rotate those files.
+Runtime rotation is not implemented.
 
 ## Parkventory
 
@@ -190,23 +200,19 @@ exact four registered files. The helper does not read or write the Auth0 client
 secret or the two SMTP inputs.
 
 `materialize-parkventory-provider-secrets` validates one exact root-only source
-directory. It installs those three provider files and the fixed public runtime
-configuration under the shared deployment lock. It publishes a separate
-generation-1 marker last for the exact three registered provider identifiers.
-It does not print or record a value, content digest, or source path. The
-provider state stays `planned` until a separate provider audit verifies the
-Auth0 and Scaleway TEM credentials.
+directory for the Auth0 client secret and fixed public runtime configuration.
+It does not read or write an SMTP file. `materialize-smtp-secrets` owns the two
+SMTP files and their generation marker. The application remains disabled.
 
 ## Mon Florian
 
 The registry requires two independent singleton file sets. One contains the
 OpenAI API key for the backend. The other contains the private-access Caddy
-snippet. Both entries have target generation `1`. They remain at generation
-`0`, with binding `unlinked` and state `absent` in the historical registry
-snapshot. This is not a current absence claim. A separate post-operation audit
-must update the complete host observation. The OpenAI provider state is
-`active` after a read-only API check on 23 August 2026. This provider result
-does not prove host state or runtime use.
+snippet. Both entries have target generation `1` and remain at generation `0`
+with binding `unlinked`. The 17:25 UTC audit found the OpenAI key materialized
+and the private-access file absent. The OpenAI provider state is `active` after
+a read-only API check on 23 August 2026. These observations do not prove runtime
+use.
 
 The `materialize-monflorian-secret` helper accepts only these identifiers:
 
@@ -258,8 +264,9 @@ contains public states and generation numbers only. The future rotation of the
 private-access file remains tracked in
 [issue #104](https://github.com/nclsppr/vps-infra/issues/104).
 
-The SMTP pair is still planned. It has no admitted runtime contract or
-materializer. The baseline audit found no Mon Florian secret file.
+`materialize-smtp-secrets` can store the planned SMTP pair and marks it as
+storage-only. Mon Florian has no SMTP runtime consumer. Materialization does not
+activate email delivery.
 
 ## Scaleway Transactional Email
 
@@ -277,10 +284,18 @@ inside the shared project.
 
 For SMTP, the project ID is the username and the Secret Key is the password.
 The Access Key is not an SMTP input and must not be deployed for this purpose.
-The registry contains none of these values.
+The registry contains none of these values. The protected GitHub
+`application-production` environment uses these names:
 
-Surplasse has an existing SMTP file contract. Parkventory has declared SMTP
-paths but no SMTP materializer. Mon Florian has planned registry entries but no
-admitted SMTP runtime contract or materializer. Do not create orphan files for
-either application. Scaleway TEM is outbound only. It does not provide the OVH
-mailbox or forwarding needed to receive mail at a domain address.
+- `SURPLASSE_SMTP_USERNAME` and `SURPLASSE_SMTP_PASSWORD`;
+- `PARKVENTORY_SMTP_USERNAME` and `PARKVENTORY_SMTP_PASSWORD`;
+- `MONFLORIAN_SMTP_USERNAME` and `MONFLORIAN_SMTP_PASSWORD`.
+
+The three username variables contain the same Project ID. Each password
+variable contains the dedicated Secret Key for its IAM application.
+
+`materialize-smtp-secrets` installs one exact product set at generation `1` and
+publishes its marker last. Surplasse and Parkventory have declared runtime
+paths. Mon Florian remains storage-only. Scaleway TEM is outbound only. It does
+not provide the OVH mailbox or forwarding needed to receive mail at a domain
+address.
