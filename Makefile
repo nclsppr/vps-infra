@@ -97,9 +97,13 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 	$(MISE_EXEC) uv run python -m json.tool \
 		releases/static-production.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
+		secrets/registry.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
 		schemas/application-production.schema.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
 		schemas/application-release.schema.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		schemas/secret-registry.schema.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
 		platform/observability/grafana/dashboards/platform/overview.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \

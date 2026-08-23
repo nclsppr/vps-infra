@@ -22,7 +22,7 @@ ansible/inventories/production/group_vars/secrets.yml
 
 secrets/*
 !secrets/README.md
-!secrets/*.sops.yaml
+!secrets/registry.json
 *.dec.yaml
 *.decrypted.yaml
 *.key

@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted on 14 August 2026 for the target architecture. No provider is
-selected. This decision does not authorize a purchase, a DNS change, a secret
-change, or production activation.
+Accepted on 14 August 2026 for the target architecture. Updated on 23 August
+2026 to select Scaleway Transactional Email (TEM). This decision records the
+provider contract. It does not authorize a DNS change, credential creation,
+secret materialization, or production activation.
 
 ADR-0013 later enables repository admission for the Surplasse tester release.
 It does not supersede the SMTP evidence gates or authorize runtime activation.
@@ -50,21 +51,43 @@ delivery events. Atlas does not expose another inbound port.
    `587`. It requires STARTTLS, normal certificate-chain validation, and
    hostname validation.
 2. The application sender is exactly `no-reply@surplasse.com`.
-3. Only the SMTP username and password are secret. The provider identity, relay
-   host, port, and expected DNS records form a reviewed public contract. This
-   repository does not contain that contract yet. A later reviewed change must
-   add it before provider activation.
-4. The OVH MX records remain unchanged. Add a provider SPF mechanism only when
+3. Use Scaleway TEM at `smtp.tem.scaleway.com` on port `587`.
+4. Use the Scaleway Project ID as the SMTP username. Use the API Secret Key as
+   the SMTP password. The API Access Key is not an SMTP input. Treat the
+   username as a protected input even though it is not a password. Do not put
+   either SMTP input or the Project ID in Git.
+5. Use project `Pieper Atlas`. Create these three IAM applications and one API
+   key for each application:
+
+   - `surplasse-prod-smtp`;
+   - `parkventory-prod-smtp`;
+   - `monflorian-prod-smtp`.
+
+   Attach each application to a policy scoped to project `Pieper Atlas`. Grant
+   only `TransactionalEmailEmailSmtpCreate`.
+6. The three applications use the same Project ID as their SMTP username. They
+   use three different Secret Keys as their SMTP passwords. This separation
+   supports independent storage, rotation, and revocation.
+7. Scaleway IAM documents project scope for this permission. It does not
+   document a TEM domain resource condition. Therefore, this repository does
+   not claim strict isolation between domains. It infers that each key can send
+   from any verified TEM domain in the project. Separate Scaleway projects are
+   not required for the MVP.
+8. The provider identity, relay host, port, application names, and permission
+   set are public contract data. The exact credentials are not public contract
+   data. Track their required paths and deployment state only in
+   [`secrets/registry.json`](../../secrets/registry.json).
+9. The OVH MX records remain unchanged. Add a provider SPF mechanism only when
    the selected provider specifies its exact value. Keep one SPF record. Use
    only domain-verification and DKIM values from the provider control plane.
    Publish DMARC with an operated report mailbox.
-5. Do not add a mail transfer agent, inbound port `25`, SMTP queue volume, or
+10. Do not add a mail transfer agent, inbound port `25`, SMTP queue volume, or
    provider secret to the common Atlas platform.
-6. Keep five independent evidence gates:
+11. Keep five independent evidence gates:
    `transactional-email-provider`, `email-domain-authentication`,
    `smtp-atlas-connectivity`, `smtp-effective-runtime-configuration`, and
    `email-delivery-observability`.
-7. Generic GitHub Actions evidence cannot satisfy an external evidence gate.
+12. Generic GitHub Actions evidence cannot satisfy an external evidence gate.
    Surplasse runtime activation stays blocked until reviewed evidence formats
    bind each result to the provider contract, Backend digest, collection time,
    and Atlas identity.
@@ -75,6 +98,7 @@ delivery events. Atlas does not expose another inbound port.
 
 - Atlas has no new inbound surface and no stateful mail service.
 - A dedicated submission identity limits the secret scope.
+- Separate keys isolate operational rotation and revocation between products.
 - DNS, transport security, effective runtime configuration, and final delivery
   use separate evidence.
 - A provider change requires review of the public contract and a bounded
@@ -85,6 +109,7 @@ delivery events. Atlas does not expose another inbound port.
 - Surplasse authentication depends on a third-party service.
 - Operators must review service limits, costs, data residency, support, and
   contractual terms.
+- Project-scoped IAM does not enforce a domain boundary between the three keys.
 - Backend SMTP acceptance does not prove final delivery. Provider events and an
   external alert must cover bounces, complaints, and delays.
 
@@ -94,7 +119,9 @@ Before an authorized DNS change, export the complete zone and record each TTL.
 If validation fails, keep the Surplasse runtime inactive and revoke the
 dedicated SMTP identity. Restore the previous SPF, DKIM, and DMARC records
 exactly. Do not change the OVH MX records. A provider change requires a new
-review. Do not use a silent SMTP fallback.
+review. An API key revocation does not change the TEM domain verification or
+published DKIM records and does not require a DNS rollback. Do not use a silent
+SMTP fallback.
 
 ## Verification
 

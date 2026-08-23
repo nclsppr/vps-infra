@@ -217,3 +217,18 @@ This dated record is evidence, not a mutable release manifest.
   sources et dashboards pilotés par fichiers.
 - [SOPS — chiffrement avec age](https://github.com/getsops/sops#23encrypting-using-age) :
   fichiers chiffrés dans Git et identités de déchiffrement externes.
+
+### Transactional email
+
+- [Scaleway TEM - SMTP configuration](https://www.scaleway.com/en/docs/transactional-email/reference-content/smtp-configuration/) :
+  relay host, ports, Project ID username, Secret Key password, and TLS modes.
+- [Scaleway TEM - API keys with IAM](https://www.scaleway.com/en/docs/transactional-email/how-to/generate-api-keys-for-tem-with-iam/) :
+  IAM application, project policy, API key, and SMTP authentication workflow.
+- [Scaleway IAM - permission sets](https://www.scaleway.com/en/docs/iam/reference-content/permission-sets/) :
+  exact Transactional Email permission-set reference.
+- [Scaleway IAM - create a policy](https://www.scaleway.com/en/docs/iam/how-to/create-policy/) :
+  project-scoped policy creation.
+- [Scaleway IAM - products with resource-level conditions](https://www.scaleway.com/en/docs/iam/reference-content/supported-products-resource-level/) :
+  documented product list used to assess domain-level isolation.
+- [Scaleway TEM - FAQ](https://www.scaleway.com/en/docs/transactional-email/faq/) :
+  service limits, sender authentication, delivery, and security information.

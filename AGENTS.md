@@ -28,6 +28,19 @@ production inventory, or business data to this repository.
   Bound each target. Reject each missing variable.
 - Never create a real inventory, a `.env` file, a key, a token, or a decrypted
   file in Git.
+- Any task that plans or requires deployment, rotation, or revocation of a
+  product or platform secret on Atlas must update `secrets/registry.json` before
+  completion. This rule also applies when the task starts in a product
+  repository. If the task cannot update `vps-infra`, report the blocker and do
+  not claim completion. Commit the target generation before the operation.
+  The materializer must write a non-secret generation marker atomically with
+  the exact file set. After the operation, use a read-only audit to verify that
+  marker before you update the observed generation. A metadata-only audit can
+  mark a file `materialized`, but it must keep generation `0` and binding
+  `unlinked`. No current materializer writes this marker. Do not advance a
+  generation or mark `runtime-loaded` until the marker exists and the current
+  consumer has generation-bound runtime proof. Never record a value, a
+  content-derived digest, or a private source path.
 - Run `make check` before each commit.
 
 ## External State

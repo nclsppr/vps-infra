@@ -608,9 +608,10 @@ vps-infra/
     doctor
   systemd/
   secrets/
-    platform.sops.yaml
-    surplasse.sops.yaml
-    parkventory.sops.yaml
+    README.md
+    registry.json
+  schemas/
+    secret-registry.schema.json
   docs/
 ```
 
@@ -633,11 +634,22 @@ legacy entries remain `enabled: false`. The canonical Surplasse tester entry is
 enabled. Parkventory has a manual workflow that resolves no deployment matrix
 while its canonical entry is disabled; no active runtime follows from admission.
 
-Les fichiers SOPS sont chiffrés. La clé age privée est conservée hors du VPS et
-hors de Git, avec au moins une copie de récupération dans un gestionnaire de
-secrets. Les fichiers déchiffrés sont matérialisés sous `/etc/vps/secrets` avec
-des permissions privées et ne sont jamais affichés par `compose config` dans
-les journaux partagés.
+The versioned secret registry contains public metadata only. It records the
+expected path, permissions, consumer, target generation, generation binding,
+and last observed host state. It separates planned, materialized, and
+runtime-loaded states. A metadata audit can mark a file materialized, but only
+a non-secret marker written by the bounded materializer can bind that file set
+to a generation. No current materializer writes such a marker. A materialized
+file is not runtime proof.
+
+The repository has no SOPS payload, no `.sops.yaml` policy, and no proved age
+recovery identity. SOPS recovery remains blocked. Until a later reviewed change
+proves that recovery path, required values stay in an approved external secret
+store. The registry reports value recovery as `not-configured`. Decrypted
+values remain under `/etc/vps/secrets` and never enter Git or shared Compose
+output. See
+[ADR-0017](decisions/0017-versioned-atlas-secret-registry.md) and the
+[secret contract](../secrets/README.md).
 
 Le dépôt `vps-infra` est public au démarrage : le VPS le récupère en HTTPS sans
 identité Git, ce qui supprime un secret de reconstruction. Cette visibilité
