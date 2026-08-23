@@ -37,10 +37,12 @@ production inventory, or business data to this repository.
   the exact file set. After the operation, use a read-only audit to verify that
   marker before you update the observed generation. A metadata-only audit can
   mark a file `materialized`, but it must keep generation `0` and binding
-  `unlinked`. No current materializer writes this marker. Do not advance a
-  generation or mark `runtime-loaded` until the marker exists and the current
-  consumer has generation-bound runtime proof. Never record a value, a
-  content-derived digest, or a private source path.
+  `unlinked`. The Parkventory materializers write markers only for their two
+  closed sets. The Mon Florian materializer writes singleton markers only for
+  its two closed identifiers. Their presence in Git is not host evidence. Do
+  not advance a generation or mark `runtime-loaded` until the marker exists and
+  the current consumer has generation-bound runtime proof. Never record a
+  value, a content-derived digest, or a private source path.
 - Run `make check` before each commit.
 
 ## External State

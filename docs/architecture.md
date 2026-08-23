@@ -640,7 +640,8 @@ and last observed host state. It separates planned, materialized, and
 runtime-loaded states. A metadata audit can mark a file materialized, but only
 a non-secret marker written by the bounded materializer can bind that file set
 to a generation. The Parkventory materializers write markers for their two
-exact sets. Other materializers do not. A materialized file is not runtime
+exact sets. The Mon Florian helper writes singleton markers for its two closed
+identifiers. Other materializers do not. A materialized file is not runtime
 proof.
 
 The repository has no SOPS payload, no `.sops.yaml` policy, and no proved age

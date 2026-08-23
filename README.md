@@ -123,10 +123,12 @@ The public [Atlas secret registry](secrets/registry.json) records paths,
 permissions, consumers, target generations, generation bindings, and the last
 read-only host observation. It contains no value or content-derived digest.
 The 23 August 2026 baseline found six materialized files. Their generation is
-`0` and their binding is `unlinked` because no current materializer writes a
+`0` and their binding is `unlinked` because the baseline audit found no
 generation marker. No entry is runtime-loaded, and no Scaleway TEM credential
-exists on Atlas. Value recovery is not configured yet, so this registry makes
-the gap visible but does not by itself recover a fresh host. See the
+exists on Atlas. The repository now contains a marker-aware Mon Florian
+materializer, but this change does not update the historical host snapshot.
+Value recovery is not configured yet, so this registry makes the gap visible
+but does not by itself recover a fresh host. See the
 [secret contract](secrets/README.md) and
 [ADR-0017](docs/decisions/0017-versioned-atlas-secret-registry.md).
 

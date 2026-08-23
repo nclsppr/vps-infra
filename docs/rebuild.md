@@ -50,10 +50,10 @@ must remain outside Git and Atlas with a tested recovery copy.
 
 The baseline read-only audit on 23 August 2026 found only the four platform
 secrets and two Surplasse database passwords. All six were materialized, but
-their generation is `0` and their binding is `unlinked`. No current
-materializer writes a generation marker. No entry had runtime-loaded evidence.
-All Scaleway Transactional Email entries were absent. Registry value recovery
-is `not-configured`.
+their generation is `0` and their binding is `unlinked`. The baseline audit
+found no generation marker. No entry had runtime-loaded evidence. All Scaleway
+Transactional Email entries were absent. Registry value recovery is
+`not-configured`.
 
 ## Contrat de commandes livré
 
@@ -216,7 +216,10 @@ runtime-loaded until the current service has loaded that marker-bound
 generation and passed its probes. A Docker file bind mount can retain the old
 inode after an atomic host-file replacement, so a rotation must recreate the
 affected service. The two Parkventory materializers complete this generation
-step for their exact registered sets. Other materializers remain unlinked.
+step for their exact registered sets. The Mon Florian helper completes it for
+its two closed identifiers. Its initial adoption path requires a separate
+read-only preflight and does not replace an existing file. Other materializers
+remain unlinked.
 
 La plateforme est restaurée avant les applications :
 

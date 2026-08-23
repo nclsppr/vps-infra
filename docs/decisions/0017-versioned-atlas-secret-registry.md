@@ -146,8 +146,9 @@ implemented control.
 - Existing local manifests commit a file-set write, but they contain no
   registry generation and do not provide the required binding.
 - The Parkventory materializers write the required generation markers for the
-  exact four-file generated set and three-file provider set. The registry stays
-  `unlinked` until a read-only Atlas audit verifies each marker.
+  exact four-file generated set and three-file provider set. The Mon Florian
+  materializer writes singleton markers for its two closed identifiers. The
+  registry stays `unlinked` until a read-only Atlas audit verifies each marker.
 - A planned entry does not authorize provider provisioning or host mutation.
 - A materialized entry does not authorize application activation.
 - Secret recovery remains dependent on an external store or an explicit
