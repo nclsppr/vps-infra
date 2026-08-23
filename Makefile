@@ -21,7 +21,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	precutover-public-static-edge activate-public-static-edge \
-	stop-public-static-edge \
+	stop-public-static-edge prepare-parkventory-public-edge \
 	start-internal-platform stop-internal-platform \
 	install-postgres-backup stop-postgres-backup-schedule \
 	backup-postgres-now rehearse-postgres-restore \
@@ -335,6 +335,11 @@ stop-public-static-edge: ## Stop only the static Caddy edge and preserve its dat
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --stop-public-static-edge
+
+prepare-parkventory-public-edge: ## Attach Caddy to Parkventory while retaining the live static route.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --prepare-parkventory-public-edge
 
 start-internal-platform: ## Start PostgreSQL and observability without Caddy.
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \

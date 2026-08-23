@@ -5,6 +5,8 @@ vps_public_static_edge_release_root: /srv/vps/releases/public-static-edge
 vps_public_static_edge_runtime_dir: /srv/vps/runtime/public-static-edge
 vps_public_static_edge_unit: vps-public-static-edge.service
 vps_public_static_edge_container: vps-public-static-edge-caddy-1
+vps_public_static_edge_application_controller: >-
+  /usr/local/libexec/vps/deploy-application
 vps_public_static_edge_surplasse_controller: >-
   /usr/local/libexec/vps/deploy-surplasse-public-edge
 vps_public_static_edge_surplasse_release_root: >-
@@ -16,6 +18,13 @@ vps_public_static_edge_surplasse_dns_materializer: >-
   /usr/local/libexec/vps/materialize-surplasse-dns-secrets
 vps_public_static_edge_network: edge
 vps_public_static_edge_network_subnet: 172.30.32.0/24
+vps_public_static_edge_parkventory_state_root: >-
+  /var/lib/vps-public-edge-parkventory
+vps_public_static_edge_parkventory_route: >-
+  /var/lib/vps-public-edge-parkventory/route.caddy
+vps_public_static_edge_parkventory_network: app_parkventory
+vps_public_static_edge_parkventory_network_subnet: 172.30.20.0/24
+vps_public_static_edge_parkventory_address: 172.30.20.254
 vps_public_static_edge_image: >-
   ghcr.io/nclsppr/vps-infra/caddy:sha-755565642f71918134151921f8eae63935951ad6@sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f
 vps_public_static_edge_files:

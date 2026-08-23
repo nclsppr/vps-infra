@@ -36,6 +36,9 @@ class PostgresBackupTests(unittest.TestCase):
         self.assertIn(
             "vps_postgres_backup_root: /srv/vps/backups/postgresql", defaults
         )
+        self.assertIn(
+            "/var/lib/vps-readiness/postgresql/local-restore.json", defaults
+        )
         self.assertIn("vps_postgres_backup_retention_count: 7", defaults)
 
         tasks = (ROOT / "ansible/roles/postgres_backup/tasks/main.yml").read_text(
@@ -74,6 +77,10 @@ class PostgresBackupTests(unittest.TestCase):
             self.assertNotIn("/var/lib/docker", unit)
             self.assertNotIn("/var/lib/postgresql", unit)
         self.assertIn("ReadOnlyPaths={{ vps_postgres_backup_root }}", restore_unit)
+        self.assertIn(
+            "ReadWritePaths=/run/lock /var/lib/vps-readiness/postgresql",
+            restore_unit,
+        )
 
         backup_timer = (
             ROOT / "ansible/roles/postgres_backup/templates/vps-postgres-backup.timer.j2"
@@ -356,6 +363,27 @@ else:
 
             rehearsed = self.run_backup(backup_root, fake, "rehearse", "--latest")
             self.assertEqual(rehearsed.returncode, 0, rehearsed.stderr)
+            readiness_path = backup_root / "local-restore-readiness.json"
+            self.assertEqual(stat.S_IMODE(readiness_path.stat().st_mode), 0o400)
+            readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                readiness["contract"],
+                "vps-postgres-local-restore-readiness-v1",
+            )
+            self.assertEqual(
+                readiness["restored_databases"],
+                ["postgres", "surplasse"],
+            )
+            self.assertEqual(
+                readiness["scope"],
+                {"encrypted": False, "offsite": False},
+            )
+            backup = next(path for path in backup_root.iterdir() if path.is_dir())
+            manifest_raw = (backup / "manifest.json").read_bytes()
+            self.assertEqual(
+                readiness["manifest_sha256"],
+                "sha256:" + hashlib.sha256(manifest_raw).hexdigest(),
+            )
             commands = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
             run_command = next(command for command in commands if command[:1] == ["run"])
             for required in (

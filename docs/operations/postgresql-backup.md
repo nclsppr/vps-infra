@@ -53,7 +53,8 @@ Docker volume. The rehearsal:
 6. compares the restored role and database inventories with the manifest;
 7. verifies the `postgres_exporter` membership grant, grantor, and options;
 8. proves a connection to every restored database;
-9. removes the scratch container and volume on success or failure.
+9. removes the scratch container and volume on success or failure;
+10. writes a protected readiness file only after successful cleanup.
 
 The rehearsal does not mount or stop the production volume. It does not prove
 application-specific business invariants. Surplasse and Parkventory must add
@@ -77,6 +78,13 @@ make rehearse-postgres-restore \
 
 The immediate backup and rehearsal modes require the verified internal
 platform to be active. They do not start Caddy or an application.
+
+The rehearsal writes
+`/var/lib/vps-readiness/postgresql/local-restore.json` with mode `0400`. The
+file binds the backup identifier and manifest digest, lists every restored
+database, and records that the copy is local and unencrypted. The application
+controller verifies the selected backup again before Parkventory migration and
+runtime start.
 
 Inspect the timer and service outcomes without reading backup content:
 
@@ -123,8 +131,10 @@ option. That archive is not an executable decision and supplies no credential.
 
 The local stage does not survive loss, compromise, or encryption of Atlas. It
 is useful only for local operator error and for continuous restore testing.
-Before production business data is accepted, the operator must select and
-record:
+Parkventory's first public launch explicitly accepts this risk while it looks
+for a first real user signal. This exception does not count as disaster
+recovery proof. After that signal, and before intentionally retaining
+irreplaceable business data, the operator must select and record:
 
 - the recovery point objective and recovery time objective;
 - an off-site object store and region with versioning or object lock;

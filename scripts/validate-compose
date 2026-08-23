@@ -84,7 +84,7 @@ PARKVENTORY_MONITORING_PROMETHEUS_VOLUMES = {
 }
 PLATFORM_SERVICES = frozenset(PLATFORM_SERVICE_NETWORKS)
 PUBLIC_STATIC_EDGE_SERVICES = frozenset({"caddy"})
-PUBLIC_STATIC_EDGE_NETWORKS = frozenset({"edge"})
+PUBLIC_STATIC_EDGE_NETWORKS = frozenset({"app_parkventory", "edge"})
 PLATFORM_ALLOWED_CAPABILITIES = {
     "caddy": frozenset({"NET_BIND_SERVICE"}),
 }
@@ -210,7 +210,16 @@ PLATFORM_NAMED_VOLUMES = {
     "prometheus_data": "vps-platform-prometheus-data",
 }
 PUBLIC_STATIC_EDGE_VOLUME_TARGETS = {
-    "caddy": frozenset({"/etc/caddy/Caddyfile", "/etc/caddy/routes", "/srv/www", "/data", "/config"}),
+    "caddy": frozenset(
+        {
+            "/config",
+            "/data",
+            "/etc/caddy/Caddyfile",
+            "/etc/caddy/routes",
+            "/etc/caddy/routes/parkventory.caddy",
+            "/srv/www",
+        }
+    ),
 }
 PUBLIC_STATIC_EDGE_WRITABLE_VOLUME_TARGETS = {
     "caddy": frozenset({"/data", "/config"}),
@@ -222,6 +231,12 @@ PUBLIC_STATIC_EDGE_VOLUME_CONTRACTS = {
         ),
         "/etc/caddy/routes": (
             "bind", "/srv/vps/runtime/public-static-edge/routes", True, {"create_host_path": False}
+        ),
+        "/etc/caddy/routes/parkventory.caddy": (
+            "bind",
+            "/var/lib/vps-public-edge-parkventory/route.caddy",
+            True,
+            {"create_host_path": False},
         ),
         "/srv/www": ("bind", "/srv/www", True, {"create_host_path": False}),
         "/data": ("volume", "caddy_data", False, {}),
@@ -583,6 +598,11 @@ def service_networks(
             fail(f"services.{service_name}.networks.{network_name}: options must be an object")
         if project == "vps-platform" and service_name == "postgresql":
             expected_options = {"aliases": ["postgresql"]}
+        elif (
+            project == "vps-public-static-edge"
+            and network_name == "app_parkventory"
+        ):
+            expected_options = {"ipv4_address": "172.30.20.254"}
         elif (
             project == "surplasse"
             and service_name == SURPLASSE_PILOT_SERVICE

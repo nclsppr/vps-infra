@@ -106,10 +106,10 @@ After that persistent reconciliation, run
 `make verify-parkventory-postgres` while the application remains disabled. A
 successful live check may then be reviewed and its exact evidence digest bound
 in the application contract. Do not set that digest, enable Parkventory, or
-transfer the public route until the independent encrypted off-site backup gate
-and every other activation gate are also verified. On a later deployment, the
-application controller rehashes the bound file and reruns this live verifier
-under the shared deployment lock before it can fetch or migrate the candidate.
+transfer the public route until the local backup and restore rehearsal have
+also passed. On a later deployment, the application controller rehashes both
+bound files and reruns their live verifiers under the shared deployment lock
+before it can fetch or migrate the candidate.
 
 ## OIDC and application secrets
 
@@ -173,30 +173,20 @@ make rehearse-postgres-restore \
   ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
 ```
 
-Verify that the selected manifest contains database `parkventory` and all
-three Parkventory roles. The local result is not disaster recovery. The
-application contract intentionally rejects activation until a reviewed digest
-binds one encrypted off-site receipt and an independent restore from an
-operator-controlled host. Keep the decryption identity and restore credential
-off Atlas.
+The successful rehearsal writes
+`/var/lib/vps-readiness/postgresql/local-restore.json` as `root:root 0400`.
+The evidence binds the exact backup identifier and manifest digest. It records
+the restored database inventory and the limits `encrypted=false` and
+`offsite=false`. A reviewed change binds its canonical digest in
+`releases/application-production.json`. The controller requires `parkventory`
+in the restored inventory, verifies every backup file again, and rejects
+evidence older than 36 hours.
 
-The sanitized readiness file is
-`/var/lib/vps-readiness/parkventory/offsite-backup.json`, owned by `root:root`
-with mode `0400`. It records no endpoint, bucket, credential, or private age
-identity. Its exact contract includes the Parkventory database, one PR-78
-`vps-postgres-offsite-receipt-v2` receipt digest, the local source-manifest and
-age-recipient digests, an off-Atlas restore evidence digest, and all five
-provider/recovery gates. The upload receipt must be at most 36 hours old at
-activation. The matching off-Atlas rehearsal must be at most 31 days old and
-cannot predate that upload beyond five minutes of clock tolerance. A reviewed
-change then binds the canonical file digest in
-`releases/application-production.json`. The controller rehashes and validates
-the file before it runs any migration.
-The controller revalidates the off-site proof after migration, immediately
-before the first candidate start. It validates the proof again after runtime
-probes and immediately before the durable commit. Recovery can forward-commit a
-probed Parkventory candidate or finalize its partially visible active tuple only
-after the same freshness check succeeds.
+The public-launch policy explicitly records the encrypted off-site backup as
+`deferred-for-public-launch`. This is an accepted launch risk, not disaster
+recovery evidence. Atlas loss, compromise, or encryption can destroy both the
+database and this backup. Add an encrypted off-site copy and an off-host
+restore rehearsal after the first user signal.
 
 ## Monitoring, logs, and probes
 
@@ -252,16 +242,14 @@ migration automatically. Use a compatible previous image only after the
 database is proved compatible, or apply a reviewed forward repair. Preserve the
 previous database volume and all backup evidence until recovery is complete.
 
-## Activation remains blocked
+## Remaining activation inputs
 
-Do not populate the application readiness digest or set `enabled: true` from
-this runbook. The protected contract has two independent empty gates:
+Do not populate an application readiness digest or set `enabled: true` from
+this runbook alone. The protected contract has two digest-bound gates:
 
 - the reviewed digest of the PostgreSQL readiness evidence;
-- verified encrypted off-site backup evidence.
+- the reviewed digest of the fresh local backup and restore evidence.
 
-The second gate has a bounded sanitized-evidence verifier, but this change does
-not provision a provider, upload identity, age recipient, receipt, or off-host
-restore. Local backups and local restore rehearsals do not satisfy it.
-Parkventory also retains the other ADR-0015 activation blockers and the explicit
-static-to-Compose ownership handoff.
+The contract records off-site backup proof as deferred for this first public
+launch. Parkventory still needs its runtime secrets, provider configuration,
+network integration, and explicit static-to-Compose ownership handoff.

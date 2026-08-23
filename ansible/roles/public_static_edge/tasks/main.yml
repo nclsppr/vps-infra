@@ -11,6 +11,9 @@
       - vps_public_static_edge_unit == 'vps-public-static-edge.service'
       - vps_public_static_edge_container == 'vps-public-static-edge-caddy-1'
       - >-
+        vps_public_static_edge_application_controller ==
+        '/usr/local/libexec/vps/deploy-application'
+      - >-
         vps_public_static_edge_surplasse_controller ==
         '/usr/local/libexec/vps/deploy-surplasse-public-edge'
       - >-
@@ -27,6 +30,16 @@
         '/usr/local/libexec/vps/materialize-surplasse-dns-secrets'
       - vps_public_static_edge_network == 'edge'
       - vps_public_static_edge_network_subnet == '172.30.32.0/24'
+      - >-
+        vps_public_static_edge_parkventory_state_root ==
+        '/var/lib/vps-public-edge-parkventory'
+      - >-
+        vps_public_static_edge_parkventory_route ==
+        '/var/lib/vps-public-edge-parkventory/route.caddy'
+      - vps_public_static_edge_parkventory_network == 'app_parkventory'
+      - >-
+        vps_public_static_edge_parkventory_network_subnet == '172.30.20.0/24'
+      - vps_public_static_edge_parkventory_address == '172.30.20.254'
       - >-
         vps_public_static_edge_image ==
         'ghcr.io/nclsppr/vps-infra/caddy:sha-755565642f71918134151921f8eae63935951ad6@sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f'
@@ -76,7 +89,7 @@
         vps_public_static_edge_domains | sort
     fail_msg: The public static edge inputs differ from the reviewed contract.
 
-- name: Create protected Surplasse public edge controller roots
+- name: Create protected application public edge controller roots
   ansible.builtin.file:
     path: "{{ item.path }}"
     state: directory
@@ -87,6 +100,8 @@
     - path: "{{ vps_public_static_edge_surplasse_release_root }}"
       mode: "0755"
     - path: "{{ vps_public_static_edge_surplasse_state_root }}"
+      mode: "0700"
+    - path: "{{ vps_public_static_edge_parkventory_state_root }}"
       mode: "0700"
 
 - name: Install the Surplasse public edge transition controller
@@ -122,44 +137,11 @@
 - name: Stop and prove the isolated public static edge is absent
   when: vps_public_static_edge_state == 'stopped'
   block:
-    - name: Disable the public static edge unit when installed
-      ansible.builtin.systemd_service:
-        name: "{{ vps_public_static_edge_unit }}"
-        enabled: false
-        daemon_reload: true
-      register: vps_public_static_edge_disable
-      failed_when: false
-      when: vps_public_static_edge_unit_file.stat.exists
-
-    - name: Stop the public static edge unit on a best-effort basis
-      ansible.builtin.systemd_service:
-        name: "{{ vps_public_static_edge_unit }}"
-        state: stopped
-      register: vps_public_static_edge_unit_stop
-      failed_when: false
-      when: vps_public_static_edge_unit_file.stat.exists
-
-    - name: Find every container owned by the public edge project
+    - name: Stop the public edge through the shared locked controller
       ansible.builtin.command:
         argv:
-          - /usr/bin/docker
-          - ps
-          - --all
-          - --quiet
-          - --filter
-          - label=com.docker.compose.project={{ vps_public_static_edge_project }}
-      register: vps_public_static_edge_all_container_ids
-      changed_when: false
-
-    - name: Stop every residual public edge project container
-      ansible.builtin.command:
-        argv:
-          - /usr/bin/docker
-          - stop
-          - --time
-          - "30"
-          - "{{ item }}"
-      loop: "{{ vps_public_static_edge_all_container_ids.stdout_lines }}"
+          - "{{ vps_public_static_edge_application_controller }}"
+          - --stop-public-edge-base
       changed_when: true
 
     - name: List running public edge project containers after stop
@@ -218,9 +200,6 @@
              '-' ~ vps_public_static_edge_state ~ '.staging' }}
         vps_public_static_edge_route_source: >-
           {{ vps_public_static_edge_route_sources[vps_public_static_edge_state] }}
-        vps_public_static_edge_switch_link: >-
-          {{ '/srv/vps/runtime/.public-static-edge-' ~ vps_infra_revision ~
-             '-' ~ vps_public_static_edge_state }}
 
     - name: Read baseline service state
       ansible.builtin.service_facts:
@@ -284,6 +263,49 @@
           The dedicated public edge network differs from the managed host
           contract.
 
+    - name: Inspect the managed Parkventory application network
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - network
+          - inspect
+          - "{{ vps_public_static_edge_parkventory_network }}"
+      register: vps_public_static_edge_parkventory_network_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Require the managed Parkventory application network
+      ansible.builtin.assert:
+        that:
+          - vps_public_static_edge_parkventory_network_inspect.rc == 0
+        fail_msg: Run host convergence to create app_parkventory.
+
+    - name: Parse the managed Parkventory application network
+      ansible.builtin.set_fact:
+        vps_public_static_edge_parkventory_network_state: >-
+          {{ vps_public_static_edge_parkventory_network_inspect.stdout |
+             from_json | first }}
+
+    - name: Prove the managed Parkventory application network contract
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_public_static_edge_parkventory_network_state.Name ==
+            vps_public_static_edge_parkventory_network
+          - vps_public_static_edge_parkventory_network_state.Driver == 'bridge'
+          - vps_public_static_edge_parkventory_network_state.Scope == 'local'
+          - >-
+            not (vps_public_static_edge_parkventory_network_state.Internal |
+                 bool)
+          - >-
+            vps_public_static_edge_parkventory_network_state.IPAM.Config |
+            map(attribute='Subnet') | list ==
+            [vps_public_static_edge_parkventory_network_subnet]
+          - >-
+            vps_public_static_edge_parkventory_network_state.Labels[
+              'com.nclsppr.vps-infra.managed'] | default('') == 'true'
+        fail_msg: app_parkventory differs from the managed host contract.
+
     - name: Inspect active static release links
       ansible.builtin.stat:
         path: "/srv/www/{{ item }}/current"
@@ -292,7 +314,6 @@
       loop:
         - personal
         - papersempire
-        - parkventory
 
     - name: Require protected relative static release links
       ansible.builtin.assert:
@@ -317,7 +338,6 @@
       loop:
         - personal
         - papersempire
-        - parkventory
 
     - name: Require protected static release directories
       ansible.builtin.assert:
@@ -720,205 +740,39 @@
         group: root
         mode: "0644"
 
-    - name: Inspect the active public edge release link
-      ansible.builtin.stat:
-        path: "{{ vps_public_static_edge_runtime_dir }}"
-        follow: false
-      register: vps_public_static_edge_runtime_link
-
-    - name: Require the active release path to be absent or a symlink
-      ansible.builtin.assert:
-        that:
-          - >-
-            not vps_public_static_edge_runtime_link.stat.exists or
-            vps_public_static_edge_runtime_link.stat.islnk
-        fail_msg: The public edge runtime path is not an atomic release link.
-
-    - name: Remember the previous active public edge release
-      ansible.builtin.set_fact:
-        vps_public_static_edge_previous_release: >-
-          {{ vps_public_static_edge_runtime_link.stat.lnk_source |
-             default('') }}
-        vps_public_static_edge_release_changed: >-
-          {{ (vps_public_static_edge_runtime_link.stat.lnk_source |
-              default('') | length > 0) and
-             (vps_public_static_edge_runtime_link.stat.lnk_source |
-              default('') != vps_public_static_edge_release_dir) }}
-
-    - name: Refuse an unmanaged base switch over an active Surplasse edge
-      ansible.builtin.command:
-        argv:
-          - "{{ vps_public_static_edge_surplasse_controller }}"
-          - --assert-base-switch-safe
-      changed_when: false
-
     - name: Switch and reconcile the public static edge
       block:
-        - name: Create the next public edge release link
-          ansible.builtin.file:
-            src: "{{ vps_public_static_edge_release_dir }}"
-            dest: "{{ vps_public_static_edge_switch_link }}"
-            state: link
-            owner: root
-            group: root
-            force: true
-
-        - name: Atomically activate the staged public edge release
+        - name: Prepare the locked public edge base transaction
           ansible.builtin.command:
             argv:
-              - /usr/bin/mv
-              - --force
-              - --no-target-directory
-              - "{{ vps_public_static_edge_switch_link }}"
-              - "{{ vps_public_static_edge_runtime_dir }}"
+              - "{{ vps_public_static_edge_application_controller }}"
+              - --prepare-public-edge-base
+              - "{{ vps_public_static_edge_release_dir }}"
+          register: vps_public_static_edge_base_prepare
           changed_when: true
-
-        - name: Unconditionally reconcile the public static edge Compose project
-          ansible.builtin.systemd_service:
-            name: "{{ vps_public_static_edge_unit }}"
-            enabled: true
-            state: restarted
-            daemon_reload: true
-
-        - name: Inspect Caddy after unit reconciliation
-          ansible.builtin.command:
-            argv:
-              - /usr/bin/docker
-              - inspect
-              - "{{ vps_public_static_edge_container }}"
-          register: vps_public_static_edge_reconciled_inspect
-          changed_when: false
-
-        - name: Compare reconciled Caddy bind identities
-          ansible.builtin.include_tasks: inspect-bind-identities.yml
-          vars:
-            vps_public_static_edge_bind_inspect_stdout: >-
-              {{ vps_public_static_edge_reconciled_inspect.stdout }}
-            vps_public_static_edge_bind_release_dir: >-
-              {{ vps_public_static_edge_release_dir }}
-
-        - name: Detect a switched or stale public edge release
-          ansible.builtin.set_fact:
-            vps_public_static_edge_requires_recreate: >-
-              {{ vps_public_static_edge_release_changed or
-                 not (vps_public_static_edge_bind_identities_match | bool) }}
-
-        - name: Force Caddy recreation for a switched or stale release
-          ansible.builtin.command:
-            argv:
-              - /usr/bin/docker
-              - compose
-              - --project-directory
-              - "{{ vps_public_static_edge_runtime_dir }}"
-              - --file
-              - "{{ vps_public_static_edge_runtime_dir }}/compose.yaml"
-              - up
-              - --detach
-              - --wait
-              - --no-build
-              - --force-recreate
-              - --remove-orphans
-              - caddy
-          changed_when: true
-          when: vps_public_static_edge_requires_recreate
 
         - name: Verify the switched public static edge from host and operator networks
           ansible.builtin.include_tasks: verify-runtime.yml
 
+        - name: Commit the probed public edge base transaction
+          ansible.builtin.command:
+            argv:
+              - "{{ vps_public_static_edge_application_controller }}"
+              - --commit-public-edge-base
+              - "{{ vps_public_static_edge_release_dir }}"
+          changed_when: true
+
       rescue:
-        - name: Create the previous public edge release link for rollback
-          ansible.builtin.file:
-            src: "{{ vps_public_static_edge_previous_release }}"
-            dest: "{{ vps_public_static_edge_switch_link }}"
-            state: link
-            owner: root
-            group: root
-            force: true
-          when: vps_public_static_edge_previous_release | length > 0
-
-        - name: Atomically restore the previous public edge release
+        - name: Roll back the durable public edge base transaction
           ansible.builtin.command:
             argv:
-              - /usr/bin/mv
-              - --force
-              - --no-target-directory
-              - "{{ vps_public_static_edge_switch_link }}"
-              - "{{ vps_public_static_edge_runtime_dir }}"
+              - "{{ vps_public_static_edge_application_controller }}"
+              - --rollback-public-edge-base
+              - "{{ vps_public_static_edge_release_dir }}"
           changed_when: true
-          when: vps_public_static_edge_previous_release | length > 0
-
-        - name: Force Caddy recreation after restoring the previous release
-          ansible.builtin.command:
-            argv:
-              - /usr/bin/docker
-              - compose
-              - --project-directory
-              - "{{ vps_public_static_edge_runtime_dir }}"
-              - --file
-              - "{{ vps_public_static_edge_runtime_dir }}/compose.yaml"
-              - up
-              - --detach
-              - --wait
-              - --no-build
-              - --force-recreate
-              - --remove-orphans
-              - caddy
-          changed_when: true
-          when: vps_public_static_edge_previous_release | length > 0
-
-        - name: Inspect Caddy after forced rollback recreation
-          ansible.builtin.command:
-            argv:
-              - /usr/bin/docker
-              - inspect
-              - "{{ vps_public_static_edge_container }}"
-          register: vps_public_static_edge_rollback_inspect
-          changed_when: false
-          when: vps_public_static_edge_previous_release | length > 0
-
-        - name: Compare restored Caddy bind identities
-          ansible.builtin.include_tasks: inspect-bind-identities.yml
-          vars:
-            vps_public_static_edge_bind_inspect_stdout: >-
-              {{ vps_public_static_edge_rollback_inspect.stdout }}
-            vps_public_static_edge_bind_release_dir: >-
-              {{ vps_public_static_edge_previous_release }}
-          when: vps_public_static_edge_previous_release | length > 0
-
-        - name: Require healthy Caddy with restored bind identities
-          ansible.builtin.assert:
-            that:
-              - >-
-                ((vps_public_static_edge_rollback_inspect.stdout |
-                  from_json) | first).State.Status == 'running'
-              - >-
-                ((vps_public_static_edge_rollback_inspect.stdout |
-                  from_json) | first).State.Health.Status == 'healthy'
-              - vps_public_static_edge_bind_identities_match | bool
-            fail_msg: Caddy did not return to the restored immutable release.
-          when: vps_public_static_edge_previous_release | length > 0
-
-        - name: Re-register the restored public edge with systemd
-          ansible.builtin.systemd_service:
-            name: "{{ vps_public_static_edge_unit }}"
-            enabled: true
-            state: started
-            daemon_reload: true
-          when: vps_public_static_edge_previous_release | length > 0
-
-        - name: Stop a first failed public edge activation
-          ansible.builtin.systemd_service:
-            name: "{{ vps_public_static_edge_unit }}"
-            enabled: false
-            state: stopped
-            daemon_reload: true
-          when: vps_public_static_edge_previous_release | length == 0
-
-        - name: Remove the failed first active release link
-          ansible.builtin.file:
-            path: "{{ vps_public_static_edge_runtime_dir }}"
-            state: absent
-          when: vps_public_static_edge_previous_release | length == 0
+          when:
+            - vps_public_static_edge_base_prepare is defined
+            - vps_public_static_edge_base_prepare is succeeded
 
         - name: Refuse the failed public edge reconciliation
           ansible.builtin.fail:

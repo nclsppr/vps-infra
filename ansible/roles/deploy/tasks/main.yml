@@ -191,7 +191,7 @@
     deploy_desired_key_identities: >-
       {{
         vps_deploy_authorized_keys | map('trim') |
-        map('regex_replace', '^([^ ]+ [^ ]+)(?: .*)?$', '\\1') | list
+        map('regex_replace', '^([^ ]+ [^ ]+)(?: .*)?$', '\1') | list
       }}
     deploy_first_key_install: >-
       {{
@@ -212,7 +212,7 @@
           'regex_replace',
           '^restrict,command="/usr/local/libexec/vps/forced-command" '
           ~ '([^ ]+ [^ ]+)(?: .*)?$',
-          '\\1'
+          '\1'
         ) | list
       }}
 
@@ -431,6 +431,8 @@
     - path: "{{ vps_application_state_dir }}/quarantine"
       mode: "0700"
     - path: "{{ vps_application_state_dir }}/transactions"
+      mode: "0700"
+    - path: "{{ vps_application_state_dir }}/handoffs"
       mode: "0700"
     - path: "{{ vps_gh_cache_root }}"
       mode: "0755"

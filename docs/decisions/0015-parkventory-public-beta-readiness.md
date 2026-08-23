@@ -1,4 +1,4 @@
-# ADR-0015: Prepare the inactive Parkventory public beta path
+# ADR-0015: Prepare the inactive Parkventory public launch path
 
 ## Status
 
@@ -127,13 +127,11 @@ gates.
 
 Retain the current daily local logical backup, seven-backup retention, and
 monthly isolated restore rehearsal. These controls are the minimum local
-recovery layer. They do not survive Atlas loss. Keep the encrypted off-site
-readiness digest unbound. Public activation remains invalid until a reviewed
-change binds a sanitized proof to an approved PR-78-format encrypted receipt
-and an independent off-Atlas restore rehearsal. The application controller
-validates the exact proof structure, both source-manifest identities, provider
-gates, digest, and freshness. It does not receive provider credentials. The
-private age identity and restore credential must stay off Atlas.
+recovery layer. They do not survive Atlas loss. For the first public launch,
+bind a fresh local restore proof and record encrypted off-site proof as
+deferred. The application controller verifies the selected local backup again
+before migration, runtime start, and commit. A later decision must add an
+encrypted copy and restore identity outside Atlas.
 
 ## Activation sequence
 
@@ -142,9 +140,8 @@ A later reviewed change must complete all of these steps:
 1. merge and re-publish the canonical Parkventory RLS and OIDC release;
 2. install public configuration and all file-backed credentials outside Git;
 3. prepare and verify PostgreSQL, then bind its exact evidence digest;
-4. prove a fresh local backup, isolated restore, encrypted off-site receipt,
-   and independent restore, install the sanitized root-only readiness file,
-   then bind its exact digest;
+4. prove a fresh local backup and isolated restore, install the root-only
+   readiness file, then bind its exact digest;
 5. stage the exact disabled Prometheus candidate, activate its scrape job,
    network override, target, rule, and tested alert delivery;
 6. prove structured logs, retention, and operator access;
@@ -175,9 +172,11 @@ the previous database volume until recovery is independently proved.
 - Runtime compromise does not provide an owner role or an RLS bypass role.
 - A failed or interrupted post-migration PostgreSQL proof cannot restart the
   previous Parkventory runtime against an untrusted database.
-- The controller checks off-site backup freshness immediately before the first
-  candidate start and immediately before its durable commit. Forward recovery
-  and partial-commit finalization repeat the commit-time check.
+- The controller checks the local backup and restore evidence immediately
+  before the first candidate start and immediately before its durable commit.
+  Forward recovery and partial-commit finalization repeat the check.
+- The first public launch defers encrypted off-site backup proof. The local
+  copy does not survive loss or compromise of Atlas.
 - OIDC secrets remain files and do not enter Git, workflow output, or runtime
   environment files.
 - Monitoring and logs are bounded before activation, but alert delivery and

@@ -120,6 +120,9 @@ COMPOSE_APPLICATION_ACTIVE_ROOT = Path("/var/lib/vps-application/active")
 COMPOSE_APPLICATION_TRANSACTION_ROOT = Path(
     "/var/lib/vps-application/transactions"
 )
+PUBLIC_EDGE_BASE_TRANSACTION = Path(
+    "/var/lib/vps-public-edge-parkventory/base-transaction.json"
+)
 COMPOSE_APPLICATION_ROOT = Path("/srv/applications")
 STATIC_DEPLOYMENT_MODES = {
     "personal": "static-site",
@@ -7905,7 +7908,12 @@ def deployment_lock() -> Iterator[None]:
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         metadata = os.fstat(descriptor)
-        if metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+        if (
+            metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
             fail("static deployment lock is not a protected root-owned file")
         deadline = time.monotonic() + 60
         while True:
@@ -7921,41 +7929,72 @@ def deployment_lock() -> Iterator[None]:
         os.close(descriptor)
 
 
-def recover_live_deployments(application: str | None = None) -> None:
-    if os.geteuid() != 0 or os.getegid() != 0:
-        fail("live static deployment recovery must run as root")
+def public_edge_base_transaction_present_locked() -> bool:
+    try:
+        PUBLIC_EDGE_BASE_TRANSACTION.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        fail(f"cannot inspect the public edge base transaction: {exc}")
+    return True
+
+
+def refuse_public_edge_base_transaction_locked() -> None:
+    if not public_edge_base_transaction_present_locked():
+        return
+    fail(
+        "an unfinished public edge base transaction owns the shared runtime; "
+        "run application recovery first"
+    )
+
+
+def recover_live_deployments_locked(application: str | None = None) -> None:
     applications = sorted(PROFILES) if application is None else [application]
     if any(item not in PROFILES for item in applications):
         fail("live static deployment recovery application is invalid")
-    with deployment_lock():
-        for item in applications:
-            app_root = PRODUCTION_ROOT / item
-            releases = app_root / "releases"
-            for path in (PRODUCTION_ROOT, app_root, releases):
-                metadata = path.lstat()
-                if (
-                    not stat.S_ISDIR(metadata.st_mode)
-                    or metadata.st_uid != 0
-                    or metadata.st_gid != 0
-                    or metadata.st_mode & 0o022
-                ):
-                    fail(f"static release root {path} is unsafe during recovery")
-            for path, label in (
-                (STATIC_STATE_ROOT, "static deployment state root"),
-                (STATIC_ACTIVE_STATE_ROOT, "active deployment state directory"),
-                (STATIC_INVENTORY_STATE_ROOT, "persisted inventory directory"),
-                (STATIC_QUARANTINE_ROOT, "quarantine directory"),
-                (STATIC_TRANSACTION_ROOT, "transaction directory"),
+    if public_edge_base_transaction_present_locked():
+        fail("public edge base transaction must recover before static state")
+    for item in applications:
+        app_root = PRODUCTION_ROOT / item
+        releases = app_root / "releases"
+        for path in (PRODUCTION_ROOT, app_root, releases):
+            metadata = path.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or metadata.st_mode & 0o022
             ):
-                descriptor = open_static_state_directory(path, label)
-                os.close(descriptor)
-            cleanup_probe_containers(item)
-            cleanup_static_filesystem_residue(item, app_root, releases)
-            recover_interrupted_deployment(
-                item,
-                app_root / "current",
-                releases,
-            )
+                fail(f"static release root {path} is unsafe during recovery")
+        for path, label in (
+            (STATIC_STATE_ROOT, "static deployment state root"),
+            (STATIC_ACTIVE_STATE_ROOT, "active deployment state directory"),
+            (STATIC_INVENTORY_STATE_ROOT, "persisted inventory directory"),
+            (STATIC_QUARANTINE_ROOT, "quarantine directory"),
+            (STATIC_TRANSACTION_ROOT, "transaction directory"),
+        ):
+            descriptor = open_static_state_directory(path, label)
+            os.close(descriptor)
+        cleanup_probe_containers(item)
+        cleanup_static_filesystem_residue(item, app_root, releases)
+        recover_interrupted_deployment(
+            item,
+            app_root / "current",
+            releases,
+        )
+
+
+def recover_live_deployments(application: str | None = None) -> None:
+    if os.geteuid() != 0 or os.getegid() != 0:
+        fail("live static deployment recovery must run as root")
+    with deployment_lock():
+        if public_edge_base_transaction_present_locked():
+            # Application recovery is ordered immediately after this unit and
+            # owns the durable base transaction. It calls the locked helper
+            # after rollback so no static transaction is stranded at boot.
+            print("static recovery deferred to the public edge base controller")
+            return
+        recover_live_deployments_locked(application)
 
 
 def refuse_isolated_worker_residue_locked() -> None:
@@ -8142,6 +8181,7 @@ def deploy(
             fail(f"static release root {path} must not be writable by group or others")
 
     with deployment_lock():
+        refuse_public_edge_base_transaction_locked()
         refuse_compose_application_owner(application)
         cleanup_probe_containers(application)
         cleanup_static_filesystem_residue(application, app_root, releases)

@@ -74,6 +74,29 @@ def state(
     return value
 
 
+def static_parkventory_state():
+    value = CONTROLLER.STATIC.DeploymentState(
+        application="parkventory",
+        source_revision=PREVIOUS_REVISION,
+        site_reference=(
+            "ghcr.io/nclsppr/parkventory-static-site@" + PREVIOUS_DIGEST
+        ),
+        routes_reference=(
+            "ghcr.io/nclsppr/parkventory-static-routes@" + PREVIOUS_DIGEST
+        ),
+        integration_revision=PREVIOUS_REVISION,
+        integration_reference=(
+            "ghcr.io/nclsppr/vps-infra/platform-integration@"
+            + PREVIOUS_DIGEST
+        ),
+        caddy_image=(
+            "ghcr.io/nclsppr/vps-infra/caddy:stable@" + PREVIOUS_DIGEST
+        ),
+    )
+    CONTROLLER.STATIC.validate_deployment_state(value)
+    return value
+
+
 def surplasse_operator_manifest(
     *,
     payment_mode: str = "test",
@@ -372,6 +395,11 @@ class ApplicationControllerTests(unittest.TestCase):
                             CONTROLLER,
                             "_run_bounded_status",
                             side_effect=rejected_check,
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "parkventory_static_handoff_preflight",
+                            return_value=False,
                         ),
                         mock.patch.object(
                             CONTROLLER,
@@ -855,6 +883,84 @@ class ApplicationControllerTests(unittest.TestCase):
             ],
         )
 
+    def test_boot_recovers_public_edge_base_before_application_state(self):
+        transaction = types.SimpleNamespace()
+        events: list[str] = []
+        with (
+            mock.patch.object(CONTROLLER, "validate_recovery_state_runtime"),
+            mock.patch.object(
+                CONTROLLER,
+                "deployment_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(CONTROLLER, "cleanup_application_filesystem_residue"),
+            mock.patch.object(
+                CONTROLLER,
+                "public_edge_base_transaction_path_present",
+                return_value=True,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_transaction",
+                return_value=transaction,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                return_value=True,
+            ),
+            mock.patch.object(CONTROLLER, "validate_runtime"),
+            mock.patch.object(
+                CONTROLLER,
+                "recover_public_edge_base_locked",
+                side_effect=lambda: events.append("base-rollback"),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "recover_live_deployments_locked",
+                side_effect=lambda: events.append("static-recovery"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "recover_application",
+                side_effect=lambda application: events.append(
+                    f"application-{application}"
+                ),
+            ),
+        ):
+            CONTROLLER.recover_live("parkventory")
+        self.assertEqual(
+            events,
+            ["base-rollback", "static-recovery", "application-parkventory"],
+        )
+
+    def test_static_boot_recovery_defers_to_public_edge_base_transaction(self):
+        with (
+            mock.patch.object(CONTROLLER.STATIC.os, "geteuid", return_value=0),
+            mock.patch.object(CONTROLLER.STATIC.os, "getegid", return_value=0),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "deployment_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "public_edge_base_transaction_present_locked",
+                return_value=True,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "cleanup_probe_containers",
+            ) as cleanup,
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "recover_interrupted_deployment",
+            ) as recover,
+        ):
+            CONTROLLER.STATIC.recover_live_deployments("parkventory")
+        cleanup.assert_not_called()
+        recover.assert_not_called()
+
     def test_parkventory_static_owner_refuses_compose_before_state_changes(self):
         candidate = state("parkventory")
         with (
@@ -904,6 +1010,130 @@ class ApplicationControllerTests(unittest.TestCase):
         self.assertEqual(lstat.call_count, 2)
         read_state.assert_not_called()
 
+    def test_parkventory_static_transaction_refuses_before_fetch_or_readiness(self):
+        policy = types.SimpleNamespace(name="parkventory", enabled=True)
+        contract = types.SimpleNamespace(applications=(policy,))
+        release_reference = (
+            "ghcr.io/nclsppr/parkventory/application-release@" + DIGEST
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(
+                CONTROLLER,
+                "load_production_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(CONTROLLER, "validate_runtime"),
+            mock.patch.object(
+                CONTROLLER,
+                "deployment_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(CONTROLLER, "refuse_public_edge_base_transaction"),
+            mock.patch.object(CONTROLLER, "cleanup_application_filesystem_residue"),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "refuse_isolated_worker_residue_locked",
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_transaction",
+                side_effect=lambda application: (
+                    types.SimpleNamespace()
+                    if application == "parkventory"
+                    else None
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_parkventory_readiness",
+            ) as readiness,
+            mock.patch.object(
+                CONTROLLER,
+                "fetch_and_validate_candidate",
+            ) as fetch,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "parkventory static deployment recovery",
+            ):
+                CONTROLLER.deploy(
+                    "parkventory",
+                    REVISION,
+                    release_reference,
+                    activate_live=True,
+                )
+        readiness.assert_not_called()
+        fetch.assert_not_called()
+
+    def test_incomplete_parkventory_static_tuple_refuses_before_fetch(self):
+        policy = types.SimpleNamespace(name="parkventory", enabled=True)
+        contract = types.SimpleNamespace(applications=(policy,))
+        static_state = static_parkventory_state()
+        release_reference = (
+            "ghcr.io/nclsppr/parkventory/application-release@" + DIGEST
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(
+                CONTROLLER,
+                "load_production_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(CONTROLLER, "validate_runtime"),
+            mock.patch.object(
+                CONTROLLER,
+                "deployment_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(CONTROLLER, "refuse_public_edge_base_transaction"),
+            mock.patch.object(CONTROLLER, "cleanup_application_filesystem_residue"),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "refuse_isolated_worker_residue_locked",
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_transaction",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                return_value=False,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_state_file",
+                return_value=static_state,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "get_current_target",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_parkventory_readiness",
+            ) as readiness,
+            mock.patch.object(
+                CONTROLLER,
+                "fetch_and_validate_candidate",
+            ) as fetch,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "static ownership is incomplete",
+            ):
+                CONTROLLER.deploy(
+                    "parkventory",
+                    REVISION,
+                    release_reference,
+                    activate_live=True,
+                )
+        readiness.assert_not_called()
+        fetch.assert_not_called()
+
     def test_parkventory_static_owner_race_fails_without_touching_a_transaction(self):
         candidate = state("parkventory")
         with (
@@ -915,12 +1145,1289 @@ class ApplicationControllerTests(unittest.TestCase):
             ),
             mock.patch.object(CONTROLLER, "read_state", return_value=None),
             mock.patch.object(CONTROLLER, "current_target", return_value=None),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_transaction",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_state_file",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "get_current_target",
+                return_value=None,
+            ),
         ):
             with self.assertRaisesRegex(
                 CONTROLLER.ApplicationDeploymentError,
                 "static state still owns",
             ):
                 CONTROLLER.prepare_transaction(candidate)
+
+    def test_parkventory_handoff_journal_binds_static_route_and_both_states(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="route-switched",
+        )
+        encoded = CONTROLLER.canonical_parkventory_handoff(handoff)
+        self.assertEqual(
+            CONTROLLER.parkventory_handoff_from_value(
+                json.loads(encoded),
+                "Parkventory handoff",
+            ),
+            handoff,
+        )
+        tampered = json.loads(encoded)
+        tampered["static_route"] = "parkventory.com { respond tampered }\n"
+        with self.assertRaisesRegex(
+            CONTROLLER.ApplicationDeploymentError,
+            "digest differs",
+        ):
+            CONTROLLER.parkventory_handoff_from_value(
+                tampered,
+                "Parkventory handoff",
+            )
+
+    def test_parkventory_handoff_switches_and_probes_before_releasing_static(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_target = CONTROLLER.STATIC.release_target_for_state(static_state)
+        static_route = b"parkventory.com { respond static }\n"
+        application_route = b"parkventory.com { respond application }\n"
+        events: list[str] = []
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                return_value=False,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_transaction",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_state_file",
+                return_value=static_state,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "get_current_target",
+                return_value=static_target,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "validate_persisted_release",
+                side_effect=lambda *_args: events.append("static-release-validated"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_parkventory_public_edge_route",
+                return_value=static_route,
+            ),
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_bounded_file",
+                return_value=static_route,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "state_release",
+                return_value=Path("/release"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "bundle_from_release",
+                return_value=types.SimpleNamespace(
+                    files={"caddy/parkventory.caddy": application_route}
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_parkventory_handoff",
+                side_effect=lambda handoff: events.append(
+                    f"journal-{handoff.phase}"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "restore_current_target",
+                side_effect=lambda *_args: events.append("static-link-removed"),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "remove_protected_state_file",
+                side_effect=lambda *_args: events.append("static-state-removed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_parkventory_public_edge_route",
+                side_effect=lambda _route: events.append("route-switched"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "reconcile_public_edge_for_parkventory",
+                side_effect=lambda _release: events.append("caddy-reconciled"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_public_edge_cutover",
+                side_effect=lambda _state, _work: events.append("edge-probed"),
+            ),
+        ):
+            handoff = CONTROLLER.begin_parkventory_handoff(
+                candidate,
+                Path("/work"),
+            )
+        self.assertEqual(handoff.phase, "static-released")
+        self.assertEqual(
+            events,
+            [
+                "static-release-validated",
+                "journal-prepared",
+                "route-switched",
+                "journal-route-switched",
+                "caddy-reconciled",
+                "edge-probed",
+                "journal-edge-verified",
+                "static-state-removed",
+                "static-link-removed",
+                "journal-static-released",
+            ],
+        )
+
+    def test_active_compose_handoff_restores_static_health_before_runtime_stop(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="route-switched",
+        )
+        events: list[str] = []
+        inventory = types.SimpleNamespace()
+        reconcile = mock.Mock()
+        with (
+            mock.patch.object(CONTROLLER, "read_state", return_value=candidate),
+            mock.patch.object(
+                CONTROLLER,
+                "current_target",
+                return_value=CONTROLLER.release_target(candidate),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_transaction",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_state_file",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "get_current_target",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "validate_persisted_release",
+                side_effect=lambda *_args: events.append("static-release-validated"),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "restore_current_target",
+                side_effect=lambda *_args: events.append("static-link-restored"),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "write_deployment_state_file",
+                side_effect=lambda *_args: events.append("static-state-restored"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_parkventory_public_edge_route",
+                side_effect=lambda route: events.append(
+                    f"route-restored-{route == static_route.encode()}"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "state_release",
+                return_value=Path("/release"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_public_edge_compose_configuration",
+                side_effect=lambda _release: events.append("compose-validated"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "force_recreate_public_edge_for_parkventory",
+                side_effect=lambda _release: events.append(
+                    "caddy-force-recreated"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_parkventory_public_edge_attachment",
+                side_effect=lambda _release: events.append("network-verified"),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_persisted_inventory",
+                side_effect=lambda _state: events.append("inventory-validated")
+                or inventory,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "probe_live_health",
+                side_effect=lambda *_args: events.append("static-health-probed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "stop_runtime",
+                side_effect=lambda _state: events.append("candidate-stopped"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "switch_current",
+                side_effect=lambda *_args: events.append("app-link-removed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "remove_state",
+                side_effect=lambda *_args: events.append("app-state-removed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_state",
+                side_effect=lambda *_args: events.append("candidate-quarantined"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "remove_parkventory_handoff",
+                side_effect=lambda: events.append("journal-removed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_parkventory_handoff",
+                side_effect=lambda value: events.append(f"journal-{value.phase}"),
+            ),
+        ):
+            CONTROLLER.restore_parkventory_static_handoff(handoff)
+        self.assertEqual(
+            events,
+            [
+                "static-release-validated",
+                "inventory-validated",
+                "compose-validated",
+                "journal-restoring-static",
+                "app-state-removed",
+                "app-link-removed",
+                "static-link-restored",
+                "route-restored-True",
+                "caddy-force-recreated",
+                "network-verified",
+                "static-health-probed",
+                "static-state-restored",
+                "candidate-stopped",
+                "candidate-quarantined",
+                "journal-removed",
+            ],
+        )
+        reconcile.assert_not_called()
+
+    def test_static_restore_preparation_failure_never_stops_active_candidate(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="static-released",
+        )
+        for failure_point in (
+            "release",
+            "inventory",
+            "compose",
+            "journal",
+            "app-state",
+            "app-link",
+            "link",
+            "route",
+            "reconcile",
+            "attachment",
+            "probe",
+            "state",
+        ):
+            with self.subTest(failure_point=failure_point):
+
+                def step(name, result=None):
+                    if name == failure_point:
+                        raise CONTROLLER.ApplicationDeploymentError(
+                            f"restore failed at {name}"
+                        )
+                    return result
+
+                with contextlib.ExitStack() as stack:
+                    patchers = (
+                        mock.patch.object(
+                            CONTROLLER, "read_state", return_value=candidate
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "current_target",
+                            return_value=CONTROLLER.release_target(candidate),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "read_deployment_transaction",
+                            return_value=None,
+                        ),
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "read_deployment_state_file",
+                            return_value=None,
+                        ),
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "get_current_target",
+                            return_value=None,
+                        ),
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "validate_persisted_release",
+                            side_effect=lambda *_args: step("release"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "read_persisted_inventory",
+                            side_effect=lambda _state: step(
+                                "inventory", types.SimpleNamespace()
+                            ),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "restore_current_target",
+                            side_effect=lambda *_args: step("link"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "write_deployment_state_file",
+                            side_effect=lambda *_args: step("state"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "write_parkventory_public_edge_route",
+                            side_effect=lambda _route: step("route"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "state_release",
+                            return_value=Path("/release"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "validate_public_edge_compose_configuration",
+                            side_effect=lambda _release: step("compose"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "force_recreate_public_edge_for_parkventory",
+                            side_effect=lambda _release: step("reconcile"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "validate_parkventory_public_edge_attachment",
+                            side_effect=lambda _release: step("attachment"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER.STATIC,
+                            "probe_live_health",
+                            side_effect=lambda *_args: step("probe"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "switch_current",
+                            side_effect=lambda *_args: step("app-link"),
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "remove_state",
+                            side_effect=lambda *_args: step("app-state"),
+                        ),
+                        mock.patch.object(CONTROLLER, "write_state"),
+                        mock.patch.object(
+                            CONTROLLER, "remove_parkventory_handoff"
+                        ),
+                        mock.patch.object(
+                            CONTROLLER,
+                            "write_parkventory_handoff",
+                            side_effect=lambda _handoff: step("journal"),
+                        ),
+                    )
+                    for patcher in patchers:
+                        stack.enter_context(patcher)
+                    stop = stack.enter_context(
+                        mock.patch.object(CONTROLLER, "stop_runtime")
+                    )
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        f"restore failed at {failure_point}",
+                    ):
+                        CONTROLLER.restore_parkventory_static_handoff(handoff)
+                stop.assert_not_called()
+
+    def test_boot_handoff_recovery_restores_static_before_inactive_caddy_starts(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="route-switched",
+        )
+        events: list[str] = []
+        with (
+            mock.patch.object(CONTROLLER, "read_state", return_value=None),
+            mock.patch.object(CONTROLLER, "current_target", return_value=None),
+            mock.patch.multiple(
+                CONTROLLER.STATIC,
+                read_deployment_transaction=mock.Mock(return_value=None),
+                read_deployment_state_file=mock.Mock(return_value=None),
+                get_current_target=mock.Mock(return_value=None),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "validate_persisted_release",
+                side_effect=lambda *_args: events.append("static-release-validated"),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_persisted_inventory",
+                side_effect=lambda _state: events.append("inventory-validated")
+                or types.SimpleNamespace(),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "restore_current_target",
+                side_effect=lambda *_args: events.append("static-link-restored"),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "write_deployment_state_file",
+                side_effect=lambda *_args: events.append("static-state-restored"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_parkventory_public_edge_route",
+                side_effect=lambda _route: events.append("route-restored"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "state_release",
+                return_value=Path("/release"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_public_edge_compose_configuration",
+                side_effect=lambda _release: events.append("compose-validated"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "force_recreate_public_edge_for_parkventory",
+                side_effect=lambda _release: events.append(
+                    "caddy-force-recreated"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_parkventory_public_edge_attachment",
+                side_effect=lambda _release: events.append("network-verified"),
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "probe_live_health",
+                side_effect=lambda *_args: events.append("static-health-probed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "stop_runtime",
+                side_effect=lambda _state: events.append("candidate-stopped"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "switch_current",
+                side_effect=lambda *_args: events.append("app-link-removed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "remove_state",
+                side_effect=lambda *_args: events.append("app-state-removed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_state",
+                side_effect=lambda *_args: events.append("candidate-quarantined"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "remove_parkventory_handoff",
+                side_effect=lambda: events.append("journal-removed"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_parkventory_handoff",
+                side_effect=lambda value: events.append(f"journal-{value.phase}"),
+            ),
+        ):
+            CONTROLLER.restore_parkventory_static_handoff(handoff)
+        self.assertEqual(
+            events,
+            [
+                "static-release-validated",
+                "inventory-validated",
+                "compose-validated",
+                "journal-restoring-static",
+                "app-state-removed",
+                "app-link-removed",
+                "static-link-restored",
+                "route-restored",
+                "caddy-force-recreated",
+                "network-verified",
+                "static-health-probed",
+                "static-state-restored",
+                "candidate-stopped",
+                "candidate-quarantined",
+                "journal-removed",
+            ],
+        )
+
+    def test_boot_crash_after_dynamic_route_restores_handoff_before_transaction(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="route-switched",
+        )
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=None,
+            previous_target=None,
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="started",
+        )
+        events: list[str] = []
+
+        def record_state(directory, *_args):
+            events.append(
+                "transaction-quarantine"
+                if directory == CONTROLLER.QUARANTINE_ROOT
+                else "state-removed"
+            )
+
+        with mock.patch.multiple(
+            CONTROLLER,
+            parkventory_handoff_path_present=mock.Mock(side_effect=(True, False)),
+            read_parkventory_handoff=mock.Mock(return_value=handoff),
+            read_transaction=mock.Mock(return_value=transaction),
+            read_state=mock.Mock(side_effect=(None, None, None)),
+            current_target=mock.Mock(side_effect=(None, None, None)),
+            write_parkventory_public_edge_route=mock.Mock(
+                side_effect=lambda _route: events.append("static-route-restored")
+            ),
+            state_release=mock.Mock(return_value=Path("/release")),
+            validate_public_edge_compose_configuration=mock.Mock(
+                side_effect=lambda _release: events.append("compose-validated")
+            ),
+            force_recreate_public_edge_for_parkventory=mock.Mock(
+                side_effect=lambda _release: events.append("caddy-force-recreated")
+            ),
+            validate_parkventory_public_edge_attachment=mock.Mock(
+                side_effect=lambda _release: events.append("network-verified")
+            ),
+            stop_runtime=mock.Mock(
+                side_effect=lambda _state: events.append("handoff-stopped-candidate")
+            ),
+            switch_current=mock.Mock(
+                side_effect=lambda *_args: events.append("app-link-cleared")
+            ),
+            remove_state=mock.Mock(side_effect=record_state),
+            write_state=mock.Mock(side_effect=record_state),
+            remove_parkventory_handoff=mock.Mock(
+                side_effect=lambda: events.append("handoff-removed")
+            ),
+            write_parkventory_handoff=mock.Mock(),
+            remove_migration_container=mock.Mock(
+                side_effect=lambda _state: events.append("transaction-recovery-started")
+            ),
+            static_parkventory_owner_present=mock.Mock(return_value=True),
+            restore_previous=mock.Mock(
+                side_effect=lambda _transaction: events.append(
+                    "transaction-stopped-candidate"
+                )
+            ),
+        ), mock.patch.multiple(
+            CONTROLLER.STATIC,
+            read_deployment_transaction=mock.Mock(return_value=None),
+            read_deployment_state_file=mock.Mock(return_value=None),
+            get_current_target=mock.Mock(return_value=None),
+            validate_persisted_release=mock.Mock(),
+            read_persisted_inventory=mock.Mock(
+                return_value=types.SimpleNamespace()
+            ),
+            restore_current_target=mock.Mock(
+                side_effect=lambda *_args: events.append("static-link-restored")
+            ),
+            write_deployment_state_file=mock.Mock(
+                side_effect=lambda *_args: events.append("static-state-restored")
+            ),
+            probe_live_health=mock.Mock(),
+        ):
+            CONTROLLER.recover_application("parkventory")
+        self.assertLess(
+            events.index("compose-validated"),
+            events.index("handoff-stopped-candidate"),
+        )
+        self.assertLess(
+            events.index("handoff-removed"),
+            events.index("transaction-recovery-started"),
+        )
+        self.assertLess(
+            events.index("handoff-stopped-candidate"),
+            events.index("transaction-stopped-candidate"),
+        )
+
+    def test_handoff_recovery_repairs_reachable_partial_candidate_tuples(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="static-released",
+        )
+        expected_target = CONTROLLER.release_target(candidate)
+        for active, target in (
+            (None, expected_target),
+            (None, None),
+        ):
+            with self.subTest(active=active, target=target):
+                with (
+                    mock.patch.object(
+                        CONTROLLER,
+                        "parkventory_handoff_path_present",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "read_parkventory_handoff",
+                        return_value=handoff,
+                    ),
+                    mock.patch.object(CONTROLLER, "read_state", return_value=active),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "current_target",
+                        return_value=target,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "restore_parkventory_static_handoff",
+                    ) as restore,
+                ):
+                    CONTROLLER.recover_parkventory_handoff()
+                restore.assert_called_once_with(handoff)
+
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                return_value=True,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_parkventory_handoff",
+                return_value=handoff,
+            ),
+            mock.patch.object(CONTROLLER, "read_state", return_value=candidate),
+            mock.patch.object(CONTROLLER, "current_target", return_value=None),
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "foreign Compose active tuple",
+            ):
+                CONTROLLER.recover_parkventory_handoff()
+
+    def test_forward_handoff_journal_is_preserved_for_transaction_recovery(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="static-released",
+        )
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                return_value=True,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_parkventory_handoff",
+                return_value=handoff,
+            ),
+            mock.patch.object(CONTROLLER, "read_state", return_value=candidate),
+            mock.patch.object(
+                CONTROLLER,
+                "current_target",
+                return_value=CONTROLLER.release_target(candidate),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_backup_before_runtime",
+            ),
+            mock.patch.object(CONTROLLER, "validate_public_edge_cutover"),
+            mock.patch.object(CONTROLLER, "probe_runtime"),
+            mock.patch.object(
+                CONTROLLER,
+                "remove_parkventory_handoff",
+            ) as remove,
+            mock.patch.object(
+                CONTROLLER,
+                "restore_parkventory_static_handoff",
+            ) as restore,
+        ):
+            CONTROLLER.recover_parkventory_handoff(
+                preserve_forward_journal=True
+            )
+        remove.assert_not_called()
+        restore.assert_not_called()
+
+    def test_reappeared_static_owner_finishes_handoff_rollback_without_transaction(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="static-released",
+        )
+        journal = {"present": True}
+        events: list[str] = []
+
+        def restore_static(value):
+            self.assertEqual(value, handoff)
+            events.append("static-rollback-finished")
+            journal["present"] = False
+
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                side_effect=lambda: journal["present"],
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_parkventory_handoff",
+                return_value=handoff,
+            ),
+            mock.patch.object(CONTROLLER, "read_state", return_value=candidate),
+            mock.patch.object(
+                CONTROLLER,
+                "current_target",
+                return_value=CONTROLLER.release_target(candidate),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "static_parkventory_owner_present",
+                return_value=True,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "restore_parkventory_static_handoff",
+                side_effect=restore_static,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "_recover_application_transaction",
+                side_effect=lambda _application: events.append("transaction-absent"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_backup_before_runtime",
+            ) as revalidate,
+            mock.patch.object(
+                CONTROLLER,
+                "remove_parkventory_handoff",
+            ) as remove,
+        ):
+            CONTROLLER.recover_application("parkventory")
+        self.assertEqual(
+            events,
+            ["static-rollback-finished", "transaction-absent"],
+        )
+        revalidate.assert_not_called()
+        remove.assert_not_called()
+
+    def test_probed_handoff_failure_restores_static_before_transaction_retry(self):
+        candidate = state("parkventory")
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=None,
+            previous_target=None,
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="probed",
+        )
+        static_state = static_parkventory_state()
+        static_route = "parkventory.com { respond static }\n"
+        handoff = CONTROLLER.ParkventoryHandoff(
+            candidate=candidate,
+            static_state=static_state,
+            static_target=CONTROLLER.STATIC.release_target_for_state(static_state),
+            static_route=static_route,
+            static_route_digest=CONTROLLER.content_digest(static_route.encode()),
+            candidate_route_digest=CONTROLLER.content_digest(
+                b"parkventory.com { respond application }\n"
+            ),
+            phase="static-released",
+        )
+        journal = {"present": True}
+        events: list[str] = []
+        transaction_attempts = 0
+
+        def recover_transaction(application):
+            nonlocal transaction_attempts
+            self.assertEqual(application, "parkventory")
+            self.assertEqual(transaction.phase, "probed")
+            transaction_attempts += 1
+            if transaction_attempts == 1:
+                events.append("promotion-failed")
+                raise CONTROLLER.ApplicationDeploymentError("promotion failed")
+            events.append("transaction-retried-after-static")
+
+        def restore_static(value):
+            self.assertEqual(value, handoff)
+            events.append("static-restored")
+            journal["present"] = False
+
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "recover_parkventory_handoff",
+                side_effect=lambda *, preserve_forward_journal=False: events.append(
+                    f"handoff-preserved-{preserve_forward_journal}"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "_recover_application_transaction",
+                side_effect=recover_transaction,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                side_effect=lambda: journal["present"],
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_parkventory_handoff",
+                return_value=handoff,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "restore_parkventory_static_handoff",
+                side_effect=restore_static,
+            ),
+        ):
+            CONTROLLER.recover_application("parkventory")
+        self.assertEqual(
+            events,
+            [
+                "handoff-preserved-True",
+                "promotion-failed",
+                "static-restored",
+                "transaction-retried-after-static",
+            ],
+        )
+
+    def test_handoff_failure_before_edge_proof_never_releases_static_owner(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_target = CONTROLLER.STATIC.release_target_for_state(static_state)
+        static_route = b"parkventory.com { respond static }\n"
+        application_route = b"parkventory.com { respond application }\n"
+        for failure_point in ("route", "reconcile", "probe"):
+            with self.subTest(failure_point=failure_point):
+                events: list[str] = []
+
+                def step(name):
+                    events.append(name)
+                    if name == failure_point:
+                        raise CONTROLLER.ApplicationDeploymentError(
+                            f"failed at {name}"
+                        )
+
+                with (
+                    mock.patch.object(
+                        CONTROLLER,
+                        "parkventory_handoff_path_present",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "read_deployment_transaction",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "read_deployment_state_file",
+                        return_value=static_state,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "get_current_target",
+                        return_value=static_target,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "validate_persisted_release",
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "read_parkventory_public_edge_route",
+                        return_value=static_route,
+                    ),
+                    mock.patch.object(CONTROLLER, "require_protected_file"),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "read_bounded_file",
+                        return_value=static_route,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "state_release",
+                        return_value=Path("/release"),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "bundle_from_release",
+                        return_value=types.SimpleNamespace(
+                            files={"caddy/parkventory.caddy": application_route}
+                        ),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "write_parkventory_handoff",
+                        side_effect=lambda handoff: events.append(
+                            f"journal-{handoff.phase}"
+                        ),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "write_parkventory_public_edge_route",
+                        side_effect=lambda _route: step("route"),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "reconcile_public_edge_for_parkventory",
+                        side_effect=lambda _release: step("reconcile"),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "validate_public_edge_cutover",
+                        side_effect=lambda _state, _work: step("probe"),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "remove_protected_state_file",
+                    ) as remove_state,
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "restore_current_target",
+                    ) as remove_link,
+                ):
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        f"failed at {failure_point}",
+                    ):
+                        CONTROLLER.begin_parkventory_handoff(
+                            candidate,
+                            Path("/work"),
+                        )
+                remove_state.assert_not_called()
+                remove_link.assert_not_called()
+                self.assertNotIn("journal-edge-verified", events)
+
+    def test_handoff_failure_while_releasing_static_keeps_recoverable_journal(self):
+        candidate = state("parkventory")
+        static_state = static_parkventory_state()
+        static_target = CONTROLLER.STATIC.release_target_for_state(static_state)
+        static_route = b"parkventory.com { respond static }\n"
+        application_route = b"parkventory.com { respond application }\n"
+        for failure_point in ("state", "link"):
+            with self.subTest(failure_point=failure_point):
+                events: list[str] = []
+
+                def release_step(name):
+                    events.append(name)
+                    if name == failure_point:
+                        raise CONTROLLER.ApplicationDeploymentError(
+                            f"failed at {name}"
+                        )
+
+                with (
+                    mock.patch.object(
+                        CONTROLLER,
+                        "parkventory_handoff_path_present",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "read_deployment_transaction",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "read_deployment_state_file",
+                        return_value=static_state,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "get_current_target",
+                        return_value=static_target,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "validate_persisted_release",
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "read_parkventory_public_edge_route",
+                        return_value=static_route,
+                    ),
+                    mock.patch.object(CONTROLLER, "require_protected_file"),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "read_bounded_file",
+                        return_value=static_route,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "state_release",
+                        return_value=Path("/release"),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "bundle_from_release",
+                        return_value=types.SimpleNamespace(
+                            files={"caddy/parkventory.caddy": application_route}
+                        ),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "write_parkventory_handoff",
+                        side_effect=lambda handoff: events.append(
+                            f"journal-{handoff.phase}"
+                        ),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "write_parkventory_public_edge_route",
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "reconcile_public_edge_for_parkventory",
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "validate_public_edge_cutover",
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "remove_protected_state_file",
+                        side_effect=lambda *_args: release_step("state"),
+                    ),
+                    mock.patch.object(
+                        CONTROLLER.STATIC,
+                        "restore_current_target",
+                        side_effect=lambda *_args: release_step("link"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        f"failed at {failure_point}",
+                    ):
+                        CONTROLLER.begin_parkventory_handoff(
+                            candidate,
+                            Path("/work"),
+                        )
+                self.assertEqual(events[-1], failure_point)
+                self.assertIn("journal-edge-verified", events)
+                self.assertNotIn("journal-static-released", events)
+
+    def test_public_edge_active_state_accepts_only_exact_systemd_results(self):
+        accepted = (
+            (subprocess.CompletedProcess([], 0, "active\n", ""), True),
+            (subprocess.CompletedProcess([], 3, "inactive\n", ""), False),
+        )
+        for result, expected in accepted:
+            with self.subTest(returncode=result.returncode, stdout=result.stdout):
+                with mock.patch.object(
+                    CONTROLLER,
+                    "_run_bounded_status",
+                    return_value=result,
+                ) as bounded:
+                    self.assertEqual(
+                        CONTROLLER.public_edge_unit_is_active(Path("/release")),
+                        expected,
+                    )
+                self.assertEqual(
+                    bounded.call_args.args[0],
+                    [
+                        str(CONTROLLER.SYSTEMCTL_PATH),
+                        "is-active",
+                        CONTROLLER.PUBLIC_EDGE_UNIT,
+                    ],
+                )
+        for result in (
+            subprocess.CompletedProcess([], 3, "failed\n", ""),
+            subprocess.CompletedProcess([], 0, "active\n", "warning\n"),
+            subprocess.CompletedProcess([], 4, "unknown\n", ""),
+        ):
+            with self.subTest(rejected=result):
+                with mock.patch.object(
+                    CONTROLLER,
+                    "_run_bounded_status",
+                    return_value=result,
+                ):
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        "unexpected active state",
+                    ):
+                        CONTROLLER.public_edge_unit_is_active(Path("/release"))
+
+    def test_live_public_edge_detection_requires_the_exact_route_bind(self):
+        identifier = "a" * 64
+        listed = subprocess.CompletedProcess([], 0, f"{identifier}\n", "")
+        inspected = subprocess.CompletedProcess(
+            [],
+            0,
+            (
+                f"{identifier}\t/{CONTROLLER.PUBLIC_EDGE_CONTAINER}\t"
+                "running\thealthy\tvps-public-static-edge\tcaddy\tbind\t"
+                f"{CONTROLLER.PARKVENTORY_PUBLIC_EDGE_ROUTE}\tfalse\n"
+            ),
+            "",
+        )
+        with mock.patch.object(
+            CONTROLLER,
+            "_run_bounded",
+            side_effect=(listed, inspected),
+        ) as bounded:
+            self.assertTrue(
+                CONTROLLER.parkventory_public_edge_container_is_live(
+                    Path("/release")
+                )
+            )
+        self.assertEqual(
+            bounded.call_args_list[0].args[0],
+            [
+                str(CONTROLLER.DOCKER_PATH),
+                "ps",
+                "--quiet",
+                "--no-trunc",
+                "--filter",
+                "label=com.docker.compose.project=vps-public-static-edge",
+                "--filter",
+                "label=com.docker.compose.service=caddy",
+            ],
+        )
+        self.assertEqual(
+            bounded.call_args_list[1].args[0][-1],
+            identifier,
+        )
+
+        wrong_bind = subprocess.CompletedProcess(
+            [],
+            0,
+            inspected.stdout.replace("\tfalse\n", "\ttrue\n"),
+            "",
+        )
+        with mock.patch.object(
+            CONTROLLER,
+            "_run_bounded",
+            side_effect=(listed, wrong_bind),
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "protected Parkventory route bind",
+            ):
+                CONTROLLER.parkventory_public_edge_container_is_live(
+                    Path("/release")
+                )
 
     def test_candidate_must_descend_from_active_before_activation(self):
         candidate = state()
@@ -989,11 +2496,25 @@ class ApplicationControllerTests(unittest.TestCase):
             edge = Path(temporary_directory)
             route_root = edge / "routes"
             route_root.mkdir()
-            (route_root / "parkventory.caddy").write_bytes(route)
-            completed = subprocess.CompletedProcess(
+            route_path = route_root / "parkventory.caddy"
+            route_path.write_bytes(route)
+            network_id = "c" * 64
+            network = subprocess.CompletedProcess(
                 [],
                 0,
-                "running\thealthy\tvps-public-static-edge\tattached\n",
+                (
+                    f"{network_id}\tapp_parkventory\tbridge\tlocal\tfalse\t"
+                    "false\tfalse\ttrue\t1\t172.30.20.0/24\n"
+                ),
+                "",
+            )
+            attached = subprocess.CompletedProcess(
+                [],
+                0,
+                (
+                    "running\thealthy\tvps-public-static-edge\t"
+                    f"{network_id}\t172.30.20.254\t24\n"
+                ),
                 "",
             )
             with (
@@ -1001,6 +2522,11 @@ class ApplicationControllerTests(unittest.TestCase):
                     CONTROLLER,
                     "PUBLIC_EDGE_RUNTIME_ROOT",
                     edge,
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "PARKVENTORY_PUBLIC_EDGE_ROUTE",
+                    route_path,
                 ),
                 mock.patch.object(CONTROLLER, "require_protected_file"),
                 mock.patch.object(CONTROLLER, "state_release", return_value=edge),
@@ -1023,12 +2549,12 @@ class ApplicationControllerTests(unittest.TestCase):
                 mock.patch.object(
                     CONTROLLER,
                     "_run_bounded",
-                    return_value=completed,
+                    side_effect=(network, attached),
                 ) as inspect,
                 mock.patch.object(CONTROLLER, "_probe_http") as probe,
             ):
                 CONTROLLER.validate_public_edge_cutover(candidate, edge)
-        command = inspect.call_args.args[0]
+        command = inspect.call_args_list[1].args[0]
         self.assertIn("app_parkventory", command[-2])
         self.assertEqual(command[-1], CONTROLLER.PUBLIC_EDGE_CONTAINER)
         probe.assert_called_once_with(
@@ -1392,6 +2918,108 @@ class ApplicationControllerTests(unittest.TestCase):
                 ):
                     CONTROLLER.validate_parkventory_runtime_configuration(invalid)
 
+    def test_parkventory_secret_materializers_are_both_checked_exactly(self):
+        successful = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"changed":false,"mode":"check","ready":true}\n',
+            "",
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file") as protected,
+            mock.patch.object(
+                CONTROLLER,
+                "_run_bounded",
+                side_effect=(successful, successful),
+            ) as bounded,
+        ):
+            CONTROLLER.validate_parkventory_secret_materializers()
+        self.assertEqual(
+            [call.args[0] for call in protected.call_args_list],
+            [
+                CONTROLLER.PARKVENTORY_DATABASE_INPUT_VALIDATOR_PATH,
+                CONTROLLER.PARKVENTORY_PROVIDER_INPUT_VALIDATOR_PATH,
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in bounded.call_args_list],
+            [
+                [
+                    str(CONTROLLER.PARKVENTORY_DATABASE_INPUT_VALIDATOR_PATH),
+                    "--check",
+                ],
+                [
+                    str(CONTROLLER.PARKVENTORY_PROVIDER_INPUT_VALIDATOR_PATH),
+                    "--check",
+                ],
+            ],
+        )
+
+    def test_parkventory_secret_materializer_rejection_is_fail_closed(self):
+        successful = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"changed":false,"mode":"check","ready":true}\n',
+            "",
+        )
+        rejected = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"changed":true,"mode":"check","ready":true}\n',
+            "",
+        )
+        for results, label, expected_calls in (
+            ((rejected,), "database secret materializer", 1),
+            (
+                (successful, rejected),
+                "provider secret materializer",
+                2,
+            ),
+        ):
+            with self.subTest(label=label):
+                with (
+                    mock.patch.object(CONTROLLER, "require_protected_file"),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "_run_bounded",
+                        side_effect=results,
+                    ) as bounded,
+                ):
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        label,
+                    ):
+                        CONTROLLER.validate_parkventory_secret_materializers()
+                self.assertEqual(bounded.call_count, expected_calls)
+
+    def test_parkventory_secret_rejection_precedes_deployment_validation(self):
+        candidate = state("parkventory")
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "validate_parkventory_secret_materializers",
+                side_effect=CONTROLLER.ApplicationDeploymentError(
+                    "provider secret materializer rejected"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_materialized_runtime_policy",
+            ) as validate_policy,
+            mock.patch.object(CONTROLLER, "prepare_transaction") as prepare,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "provider secret materializer rejected",
+            ):
+                CONTROLLER.activate_candidate(
+                    candidate,
+                    Path("/work"),
+                    static_handoff_required=False,
+                )
+        validate_policy.assert_not_called()
+        prepare.assert_not_called()
+
     def test_parkventory_readiness_is_digest_bound_and_live_checked(self):
         contract = CONTROLLER.load_production_contract(
             ROOT / "releases/application-production.json"
@@ -1409,34 +3037,37 @@ class ApplicationControllerTests(unittest.TestCase):
             microsecond=0
         )
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        offsite_evidence = CONTROLLER.canonical_json(
+        backup_id = "20260823T120000000000Z-012345abcdef"
+        backup_manifest = CONTROLLER.canonical_json(
             {
-                "backup_id": "20260823T120000000000Z-012345abcdef",
-                "contract": (
-                    "vps-infra.parkventory-offsite-backup-readiness.v1"
-                ),
-                "database": "parkventory",
-                "provider_gates": {
-                    "bucket_object_lock_verified": True,
-                    "bucket_versioning_verified": True,
-                    "failure_domain_independence_reviewed": True,
-                    "recovery_key_off_host_verified": True,
-                    "restore_identity_separate_verified": True,
+                "backup_id": backup_id,
+                "contract": "vps-postgres-logical-backup-v1",
+                "created_at": timestamp,
+                "files": [
+                    {
+                        "database_name_hex": "parkventory".encode().hex(),
+                        "kind": "database",
+                    },
+                    {
+                        "database_name_hex": "postgres".encode().hex(),
+                        "kind": "database",
+                    },
+                ],
+                "source": {
+                    "compose_project": "vps-platform",
+                    "compose_service": "postgresql",
+                    "system_identifier": "7612345678901234567",
                 },
-                "restore_rehearsal": {
-                    "completed_at": timestamp,
-                    "evidence_sha256": "sha256:" + "c" * 64,
-                    "performed_off_atlas": True,
-                    "rehearsed": True,
-                    "source_manifest_sha256": "sha256:" + "d" * 64,
-                },
-                "upload_receipt": {
-                    "age_recipient_sha256": "sha256:" + "e" * 64,
-                    "contract": "vps-postgres-offsite-receipt-v2",
-                    "receipt_sha256": "sha256:" + "f" * 64,
-                    "recorded_at": timestamp,
-                    "source_manifest_sha256": "sha256:" + "d" * 64,
-                },
+            }
+        )
+        local_backup_evidence = CONTROLLER.canonical_json(
+            {
+                "backup_id": backup_id,
+                "completed_at": timestamp,
+                "contract": "vps-postgres-local-restore-readiness-v1",
+                "manifest_sha256": CONTROLLER.content_digest(backup_manifest),
+                "restored_databases": ["parkventory", "postgres"],
+                "scope": {"encrypted": False, "offsite": False},
             }
         )
         policy = CONTROLLER.dataclasses.replace(
@@ -1448,12 +3079,14 @@ class ApplicationControllerTests(unittest.TestCase):
                     "path": str(CONTROLLER.PARKVENTORY_POSTGRES_READINESS),
                     "sha256": CONTROLLER.content_digest(evidence),
                 },
+                "local_backup": {
+                    "contract": "vps-postgres-local-restore-readiness-v1",
+                    "path": str(CONTROLLER.PARKVENTORY_LOCAL_BACKUP_READINESS),
+                    "sha256": CONTROLLER.content_digest(local_backup_evidence),
+                },
                 "encrypted_offsite_backup": {
-                    "contract": (
-                        "vps-infra.parkventory-offsite-backup-readiness.v1"
-                    ),
-                    "path": str(CONTROLLER.PARKVENTORY_OFFSITE_READINESS),
-                    "sha256": CONTROLLER.content_digest(offsite_evidence),
+                    "required": False,
+                    "status": "deferred-for-public-launch",
                 },
             },
         )
@@ -1463,27 +3096,61 @@ class ApplicationControllerTests(unittest.TestCase):
             '{"changed":false,"mode":"check","ready":true}\n',
             "",
         )
+        backup_verified = subprocess.CompletedProcess(
+            [
+                str(CONTROLLER.POSTGRES_BACKUP_VALIDATOR),
+                "verify",
+                "--backup-id",
+                backup_id,
+            ],
+            0,
+            f"local PostgreSQL backup verified: {backup_id}\n",
+            "",
+        )
         with (
             mock.patch.object(CONTROLLER, "require_protected_file") as protected,
+            mock.patch.object(CONTROLLER, "require_protected_directory"),
             mock.patch.object(
                 CONTROLLER.STATIC,
                 "read_bounded_file",
-                side_effect=[evidence, offsite_evidence],
+                side_effect=[evidence, local_backup_evidence, backup_manifest],
             ),
             mock.patch.object(
                 CONTROLLER,
                 "_run_bounded",
-                return_value=completed,
+                side_effect=[completed, backup_verified],
             ) as live_check,
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_postgres_system_identifier",
+                return_value="7612345678901234567",
+            ) as cluster_identity,
         ):
             CONTROLLER.validate_parkventory_readiness(policy)
-        self.assertEqual(protected.call_count, 3)
-        live_check.assert_called_once_with(
-            [str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR), "--check"],
-            environment=CONTROLLER.safe_environment(Path("/root")),
-            timeout=120,
-            maximum_stdout=4096,
+        self.assertEqual(protected.call_count, 5)
+        self.assertEqual(
+            live_check.call_args_list,
+            [
+                mock.call(
+                    [str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR), "--check"],
+                    environment=CONTROLLER.safe_environment(Path("/root")),
+                    timeout=120,
+                    maximum_stdout=4096,
+                ),
+                mock.call(
+                    [
+                        str(CONTROLLER.POSTGRES_BACKUP_VALIDATOR),
+                        "verify",
+                        "--backup-id",
+                        backup_id,
+                    ],
+                    environment=CONTROLLER.safe_environment(Path("/root")),
+                    timeout=300,
+                    maximum_stdout=4096,
+                ),
+            ],
         )
+        cluster_identity.assert_called_once_with()
 
         rejected = CONTROLLER.dataclasses.replace(
             policy,
@@ -1492,6 +3159,7 @@ class ApplicationControllerTests(unittest.TestCase):
                     **policy.readiness_evidence["postgres"],
                     "sha256": "sha256:" + "f" * 64,
                 },
+                "local_backup": policy.readiness_evidence["local_backup"],
                 "encrypted_offsite_backup": policy.readiness_evidence[
                     "encrypted_offsite_backup"
                 ],
@@ -1510,6 +3178,229 @@ class ApplicationControllerTests(unittest.TestCase):
                 "differs from admission",
             ):
                 CONTROLLER.validate_parkventory_readiness(rejected)
+
+        incomplete_backup = CONTROLLER.canonical_json(
+            {
+                "backup_id": backup_id,
+                "completed_at": timestamp,
+                "contract": "vps-postgres-local-restore-readiness-v1",
+                "manifest_sha256": CONTROLLER.content_digest(backup_manifest),
+                "restored_databases": ["postgres"],
+                "scope": {"encrypted": False, "offsite": False},
+            }
+        )
+        incomplete_policy = CONTROLLER.dataclasses.replace(
+            policy,
+            readiness_evidence={
+                **policy.readiness_evidence,
+                "local_backup": {
+                    **policy.readiness_evidence["local_backup"],
+                    "sha256": CONTROLLER.content_digest(incomplete_backup),
+                },
+            },
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_bounded_file",
+                return_value=incomplete_backup,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "local backup and restore proof is incomplete",
+            ):
+                CONTROLLER.validate_parkventory_local_backup_readiness(
+                    incomplete_policy
+                )
+
+    def test_backup_gate_rejects_a_stale_source_rehearsed_today(self):
+        current = next(
+            item
+            for item in CONTROLLER.load_production_contract(
+                ROOT / "releases/application-production.json"
+            ).applications
+            if item.name == "parkventory"
+        )
+        now = CONTROLLER.dt.datetime.now(CONTROLLER.dt.timezone.utc).replace(
+            microsecond=0
+        )
+        completed_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        created_at = (now - CONTROLLER.dt.timedelta(days=3)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        backup_id = "20260820T120000000000Z-012345abcdef"
+        manifest = CONTROLLER.canonical_json(
+            {
+                "backup_id": backup_id,
+                "contract": "vps-postgres-logical-backup-v1",
+                "created_at": created_at,
+                "files": [
+                    {
+                        "database_name_hex": "parkventory".encode().hex(),
+                        "kind": "database",
+                    }
+                ],
+                "source": {
+                    "compose_project": "vps-platform",
+                    "compose_service": "postgresql",
+                    "system_identifier": "7612345678901234567",
+                },
+            }
+        )
+        evidence = CONTROLLER.canonical_json(
+            {
+                "backup_id": backup_id,
+                "completed_at": completed_at,
+                "contract": "vps-postgres-local-restore-readiness-v1",
+                "manifest_sha256": CONTROLLER.content_digest(manifest),
+                "restored_databases": ["parkventory"],
+                "scope": {"encrypted": False, "offsite": False},
+            }
+        )
+        policy = CONTROLLER.dataclasses.replace(
+            current,
+            readiness_evidence={
+                "local_backup": {
+                    "contract": "vps-postgres-local-restore-readiness-v1",
+                    "path": str(CONTROLLER.PARKVENTORY_LOCAL_BACKUP_READINESS),
+                    "sha256": CONTROLLER.content_digest(evidence),
+                }
+            },
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(CONTROLLER, "require_protected_directory"),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_bounded_file",
+                side_effect=(evidence, manifest),
+            ),
+            mock.patch.object(CONTROLLER, "_run_bounded") as bounded,
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_postgres_system_identifier",
+            ) as live_identity,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "source backup is stale",
+            ):
+                CONTROLLER.validate_parkventory_local_backup_readiness(policy)
+        bounded.assert_not_called()
+        live_identity.assert_not_called()
+
+    def test_backup_gate_binds_the_live_postgresql_cluster_identity(self):
+        current = next(
+            item
+            for item in CONTROLLER.load_production_contract(
+                ROOT / "releases/application-production.json"
+            ).applications
+            if item.name == "parkventory"
+        )
+        timestamp = CONTROLLER.dt.datetime.now(
+            CONTROLLER.dt.timezone.utc
+        ).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        backup_id = "20260823T120000000000Z-012345abcdef"
+        manifest = CONTROLLER.canonical_json(
+            {
+                "backup_id": backup_id,
+                "contract": "vps-postgres-logical-backup-v1",
+                "created_at": timestamp,
+                "files": [
+                    {
+                        "database_name_hex": "parkventory".encode().hex(),
+                        "kind": "database",
+                    }
+                ],
+                "source": {
+                    "compose_project": "vps-platform",
+                    "compose_service": "postgresql",
+                    "system_identifier": "7612345678901234567",
+                },
+            }
+        )
+        evidence = CONTROLLER.canonical_json(
+            {
+                "backup_id": backup_id,
+                "completed_at": timestamp,
+                "contract": "vps-postgres-local-restore-readiness-v1",
+                "manifest_sha256": CONTROLLER.content_digest(manifest),
+                "restored_databases": ["parkventory"],
+                "scope": {"encrypted": False, "offsite": False},
+            }
+        )
+        policy = CONTROLLER.dataclasses.replace(
+            current,
+            readiness_evidence={
+                "local_backup": {
+                    "contract": "vps-postgres-local-restore-readiness-v1",
+                    "path": str(CONTROLLER.PARKVENTORY_LOCAL_BACKUP_READINESS),
+                    "sha256": CONTROLLER.content_digest(evidence),
+                }
+            },
+        )
+        verified = subprocess.CompletedProcess(
+            [],
+            0,
+            f"local PostgreSQL backup verified: {backup_id}\n",
+            "",
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(CONTROLLER, "require_protected_directory"),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_bounded_file",
+                side_effect=(evidence, manifest),
+            ),
+            mock.patch.object(CONTROLLER, "_run_bounded", return_value=verified),
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_postgres_system_identifier",
+                return_value="7699999999999999999",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "another PostgreSQL cluster",
+            ):
+                CONTROLLER.validate_parkventory_local_backup_readiness(policy)
+
+    def test_live_postgresql_identity_uses_one_exact_platform_container(self):
+        identifier = "b" * 64
+        system_identifier = "7612345678901234567"
+        with mock.patch.object(
+            CONTROLLER,
+            "_run_bounded",
+            side_effect=(
+                subprocess.CompletedProcess([], 0, f"{identifier}\n", ""),
+                subprocess.CompletedProcess([], 0, f"{system_identifier}\n", ""),
+            ),
+        ) as bounded:
+            self.assertEqual(
+                CONTROLLER.parkventory_postgres_system_identifier(),
+                system_identifier,
+            )
+        self.assertEqual(
+            bounded.call_args_list[0].args[0],
+            [
+                str(CONTROLLER.DOCKER_PATH),
+                "ps",
+                "--quiet",
+                "--no-trunc",
+                "--filter",
+                "label=com.docker.compose.project=vps-platform",
+                "--filter",
+                "label=com.docker.compose.service=postgresql",
+            ],
+        )
+        self.assertEqual(bounded.call_args_list[1].args[0][2], identifier)
+        self.assertEqual(
+            bounded.call_args_list[1].args[0][-1],
+            "--command=SELECT system_identifier::text FROM pg_control_system();",
+        )
 
     def test_parkventory_postmigration_reconciliation_uses_mutating_mode(self):
         completed = subprocess.CompletedProcess(
@@ -2388,12 +4279,18 @@ class ApplicationControllerTests(unittest.TestCase):
             edge = Path(temporary_directory)
             route_root = edge / "routes"
             route_root.mkdir()
-            (route_root / "parkventory.caddy").write_bytes(b"old route\n")
+            route_path = route_root / "parkventory.caddy"
+            route_path.write_bytes(b"old route\n")
             with (
                 mock.patch.object(
                     CONTROLLER,
                     "PUBLIC_EDGE_RUNTIME_ROOT",
                     edge,
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "PARKVENTORY_PUBLIC_EDGE_ROUTE",
+                    route_path,
                 ),
                 mock.patch.object(CONTROLLER, "require_protected_file"),
                 mock.patch.object(CONTROLLER, "state_release", return_value=edge),
@@ -2468,11 +4365,139 @@ class ApplicationControllerTests(unittest.TestCase):
         committed_transaction = commit.call_args.args[0]
         self.assertEqual(committed_transaction.phase, "probed")
 
+    def test_parkventory_runtime_is_ready_before_public_static_handoff(self):
+        candidate = state("parkventory")
+        events: list[str] = []
+        with (
+            mock.patch.object(CONTROLLER, "validate_parkventory_secret_materializers"),
+            mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
+            mock.patch.object(
+                CONTROLLER,
+                "static_parkventory_owner_present",
+                return_value=True,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "prepare_transaction",
+                return_value=(True, None),
+            ),
+            mock.patch.object(CONTROLLER, "current_target", return_value=None),
+            mock.patch.object(CONTROLLER, "write_transaction"),
+            mock.patch.object(CONTROLLER, "pull_and_verify_images"),
+            mock.patch.object(CONTROLLER, "run_migration"),
+            mock.patch.object(CONTROLLER, "validate_parkventory_postgres_live"),
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_backup_before_runtime",
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "start_runtime",
+                side_effect=lambda _state, *, precommit: events.append(
+                    f"runtime-ready-{precommit}"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "begin_parkventory_handoff",
+                side_effect=lambda _state, _work: events.append("public-handoff"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "probe_runtime",
+                side_effect=lambda _state, _work: events.append("runtime-probed"),
+            ),
+            mock.patch.object(CONTROLLER, "assert_exact_source_head"),
+            mock.patch.object(CONTROLLER, "commit_probed_candidate"),
+            mock.patch.object(CONTROLLER, "complete_parkventory_handoff"),
+        ):
+            CONTROLLER.activate_candidate(
+                candidate,
+                Path("/work"),
+                static_handoff_required=True,
+            )
+        self.assertEqual(
+            events,
+            [
+                "runtime-ready-True",
+                "public-handoff",
+                "runtime-probed",
+            ],
+        )
+
+    def test_failed_parkventory_activation_restores_edge_before_stopping_runtime(self):
+        candidate = state("parkventory")
+        events: list[str] = []
+        transactions: list[CONTROLLER.ApplicationTransaction] = []
+        with (
+            mock.patch.object(CONTROLLER, "validate_parkventory_secret_materializers"),
+            mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
+            mock.patch.object(
+                CONTROLLER,
+                "static_parkventory_owner_present",
+                return_value=True,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "prepare_transaction",
+                return_value=(True, None),
+            ),
+            mock.patch.object(CONTROLLER, "current_target", return_value=None),
+            mock.patch.object(
+                CONTROLLER,
+                "write_transaction",
+                side_effect=lambda transaction: transactions.append(transaction),
+            ),
+            mock.patch.object(CONTROLLER, "pull_and_verify_images"),
+            mock.patch.object(CONTROLLER, "run_migration"),
+            mock.patch.object(CONTROLLER, "validate_parkventory_postgres_live"),
+            mock.patch.object(
+                CONTROLLER,
+                "revalidate_parkventory_backup_before_runtime",
+            ),
+            mock.patch.object(CONTROLLER, "start_runtime"),
+            mock.patch.object(CONTROLLER, "begin_parkventory_handoff"),
+            mock.patch.object(
+                CONTROLLER,
+                "probe_runtime",
+                side_effect=CONTROLLER.ApplicationDeploymentError(
+                    "candidate probe rejected"
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_transaction",
+                side_effect=lambda _application: transactions[-1],
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "recover_application",
+                side_effect=lambda _application: events.append(
+                    "candidate-runtime-stopped"
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "candidate probe rejected",
+            ):
+                CONTROLLER.activate_candidate(
+                    candidate,
+                    Path("/work"),
+                    static_handoff_required=True,
+                )
+        self.assertEqual(
+            events,
+            ["candidate-runtime-stopped"],
+        )
+        self.assertEqual(transactions[-1].phase, "probe-rejected")
+
     def test_parkventory_rechecks_exact_access_after_migration(self):
         candidate = state("parkventory")
         events: list[str] = []
         transactions: list[CONTROLLER.ApplicationTransaction] = []
         with (
+            mock.patch.object(CONTROLLER, "validate_parkventory_secret_materializers"),
             mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
             mock.patch.object(
                 CONTROLLER,
@@ -2501,8 +4526,8 @@ class ApplicationControllerTests(unittest.TestCase):
             ) as postgres,
             mock.patch.object(
                 CONTROLLER,
-                "revalidate_parkventory_offsite_before_runtime",
-                side_effect=lambda: events.append("offsite-proof"),
+                "revalidate_parkventory_backup_before_runtime",
+                side_effect=lambda: events.append("backup-proof"),
             ),
             mock.patch.object(
                 CONTROLLER,
@@ -2519,15 +4544,19 @@ class ApplicationControllerTests(unittest.TestCase):
                 side_effect=lambda _transaction: events.append("commit"),
             ),
         ):
-            CONTROLLER.activate_candidate(candidate, Path("/unused"))
+            CONTROLLER.activate_candidate(
+                candidate,
+                Path("/unused"),
+                static_handoff_required=False,
+            )
         self.assertEqual(
             events,
             [
                 "migration",
                 "postgres-proof-True",
-                "offsite-proof",
+                "backup-proof",
                 "runtime-True",
-                "offsite-proof",
+                "backup-proof",
                 "commit",
             ],
         )
@@ -2552,6 +4581,7 @@ class ApplicationControllerTests(unittest.TestCase):
         )
         transactions: list[CONTROLLER.ApplicationTransaction] = []
         with (
+            mock.patch.object(CONTROLLER, "validate_parkventory_secret_materializers"),
             mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
             mock.patch.object(
                 CONTROLLER,
@@ -2587,28 +4617,33 @@ class ApplicationControllerTests(unittest.TestCase):
             mock.patch.object(CONTROLLER, "start_runtime") as start,
             mock.patch.object(
                 CONTROLLER,
-                "revalidate_parkventory_offsite_before_runtime",
-            ) as offsite,
+                "revalidate_parkventory_backup_before_runtime",
+            ) as backup,
             mock.patch.object(CONTROLLER, "commit_probed_candidate") as commit,
         ):
             with self.assertRaisesRegex(
                 CONTROLLER.ApplicationDeploymentError,
                 "PostgreSQL proof rejected",
             ):
-                CONTROLLER.activate_candidate(candidate, Path("/unused"))
+                CONTROLLER.activate_candidate(
+                    candidate,
+                    Path("/unused"),
+                    static_handoff_required=False,
+                )
         self.assertEqual(
             [transaction.phase for transaction in transactions],
             ["prepared", "migration-running", "postgres-unverified"],
         )
         recover.assert_called_once_with("parkventory")
         start.assert_not_called()
-        offsite.assert_not_called()
+        backup.assert_not_called()
         commit.assert_not_called()
 
-    def test_parkventory_offsite_expiry_after_probes_blocks_runtime_commit(self):
+    def test_parkventory_backup_expiry_after_probes_blocks_runtime_commit(self):
         candidate = state("parkventory")
         transactions: list[CONTROLLER.ApplicationTransaction] = []
         with (
+            mock.patch.object(CONTROLLER, "validate_parkventory_secret_materializers"),
             mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
             mock.patch.object(
                 CONTROLLER,
@@ -2627,14 +4662,14 @@ class ApplicationControllerTests(unittest.TestCase):
             mock.patch.object(CONTROLLER, "validate_parkventory_postgres_live"),
             mock.patch.object(
                 CONTROLLER,
-                "revalidate_parkventory_offsite_before_runtime",
+                "revalidate_parkventory_backup_before_runtime",
                 side_effect=(
                     None,
                     CONTROLLER.ApplicationDeploymentError(
-                        "off-site proof expired before commit"
+                        "backup proof expired before commit"
                     ),
                 ),
-            ) as offsite,
+            ) as backup,
             mock.patch.object(CONTROLLER, "start_runtime") as start,
             mock.patch.object(CONTROLLER, "probe_runtime"),
             mock.patch.object(CONTROLLER, "assert_exact_source_head"),
@@ -2648,10 +4683,14 @@ class ApplicationControllerTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 CONTROLLER.ApplicationDeploymentError,
-                "off-site proof expired before commit",
+                "backup proof expired before commit",
             ):
-                CONTROLLER.activate_candidate(candidate, Path("/unused"))
-        self.assertEqual(offsite.call_count, 2)
+                CONTROLLER.activate_candidate(
+                    candidate,
+                    Path("/unused"),
+                    static_handoff_required=False,
+                )
+        self.assertEqual(backup.call_count, 2)
         start.assert_called_once_with(candidate, precommit=True)
         self.assertEqual(transactions[-1].phase, "probe-rejected")
         recover.assert_called_once_with("parkventory")
@@ -2930,7 +4969,7 @@ class ApplicationControllerTests(unittest.TestCase):
         remove.assert_called_once()
         switch.assert_not_called()
 
-    def test_parkventory_partial_commit_revalidates_offsite_before_promotion(self):
+    def test_parkventory_partial_commit_revalidates_backup_before_promotion(self):
         candidate = state("parkventory")
         previous = state(
             "parkventory",
@@ -2965,11 +5004,11 @@ class ApplicationControllerTests(unittest.TestCase):
             mock.patch.object(CONTROLLER, "validate_materialized_release"),
             mock.patch.object(
                 CONTROLLER,
-                "revalidate_parkventory_offsite_before_runtime",
+                "revalidate_parkventory_backup_before_runtime",
                 side_effect=CONTROLLER.ApplicationDeploymentError(
-                    "off-site proof expired before recovery promotion"
+                    "backup proof expired before recovery promotion"
                 ),
-            ) as offsite,
+            ) as backup,
             mock.patch.object(CONTROLLER, "restore_previous") as restore,
             mock.patch.object(CONTROLLER, "start_runtime") as start,
             mock.patch.object(
@@ -2980,7 +5019,7 @@ class ApplicationControllerTests(unittest.TestCase):
             mock.patch.object(CONTROLLER, "remove_state") as remove,
         ):
             CONTROLLER.recover_application("parkventory")
-        offsite.assert_called_once_with()
+        backup.assert_called_once_with()
         restore.assert_called_once_with(transaction)
         start.assert_not_called()
         promote.assert_not_called()
@@ -3082,7 +5121,7 @@ class ApplicationControllerTests(unittest.TestCase):
             "application transaction",
         )
 
-    def test_parkventory_probed_recovery_rejects_expired_offsite_proof(self):
+    def test_parkventory_probed_recovery_rejects_expired_backup_proof(self):
         candidate = state("parkventory")
         previous = state(
             "parkventory",
@@ -3117,11 +5156,11 @@ class ApplicationControllerTests(unittest.TestCase):
             mock.patch.object(CONTROLLER, "validate_materialized_release"),
             mock.patch.object(
                 CONTROLLER,
-                "revalidate_parkventory_offsite_before_runtime",
+                "revalidate_parkventory_backup_before_runtime",
                 side_effect=CONTROLLER.ApplicationDeploymentError(
-                    "off-site proof is stale"
+                    "backup proof is stale"
                 ),
-            ) as offsite,
+            ) as backup,
             mock.patch.object(CONTROLLER, "restore_previous") as restore,
             mock.patch.object(CONTROLLER, "start_runtime") as start,
             mock.patch.object(CONTROLLER, "switch_current") as switch,
@@ -3129,7 +5168,7 @@ class ApplicationControllerTests(unittest.TestCase):
             mock.patch.object(CONTROLLER, "remove_state") as remove,
         ):
             CONTROLLER.recover_application("parkventory")
-        offsite.assert_called_once_with()
+        backup.assert_called_once_with()
         restore.assert_called_once_with(transaction)
         start.assert_not_called()
         switch.assert_not_called()
@@ -3262,6 +5301,647 @@ class ApplicationControllerTests(unittest.TestCase):
                 CONTROLLER.deployment_temporary_root("surplasse", True),
                 runtime,
             )
+
+    def test_restore_previous_makes_rollback_intent_durable_before_mutation(self):
+        candidate = state()
+        previous = state(revision=PREVIOUS_REVISION, digest=PREVIOUS_DIGEST)
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=previous,
+            previous_target=CONTROLLER.release_target(previous),
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="started",
+        )
+        events: list[str] = []
+        with mock.patch.multiple(
+            CONTROLLER,
+            write_transaction=mock.Mock(
+                side_effect=lambda value: events.append(f"journal-{value.phase}")
+            ),
+            validate_materialized_release=mock.Mock(
+                side_effect=lambda *_args: events.append("previous-validated")
+            ),
+            start_runtime=mock.Mock(
+                side_effect=lambda _state: events.append("previous-started")
+            ),
+            write_state=mock.Mock(
+                side_effect=lambda *_args: events.append("active-previous")
+            ),
+            switch_current=mock.Mock(
+                side_effect=lambda *_args: events.append("current-previous")
+            ),
+        ):
+            CONTROLLER.restore_previous(transaction)
+        self.assertEqual(
+            events,
+            [
+                "journal-rollback",
+                "previous-validated",
+                "previous-started",
+                "active-previous",
+                "current-previous",
+            ],
+        )
+
+    def test_restore_previous_crashes_keep_one_way_rollback_journal(self):
+        candidate = state()
+        previous = state(revision=PREVIOUS_REVISION, digest=PREVIOUS_DIGEST)
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=previous,
+            previous_target=CONTROLLER.release_target(previous),
+            expected_target=CONTROLLER.release_target(candidate),
+            phase="probed",
+        )
+        for failure_point in ("start", "active", "current"):
+            with self.subTest(failure_point=failure_point):
+                events: list[str] = []
+
+                def step(name):
+                    events.append(name)
+                    if name == failure_point:
+                        raise CONTROLLER.ApplicationDeploymentError(
+                            f"crashed at {name}"
+                        )
+
+                with mock.patch.multiple(
+                    CONTROLLER,
+                    write_transaction=mock.Mock(
+                        side_effect=lambda value: events.append(
+                            f"journal-{value.phase}"
+                        )
+                    ),
+                    validate_materialized_release=mock.Mock(),
+                    start_runtime=mock.Mock(side_effect=lambda _state: step("start")),
+                    write_state=mock.Mock(side_effect=lambda *_args: step("active")),
+                    switch_current=mock.Mock(
+                        side_effect=lambda *_args: step("current")
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        f"crashed at {failure_point}",
+                    ):
+                        CONTROLLER.restore_previous(transaction)
+                self.assertEqual(events[0], "journal-rollback")
+
+    def test_rollback_recovery_accepts_only_canonical_partial_tuples(self):
+        candidate = state()
+        previous = state(revision=PREVIOUS_REVISION, digest=PREVIOUS_DIGEST)
+        candidate_target = CONTROLLER.release_target(candidate)
+        previous_target = CONTROLLER.release_target(previous)
+        transaction = CONTROLLER.ApplicationTransaction(
+            candidate=candidate,
+            previous_state=previous,
+            previous_target=previous_target,
+            expected_target=candidate_target,
+            phase="rollback",
+        )
+        for active, target in (
+            (candidate, candidate_target),
+            (previous, candidate_target),
+            (previous, previous_target),
+        ):
+            with self.subTest(active=active, target=target):
+                with mock.patch.multiple(
+                    CONTROLLER,
+                    read_transaction=mock.Mock(return_value=transaction),
+                    remove_migration_container=mock.Mock(),
+                    read_state=mock.Mock(return_value=active),
+                    current_target=mock.Mock(return_value=target),
+                    restore_previous=mock.DEFAULT,
+                    write_state=mock.DEFAULT,
+                    remove_state=mock.DEFAULT,
+                ) as patched:
+                    CONTROLLER._recover_application_transaction("surplasse")
+                patched["restore_previous"].assert_called_once_with(transaction)
+                patched["write_state"].assert_called_once()
+                patched["remove_state"].assert_called_once()
+
+        with mock.patch.multiple(
+            CONTROLLER,
+            read_transaction=mock.Mock(return_value=transaction),
+            remove_migration_container=mock.Mock(),
+            read_state=mock.Mock(return_value=candidate),
+            current_target=mock.Mock(return_value=previous_target),
+            restore_previous=mock.DEFAULT,
+        ) as patched:
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "rollback found an unreachable active tuple",
+            ):
+                CONTROLLER._recover_application_transaction("surplasse")
+        patched["restore_previous"].assert_not_called()
+
+    def test_public_edge_base_prepare_journals_before_every_runtime_mutation(self):
+        candidate = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + REVISION
+            + "-activate"
+        )
+        previous = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + PREVIOUS_REVISION
+            + "-precutover"
+        )
+        old_route = b"parkventory.com { respond old }\n"
+        new_route = b"parkventory.com { respond new }\n"
+        events: list[str] = []
+        transactions: list[object] = []
+
+        def journal(value):
+            transactions.append(value)
+            events.append(f"journal-{value.phase}")
+
+        with mock.patch.multiple(
+            CONTROLLER,
+            read_public_edge_base_transaction=mock.Mock(return_value=None),
+            refuse_public_edge_stop_journals_locked=mock.Mock(
+                side_effect=lambda: events.append("journals-clear")
+            ),
+            validate_public_edge_base_release=mock.Mock(),
+            public_edge_release_has_route_selector=mock.Mock(return_value=True),
+            refuse_surplasse_public_edge_owner=mock.Mock(),
+            read_public_edge_runtime_release=mock.Mock(return_value=previous),
+            read_optional_parkventory_public_edge_route=mock.Mock(
+                return_value=old_route
+            ),
+            parkventory_base_route_for_candidate=mock.Mock(return_value=new_route),
+            public_edge_unit_state=mock.Mock(return_value=(True, True)),
+            write_public_edge_base_transaction=mock.Mock(side_effect=journal),
+            write_parkventory_public_edge_route=mock.Mock(
+                side_effect=lambda _route: events.append("route")
+            ),
+            switch_public_edge_runtime_release=mock.Mock(
+                side_effect=lambda _release: events.append("link")
+            ),
+            run_public_edge_systemctl=mock.Mock(
+                side_effect=lambda *_args: events.append("systemd")
+            ),
+            force_recreate_public_edge_for_parkventory=mock.Mock(
+                side_effect=lambda _release: events.append("caddy")
+            ),
+            validate_public_edge_base_live=mock.Mock(
+                side_effect=lambda _release: events.append("verified")
+            ),
+        ):
+            CONTROLLER.prepare_public_edge_base_locked(candidate)
+        self.assertEqual(events[0], "journals-clear")
+        self.assertLess(events.index("journals-clear"), events.index("journal-prepared"))
+        self.assertLess(events.index("journal-prepared"), events.index("route"))
+        self.assertLess(events.index("route"), events.index("link"))
+        self.assertLess(events.index("link"), events.index("caddy"))
+        self.assertLess(events.index("caddy"), events.index("verified"))
+        self.assertEqual(events[-1], "journal-reconciled")
+        self.assertEqual(transactions[0].previous_route, old_route.decode())
+        self.assertEqual(transactions[0].previous_release, str(previous))
+        self.assertTrue(transactions[0].previous_unit_active)
+        self.assertTrue(transactions[0].previous_unit_enabled)
+
+    def test_locked_public_edge_restart_does_not_schedule_recovery_dependencies(self):
+        release = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + REVISION
+            + "-activate"
+        )
+        with mock.patch.object(
+            CONTROLLER,
+            "_run_bounded",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            CONTROLLER.run_public_edge_systemctl(release, "restart")
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                str(CONTROLLER.SYSTEMCTL_PATH),
+                "--job-mode=ignore-dependencies",
+                "restart",
+                CONTROLLER.PUBLIC_EDGE_UNIT,
+            ],
+        )
+
+    def test_public_edge_base_refuses_every_static_transaction_before_journal(self):
+        candidate = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + REVISION
+            + "-activate"
+        )
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "read_public_edge_base_transaction",
+                return_value=None,
+            ),
+            mock.patch.object(CONTROLLER, "validate_public_edge_base_release"),
+            mock.patch.object(
+                CONTROLLER,
+                "public_edge_release_has_route_selector",
+                return_value=True,
+            ),
+            mock.patch.object(CONTROLLER, "refuse_surplasse_public_edge_owner"),
+            mock.patch.object(
+                CONTROLLER,
+                "read_public_edge_runtime_release",
+                return_value=None,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_optional_parkventory_public_edge_route",
+                return_value=None,
+            ),
+            mock.patch.object(CONTROLLER, "read_transaction", return_value=None),
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                return_value=False,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_transaction",
+                side_effect=lambda application: (
+                    types.SimpleNamespace()
+                    if application == "personal"
+                    else None
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "write_public_edge_base_transaction",
+            ) as journal,
+            mock.patch.object(
+                CONTROLLER,
+                "write_parkventory_public_edge_route",
+            ) as route,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "personal static deployment recovery",
+            ):
+                CONTROLLER.prepare_public_edge_base_locked(candidate)
+        journal.assert_not_called()
+        route.assert_not_called()
+
+    def test_public_edge_base_rollback_is_durable_and_idempotent(self):
+        candidate = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + REVISION
+            + "-activate"
+        )
+        previous = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + PREVIOUS_REVISION
+            + "-precutover"
+        )
+        transaction = CONTROLLER.PublicEdgeBaseTransaction(
+            candidate_release=str(candidate),
+            previous_release=str(previous),
+            candidate_route="parkventory.com { respond new }\n",
+            previous_route="parkventory.com { respond old }\n",
+            previous_unit_active=True,
+            previous_unit_enabled=True,
+            phase="reconciled",
+        )
+        events: list[str] = []
+        with mock.patch.multiple(
+            CONTROLLER,
+            write_public_edge_base_transaction=mock.Mock(
+                side_effect=lambda value: events.append(f"journal-{value.phase}")
+            ),
+            validate_public_edge_base_release=mock.Mock(),
+            read_public_edge_runtime_release=mock.Mock(return_value=candidate),
+            read_optional_parkventory_public_edge_route=mock.Mock(
+                return_value=transaction.candidate_route.encode()
+            ),
+            write_parkventory_public_edge_route=mock.Mock(
+                side_effect=lambda _route: events.append("route-old")
+            ),
+            switch_public_edge_runtime_release=mock.Mock(
+                side_effect=lambda _release: events.append("link-old")
+            ),
+            restore_public_edge_service_state=mock.Mock(
+                side_effect=lambda *_args: events.append("service-old")
+            ),
+            remove_public_edge_base_transaction=mock.Mock(
+                side_effect=lambda: events.append("journal-removed")
+            ),
+        ):
+            CONTROLLER.rollback_public_edge_base_locked(transaction)
+        self.assertEqual(
+            events,
+            [
+                "journal-rollback",
+                "route-old",
+                "link-old",
+                "service-old",
+                "journal-removed",
+            ],
+        )
+
+        rollback = CONTROLLER.dataclasses.replace(transaction, phase="rollback")
+        with mock.patch.multiple(
+            CONTROLLER,
+            validate_public_edge_base_release=mock.Mock(),
+            read_public_edge_runtime_release=mock.Mock(return_value=previous),
+            read_optional_parkventory_public_edge_route=mock.Mock(
+                return_value=rollback.previous_route.encode()
+            ),
+            write_parkventory_public_edge_route=mock.Mock(),
+            switch_public_edge_runtime_release=mock.Mock(),
+            restore_public_edge_service_state=mock.Mock(),
+            remove_public_edge_base_transaction=mock.Mock(),
+            write_public_edge_base_transaction=mock.DEFAULT,
+        ) as patched:
+            CONTROLLER.rollback_public_edge_base_locked(rollback)
+        patched["write_public_edge_base_transaction"].assert_not_called()
+
+    def test_first_public_edge_activation_stops_unit_before_removing_runtime_link(self):
+        candidate = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + REVISION
+            + "-activate"
+        )
+        transaction = CONTROLLER.PublicEdgeBaseTransaction(
+            candidate_release=str(candidate),
+            previous_release=None,
+            candidate_route="parkventory.com { respond new }\n",
+            previous_route=None,
+            previous_unit_active=False,
+            previous_unit_enabled=False,
+            phase="reconciled",
+        )
+        events: list[str] = []
+        with mock.patch.multiple(
+            CONTROLLER,
+            write_public_edge_base_transaction=mock.Mock(
+                side_effect=lambda value: events.append(f"journal-{value.phase}")
+            ),
+            validate_public_edge_base_release=mock.Mock(),
+            read_public_edge_runtime_release=mock.Mock(return_value=candidate),
+            read_optional_parkventory_public_edge_route=mock.Mock(
+                return_value=transaction.candidate_route.encode()
+            ),
+            restore_public_edge_service_state=mock.Mock(
+                side_effect=lambda *_args: events.append("service-stopped")
+            ),
+            remove_parkventory_public_edge_route=mock.Mock(
+                side_effect=lambda: events.append("route-removed")
+            ),
+            switch_public_edge_runtime_release=mock.Mock(
+                side_effect=lambda _release: events.append("link-removed")
+            ),
+            remove_public_edge_base_transaction=mock.Mock(
+                side_effect=lambda: events.append("journal-removed")
+            ),
+        ):
+            CONTROLLER.rollback_public_edge_base_locked(transaction)
+        self.assertEqual(
+            events,
+            [
+                "journal-rollback",
+                "service-stopped",
+                "route-removed",
+                "link-removed",
+                "journal-removed",
+            ],
+        )
+
+    def test_public_edge_stop_command_holds_the_shared_lock(self):
+        lock_state = {"held": False}
+
+        @contextlib.contextmanager
+        def tracked_lock():
+            lock_state["held"] = True
+            try:
+                yield
+            finally:
+                lock_state["held"] = False
+
+        with (
+            mock.patch.object(CONTROLLER, "validate_runtime"),
+            mock.patch.object(
+                CONTROLLER,
+                "deployment_lock",
+                side_effect=tracked_lock,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "stop_public_edge_base_locked",
+                side_effect=lambda: self.assertTrue(lock_state["held"]),
+            ) as stop,
+        ):
+            CONTROLLER.stop_public_edge_base()
+        stop.assert_called_once_with()
+
+    def test_public_edge_stop_refuses_static_journal_before_mutation(self):
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "read_public_edge_base_transaction",
+                return_value=None,
+            ),
+            mock.patch.object(CONTROLLER, "read_transaction", return_value=None),
+            mock.patch.object(
+                CONTROLLER,
+                "parkventory_handoff_path_present",
+                return_value=False,
+            ),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_deployment_transaction",
+                side_effect=lambda application: (
+                    types.SimpleNamespace()
+                    if application == "papersempire"
+                    else None
+                ),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_public_edge_runtime_release",
+            ) as runtime,
+            mock.patch.object(
+                CONTROLLER,
+                "run_public_edge_systemctl",
+            ) as systemctl,
+            mock.patch.object(
+                CONTROLLER,
+                "public_edge_project_container_ids",
+            ) as containers,
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "papersempire static deployment recovery",
+            ):
+                CONTROLLER.stop_public_edge_base_locked()
+        runtime.assert_not_called()
+        systemctl.assert_not_called()
+        containers.assert_not_called()
+
+    def test_public_edge_stop_is_idempotent_and_proves_no_running_container(self):
+        release = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + REVISION
+            + "-activate"
+        )
+        identifier = "c" * 64
+        events: list[str] = []
+        with (
+            mock.patch.object(
+                CONTROLLER,
+                "refuse_public_edge_stop_journals_locked",
+                side_effect=lambda: events.append("journals-clear"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "read_public_edge_runtime_release",
+                return_value=release,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "public_edge_unit_installed",
+                return_value=True,
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "run_public_edge_systemctl",
+                side_effect=lambda _release, action: events.append(action),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "public_edge_unit_state",
+                return_value=(False, False),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "public_edge_project_container_ids",
+                side_effect=((identifier,), ()),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "_run_bounded",
+                return_value=subprocess.CompletedProcess(
+                    [],
+                    0,
+                    f"{identifier}\n",
+                    "",
+                ),
+            ) as stopped,
+        ):
+            CONTROLLER.stop_public_edge_base_locked()
+        self.assertEqual(events, ["journals-clear", "disable", "stop"])
+        self.assertEqual(
+            stopped.call_args.args[0],
+            [str(CONTROLLER.DOCKER_PATH), "stop", "--time", "30", identifier],
+        )
+
+    def test_legacy_public_edge_rollback_uses_two_bind_identities(self):
+        release = Path(
+            "/srv/vps/releases/public-static-edge/"
+            + PREVIOUS_REVISION
+            + "-precutover"
+        )
+        for has_selector in (False, True):
+            with self.subTest(has_selector=has_selector):
+                with (
+                    mock.patch.object(
+                        CONTROLLER,
+                        "public_edge_release_has_route_selector",
+                        return_value=has_selector,
+                    ),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "validate_public_edge_bind_identities",
+                    ) as binds,
+                    mock.patch.object(
+                        CONTROLLER,
+                        "validate_parkventory_public_edge_attachment",
+                    ) as attachment,
+                ):
+                    CONTROLLER.validate_public_edge_base_live(release)
+                binds.assert_called_once_with(
+                    release,
+                    include_route_selector=has_selector,
+                )
+                if has_selector:
+                    attachment.assert_called_once_with(release)
+                else:
+                    attachment.assert_not_called()
+
+    def test_application_and_static_writers_refuse_base_transaction(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            transaction = Path(temporary_directory) / "base-transaction.json"
+            transaction.write_text("{}\n", encoding="utf-8")
+            transaction.chmod(0o600)
+            with mock.patch.object(
+                CONTROLLER, "PUBLIC_EDGE_BASE_TRANSACTION", transaction
+            ):
+                with self.assertRaisesRegex(
+                    CONTROLLER.ApplicationDeploymentError,
+                    "unfinished public edge base transaction",
+                ):
+                    CONTROLLER.refuse_public_edge_base_transaction()
+            with mock.patch.object(
+                CONTROLLER.STATIC, "PUBLIC_EDGE_BASE_TRANSACTION", transaction
+            ):
+                with self.assertRaisesRegex(
+                    CONTROLLER.STATIC.StaticDeploymentError,
+                    "unfinished public edge base transaction",
+                ):
+                    CONTROLLER.STATIC.refuse_public_edge_base_transaction_locked()
+
+    def test_shared_deployment_lock_rejects_real_process_contention(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            lock = Path(temporary_directory) / "vps-static.lock"
+            lock.touch(mode=0o600)
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import fcntl,sys; "
+                        "f=open(sys.argv[1], 'r+'); "
+                        "fcntl.flock(f, fcntl.LOCK_EX); "
+                        "print('locked', flush=True); input()"
+                    ),
+                    str(lock),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline(), "locked\n")
+                metadata = lock.stat()
+                protected = types.SimpleNamespace(
+                    st_uid=0,
+                    st_gid=0,
+                    st_nlink=1,
+                    st_mode=(metadata.st_mode & ~0o777) | 0o600,
+                )
+                with (
+                    mock.patch.object(CONTROLLER, "LOCK_PATH", lock),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "Path",
+                        side_effect=lambda value: (
+                            lock
+                            if value == "/run/lock/vps-static.lock"
+                            else Path(value)
+                        ),
+                    ),
+                    mock.patch.object(CONTROLLER.os, "fstat", return_value=protected),
+                    self.assertRaisesRegex(
+                        CONTROLLER.ApplicationDeploymentError,
+                        "holds the shared lock",
+                    ),
+                ):
+                    with CONTROLLER.deployment_lock(timeout_seconds=0):
+                        self.fail("contended lock unexpectedly acquired")
+            finally:
+                if holder.stdin is not None:
+                    holder.stdin.write("\n")
+                    holder.stdin.flush()
+                holder.communicate(timeout=5)
 
 
 class ApplicationLiveGateTests(unittest.TestCase):

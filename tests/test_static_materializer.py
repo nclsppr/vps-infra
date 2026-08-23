@@ -3107,6 +3107,10 @@ class StaticBundleContractTests(unittest.TestCase):
             side_effect=tracked_deployment_lock,
         ), mock.patch.object(
             MATERIALIZER,
+            "refuse_public_edge_base_transaction_locked",
+            side_effect=lambda: self.assertTrue(lock_state["held"]),
+        ) as check_base_transaction, mock.patch.object(
+            MATERIALIZER,
             "refuse_compose_application_owner",
             side_effect=assert_owner_guard_is_locked,
         ) as check_compose_owner, mock.patch.object(
@@ -3157,6 +3161,7 @@ class StaticBundleContractTests(unittest.TestCase):
                 activate_live=True,
             )
         read_inventory.assert_called_once_with(candidate)
+        check_base_transaction.assert_called_once_with()
         check_compose_owner.assert_called_once_with(candidate.application)
         read_application_enablement.assert_called_once_with(
             MATERIALIZER.APPLICATION_PRODUCTION_CONTRACT_PATH,

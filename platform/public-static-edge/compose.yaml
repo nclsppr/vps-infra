@@ -30,6 +30,12 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: /var/lib/vps-public-edge-parkventory/route.caddy
+        target: /etc/caddy/routes/parkventory.caddy
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: /srv/www
         target: /srv/www
         read_only: true
@@ -45,6 +51,8 @@ services:
         volume: {}
     networks:
       edge: {}
+      app_parkventory:
+        ipv4_address: 172.30.20.254
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
@@ -73,6 +81,9 @@ services:
       start_period: 15s
 
 networks:
+  app_parkventory:
+    external: true
+    name: app_parkventory
   edge:
     external: true
     name: edge

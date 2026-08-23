@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
@@ -25,7 +26,11 @@ EX_CONFIG = 78
 PRODUCTION_ROOT = Path("/srv/vps/backups/postgresql")
 PRODUCTION_LOCK = Path("/run/lock/vps-postgres-backup.lock")
 PRODUCTION_DOCKER = Path("/usr/bin/docker")
+PRODUCTION_READINESS = Path(
+    "/var/lib/vps-readiness/postgresql/local-restore.json"
+)
 BACKUP_CONTRACT = "vps-postgres-logical-backup-v1"
+LOCAL_RESTORE_CONTRACT = "vps-postgres-local-restore-readiness-v1"
 BACKUP_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}$")
 IMAGE_RE = re.compile(
     r"^ghcr[.]io/nclsppr/vps-infra/postgres:sha-[0-9a-f]{40}"
@@ -152,10 +157,18 @@ def checked_file(
 
 
 class Runtime:
-    def __init__(self, root: Path, lock_path: Path, docker: Path, owner: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        lock_path: Path,
+        docker: Path,
+        readiness_path: Path,
+        owner: int,
+    ) -> None:
         self.root = root
         self.lock_path = lock_path
         self.docker = docker
+        self.readiness_path = readiness_path
         self.owner = owner
 
     def command_environment(self) -> dict[str, str]:
@@ -1019,6 +1032,105 @@ def cleanup_rehearsal(runtime: Runtime, container_name: str, volume_name: str) -
         raise BackupError(" and ".join(failures) + " failed")
 
 
+def write_local_restore_readiness(
+    runtime: Runtime,
+    backup_id: str,
+    restored_databases: set[str],
+) -> None:
+    backup_fd, _manifest = backup_directory(runtime, backup_id)
+    try:
+        manifest_fd = checked_file(backup_fd, "manifest.json", owner=runtime.owner)
+        try:
+            manifest_digest = sha256_file(manifest_fd)
+        finally:
+            os.close(manifest_fd)
+    finally:
+        os.close(backup_fd)
+    evidence = {
+        "backup_id": backup_id,
+        "completed_at": dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "contract": LOCAL_RESTORE_CONTRACT,
+        "manifest_sha256": f"sha256:{manifest_digest}",
+        "restored_databases": sorted(restored_databases),
+        "scope": {"encrypted": False, "offsite": False},
+    }
+    encoded = (
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_MANIFEST_BYTES:
+        raise BackupError("local restore readiness evidence exceeds its size limit")
+
+    parent = runtime.readiness_path.parent
+    try:
+        parent_fd = os.open(parent, DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise BackupError(
+            f"cannot open local restore readiness directory: {exc.strerror}"
+        ) from exc
+    temporary_name = f".{runtime.readiness_path.name}-{uuid.uuid4().hex[:12]}"
+    descriptor: int | None = None
+    try:
+        parent_metadata = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != runtime.owner
+            or parent_metadata.st_gid != os.getegid()
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        ):
+            raise BackupError(
+                "local restore readiness directory must be owner-owned with mode 0700"
+            )
+        try:
+            existing = os.stat(
+                runtime.readiness_path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISREG(existing.st_mode)
+            or existing.st_nlink != 1
+            or existing.st_uid != runtime.owner
+            or existing.st_gid != os.getegid()
+            or stat.S_IMODE(existing.st_mode) != 0o400
+        ):
+            raise BackupError("local restore readiness evidence has unsafe metadata")
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o400,
+            dir_fd=parent_fd,
+        )
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise BackupError("local restore readiness evidence write was incomplete")
+            view = view[written:]
+        os.fchmod(descriptor, 0o400)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            runtime.readiness_path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    except OSError as exc:
+        raise BackupError(f"cannot write local restore readiness evidence: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        os.close(parent_fd)
+
+
 def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
     manifest = verify_backup(runtime, backup_id)
     source = require_dictionary(manifest["source"], "backup source")
@@ -1271,6 +1383,11 @@ def rehearse_restore(runtime: Runtime, backup_id: str) -> None:
         raise operation_error
     if cleanup_error is not None:
         raise cleanup_error
+    write_local_restore_readiness(
+        runtime,
+        backup_id,
+        expected_database_names,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1295,7 +1412,13 @@ def configured_runtime(args: argparse.Namespace) -> Runtime:
             raise BackupError("production mode requires root")
         if args.docker is not None:
             raise BackupError("production mode does not accept a Docker path override")
-        return Runtime(PRODUCTION_ROOT, PRODUCTION_LOCK, PRODUCTION_DOCKER, 0)
+        return Runtime(
+            PRODUCTION_ROOT,
+            PRODUCTION_LOCK,
+            PRODUCTION_DOCKER,
+            PRODUCTION_READINESS,
+            0,
+        )
     if os.geteuid() == 0:
         raise BackupError("root cannot use test mode")
     if os.environ.get("VPS_POSTGRES_BACKUP_TESTING") != "1":
@@ -1306,6 +1429,7 @@ def configured_runtime(args: argparse.Namespace) -> Runtime:
         args.test_root,
         args.test_root.parent / ".vps-postgres-backup-test.lock",
         args.docker,
+        args.test_root / "local-restore-readiness.json",
         os.geteuid(),
     )
 

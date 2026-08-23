@@ -50,7 +50,7 @@
         site_deploy_key_identities: >-
           {{
             vps_deploy_authorized_keys | map('trim') |
-            map('regex_replace', '^([^ ]+ [^ ]+)(?: .*)?$', '\\1') | list
+            map('regex_replace', '^([^ ]+ [^ ]+)(?: .*)?$', '\1') | list
           }}
 
     - name: Refuse duplicate deployment key identities before any role

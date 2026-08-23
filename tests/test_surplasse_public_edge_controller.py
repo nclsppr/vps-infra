@@ -78,6 +78,8 @@ class ControllerFixture:
             / "usr/local/libexec/vps/materialize-surplasse-dns-secrets",
             dns_bundle_root=root / "etc/vps/secrets/dns/surplasse",
             deployment_lock=root / "run/lock/vps-static.lock",
+            base_transaction=root
+            / "var/lib/vps-public-edge-parkventory/base-transaction.json",
             docker=root / "usr/bin/docker",
             systemctl=root / "usr/bin/systemctl",
             expected_uid=os.getuid(),
@@ -88,6 +90,7 @@ class ControllerFixture:
             (self.paths.base_release_root, 0o755),
             (self.paths.extension_release_root, 0o755),
             (self.paths.state_root, 0o700),
+            (self.paths.base_transaction.parent, 0o700),
             (self.paths.repository_root, 0o755),
             (self.paths.deployment_lock.parent, 0o755),
             (self.paths.controller_revision.parent, 0o755),
@@ -674,12 +677,22 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
         self.assertIn("--force-recreate", commands[0])
         self.assertEqual(commands[0][-1], "caddy")
 
+    def test_surplasse_writer_refuses_a_public_edge_base_transaction(self) -> None:
+        self.fixture.paths.base_transaction.write_text("{}\n", encoding="utf-8")
+        self.fixture.paths.base_transaction.chmod(0o600)
+        with self.assertRaisesRegex(
+            CONTROLLER.EdgeDeploymentError,
+            "unfinished public edge base transaction",
+        ):
+            CONTROLLER.refuse_public_edge_base_transaction(self.fixture.paths)
+
     def test_ansible_installs_recovery_before_the_public_edge(self) -> None:
         defaults = (
             ROOT / "ansible/roles/public_static_edge/defaults/main.yml"
         ).read_text()
         self.assertIn("vps_public_static_edge_surplasse_controller: >-", defaults)
         self.assertIn("/usr/local/libexec/vps/deploy-surplasse-public-edge", defaults)
+        self.assertIn("vps_public_static_edge_application_controller: >-", defaults)
         unit = (
             ROOT
             / "ansible/roles/public_static_edge/templates/vps-public-static-edge.service.j2"
@@ -691,13 +704,10 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
         tasks = (ROOT / "ansible/roles/public_static_edge/tasks/main.yml").read_text()
         self.assertIn("vps_public_static_edge_surplasse_recovery_unit", unit)
         self.assertIn("--recover", recovery)
-        self.assertIn("--assert-base-switch-safe", tasks)
-        self.assertLess(
-            tasks.index(
-                "Refuse an unmanaged base switch over an active Surplasse edge"
-            ),
-            tasks.index("Create the next public edge release link"),
-        )
+        self.assertNotIn("--assert-base-switch-safe", tasks)
+        self.assertIn("--prepare-public-edge-base", tasks)
+        self.assertIn("--commit-public-edge-base", tasks)
+        self.assertIn("--rollback-public-edge-base", tasks)
         top_level_tasks = yaml.safe_load(tasks)
         convergence = next(
             task
@@ -706,22 +716,19 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
             == "Stage, switch, and verify the isolated public static edge"
         )
         convergence_tasks = convergence["block"]
-        preflight = next(
-            task
-            for task in convergence_tasks
-            if task.get("name")
-            == "Refuse an unmanaged base switch over an active Surplasse edge"
-        )
-        self.assertIn("ansible.builtin.command", preflight)
         transaction = next(
             task
             for task in convergence_tasks
             if task.get("name") == "Switch and reconcile the public static edge"
         )
-        nested_names = {task.get("name") for task in transaction["block"]}
-        self.assertNotIn(
-            "Refuse an unmanaged base switch over an active Surplasse edge",
+        nested_names = [task.get("name") for task in transaction["block"]]
+        self.assertEqual(
             nested_names,
+            [
+                "Prepare the locked public edge base transaction",
+                "Verify the switched public static edge from host and operator networks",
+                "Commit the probed public edge base transaction",
+            ],
         )
 
     def test_canonical_admission_is_enabled_but_legacy_adapter_remains_locked(self) -> None:

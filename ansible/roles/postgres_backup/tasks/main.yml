@@ -7,6 +7,9 @@
         ['installed', 'stopped', 'backup-now', 'rehearse-latest']
       - vps_postgres_backup_root == '/srv/vps/backups/postgresql'
       - vps_postgres_backup_script == '/usr/local/libexec/vps/postgres-backup'
+      - >-
+        vps_postgres_local_restore_readiness ==
+        '/var/lib/vps-readiness/postgresql/local-restore.json'
       - vps_postgres_backup_service == 'vps-postgres-backup.service'
       - vps_postgres_backup_timer == 'vps-postgres-backup.timer'
       - >-
@@ -49,6 +52,10 @@
     - path: /srv/vps/backups
       mode: "0700"
     - path: "{{ vps_postgres_backup_root }}"
+      mode: "0700"
+    - path: /var/lib/vps-readiness
+      mode: "0700"
+    - path: /var/lib/vps-readiness/postgresql
       mode: "0700"
   when: vps_postgres_backup_state != 'stopped'
 

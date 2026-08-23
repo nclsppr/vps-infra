@@ -32,6 +32,8 @@ APPROVED_ROUTE_PATH = (
 PROJECT = "vps-public-static-edge"
 APPLICATION_NETWORK = "app_surplasse"
 APPLICATION_ADDRESS = "172.30.10.254"
+PARKVENTORY_NETWORK = "app_parkventory"
+PARKVENTORY_ADDRESS = "172.30.20.254"
 RUNTIME_ROUTE_SOURCE = "/srv/vps/runtime/public-static-edge/routes"
 RUNTIME_ROUTE_PATH = f"{RUNTIME_ROUTE_SOURCE}/surplasse.caddy"
 CONTAINER_ROUTE_TARGET = "/etc/caddy/routes"
@@ -222,9 +224,10 @@ def validate_candidate_compose(document: Any) -> None:
         fail("services.caddy.secrets differs from the exact scoped credential contract")
     if caddy.get("networks") != {
         APPLICATION_NETWORK: {"ipv4_address": APPLICATION_ADDRESS},
+        PARKVENTORY_NETWORK: {"ipv4_address": PARKVENTORY_ADDRESS},
         "edge": {},
     }:
-        fail("services.caddy.networks differs from the exact edge and application attachment")
+        fail("services.caddy.networks differs from the exact permanent attachments")
 
     route_mount = find_volume(caddy, CONTAINER_ROUTE_TARGET)
     if route_mount != {
@@ -246,14 +249,27 @@ def validate_candidate_compose(document: Any) -> None:
         fail("Atlas Surplasse TLS snippet mount differs from the exact contract")
 
     networks = document.get("networks")
-    if not isinstance(networks, dict) or set(networks) != {"edge", APPLICATION_NETWORK}:
-        fail("top-level networks must contain exactly edge and app_surplasse")
+    if not isinstance(networks, dict) or set(networks) != {
+        "edge",
+        APPLICATION_NETWORK,
+        PARKVENTORY_NETWORK,
+    }:
+        fail(
+            "top-level networks must contain edge, app_parkventory, and "
+            "app_surplasse"
+        )
     if networks[APPLICATION_NETWORK] != {
         "name": APPLICATION_NETWORK,
         "ipam": {},
         "external": True,
     }:
         fail("top-level app_surplasse network differs from the managed external network")
+    if networks[PARKVENTORY_NETWORK] != {
+        "name": PARKVENTORY_NETWORK,
+        "ipam": {},
+        "external": True,
+    }:
+        fail("top-level app_parkventory network differs from the managed external network")
 
     secrets = document.get("secrets")
     expected_credential_definitions = {

@@ -15,9 +15,13 @@
   ansible.builtin.stat:
     path: "{{ item }}"
     follow: true
-  loop:
-    - "{{ vps_public_static_edge_bind_release_dir }}/Caddyfile"
-    - "{{ vps_public_static_edge_bind_release_dir }}/routes"
+  loop: >-
+    {{ [vps_public_static_edge_bind_release_dir ~ '/Caddyfile',
+        vps_public_static_edge_bind_release_dir ~ '/routes'] +
+       ([vps_public_static_edge_parkventory_route]
+        if (vps_public_static_edge_bind_include_parkventory_route |
+            default(true) | bool)
+        else []) }}
   register: vps_public_static_edge_expected_bind_sources
 
 - name: Inspect the effective Caddy bind targets
@@ -33,16 +37,25 @@
     get_attributes: false
     get_checksum: false
     get_mime: false
-  loop:
-    - /etc/caddy/Caddyfile
-    - /etc/caddy/routes
+  loop: >-
+    {{ ['/etc/caddy/Caddyfile', '/etc/caddy/routes'] +
+       (['/etc/caddy/routes/parkventory.caddy']
+        if (vps_public_static_edge_bind_include_parkventory_route |
+            default(true) | bool)
+        else []) }}
   register: vps_public_static_edge_effective_bind_targets
 
 - name: Require complete Caddy bind identity evidence
   ansible.builtin.assert:
     that:
-      - vps_public_static_edge_expected_bind_sources.results | length == 2
-      - vps_public_static_edge_effective_bind_targets.results | length == 2
+      - >-
+        vps_public_static_edge_expected_bind_sources.results | length ==
+        (3 if (vps_public_static_edge_bind_include_parkventory_route |
+               default(true) | bool) else 2)
+      - >-
+        vps_public_static_edge_effective_bind_targets.results | length ==
+        (3 if (vps_public_static_edge_bind_include_parkventory_route |
+               default(true) | bool) else 2)
       - >-
         vps_public_static_edge_expected_bind_sources.results[0].stat.isreg |
         default(false)
@@ -55,6 +68,16 @@
       - >-
         vps_public_static_edge_effective_bind_targets.results[1].stat.isdir |
         default(false)
+      - >-
+        not (vps_public_static_edge_bind_include_parkventory_route |
+             default(true) | bool) or
+        (vps_public_static_edge_expected_bind_sources.results[2].stat.isreg |
+         default(false))
+      - >-
+        not (vps_public_static_edge_bind_include_parkventory_route |
+             default(true) | bool) or
+        (vps_public_static_edge_effective_bind_targets.results[2].stat.isreg |
+         default(false))
     fail_msg: Caddy bind mount identity evidence is incomplete.
 
 - name: Record whether Caddy uses the expected immutable bind identities
@@ -67,4 +90,10 @@
          (vps_public_static_edge_expected_bind_sources.results[1].stat.dev ==
           vps_public_static_edge_effective_bind_targets.results[1].stat.dev) and
          (vps_public_static_edge_expected_bind_sources.results[1].stat.inode ==
-          vps_public_static_edge_effective_bind_targets.results[1].stat.inode) }}
+          vps_public_static_edge_effective_bind_targets.results[1].stat.inode) and
+         (not (vps_public_static_edge_bind_include_parkventory_route |
+               default(true) | bool) or
+          ((vps_public_static_edge_expected_bind_sources.results[2].stat.dev ==
+            vps_public_static_edge_effective_bind_targets.results[2].stat.dev) and
+           (vps_public_static_edge_expected_bind_sources.results[2].stat.inode ==
+            vps_public_static_edge_effective_bind_targets.results[2].stat.inode))) }}

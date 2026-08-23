@@ -41,10 +41,14 @@ class SurplassePublicEdgeCandidateTests(unittest.TestCase):
         )
         caddy = base["services"]["caddy"]
         self.assertEqual(base["name"], "vps-public-static-edge")
-        self.assertEqual(set(base["networks"]), {"edge"})
+        self.assertEqual(set(base["networks"]), {"app_parkventory", "edge"})
         self.assertNotIn("environment", caddy)
         self.assertNotIn("secrets", caddy)
-        self.assertEqual(set(caddy["networks"]), {"edge"})
+        self.assertEqual(set(caddy["networks"]), {"app_parkventory", "edge"})
+        self.assertEqual(
+            caddy["networks"]["app_parkventory"],
+            {"ipv4_address": "172.30.20.254"},
+        )
 
     def test_override_is_exact_and_uses_the_separate_dns_directory(self) -> None:
         override = yaml.safe_load(
