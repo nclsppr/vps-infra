@@ -51,6 +51,8 @@ services:
         volume: {}
     networks:
       edge: {}
+      app_monflorian:
+        ipv4_address: 172.30.40.254
       app_parkventory:
         ipv4_address: 172.30.20.254
     read_only: true
@@ -81,6 +83,9 @@ services:
       start_period: 15s
 
 networks:
+  app_monflorian:
+    external: true
+    name: app_monflorian
   app_parkventory:
     external: true
     name: app_parkventory

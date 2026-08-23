@@ -34,6 +34,8 @@ APPLICATION_NETWORK = "app_surplasse"
 APPLICATION_ADDRESS = "172.30.10.254"
 PARKVENTORY_NETWORK = "app_parkventory"
 PARKVENTORY_ADDRESS = "172.30.20.254"
+MONFLORIAN_NETWORK = "app_monflorian"
+MONFLORIAN_ADDRESS = "172.30.40.254"
 RUNTIME_ROUTE_SOURCE = "/srv/vps/runtime/public-static-edge/routes"
 RUNTIME_ROUTE_PATH = f"{RUNTIME_ROUTE_SOURCE}/surplasse.caddy"
 CONTAINER_ROUTE_TARGET = "/etc/caddy/routes"
@@ -224,6 +226,7 @@ def validate_candidate_compose(document: Any) -> None:
         fail("services.caddy.secrets differs from the exact scoped credential contract")
     if caddy.get("networks") != {
         APPLICATION_NETWORK: {"ipv4_address": APPLICATION_ADDRESS},
+        MONFLORIAN_NETWORK: {"ipv4_address": MONFLORIAN_ADDRESS},
         PARKVENTORY_NETWORK: {"ipv4_address": PARKVENTORY_ADDRESS},
         "edge": {},
     }:
@@ -252,11 +255,12 @@ def validate_candidate_compose(document: Any) -> None:
     if not isinstance(networks, dict) or set(networks) != {
         "edge",
         APPLICATION_NETWORK,
+        MONFLORIAN_NETWORK,
         PARKVENTORY_NETWORK,
     }:
         fail(
-            "top-level networks must contain edge, app_parkventory, and "
-            "app_surplasse"
+            "top-level networks must contain edge, app_monflorian, "
+            "app_parkventory, and app_surplasse"
         )
     if networks[APPLICATION_NETWORK] != {
         "name": APPLICATION_NETWORK,
@@ -270,6 +274,12 @@ def validate_candidate_compose(document: Any) -> None:
         "external": True,
     }:
         fail("top-level app_parkventory network differs from the managed external network")
+    if networks[MONFLORIAN_NETWORK] != {
+        "name": MONFLORIAN_NETWORK,
+        "ipam": {},
+        "external": True,
+    }:
+        fail("top-level app_monflorian network differs from the managed external network")
 
     secrets = document.get("secrets")
     expected_credential_definitions = {

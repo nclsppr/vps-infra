@@ -1023,7 +1023,13 @@ def _expected_probes(
                 "path": "/.well-known/monflorian-release",
                 "status": 200,
             },
-            {"host": "monflorian.com", "path": "/", "status": 401},
+            {"host": "monflorian.com", "path": "/", "status": 200},
+            {
+                "body_contains": '"serviceReady":false',
+                "host": "monflorian.com",
+                "path": "/api/config",
+                "status": 200,
+            },
             {"host": "www.monflorian.com", "path": "/", "status": 308},
         ],
         "schema": 1,
@@ -1176,6 +1182,17 @@ def validate_bundle(
         _validate_pilot_bootstrap_schema(files["pilot-bootstrap.schema.json"])
         _validate_surplasse_pilot_source_compose(files["compose.yaml"])
     compose = files["compose.yaml"].decode("utf-8")
+    if profile.application == "monflorian":
+        required_preview_settings = (
+            '      MONFLORIAN_ACCESS_MODE: public\n',
+            '      MONFLORIAN_GENERATION_ENABLED: "false"\n',
+            '      MONFLORIAN_ILLUSTRATION_ENABLED: "false"\n',
+        )
+        if any(setting not in compose for setting in required_preview_settings):
+            _fail(
+                "Mon Florian integration compose",
+                "must keep the exact public preview feature gates",
+            )
     if not (
         compose.startswith(f"---\nname: {profile.application}\n")
         or compose.startswith(f"name: {profile.application}\n")

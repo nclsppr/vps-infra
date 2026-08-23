@@ -84,7 +84,9 @@ PARKVENTORY_MONITORING_PROMETHEUS_VOLUMES = {
 }
 PLATFORM_SERVICES = frozenset(PLATFORM_SERVICE_NETWORKS)
 PUBLIC_STATIC_EDGE_SERVICES = frozenset({"caddy"})
-PUBLIC_STATIC_EDGE_NETWORKS = frozenset({"app_parkventory", "edge"})
+PUBLIC_STATIC_EDGE_NETWORKS = frozenset(
+    {"app_monflorian", "app_parkventory", "edge"}
+)
 PLATFORM_ALLOWED_CAPABILITIES = {
     "caddy": frozenset({"NET_BIND_SERVICE"}),
 }
@@ -598,6 +600,11 @@ def service_networks(
             fail(f"services.{service_name}.networks.{network_name}: options must be an object")
         if project == "vps-platform" and service_name == "postgresql":
             expected_options = {"aliases": ["postgresql"]}
+        elif (
+            project == "vps-public-static-edge"
+            and network_name == "app_monflorian"
+        ):
+            expected_options = {"ipv4_address": "172.30.40.254"}
         elif (
             project == "vps-public-static-edge"
             and network_name == "app_parkventory"

@@ -52,7 +52,7 @@
       }
     },
     "monflorian": {
-      "enabled": false,
+      "enabled": true,
       "mode": "compose",
       "source_repository": "nclsppr/monflorian",
       "source_branch": "main",
