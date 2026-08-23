@@ -440,7 +440,13 @@ class ParkventoryPostgresTests(unittest.TestCase):
     def test_credential_address_is_bounded_to_db_parkventory(self) -> None:
         original_docker_json = PROVISIONER.docker_json
         try:
-            for address in (None, "172.30.31.2", "172.30.21.0", "172.30.21.255"):
+            for address in (
+                None,
+                2887652610,
+                "172.30.31.2",
+                "172.30.21.0",
+                "172.30.21.255",
+            ):
                 with self.subTest(address=address):
                     PROVISIONER.docker_json = lambda arguments, label, value=address: [
                         {
@@ -454,6 +460,18 @@ class ParkventoryPostgresTests(unittest.TestCase):
                     with self.assertRaisesRegex(
                         PROVISIONER.ProvisionError,
                         "db_parkventory|outside",
+                    ):
+                        PROVISIONER.parkventory_database_address(
+                            "postgres-container"
+                        )
+            for invalid in ([None], [{"NetworkSettings": None}]):
+                with self.subTest(invalid=invalid):
+                    PROVISIONER.docker_json = (
+                        lambda arguments, label, value=invalid: value
+                    )
+                    with self.assertRaisesRegex(
+                        PROVISIONER.ProvisionError,
+                        "incomplete|db_parkventory",
                     ):
                         PROVISIONER.parkventory_database_address(
                             "postgres-container"

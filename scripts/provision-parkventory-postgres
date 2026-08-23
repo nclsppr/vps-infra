@@ -698,9 +698,18 @@ def parkventory_database_address(container: str) -> str:
         ["inspect", container],
         "shared PostgreSQL credential address",
     )
-    if not isinstance(inspected, list) or len(inspected) != 1:
+    if (
+        not isinstance(inspected, list)
+        or len(inspected) != 1
+        or not isinstance(inspected[0], dict)
+    ):
         raise ProvisionError("shared PostgreSQL credential address is incomplete")
-    networks = inspected[0].get("NetworkSettings", {}).get("Networks", {})
+    network_settings = inspected[0].get("NetworkSettings", {})
+    networks = (
+        network_settings.get("Networks", {})
+        if isinstance(network_settings, dict)
+        else {}
+    )
     parkventory_network = (
         networks.get("db_parkventory", {}) if isinstance(networks, dict) else {}
     )
@@ -711,6 +720,10 @@ def parkventory_database_address(container: str) -> str:
     )
     expected_network = EXPECTED_CONTRACT["network"]
     assert isinstance(expected_network, dict)
+    if not isinstance(raw_address, str):
+        raise ProvisionError(
+            "shared PostgreSQL has no valid db_parkventory address"
+        )
     try:
         address = ipaddress.IPv4Address(raw_address)
         subnet = ipaddress.IPv4Network(str(expected_network["subnet"]))
