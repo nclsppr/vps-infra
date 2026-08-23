@@ -108,17 +108,26 @@ A later reviewed change must complete all of these steps:
 ## Rollback
 
 Before migration, leave the static owner active and remove only the inactive
-candidate changes. During application activation, the existing transaction
-controller restores the previous runtime and quarantines a rejected tuple.
-Never reverse an applied migration automatically. Use expand-and-contract
-migrations so the prior image remains compatible, or apply a reviewed forward
-repair. Keep backup data, encrypted objects, receipts, and the previous database
-volume until recovery is independently proved.
+candidate changes. The transaction controller normally restores the previous
+runtime and quarantines a rejected tuple. It does not use that rollback after a
+Parkventory migration starts without a valid post-migration PostgreSQL proof.
+In that state, it stops and verifies the absence of every Parkventory runtime
+container, removes the migrator, quarantines the candidate, and leaves the
+previous runtime stopped. An operator must repair or prove the database before
+another activation. Never reverse an applied migration automatically. Use
+expand-and-contract migrations so the prior image remains compatible, or apply
+a reviewed forward repair. Keep backup data, encrypted objects, receipts, and
+the previous database volume until recovery is independently proved.
 
 ## Consequences
 
 - A merge of this decision cannot deploy Parkventory by itself.
 - Runtime compromise does not provide an owner role or an RLS bypass role.
+- A failed or interrupted post-migration PostgreSQL proof cannot restart the
+  previous Parkventory runtime against an untrusted database.
+- The controller checks off-site backup freshness immediately before the first
+  candidate start and immediately before its durable commit. Forward recovery
+  and partial-commit finalization repeat the commit-time check.
 - OIDC secrets remain files and do not enter Git, workflow output, or runtime
   environment files.
 - Monitoring and logs are bounded before activation, but alert delivery and

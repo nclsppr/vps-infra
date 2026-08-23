@@ -218,11 +218,16 @@ TRANSACTION_PHASES = frozenset(
     {
         "prepared",
         "migration-running",
+        "postgres-unverified",
         "migrated",
         "started",
         "probe-rejected",
         "probed",
     }
+)
+
+PARKVENTORY_UNTRUSTED_DATABASE_PHASES = frozenset(
+    {"migration-running", "postgres-unverified"}
 )
 
 
@@ -618,6 +623,16 @@ def validate_parkventory_readiness(policy: ApplicationPolicy) -> None:
         fail("Parkventory PostgreSQL readiness evidence differs from admission")
     validate_parkventory_postgres_live()
 
+    validate_parkventory_offsite_readiness(policy)
+
+
+def validate_parkventory_offsite_readiness(policy: ApplicationPolicy) -> None:
+    if policy.name != "parkventory":
+        return
+    readiness = policy.readiness_evidence
+    if not isinstance(readiness, Mapping):
+        fail("Parkventory encrypted off-site backup evidence is absent")
+
     offsite = readiness.get("encrypted_offsite_backup")
     if not isinstance(offsite, Mapping):
         fail("Parkventory encrypted off-site backup evidence is absent")
@@ -731,6 +746,23 @@ def validate_parkventory_readiness(policy: ApplicationPolicy) -> None:
         or restored_at < recorded_at - dt.timedelta(minutes=5)
     ):
         fail("Parkventory encrypted off-site backup proof is stale")
+
+
+def current_parkventory_policy() -> ApplicationPolicy:
+    contract = load_production_contract(
+        APPLICATION_PRODUCTION_CONTRACT,
+        STATIC_PRODUCTION_CONTRACT,
+    )
+    policy = next(
+        item for item in contract.applications if item.name == "parkventory"
+    )
+    if not policy.enabled:
+        fail("Parkventory is disabled by the protected production contract")
+    return policy
+
+
+def revalidate_parkventory_offsite_before_runtime() -> None:
+    validate_parkventory_offsite_readiness(current_parkventory_policy())
 
 
 def validate_recovery_state_runtime() -> None:
@@ -2660,6 +2692,18 @@ def start_runtime(state: ApplicationState, *, precommit: bool = False) -> None:
     )
 
 
+def require_runtime_containers_absent(state: ApplicationState) -> None:
+    services = sorted(PROFILES[state.application].component_repositories)
+    result = _compose_for_state(
+        state,
+        ["ps", "--all", "--quiet", *services],
+        timeout=30,
+        validate_policy=False,
+    )
+    if result.stdout or result.stderr:
+        fail("application runtime containers did not reach exact absence")
+
+
 def stop_runtime(state: ApplicationState) -> None:
     _compose_for_state(
         state,
@@ -2667,6 +2711,7 @@ def stop_runtime(state: ApplicationState) -> None:
         timeout=120,
         validate_policy=False,
     )
+    require_runtime_containers_absent(state)
 
 
 def _probe_http(
@@ -3099,6 +3144,51 @@ def restore_previous(transaction: ApplicationTransaction) -> None:
         )
 
 
+def rollback_and_quarantine_candidate(
+    transaction: ApplicationTransaction,
+) -> None:
+    application = transaction.candidate.application
+    restore_previous(transaction)
+    write_state(
+        QUARANTINE_ROOT,
+        quarantine_name(transaction.candidate),
+        transaction.candidate,
+        "quarantined application state",
+    )
+    remove_state(
+        TRANSACTION_ROOT,
+        f"{application}.json",
+        "application transaction",
+    )
+
+
+def contain_parkventory_untrusted_database(
+    transaction: ApplicationTransaction,
+) -> None:
+    if (
+        transaction.candidate.application != "parkventory"
+        or transaction.phase not in PARKVENTORY_UNTRUSTED_DATABASE_PHASES
+    ):
+        fail("Parkventory database containment received an invalid transaction")
+    failures: list[str] = []
+    for label, action in (
+        ("runtime stop", lambda: stop_runtime(transaction.candidate)),
+        (
+            "migration container removal",
+            lambda: remove_migration_container(transaction.candidate),
+        ),
+    ):
+        try:
+            action()
+        except BaseException as exc:
+            failures.append(f"{label}: {exc}")
+    if failures:
+        fail(
+            "Parkventory database containment did not reach a safe state: "
+            + "; ".join(failures)
+        )
+
+
 def application_tuple_is_active(transaction: ApplicationTransaction) -> bool:
     application = transaction.candidate.application
     app_root = APPLICATION_ROOT / application
@@ -3118,7 +3208,13 @@ def recover_application(application: str) -> None:
     transaction = read_transaction(application)
     if transaction is None:
         return
-    if transaction.phase != "prepared":
+    untrusted_parkventory_database = (
+        application == "parkventory"
+        and transaction.phase in PARKVENTORY_UNTRUSTED_DATABASE_PHASES
+    )
+    if untrusted_parkventory_database:
+        contain_parkventory_untrusted_database(transaction)
+    elif transaction.phase != "prepared":
         remove_migration_container(transaction.candidate)
     else:
         require_migration_container_absent(transaction.candidate)
@@ -3138,14 +3234,35 @@ def recover_application(application: str) -> None:
             or transaction.previous_target is not None
         ):
             fail("Parkventory static and Compose recovery ownership overlap")
-        if transaction.phase != "prepared":
+        if transaction.phase != "prepared" and not untrusted_parkventory_database:
             restore_previous(transaction)
+        if transaction.phase != "prepared":
             write_state(
                 QUARANTINE_ROOT,
                 quarantine_name(transaction.candidate),
                 transaction.candidate,
                 "quarantined application state",
             )
+        remove_state(
+            TRANSACTION_ROOT,
+            f"{application}.json",
+            "application transaction",
+        )
+        return
+    if untrusted_parkventory_database:
+        if (
+            active != transaction.previous_state
+            or target != transaction.previous_target
+        ):
+            fail(
+                "untrusted Parkventory database transaction changed the active tuple"
+            )
+        write_state(
+            QUARANTINE_ROOT,
+            quarantine_name(transaction.candidate),
+            transaction.candidate,
+            "quarantined application state",
+        )
         remove_state(
             TRANSACTION_ROOT,
             f"{application}.json",
@@ -3168,6 +3285,12 @@ def recover_application(application: str) -> None:
             state_release(transaction.candidate),
             transaction.candidate,
         )
+        if application == "parkventory":
+            try:
+                revalidate_parkventory_offsite_before_runtime()
+            except BaseException:
+                rollback_and_quarantine_candidate(transaction)
+                return
         start_runtime(transaction.candidate, precommit=True)
         promote_runtime_restart_policy(transaction.candidate)
         remove_state(
@@ -3180,6 +3303,12 @@ def recover_application(application: str) -> None:
         validate_materialized_release(
             state_release(transaction.candidate), transaction.candidate
         )
+        if application == "parkventory":
+            try:
+                revalidate_parkventory_offsite_before_runtime()
+            except BaseException:
+                rollback_and_quarantine_candidate(transaction)
+                return
         start_runtime(transaction.candidate, precommit=True)
         switch_current(app_root / "current", transaction.expected_target, releases)
         write_state(
@@ -3287,14 +3416,23 @@ def activate_candidate(state: ApplicationState, work: Path) -> None:
             write_transaction(transaction)
             run_migration(state)
             if application == "parkventory":
+                transaction = dataclasses.replace(
+                    transaction,
+                    phase="postgres-unverified",
+                )
+                write_transaction(transaction)
                 validate_parkventory_postgres_live()
             transaction = dataclasses.replace(transaction, phase="migrated")
             write_transaction(transaction)
+            if application == "parkventory":
+                revalidate_parkventory_offsite_before_runtime()
         start_runtime(state, precommit=True)
         transaction = dataclasses.replace(transaction, phase="started")
         write_transaction(transaction)
         probe_runtime(state, work)
         assert_exact_source_head(PROFILES[application], state.source_revision)
+        if application == "parkventory":
+            revalidate_parkventory_offsite_before_runtime()
     except BaseException as activation_error:
         try:
             current = read_transaction(application)

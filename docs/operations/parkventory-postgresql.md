@@ -82,7 +82,10 @@ object not owned by `parkventory_owner`; or runtime privileges outside the
 exact allowlist. It forbids per-column ACLs and proves that global owner default
 privileges do not restore PostgreSQL's implicit `PUBLIC EXECUTE` on new
 functions. The activation controller repeats this proof after migrations and
-before starting the Backend.
+before starting the Backend. If that post-migration proof fails or cannot
+complete, the controller stops and verifies the absence of every Parkventory
+runtime container. It removes the migrator, quarantines the candidate, and does
+not restart the previous runtime against the untrusted database.
 
 ## Persistent network transition
 
@@ -150,6 +153,11 @@ cannot predate that upload beyond five minutes of clock tolerance. A reviewed
 change then binds the canonical file digest in
 `releases/application-production.json`. The controller rehashes and validates
 the file before it runs any migration.
+The controller revalidates the off-site proof after migration, immediately
+before the first candidate start. It validates the proof again after runtime
+probes and immediately before the durable commit. Recovery can forward-commit a
+probed Parkventory candidate or finalize its partially visible active tuple only
+after the same freshness check succeeds.
 
 ## Monitoring, logs, and probes
 
@@ -196,11 +204,14 @@ delivery, logs, active state, backup timers, and strict public TLS.
 ## Rollback
 
 Before cutover, leave the static release active. During application activation,
-the transaction controller restores the previous runtime and quarantines a
-candidate that fails migration, health, source-head, route, or public probes.
-Do not reverse an applied migration automatically. Use a compatible previous
-image or a reviewed forward repair. Preserve the previous database volume and
-all backup evidence until recovery is complete.
+the transaction controller normally restores the previous runtime and
+quarantines a candidate that fails health, source-head, route, or public probes.
+A failed or interrupted Parkventory migration proof uses a stricter path. The
+controller leaves every Parkventory runtime container absent and never restarts
+the previous runtime against the untrusted database. Do not reverse an applied
+migration automatically. Use a compatible previous image only after the
+database is proved compatible, or apply a reviewed forward repair. Preserve the
+previous database volume and all backup evidence until recovery is complete.
 
 ## Activation remains blocked
 
