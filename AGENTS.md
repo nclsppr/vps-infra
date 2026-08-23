@@ -35,3 +35,17 @@ production inventory, or business data to this repository.
 OVHcloud addresses, API identifiers, DNS zones, SSH keys, and production
 secrets are supplied separately. Their absence is an expected gate. Do not
 invent a value.
+
+## Agent skills
+
+### Issue tracker
+
+Use GitHub Issues for tickets and specifications. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default Matt Pocock triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use one root context and the existing decision records. See `docs/agents/domain.md`.
