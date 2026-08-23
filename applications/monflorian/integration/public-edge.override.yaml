@@ -1,0 +1,18 @@
+---
+services:
+  caddy:
+    volumes:
+      - type: bind
+        source: ${MONFLORIAN_PRIVATE_ACCESS_SOURCE:?required}
+        target: /etc/caddy/monflorian-private-access.caddy
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      app_monflorian:
+        ipv4_address: 172.30.40.254
+
+networks:
+  app_monflorian:
+    external: true
+    name: app_monflorian

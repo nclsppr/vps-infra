@@ -17,7 +17,6 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from unittest import mock
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -126,9 +125,7 @@ def surplasse_pilot_service(profile):
                 "-XX:MaxRAMPercentage=75.0 "
                 "-Djava.util.logging.manager=org.jboss.logmanager.LogManager"
             ),
-            "PILOT_BOOTSTRAP_MANIFEST_FILE": (
-                "/run/surplasse/pilot-bootstrap.json"
-            ),
+            "PILOT_BOOTSTRAP_MANIFEST_FILE": ("/run/surplasse/pilot-bootstrap.json"),
             "QUARKUS_DATASOURCE_JDBC_URL": (
                 "jdbc:postgresql://postgresql:5432/surplasse"
             ),
@@ -137,9 +134,7 @@ def surplasse_pilot_service(profile):
             ),
             "QUARKUS_DATASOURCE_USERNAME": "surplasse_runtime",
             "STRIPE_LIVE_MODE": "false",
-            "STRIPE_SECRET_KEY_FILE": (
-                "/run/secrets/surplasse_stripe_secret_key"
-            ),
+            "STRIPE_SECRET_KEY_FILE": ("/run/secrets/surplasse_stripe_secret_key"),
             "SURPLASSE_PRODUCTION_RELEASE_MODE": "testers",
         },
         "networks": {
@@ -160,9 +155,7 @@ def surplasse_pilot_service(profile):
             {
                 "bind": {},
                 "read_only": True,
-                "source": (
-                    "/etc/vps/applications/surplasse-pilot-bootstrap.json"
-                ),
+                "source": ("/etc/vps/applications/surplasse-pilot-bootstrap.json"),
                 "target": "/run/surplasse/pilot-bootstrap.json",
                 "type": "bind",
             }
@@ -210,9 +203,7 @@ class ApplicationControllerTests(unittest.TestCase):
     def test_disabled_application_stops_before_runtime_and_network(self):
         disabled = types.SimpleNamespace(name="surplasse", enabled=False)
         contract = types.SimpleNamespace(applications=(disabled,))
-        release_reference = (
-            "ghcr.io/nclsppr/surplasse/application-release@" + DIGEST
-        )
+        release_reference = "ghcr.io/nclsppr/surplasse/application-release@" + DIGEST
         with (
             mock.patch.object(CONTROLLER, "require_protected_file"),
             mock.patch.object(
@@ -249,6 +240,76 @@ class ApplicationControllerTests(unittest.TestCase):
         source_head.assert_not_called()
         trusted_root.assert_not_called()
 
+    def test_disabled_monflorian_can_materialize_only_its_attested_edge_route(self):
+        candidate = state("monflorian")
+        route = (
+            (ROOT / "platform/caddy/routes/monflorian.caddy.disabled")
+            .read_bytes()
+            .replace(b"__SOURCE_REVISION__", REVISION.encode("ascii"))
+        )
+        bundle = types.SimpleNamespace(files={"caddy/monflorian.caddy": route})
+        policy = types.SimpleNamespace(name="monflorian", enabled=False)
+        contract = types.SimpleNamespace(applications=(policy,))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            edge_root = temporary / "edge-releases"
+            edge_root.mkdir()
+            with (
+                mock.patch.object(
+                    CONTROLLER,
+                    "MONFLORIAN_EDGE_RELEASE_ROOT",
+                    edge_root,
+                ),
+                mock.patch.object(CONTROLLER, "require_protected_file"),
+                mock.patch.object(CONTROLLER, "require_protected_directory"),
+                mock.patch.object(
+                    CONTROLLER,
+                    "load_production_contract",
+                    return_value=contract,
+                ),
+                mock.patch.object(CONTROLLER, "validate_runtime"),
+                mock.patch.object(
+                    CONTROLLER,
+                    "deployment_lock",
+                    return_value=contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "cleanup_application_filesystem_residue",
+                ),
+                mock.patch.object(
+                    CONTROLLER.STATIC,
+                    "refuse_isolated_worker_residue_locked",
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "deployment_temporary_root",
+                    return_value=temporary,
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "fetch_and_validate_candidate",
+                    return_value=(candidate, bundle, {}),
+                ),
+            ):
+                CONTROLLER.deploy(
+                    "monflorian",
+                    REVISION,
+                    candidate.release_reference,
+                    activate_live=False,
+                    materialize_edge_route_only=True,
+                )
+                route_path = CONTROLLER.materialize_edge_route(candidate, bundle)
+            release = edge_root / CONTROLLER.release_name(candidate)
+            self.assertEqual(route_path, release / "monflorian.caddy")
+            self.assertEqual(route_path.read_bytes(), route)
+            self.assertEqual(
+                sorted(path.name for path in release.iterdir()),
+                ["monflorian.caddy", "state.json"],
+            )
+            self.assertFalse((temporary / "current").exists())
+            self.assertFalse((temporary / "secrets").exists())
+
     def test_static_and_application_deployments_share_one_lock(self):
         self.assertEqual(
             CONTROLLER.LOCK_PATH,
@@ -270,7 +331,9 @@ class ApplicationControllerTests(unittest.TestCase):
         profile = CONTROLLER.PROFILES["parkventory"]
         release_manifest = b"release manifest"
         release_digest = CONTROLLER.content_digest(release_manifest)
-        release_reference = f"ghcr.io/nclsppr/parkventory/application-release@{release_digest}"
+        release_reference = (
+            f"ghcr.io/nclsppr/parkventory/application-release@{release_digest}"
+        )
         candidate = CONTROLLER.ApplicationState(
             application="parkventory",
             source_revision=REVISION,
@@ -375,25 +438,29 @@ class ApplicationControllerTests(unittest.TestCase):
         self.assertEqual(
             [call.args[-2:] for call in provenance.call_args_list],
             [
-                (CONTROLLER.STATIC.OCI_MANIFEST_MEDIA_TYPE, CONTROLLER.MAX_RELEASE_BYTES),
                 (
-                    CONTROLLER.STATIC.OCI_INDEX_MEDIA_TYPE,
-                    CONTROLLER.MAX_COMPONENT_MANIFEST_BYTES,
+                    CONTROLLER.STATIC.OCI_MANIFEST_MEDIA_TYPE,
+                    CONTROLLER.MAX_RELEASE_BYTES,
                 ),
                 (
                     CONTROLLER.STATIC.OCI_INDEX_MEDIA_TYPE,
                     CONTROLLER.MAX_COMPONENT_MANIFEST_BYTES,
                 ),
-                (CONTROLLER.STATIC.OCI_MANIFEST_MEDIA_TYPE, CONTROLLER.MAX_MANIFEST_BYTES),
+                (
+                    CONTROLLER.STATIC.OCI_INDEX_MEDIA_TYPE,
+                    CONTROLLER.MAX_COMPONENT_MANIFEST_BYTES,
+                ),
+                (
+                    CONTROLLER.STATIC.OCI_MANIFEST_MEDIA_TYPE,
+                    CONTROLLER.MAX_MANIFEST_BYTES,
+                ),
             ],
         )
 
     def test_shared_registry_worker_admits_only_exact_application_bounds(self):
         contracts = []
         for application, profile in CONTROLLER.PROFILES.items():
-            release_repository = (
-                f"ghcr.io/nclsppr/{application}/application-release"
-            )
+            release_repository = f"ghcr.io/nclsppr/{application}/application-release"
             contracts.extend(
                 (
                     CONTROLLER.STATIC.RegistryFetchContract(
@@ -479,18 +546,14 @@ class ApplicationControllerTests(unittest.TestCase):
                 1,
             ),
             CONTROLLER.STATIC.RegistryFetchContract(
-                CONTROLLER.PROFILES["parkventory"].component_repositories[
-                    "backend"
-                ],
+                CONTROLLER.PROFILES["parkventory"].component_repositories["backend"],
                 "manifest",
                 DIGEST,
                 CONTROLLER.MAX_COMPONENT_MANIFEST_BYTES + 1,
                 None,
             ),
             CONTROLLER.STATIC.RegistryFetchContract(
-                CONTROLLER.PROFILES["parkventory"].component_repositories[
-                    "backend"
-                ],
+                CONTROLLER.PROFILES["parkventory"].component_repositories["backend"],
                 "blob",
                 DIGEST,
                 CONTROLLER.MAX_IMAGE_CONFIG_BYTES + 1,
@@ -971,6 +1034,84 @@ class ApplicationControllerTests(unittest.TestCase):
                 CONTROLLER.validate_public_edge_cutover(candidate, edge)
         attachment.assert_called_once_with(edge)
 
+    def test_monflorian_cutover_rejects_both_costly_posts_before_start(self):
+        candidate = state("monflorian")
+        route = b"monflorian.com { respond monflorian-release-v1 }\n"
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            "running\thealthy\tvps-public-static-edge\tattached\n",
+            "",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            edge = Path(temporary_directory)
+            route_root = edge / "routes"
+            route_root.mkdir()
+            (route_root / "monflorian.caddy").write_bytes(route)
+            with (
+                mock.patch.object(
+                    CONTROLLER,
+                    "PUBLIC_EDGE_RUNTIME_ROOT",
+                    edge,
+                ),
+                mock.patch.object(CONTROLLER, "require_protected_file"),
+                mock.patch.object(CONTROLLER, "state_release", return_value=edge),
+                mock.patch.object(
+                    CONTROLLER,
+                    "bundle_from_release",
+                    return_value=types.SimpleNamespace(
+                        files={"caddy/monflorian.caddy": route},
+                        probes={
+                            "public": [
+                                {
+                                    "body_contains": REVISION,
+                                    "host": "monflorian.com",
+                                    "path": "/.well-known/monflorian-release",
+                                    "status": 200,
+                                }
+                            ]
+                        },
+                    ),
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "_run_bounded",
+                    return_value=completed,
+                ),
+                mock.patch.object(CONTROLLER, "_probe_http") as probe,
+            ):
+                CONTROLLER.validate_public_edge_cutover(candidate, edge)
+        self.assertEqual(
+            probe.call_args_list,
+            [
+                mock.call(
+                    "https://monflorian.com/.well-known/monflorian-release",
+                    expected_status=200,
+                    expected_body=REVISION,
+                    work=edge,
+                    resolve_host="monflorian.com",
+                ),
+                mock.call(
+                    "https://monflorian.com/api/itineraries",
+                    expected_status=401,
+                    expected_body=None,
+                    work=edge,
+                    resolve_host="monflorian.com",
+                    method="POST",
+                    require_basic_challenge=True,
+                ),
+                mock.call(
+                    "https://monflorian.com/api/illustrations",
+                    expected_status=401,
+                    expected_body=None,
+                    work=edge,
+                    resolve_host="monflorian.com",
+                    method="POST",
+                    require_basic_challenge=True,
+                ),
+            ],
+        )
+
     def test_surplasse_edge_rejects_each_network_identity_mismatch(self):
         network_id = "c" * 64
         valid = [
@@ -1089,6 +1230,39 @@ class ApplicationControllerTests(unittest.TestCase):
             command[command.index("--max-filesize") + 1],
             str(CONTROLLER.MAX_PROBE_BODY_BYTES),
         )
+        self.assertEqual(command[command.index("--request") + 1], "GET")
+
+    def test_unauthorized_probe_requires_one_basic_auth_challenge(self):
+        completed = subprocess.CompletedProcess([], 0, "401", "")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work = Path(temporary_directory)
+            with (
+                mock.patch.object(
+                    CONTROLLER,
+                    "_run_bounded",
+                    return_value=completed,
+                ) as bounded,
+                mock.patch.object(
+                    CONTROLLER.STATIC,
+                    "read_bounded_file",
+                    side_effect=(
+                        b"",
+                        b'HTTP/2 401\r\nWww-Authenticate: Basic realm="restricted"\r\n\r\n',
+                    ),
+                ),
+            ):
+                CONTROLLER._probe_http(
+                    "https://monflorian.com/api/itineraries",
+                    expected_status=401,
+                    expected_body=None,
+                    work=work,
+                    resolve_host="monflorian.com",
+                    method="POST",
+                    require_basic_challenge=True,
+                )
+        command = bounded.call_args.args[0]
+        self.assertEqual(command[command.index("--request") + 1], "POST")
+        self.assertIn("--dump-header", command)
 
     def test_public_runtime_probes_are_pinned_to_the_local_edge(self):
         candidate = state("parkventory")
@@ -1106,7 +1280,9 @@ class ApplicationControllerTests(unittest.TestCase):
             }
         )
         with (
-            mock.patch.object(CONTROLLER, "state_release", return_value=Path("/release")),
+            mock.patch.object(
+                CONTROLLER, "state_release", return_value=Path("/release")
+            ),
             mock.patch.object(CONTROLLER, "bundle_from_release", return_value=bundle),
             mock.patch.object(CONTROLLER, "_probe_http") as probe,
         ):
@@ -1162,9 +1338,7 @@ class ApplicationControllerTests(unittest.TestCase):
             "entrypoint differs",
         ):
             CONTROLLER.validate_application_compose_semantics(profile, rendered)
-        rendered["services"]["migrator"]["entrypoint"] = [
-            profile.migration_runner
-        ]
+        rendered["services"]["migrator"]["entrypoint"] = [profile.migration_runner]
         rendered["services"]["backend"]["environment"][
             "QUARKUS_FLYWAY_MIGRATE_AT_START"
         ] = "true"
@@ -1197,9 +1371,7 @@ class ApplicationControllerTests(unittest.TestCase):
             "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
             **parkventory_oidc_file_environment(),
         }
-        rendered["services"]["migrator"]["entrypoint"] = [
-            profile.migration_runner
-        ]
+        rendered["services"]["migrator"]["entrypoint"] = [profile.migration_runner]
         rendered["services"]["backend"]["user"] = "10001:10001"
         rendered["services"]["migrator"]["user"] = "10001:10001"
         CONTROLLER.validate_application_compose_semantics(profile, rendered)
@@ -1462,8 +1634,14 @@ class ApplicationControllerTests(unittest.TestCase):
             Path("/release"),
             CONTROLLER.PROFILES["surplasse"],
         )
-        self.assertIn(["--profile", "migration"], [prefix[index:index + 2] for index in range(len(prefix) - 1)])
-        self.assertIn(["--profile", "pilot-bootstrap"], [prefix[index:index + 2] for index in range(len(prefix) - 1)])
+        self.assertIn(
+            ["--profile", "migration"],
+            [prefix[index : index + 2] for index in range(len(prefix) - 1)],
+        )
+        self.assertIn(
+            ["--profile", "pilot-bootstrap"],
+            [prefix[index : index + 2] for index in range(len(prefix) - 1)],
+        )
 
     def test_monflorian_has_one_backend_and_no_migration_execution(self):
         candidate = state("monflorian")
@@ -1504,10 +1682,7 @@ class ApplicationControllerTests(unittest.TestCase):
         rendered = {
             "secrets": {
                 "monflorian_openai_api_key": {
-                    "file": (
-                        "/etc/vps/secrets/monflorian/"
-                        "monflorian-openai-api-key"
-                    )
+                    "file": ("/etc/vps/secrets/monflorian/" "monflorian-openai-api-key")
                 }
             }
         }
@@ -1517,9 +1692,7 @@ class ApplicationControllerTests(unittest.TestCase):
         ):
             CONTROLLER.validate_secret_metadata(profile, rendered)
         secret.assert_called_once_with(
-            Path(
-                "/etc/vps/secrets/monflorian/monflorian-openai-api-key"
-            ),
+            Path("/etc/vps/secrets/monflorian/monflorian-openai-api-key"),
             "monflorian secret monflorian_openai_api_key",
             allowed_modes=frozenset({0o440}),
             maximum_size=64 * 1024,
@@ -1530,8 +1703,7 @@ class ApplicationControllerTests(unittest.TestCase):
         profile = CONTROLLER.PROFILES["parkventory"]
         rendered = {
             "secrets": {
-                name: {"file": path}
-                for name, path in profile.credential_files.items()
+                name: {"file": path} for name, path in profile.credential_files.items()
             }
         }
         with (
@@ -1598,7 +1770,9 @@ class ApplicationControllerTests(unittest.TestCase):
                 "validate_materialized_runtime_policy",
                 return_value=(profile, bundle, environment),
             ) as validate,
-            mock.patch.object(CONTROLLER, "state_release", return_value=Path("/release")),
+            mock.patch.object(
+                CONTROLLER, "state_release", return_value=Path("/release")
+            ),
             mock.patch.object(
                 CONTROLLER,
                 "_run_bounded",
@@ -1757,7 +1931,9 @@ class ApplicationControllerTests(unittest.TestCase):
                 "Surplasse input validator",
             ),
         )
-        self.assertEqual(protected.call_args.kwargs["allowed_modes"], frozenset({0o500}))
+        self.assertEqual(
+            protected.call_args.kwargs["allowed_modes"], frozenset({0o500})
+        )
         self.assertEqual(
             bounded.call_args.args[0],
             [
@@ -2038,9 +2214,7 @@ class ApplicationControllerTests(unittest.TestCase):
 
     def test_migration_has_one_deterministic_container_identity(self):
         candidate = state("parkventory")
-        expected_name = (
-            "vps-application-parkventory-migrator-" + "a" * 64
-        )
+        expected_name = "vps-application-parkventory-migrator-" + "a" * 64
         with (
             mock.patch.object(
                 CONTROLLER,
@@ -2131,10 +2305,7 @@ class ApplicationControllerTests(unittest.TestCase):
         inspected = subprocess.CompletedProcess(
             [],
             0,
-            (
-                f"/{name}\t{container_id}\t{image}\tsurplasse\t"
-                "migrator\tTrue\n"
-            ),
+            (f"/{name}\t{container_id}\t{image}\tsurplasse\t" "migrator\tTrue\n"),
             "",
         )
         removed = subprocess.CompletedProcess([], 0, f"{container_id}\n", "")
@@ -2152,7 +2323,9 @@ class ApplicationControllerTests(unittest.TestCase):
             mock.patch.object(CONTROLLER.time, "sleep") as sleep,
         ):
             CONTROLLER.remove_migration_container(candidate)
-        self.assertEqual(bounded.call_args_list[0].args[0][1:3], ["container", "inspect"])
+        self.assertEqual(
+            bounded.call_args_list[0].args[0][1:3], ["container", "inspect"]
+        )
         self.assertEqual(
             bounded.call_args_list[1].args[0][1:5],
             ["container", "rm", "--force", "--volumes"],
@@ -2214,10 +2387,7 @@ class ApplicationControllerTests(unittest.TestCase):
         inspected = subprocess.CompletedProcess(
             [],
             0,
-            (
-                f"/{name}\t{container_id}\t{image}\tsurplasse\t"
-                "migrator\tTrue\n"
-            ),
+            (f"/{name}\t{container_id}\t{image}\tsurplasse\t" "migrator\tTrue\n"),
             "",
         )
         disappeared = subprocess.CompletedProcess([], 1, "", "No such container")
@@ -2255,9 +2425,7 @@ class ApplicationControllerTests(unittest.TestCase):
                     CONTROLLER,
                     "bundle_from_release",
                     return_value=types.SimpleNamespace(
-                        files={
-                            "caddy/parkventory.caddy": b"parkventory.com {}\n"
-                        },
+                        files={"caddy/parkventory.caddy": b"parkventory.com {}\n"},
                         probes={"public": []},
                     ),
                 ),
@@ -3101,9 +3269,7 @@ class ApplicationControllerTests(unittest.TestCase):
         switch.assert_not_called()
 
     def test_live_runtime_stays_inside_the_outer_systemd_directory(self):
-        runtime = Path(
-            "/run/vps-application-live-surplasse-0123456789abcdef01234567"
-        )
+        runtime = Path("/run/vps-application-live-surplasse-0123456789abcdef01234567")
         with (
             mock.patch.dict(
                 os.environ,

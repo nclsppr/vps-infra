@@ -20,7 +20,7 @@
           - vps_infra_revision is match('^[0-9a-f]{40}$')
           - >-
             vps_public_static_edge_state in
-            ['prepare', 'precutover', 'activate', 'stopped']
+            ['preserve', 'prepare', 'precutover', 'activate', 'stopped']
         fail_msg: >-
           The public static edge requires the converged Atlas administrator
           boundary and one exact infrastructure revision.

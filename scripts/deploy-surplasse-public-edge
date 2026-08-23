@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage, activate, verify, and recover the Surplasse public edge extension."""
+"""Stage, activate, verify, and recover the application public edge extension."""
 
 from __future__ import annotations
 
@@ -28,6 +28,10 @@ APPLICATION_RELEASE_RE = re.compile(
     r"^/srv/applications/surplasse/releases/sha256-[0-9a-f]{64}/"
     r"integration/caddy/surplasse\.caddy$"
 )
+MONFLORIAN_APPLICATION_RELEASE_RE = re.compile(
+    r"^/srv/applications/monflorian/edge-releases/sha256-[0-9a-f]{64}/"
+    r"monflorian\.caddy$"
+)
 BASE_RELEASE_RE = re.compile(
     r"^/srv/vps/releases/public-static-edge/[0-9a-f]{40}-"
     r"(?:prepare|precutover|activate)$"
@@ -45,8 +49,27 @@ IMAGE_DIGEST_RE = re.compile(
 APP_NETWORK = "app_surplasse"
 APP_SUBNET = "172.30.10.0/24"
 APP_ADDRESS = "172.30.10.254"
+MONFLORIAN_APP_NETWORK = "app_monflorian"
+MONFLORIAN_APP_SUBNET = "172.30.40.0/24"
+MONFLORIAN_APP_ADDRESS = "172.30.40.254"
+PRIVATE_ACCESS_PATH = Path(
+    "/etc/vps/secrets/monflorian/monflorian-private-access.caddy"
+)
+PRIVATE_ACCESS_TARGET = "/etc/caddy/monflorian-private-access.caddy"
+PRIVATE_ACCESS_NAME = "monflorian-private-access.caddy"
+ROUTES_TARGET = "/etc/caddy/routes"
+TLS_TARGET = "/etc/caddy/surplasse-tls.caddy"
 EDGE_NETWORK = "edge"
 ROUTE_SHA256 = "645931a03bd1c80ab5b3982d6a285e673906d68fb010adbd1756d43d8a0cd306"
+MONFLORIAN_APPROVED_ROUTE_SHA256 = (
+    "331a405bf3f5a9be2e943fbebe2cca633461d754e0f42a001940d11bdfa8f7bc"
+)
+PRIVATE_ACCESS_RE = re.compile(
+    rb"basic_auth \{\n"
+    rb"\t[A-Za-z0-9][A-Za-z0-9._-]{0,63} "
+    rb"\$2[aby]\$14\$[./A-Za-z0-9]{53}\n"
+    rb"\}\n"
+)
 ROUTE_NAMES = ("papersempire.caddy", "parkventory.caddy", "personal.caddy")
 BASE_FILES = (
     "Caddyfile",
@@ -62,6 +85,7 @@ MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_CONTROL_EXECUTABLE_BYTES = 16 * 1024 * 1024
 MAX_DOCKER_EXECUTABLE_BYTES = 128 * 1024 * 1024
 MAX_STATE_BYTES = 16 * 1024
+MAX_PRIVATE_ACCESS_BYTES = 4096
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 LOCK_TIMEOUT_SECONDS = 60
 REPOSITORY_FILE_MODES = frozenset({0o444, 0o644})
@@ -92,6 +116,7 @@ class RuntimePaths:
     deployment_lock: Path = Path("/run/lock/vps-static.lock")
     docker: Path = Path("/usr/bin/docker")
     systemctl: Path = Path("/usr/bin/systemctl")
+    private_access_snippet: Path = PRIVATE_ACCESS_PATH
     expected_uid: int = 0
     expected_gid: int = 0
 
@@ -108,6 +133,10 @@ class RuntimePaths:
         return self.repository_root / "platform/caddy/routes/surplasse.caddy.disabled"
 
     @property
+    def approved_monflorian_route(self) -> Path:
+        return self.repository_root / "platform/caddy/routes/monflorian.caddy.disabled"
+
+    @property
     def tls_snippet(self) -> Path:
         return self.repository_root / "platform/public-static-edge/surplasse-tls.caddy"
 
@@ -116,6 +145,13 @@ class RuntimePaths:
         return (
             self.repository_root
             / "applications/surplasse/integration/public-edge.override.yaml"
+        )
+
+    @property
+    def monflorian_overlay(self) -> Path:
+        return (
+            self.repository_root
+            / "applications/monflorian/integration/public-edge.override.yaml"
         )
 
     @property
@@ -139,9 +175,18 @@ class EdgeState:
     overlay_sha256: str
     caddy_image: str
     fingerprint: str
+    monflorian_attested_route: str | None = None
+    monflorian_route_sha256: str | None = None
+    monflorian_source_revision: str | None = None
+    monflorian_overlay_sha256: str | None = None
+    monflorian_private_access_sha256: str | None = None
+
+    @property
+    def composite(self) -> bool:
+        return self.monflorian_attested_route is not None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "attested_route": self.attested_route,
             "base_release": self.base_release,
             "caddy_image": self.caddy_image,
@@ -150,10 +195,23 @@ class EdgeState:
             "overlay_sha256": self.overlay_sha256,
             "release": self.release,
             "route_sha256": self.route_sha256,
-            "schema": 1,
+            "schema": 2 if self.composite else 1,
             "source_revision": self.source_revision,
             "tls_sha256": self.tls_sha256,
         }
+        if self.composite:
+            value.update(
+                {
+                    "monflorian_attested_route": self.monflorian_attested_route,
+                    "monflorian_overlay_sha256": self.monflorian_overlay_sha256,
+                    "monflorian_private_access_sha256": (
+                        self.monflorian_private_access_sha256
+                    ),
+                    "monflorian_route_sha256": self.monflorian_route_sha256,
+                    "monflorian_source_revision": self.monflorian_source_revision,
+                }
+            )
+        return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,15 +220,19 @@ class EdgeTransaction:
     previous: EdgeState | None
     previous_release: str
     phase: str
+    remove_monflorian: bool = False
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        value: dict[str, object] = {
             "candidate": self.candidate.as_dict(),
             "phase": self.phase,
             "previous": None if self.previous is None else self.previous.as_dict(),
             "previous_release": self.previous_release,
-            "schema": 1,
+            "schema": 2 if self.remove_monflorian else 1,
         }
+        if self.remove_monflorian:
+            value["remove_monflorian"] = True
+        return value
 
 
 def safe_environment() -> dict[str, str]:
@@ -371,15 +433,19 @@ def run(
     input_bytes: bytes | None = None,
     maximum_stdout: int = MAX_OUTPUT_BYTES,
     sensitive: bool = False,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     command = [str(item) for item in arguments]
+    command_environment = safe_environment()
+    if environment is not None:
+        command_environment.update(environment)
     try:
         result = subprocess.run(
             command,
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=safe_environment(),
+            env=command_environment,
             timeout=timeout,
             check=False,
         )
@@ -396,7 +462,7 @@ def run(
 
 
 def validate_state(value: object, paths: RuntimePaths, label: str) -> EdgeState:
-    fields = {
+    base_fields = {
         "attested_route",
         "base_release",
         "caddy_image",
@@ -409,11 +475,22 @@ def validate_state(value: object, paths: RuntimePaths, label: str) -> EdgeState:
         "source_revision",
         "tls_sha256",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    composite_fields = {
+        "monflorian_attested_route",
+        "monflorian_overlay_sha256",
+        "monflorian_private_access_sha256",
+        "monflorian_route_sha256",
+        "monflorian_source_revision",
+    }
+    if not isinstance(value, dict):
         fail(f"{label} has an invalid shape")
-    if value["schema"] != 1 or isinstance(value["schema"], bool):
+    schema = value.get("schema")
+    expected_fields = base_fields if schema == 1 else base_fields | composite_fields
+    if set(value) != expected_fields:
+        fail(f"{label} has an invalid shape")
+    if schema not in {1, 2} or isinstance(schema, bool):
         fail(f"{label} schema is invalid")
-    if any(not isinstance(value[key], str) for key in fields - {"schema"}):
+    if any(not isinstance(value[key], str) for key in expected_fields - {"schema"}):
         fail(f"{label} contains a non-string field")
     state = EdgeState(
         base_release=value["base_release"],
@@ -426,6 +503,11 @@ def validate_state(value: object, paths: RuntimePaths, label: str) -> EdgeState:
         overlay_sha256=value["overlay_sha256"],
         caddy_image=value["caddy_image"],
         fingerprint=value["fingerprint"],
+        monflorian_attested_route=value.get("monflorian_attested_route"),
+        monflorian_route_sha256=value.get("monflorian_route_sha256"),
+        monflorian_source_revision=value.get("monflorian_source_revision"),
+        monflorian_overlay_sha256=value.get("monflorian_overlay_sha256"),
+        monflorian_private_access_sha256=value.get("monflorian_private_access_sha256"),
     )
     if SHA40_RE.fullmatch(state.source_revision) is None:
         fail(f"{label} source revision is invalid")
@@ -437,6 +519,15 @@ def validate_state(value: object, paths: RuntimePaths, label: str) -> EdgeState:
             state.tls_sha256,
             state.overlay_sha256,
             state.fingerprint,
+            *(
+                (
+                    state.monflorian_route_sha256,
+                    state.monflorian_overlay_sha256,
+                    state.monflorian_private_access_sha256,
+                )
+                if state.composite
+                else ()
+            ),
         )
     ):
         fail(f"{label} contains an invalid SHA-256 value")
@@ -451,11 +542,24 @@ def validate_state(value: object, paths: RuntimePaths, label: str) -> EdgeState:
             fail(f"{label} release path is invalid")
         if APPLICATION_RELEASE_RE.fullmatch(state.attested_route) is None:
             fail(f"{label} attested route path is invalid")
+        if state.composite and (
+            state.monflorian_attested_route is None
+            or MONFLORIAN_APPLICATION_RELEASE_RE.fullmatch(
+                state.monflorian_attested_route
+            )
+            is None
+        ):
+            fail(f"{label} Mon Florian attested route path is invalid")
     else:
         if Path(state.base_release).parent != paths.base_release_root:
             fail(f"{label} test base release path is invalid")
         if Path(state.release).parent != paths.extension_release_root:
             fail(f"{label} test release path is invalid")
+    if state.composite and (
+        state.monflorian_source_revision is None
+        or SHA40_RE.fullmatch(state.monflorian_source_revision) is None
+    ):
+        fail(f"{label} Mon Florian source revision is invalid")
     if Path(state.release).name != state.fingerprint:
         fail(f"{label} release name does not match its fingerprint")
     return state
@@ -464,16 +568,26 @@ def validate_state(value: object, paths: RuntimePaths, label: str) -> EdgeState:
 def validate_transaction(
     value: object, paths: RuntimePaths, label: str
 ) -> EdgeTransaction:
-    if not isinstance(value, dict) or set(value) != {
+    base_fields = {
         "candidate",
         "phase",
         "previous",
         "previous_release",
         "schema",
-    }:
+    }
+    if not isinstance(value, dict):
         fail(f"{label} has an invalid shape")
-    if value["schema"] != 1 or isinstance(value["schema"], bool):
+    schema = value.get("schema")
+    expected_fields = (
+        base_fields if schema == 1 else base_fields | {"remove_monflorian"}
+    )
+    if set(value) != expected_fields:
+        fail(f"{label} has an invalid shape")
+    if schema not in {1, 2} or isinstance(schema, bool):
         fail(f"{label} schema is invalid")
+    remove_monflorian = value.get("remove_monflorian", False)
+    if schema == 2 and remove_monflorian is not True:
+        fail(f"{label} Mon Florian removal authorization is invalid")
     candidate = validate_state(value["candidate"], paths, f"{label} candidate")
     previous = (
         None
@@ -492,6 +606,11 @@ def validate_transaction(
         fail(f"{label} previous state and release differ")
     if previous is not None and candidate.base_release != previous.base_release:
         fail(f"{label} candidate and previous state retain different bases")
+    removes_composition = (
+        previous is not None and previous.composite and not candidate.composite
+    )
+    if removes_composition != remove_monflorian:
+        fail(f"{label} Mon Florian removal authorization differs from the transition")
     if previous is None:
         if paths.expected_uid == 0:
             if BASE_RELEASE_RE.fullmatch(previous_release) is None:
@@ -505,6 +624,7 @@ def validate_transaction(
         previous=previous,
         previous_release=previous_release,
         phase=phase,
+        remove_monflorian=remove_monflorian,
     )
 
 
@@ -872,7 +992,118 @@ def validate_attested_route(path: Path, paths: RuntimePaths) -> bytes:
     return route
 
 
-def validate_repository_inputs(paths: RuntimePaths) -> tuple[bytes, bytes]:
+def validate_monflorian_route_content(
+    route: bytes, paths: RuntimePaths, *, label: str
+) -> str:
+    approved = read_protected_file(
+        paths.approved_monflorian_route,
+        "approved Mon Florian route",
+        paths,
+        modes=REPOSITORY_FILE_MODES,
+    )
+    if sha256(approved) != MONFLORIAN_APPROVED_ROUTE_SHA256:
+        fail("approved Mon Florian route differs from its reviewed digest")
+    placeholder = b"__SOURCE_REVISION__"
+    if approved.count(placeholder) != 1:
+        fail("approved Mon Florian route has an invalid revision placeholder")
+    prefix, suffix = approved.split(placeholder)
+    if not route.startswith(prefix) or not route.endswith(suffix):
+        fail(f"{label} differs from the approved route")
+    revision_end = len(route) - len(suffix) if suffix else len(route)
+    revision_raw = route[len(prefix) : revision_end]
+    try:
+        revision = revision_raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        fail(f"{label} revision is not ASCII: {exc}")
+    if SHA40_RE.fullmatch(revision) is None:
+        fail(f"{label} revision is invalid")
+    if route != prefix + revision_raw + suffix:
+        fail(f"{label} framing is invalid")
+    return revision
+
+
+def validate_monflorian_attested_route(
+    path: Path, paths: RuntimePaths
+) -> tuple[bytes, str]:
+    if not path.is_absolute():
+        fail("attested Mon Florian route path must be absolute")
+    if paths.expected_uid == 0:
+        if MONFLORIAN_APPLICATION_RELEASE_RE.fullmatch(str(path)) is None:
+            fail(
+                "attested Mon Florian route is outside an admitted application release"
+            )
+        for directory, label in (
+            (path.parents[0], "attested Mon Florian route caddy directory"),
+            (path.parents[1], "attested Mon Florian integration directory"),
+            (path.parents[2], "attested Mon Florian application release"),
+            (path.parents[3], "Mon Florian application release root"),
+        ):
+            require_directory(directory, label, paths, modes=frozenset({0o755}))
+    route = read_protected_file(path, "attested Mon Florian route", paths)
+    revision = validate_monflorian_route_content(
+        route,
+        paths,
+        label="attested Mon Florian route",
+    )
+    if paths.expected_uid == 0:
+        state_raw = read_protected_file(
+            path.with_name("state.json"),
+            "attested Mon Florian edge state",
+            paths,
+            maximum_size=MAX_STATE_BYTES,
+        )
+        state = strict_json(state_raw, "attested Mon Florian edge state")
+        expected_fields = {
+            "application",
+            "components",
+            "integration_reference",
+            "migration_inventory_digest",
+            "probe_inventory_digest",
+            "release_reference",
+            "schema",
+            "source_revision",
+        }
+        release_digest = path.parent.name.removeprefix("sha256-")
+        digest_reference = re.compile(r"^sha256:[0-9a-f]{64}$")
+        if (
+            not isinstance(state, dict)
+            or set(state) != expected_fields
+            or state.get("schema") != 1
+            or isinstance(state.get("schema"), bool)
+            or state.get("application") != "monflorian"
+            or state.get("source_revision") != revision
+            or state.get("release_reference")
+            != (
+                "ghcr.io/nclsppr/monflorian/application-release@sha256:"
+                f"{release_digest}"
+            )
+            or not isinstance(state.get("integration_reference"), str)
+            or re.fullmatch(
+                r"ghcr\.io/nclsppr/monflorian/vps-integration@sha256:[0-9a-f]{64}",
+                state["integration_reference"],
+            )
+            is None
+            or not isinstance(state.get("components"), dict)
+            or set(state["components"]) != {"backend"}
+            or not isinstance(state["components"]["backend"], str)
+            or re.fullmatch(
+                r"ghcr\.io/nclsppr/monflorian/backend@sha256:[0-9a-f]{64}",
+                state["components"]["backend"],
+            )
+            is None
+            or not isinstance(state.get("migration_inventory_digest"), str)
+            or digest_reference.fullmatch(state["migration_inventory_digest"]) is None
+            or not isinstance(state.get("probe_inventory_digest"), str)
+            or digest_reference.fullmatch(state["probe_inventory_digest"]) is None
+            or state_raw != canonical_json(state)
+        ):
+            fail("attested Mon Florian edge state is invalid")
+    return route, revision
+
+
+def validate_repository_inputs(
+    paths: RuntimePaths, *, composite: bool = False
+) -> tuple[bytes, bytes, bytes | None, bytes | None]:
     tls = read_protected_file(
         paths.tls_snippet,
         "approved Surplasse TLS snippet",
@@ -885,6 +1116,27 @@ def validate_repository_inputs(paths: RuntimePaths) -> tuple[bytes, bytes]:
         paths,
         modes=REPOSITORY_FILE_MODES,
     )
+    monflorian_overlay = None
+    private_access = None
+    if composite:
+        monflorian_overlay = read_protected_file(
+            paths.monflorian_overlay,
+            "approved Mon Florian public edge overlay",
+            paths,
+            modes=REPOSITORY_FILE_MODES,
+        )
+        private_access = read_protected_file(
+            paths.private_access_snippet,
+            "Mon Florian private access snippet",
+            paths,
+            modes=frozenset({0o400}),
+            maximum_size=MAX_PRIVATE_ACCESS_BYTES,
+        )
+        if PRIVATE_ACCESS_RE.fullmatch(private_access) is None:
+            fail(
+                "Mon Florian private access snippet must contain one canonical "
+                "bcrypt basic_auth account"
+            )
     for path, label in (
         (paths.candidate_validator, "Surplasse public edge validator"),
         (paths.caddy_verifier, "Surplasse Caddy verifier"),
@@ -896,7 +1148,7 @@ def validate_repository_inputs(paths: RuntimePaths) -> tuple[bytes, bytes]:
             modes=frozenset({0o555, 0o755}),
             maximum_size=MAX_FILE_BYTES,
         )
-    return tls, overlay
+    return tls, overlay, monflorian_overlay, private_access
 
 
 def require_dns_secrets(paths: RuntimePaths) -> None:
@@ -917,23 +1169,42 @@ def require_dns_secrets(paths: RuntimePaths) -> None:
 
 
 def render_candidate_compose(
-    base_release: Path, staging: Path, paths: RuntimePaths
+    base_release: Path,
+    staging: Path,
+    paths: RuntimePaths,
+    *,
+    composite: bool = False,
+    private_access_source: Path | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
+    compose_files: list[str | Path] = [
+        "--file",
+        base_release / "compose.yaml",
+        "--file",
+        paths.overlay,
+    ]
+    if composite:
+        if private_access_source is None:
+            fail("composite Compose rendering requires its versioned private snippet")
+        compose_files.extend(["--file", paths.monflorian_overlay])
+    elif private_access_source is not None:
+        fail("legacy Compose rendering cannot receive a Mon Florian private snippet")
     result = run(
         [
             paths.docker,
             "compose",
             "--project-directory",
             staging,
-            "--file",
-            base_release / "compose.yaml",
-            "--file",
-            paths.overlay,
+            *compose_files,
             "config",
             "--format",
             "json",
         ],
         timeout=60,
+        environment=(
+            {"MONFLORIAN_PRIVATE_ACCESS_SOURCE": str(private_access_source)}
+            if private_access_source is not None
+            else None
+        ),
     )
     value = strict_json(result.stdout, "rendered Surplasse public edge Compose")
     if not isinstance(value, dict):
@@ -942,14 +1213,19 @@ def render_candidate_compose(
     compose_path = staging / "compose.yaml"
     compose_path.write_bytes(rendered)
     os.chmod(compose_path, 0o444)
+    validation_arguments: list[str | Path] = [
+        paths.candidate_validator,
+        compose_path,
+        "--approved-route",
+        paths.approved_route,
+        "--candidate-only",
+    ]
+    if composite:
+        validation_arguments.extend(
+            ["--approved-monflorian-route", paths.approved_monflorian_route]
+        )
     run(
-        [
-            paths.candidate_validator,
-            compose_path,
-            "--approved-route",
-            paths.approved_route,
-            "--candidate-only",
-        ],
+        validation_arguments,
         timeout=60,
     )
     services = value.get("services")
@@ -977,8 +1253,21 @@ def validate_local_image(image: str, paths: RuntimePaths) -> None:
         fail("local Caddy image does not contain the reviewed registry digest")
 
 
-def validate_caddy_candidate(release: Path, image: str, paths: RuntimePaths) -> None:
-    run([paths.caddy_verifier, image, paths.approved_route], timeout=120)
+def validate_caddy_candidate(
+    release: Path,
+    image: str,
+    paths: RuntimePaths,
+    *,
+    composite: bool = False,
+) -> None:
+    verifier_arguments: list[str | Path] = [
+        paths.caddy_verifier,
+        image,
+        paths.approved_route,
+    ]
+    if composite:
+        verifier_arguments.append(release / "routes/monflorian.caddy")
+    run(verifier_arguments, timeout=120)
     credential_mapping = (
         (
             "OVH_APPLICATION_KEY_FILE",
@@ -1040,7 +1329,31 @@ def validate_caddy_candidate(release: Path, image: str, paths: RuntimePaths) -> 
             "caddyfile",
         ]
     )
+    if composite:
+        arguments[arguments.index(image) : arguments.index(image)] = [
+            "--volume",
+            f"{release / 'private' / PRIVATE_ACCESS_NAME}:{PRIVATE_ACCESS_TARGET}:ro",
+        ]
     run(arguments, timeout=120, sensitive=True)
+
+
+def _write_exact(destination: Path, raw: bytes, mode: int) -> None:
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        mode,
+    )
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                fail(f"cannot write protected candidate file {destination.name}")
+            view = view[written:]
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _copy_exact(
@@ -1053,20 +1366,7 @@ def _copy_exact(
         modes=frozenset({0o444, 0o555}),
         maximum_size=MAX_FILE_BYTES,
     )
-    descriptor = os.open(
-        destination,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        mode,
-    )
-    try:
-        view = memoryview(raw)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
-        os.fchmod(descriptor, mode)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _write_exact(destination, raw, mode)
     return raw
 
 
@@ -1078,20 +1378,57 @@ def candidate_fingerprint(
     route: bytes,
     tls: bytes,
     overlay: bytes,
+    monflorian_attested_route: Path | None = None,
+    monflorian_route: bytes | None = None,
+    monflorian_source_revision: str | None = None,
+    monflorian_overlay: bytes | None = None,
+    monflorian_private_access: bytes | None = None,
 ) -> str:
+    monflorian_inputs = (
+        monflorian_attested_route,
+        monflorian_route,
+        monflorian_source_revision,
+        monflorian_overlay,
+        monflorian_private_access,
+    )
+    if any(item is not None for item in monflorian_inputs) and not all(
+        item is not None for item in monflorian_inputs
+    ):
+        fail("Mon Florian candidate fingerprint inputs are incomplete")
+    composite = all(item is not None for item in monflorian_inputs)
     subject = {
         "attested_route": str(attested_route),
         "base_release": str(base_release),
         "overlay_sha256": sha256(overlay),
         "route_sha256": sha256(route),
-        "schema": 1,
+        "schema": 2 if composite else 1,
         "source_revision": revision,
         "tls_sha256": sha256(tls),
     }
+    if composite:
+        assert monflorian_attested_route is not None
+        assert monflorian_route is not None
+        assert monflorian_source_revision is not None
+        assert monflorian_overlay is not None
+        assert monflorian_private_access is not None
+        subject.update(
+            {
+                "monflorian_attested_route": str(monflorian_attested_route),
+                "monflorian_overlay_sha256": sha256(monflorian_overlay),
+                "monflorian_private_access_sha256": sha256(monflorian_private_access),
+                "monflorian_route_sha256": sha256(monflorian_route),
+                "monflorian_source_revision": monflorian_source_revision,
+            }
+        )
     return sha256(canonical_json(subject))
 
 
-def stage_candidate(attested_route: Path, paths: RuntimePaths) -> EdgeState:
+def stage_candidate(
+    attested_route: Path,
+    paths: RuntimePaths,
+    monflorian_attested_route: Path | None = None,
+) -> EdgeState:
+    composite = monflorian_attested_route is not None
     require_dns_secrets(paths)
     active = read_active(paths)
     current = current_release(paths)
@@ -1101,10 +1438,24 @@ def stage_candidate(attested_route: Path, paths: RuntimePaths) -> EdgeState:
         if current != Path(active.release):
             fail("active Surplasse edge state does not match the runtime link")
         validate_candidate_release(Path(active.release), active, paths)
+        if active.composite and not composite:
+            fail("a legacy candidate cannot remove the active Mon Florian edge")
         base_release = Path(active.base_release)
-    revision, _phase = validate_base_release(base_release, paths)
+    revision, _phase = validate_base_release(
+        base_release,
+        paths,
+        require_current_revision=active is None,
+    )
     route = validate_attested_route(attested_route, paths)
-    tls, overlay = validate_repository_inputs(paths)
+    monflorian_route = None
+    monflorian_source_revision = None
+    if monflorian_attested_route is not None:
+        monflorian_route, monflorian_source_revision = (
+            validate_monflorian_attested_route(monflorian_attested_route, paths)
+        )
+    tls, overlay, monflorian_overlay, private_access = validate_repository_inputs(
+        paths, composite=composite
+    )
     fingerprint = candidate_fingerprint(
         base_release=base_release,
         revision=revision,
@@ -1112,6 +1463,11 @@ def stage_candidate(attested_route: Path, paths: RuntimePaths) -> EdgeState:
         route=route,
         tls=tls,
         overlay=overlay,
+        monflorian_attested_route=monflorian_attested_route,
+        monflorian_route=monflorian_route,
+        monflorian_source_revision=monflorian_source_revision,
+        monflorian_overlay=monflorian_overlay,
+        monflorian_private_access=private_access,
     )
     release = paths.extension_release_root / fingerprint
     if release.exists():
@@ -1152,10 +1508,27 @@ def stage_candidate(attested_route: Path, paths: RuntimePaths) -> EdgeState:
         route_path = routes / "surplasse.caddy"
         route_path.write_bytes(route)
         os.chmod(route_path, 0o444)
+        if monflorian_route is not None:
+            monflorian_route_path = routes / "monflorian.caddy"
+            monflorian_route_path.write_bytes(monflorian_route)
+            os.chmod(monflorian_route_path, 0o444)
+        private = None
+        if private_access is not None:
+            private = staging / "private"
+            private.mkdir(mode=0o700)
+            _write_exact(private / PRIVATE_ACCESS_NAME, private_access, 0o400)
         tls_path = staging / "surplasse-tls.caddy"
         tls_path.write_bytes(tls)
         os.chmod(tls_path, 0o444)
-        rendered, document = render_candidate_compose(base_release, staging, paths)
+        rendered, document = render_candidate_compose(
+            base_release,
+            staging,
+            paths,
+            composite=composite,
+            private_access_source=(
+                release / "private" / PRIVATE_ACCESS_NAME if composite else None
+            ),
+        )
         image = document["services"]["caddy"]["image"]
         if not isinstance(image, str):
             fail("rendered Caddy image is not a string")
@@ -1170,13 +1543,32 @@ def stage_candidate(attested_route: Path, paths: RuntimePaths) -> EdgeState:
             overlay_sha256=sha256(overlay),
             caddy_image=image,
             fingerprint=fingerprint,
+            monflorian_attested_route=(
+                str(monflorian_attested_route)
+                if monflorian_attested_route is not None
+                else None
+            ),
+            monflorian_route_sha256=(
+                sha256(monflorian_route) if monflorian_route is not None else None
+            ),
+            monflorian_source_revision=monflorian_source_revision,
+            monflorian_overlay_sha256=(
+                sha256(monflorian_overlay) if monflorian_overlay is not None else None
+            ),
+            monflorian_private_access_sha256=(
+                sha256(private_access) if private_access is not None else None
+            ),
         )
         candidate_path = staging / "candidate.json"
         candidate_path.write_bytes(canonical_json(state.as_dict()))
         os.chmod(candidate_path, 0o444)
         validate_local_image(image, paths)
-        validate_caddy_candidate(staging, image, paths)
-        for directory in (routes, staging):
+        validate_caddy_candidate(staging, image, paths, composite=composite)
+        protected_directories = [(routes, 0o555)]
+        if private is not None:
+            protected_directories.append((private, 0o700))
+        protected_directories.append((staging, 0o555))
+        for directory, mode in protected_directories:
             descriptor = os.open(
                 directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
             )
@@ -1184,7 +1576,7 @@ def stage_candidate(attested_route: Path, paths: RuntimePaths) -> EdgeState:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-            os.chmod(directory, 0o555)
+            os.chmod(directory, mode)
         os.replace(staging, release)
         parent = os.open(
             paths.extension_release_root,
@@ -1214,20 +1606,37 @@ def validate_candidate_release(
     if base_revision != state.source_revision:
         fail("edge candidate source revision differs from its retained base")
     require_directory(
-        release, "Surplasse edge candidate", paths, modes=frozenset({0o555})
+        release, "application edge candidate", paths, modes=frozenset({0o555})
     )
-    if _list_directory(release, "Surplasse edge candidate") != sorted(
-        (*CANDIDATE_FILES, "routes")
-    ):
-        fail("Surplasse edge candidate has an unexpected entry set")
+    expected_entries = {*CANDIDATE_FILES, "routes"}
+    if state.composite:
+        expected_entries.add("private")
+    if set(_list_directory(release, "application edge candidate")) != expected_entries:
+        fail("application edge candidate has an unexpected entry set")
     routes = release / "routes"
     require_directory(
-        routes, "Surplasse edge candidate routes", paths, modes=frozenset({0o555})
+        routes, "application edge candidate routes", paths, modes=frozenset({0o555})
     )
-    if _list_directory(routes, "Surplasse edge candidate routes") != sorted(
-        (*ROUTE_NAMES, "surplasse.caddy")
+    expected_routes = {*ROUTE_NAMES, "surplasse.caddy"}
+    if state.composite:
+        private = release / "private"
+        require_directory(
+            private,
+            "application edge candidate private directory",
+            paths,
+            modes=frozenset({0o700}),
+        )
+        if _list_directory(
+            private,
+            "application edge candidate private directory",
+        ) != [PRIVATE_ACCESS_NAME]:
+            fail("application edge candidate private directory has unexpected entries")
+        expected_routes.add("monflorian.caddy")
+    if (
+        set(_list_directory(routes, "application edge candidate routes"))
+        != expected_routes
     ):
-        fail("Surplasse edge candidate does not retain the exact route set")
+        fail("application edge candidate does not retain the exact route set")
     manifest = read_protected_file(
         release / "candidate.json", "edge candidate manifest", paths
     )
@@ -1288,6 +1697,45 @@ def validate_candidate_release(
     )
     if sha256(overlay) != state.overlay_sha256:
         fail("edge candidate overlay source differs from its staged digest")
+    monflorian_route = None
+    monflorian_overlay = None
+    private_access = None
+    if state.composite:
+        monflorian_route = read_protected_file(
+            routes / "monflorian.caddy",
+            "installed Mon Florian route",
+            paths,
+        )
+        source_revision = validate_monflorian_route_content(
+            monflorian_route,
+            paths,
+            label="installed Mon Florian route",
+        )
+        if (
+            sha256(monflorian_route) != state.monflorian_route_sha256
+            or source_revision != state.monflorian_source_revision
+        ):
+            fail("Mon Florian edge route differs from its attested bytes")
+        monflorian_overlay = read_protected_file(
+            paths.monflorian_overlay,
+            "approved Mon Florian public edge overlay",
+            paths,
+            modes=REPOSITORY_FILE_MODES,
+        )
+        if sha256(monflorian_overlay) != state.monflorian_overlay_sha256:
+            fail("Mon Florian edge overlay differs from its staged digest")
+        private_access = read_protected_file(
+            private / PRIVATE_ACCESS_NAME,
+            "versioned Mon Florian private access snippet",
+            paths,
+            modes=frozenset({0o400}),
+            maximum_size=MAX_PRIVATE_ACCESS_BYTES,
+        )
+        if (
+            PRIVATE_ACCESS_RE.fullmatch(private_access) is None
+            or sha256(private_access) != state.monflorian_private_access_sha256
+        ):
+            fail("Mon Florian private access snippet differs from its staged digest")
     expected_fingerprint = candidate_fingerprint(
         base_release=Path(state.base_release),
         revision=state.source_revision,
@@ -1295,6 +1743,15 @@ def validate_candidate_release(
         route=route,
         tls=tls,
         overlay=overlay,
+        monflorian_attested_route=(
+            Path(state.monflorian_attested_route)
+            if state.monflorian_attested_route is not None
+            else None
+        ),
+        monflorian_route=monflorian_route,
+        monflorian_source_revision=state.monflorian_source_revision,
+        monflorian_overlay=monflorian_overlay,
+        monflorian_private_access=private_access,
     )
     if expected_fingerprint != state.fingerprint:
         fail("edge candidate fingerprint differs from its exact staged inputs")
@@ -1388,38 +1845,77 @@ def verify_live_runtime(paths: RuntimePaths, state: EdgeState | None = None) -> 
     config = container.get("Config", {})
     network_settings = container.get("NetworkSettings", {})
     networks = network_settings.get("Networks", {})
+    mounts = container.get("Mounts", [])
     if (
         status_value.get("Status") != "running"
         or status_value.get("Health", {}).get("Status") != "healthy"
         or config.get("Image") != expected_image
         or config.get("Labels", {}).get("com.docker.compose.project") != PROJECT
         or not isinstance(networks, dict)
+        or not isinstance(mounts, list)
     ):
         fail("public edge Caddy container identity or health differs")
     expected_networks = {EDGE_NETWORK} if state is None else {EDGE_NETWORK, APP_NETWORK}
+    if state is not None and state.composite:
+        expected_networks.add(MONFLORIAN_APP_NETWORK)
     if set(networks) != expected_networks:
         fail("public edge Caddy network set differs from the expected composition")
     if state is not None:
-        network_id, network = network_identity(APP_NETWORK, paths)
-        ipam = network.get("IPAM", {}).get("Config", [])
-        if (
-            network.get("Name") != APP_NETWORK
-            or network.get("Driver") != "bridge"
-            or network.get("Scope") != "local"
-            or network.get("Internal") is not False
-            or network.get("Labels", {}).get("com.nclsppr.vps-infra.managed") != "true"
-            or not isinstance(ipam, list)
-            or len(ipam) != 1
-            or ipam[0].get("Subnet") != APP_SUBNET
-        ):
-            fail("app_surplasse network differs from the managed host contract")
-        attachment = networks.get(APP_NETWORK, {})
-        if (
-            attachment.get("NetworkID") != network_id
-            or attachment.get("IPAddress") != APP_ADDRESS
-            or attachment.get("IPPrefixLen") != 24
-        ):
-            fail("public edge Caddy does not own the exact app_surplasse address")
+        network_contracts = [(APP_NETWORK, APP_SUBNET, APP_ADDRESS)]
+        if state.composite:
+            network_contracts.append(
+                (
+                    MONFLORIAN_APP_NETWORK,
+                    MONFLORIAN_APP_SUBNET,
+                    MONFLORIAN_APP_ADDRESS,
+                )
+            )
+        for name, subnet, address in network_contracts:
+            network_id, network = network_identity(name, paths)
+            ipam = network.get("IPAM", {}).get("Config", [])
+            if (
+                network.get("Name") != name
+                or network.get("Driver") != "bridge"
+                or network.get("Scope") != "local"
+                or network.get("Internal") is not False
+                or network.get("Labels", {}).get("com.nclsppr.vps-infra.managed")
+                != "true"
+                or not isinstance(ipam, list)
+                or len(ipam) != 1
+                or ipam[0].get("Subnet") != subnet
+            ):
+                fail(f"{name} network differs from the managed host contract")
+            attachment = networks.get(name, {})
+            if (
+                attachment.get("NetworkID") != network_id
+                or attachment.get("IPAddress") != address
+                or attachment.get("IPPrefixLen") != 24
+            ):
+                fail(f"public edge Caddy does not own the exact {name} address")
+    if state is not None:
+        expected_binds = {
+            ROUTES_TARGET: str(paths.runtime_link / "routes"),
+            TLS_TARGET: str(paths.runtime_link / "surplasse-tls.caddy"),
+        }
+        if state.composite:
+            expected_binds[PRIVATE_ACCESS_TARGET] = str(
+                Path(state.release) / "private" / PRIVATE_ACCESS_NAME
+            )
+        for destination, source in expected_binds.items():
+            matching = [
+                mount
+                for mount in mounts
+                if isinstance(mount, dict) and mount.get("Destination") == destination
+            ]
+            if len(matching) != 1:
+                fail(f"public edge Caddy bind {destination} differs from the candidate")
+            mount = matching[0]
+            if (
+                mount.get("Type") != "bind"
+                or mount.get("Source") != source
+                or mount.get("RW") is not False
+            ):
+                fail(f"public edge Caddy bind {destination} differs from the candidate")
 
 
 def restart_edge(paths: RuntimePaths) -> None:
@@ -1526,7 +2022,12 @@ def recover_locked(paths: RuntimePaths) -> None:
     rollback(transaction, paths)
 
 
-def activate_candidate(release: Path, paths: RuntimePaths) -> None:
+def activate_candidate(
+    release: Path,
+    paths: RuntimePaths,
+    *,
+    remove_monflorian: bool = False,
+) -> None:
     recover_locked(paths)
     verify_unit_active(paths)
     require_directory(
@@ -1542,11 +2043,24 @@ def activate_candidate(release: Path, paths: RuntimePaths) -> None:
     validate_candidate_release(release, state, paths)
     require_dns_secrets(paths)
     validate_local_image(state.caddy_image, paths)
-    validate_caddy_candidate(release, state.caddy_image, paths)
+    validate_caddy_candidate(
+        release,
+        state.caddy_image,
+        paths,
+        composite=state.composite,
+    )
     previous = read_active(paths)
     current = current_release(paths)
     if previous is not None and current != Path(previous.release):
         fail("active Surplasse edge state differs from the runtime link")
+    removes_composition = (
+        previous is not None and previous.composite and not state.composite
+    )
+    if removes_composition != remove_monflorian:
+        fail(
+            "Mon Florian removal requires the explicit removal command and "
+            "one active composite state"
+        )
     if previous == state and current == release:
         restart_edge(paths)
         verify_live_runtime(paths, state)
@@ -1559,6 +2073,7 @@ def activate_candidate(release: Path, paths: RuntimePaths) -> None:
         previous=previous,
         previous_release=str(current),
         phase="prepared",
+        remove_monflorian=remove_monflorian,
     )
     _write_transaction(transaction, paths)
     try:
@@ -1612,10 +2127,18 @@ def main(argv: list[str] | None = None, *, paths: RuntimePaths | None = None) ->
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--stage", metavar="ATTESTED_ROUTE")
     modes.add_argument("--activate", metavar="CANDIDATE_RELEASE")
+    modes.add_argument("--remove-monflorian", metavar="LEGACY_CANDIDATE_RELEASE")
     modes.add_argument("--recover", action="store_true")
     modes.add_argument("--verify-live", action="store_true")
     modes.add_argument("--assert-base-switch-safe", action="store_true")
+    parser.add_argument(
+        "--monflorian-route",
+        metavar="ATTESTED_MONFLORIAN_ROUTE",
+        help="add the attested Mon Florian route to a staged composite candidate",
+    )
     args = parser.parse_args(argv)
+    if args.monflorian_route is not None and args.stage is None:
+        parser.error("--monflorian-route requires --stage")
     runtime = RuntimePaths() if paths is None else paths
     try:
         require_runtime(runtime, recovery=args.recover)
@@ -1625,10 +2148,23 @@ def main(argv: list[str] | None = None, *, paths: RuntimePaths | None = None) ->
                 print("Surplasse public edge recovery complete")
             elif args.stage is not None:
                 recover_locked(runtime)
-                state = stage_candidate(Path(args.stage), runtime)
-                print(f"Surplasse public edge candidate staged: {state.release}")
+                if args.monflorian_route is None:
+                    state = stage_candidate(Path(args.stage), runtime)
+                else:
+                    state = stage_candidate(
+                        Path(args.stage),
+                        runtime,
+                        Path(args.monflorian_route),
+                    )
+                print(f"application public edge candidate staged: {state.release}")
             elif args.activate is not None:
                 activate_candidate(parse_release_path(args.activate, runtime), runtime)
+            elif args.remove_monflorian is not None:
+                activate_candidate(
+                    parse_release_path(args.remove_monflorian, runtime),
+                    runtime,
+                    remove_monflorian=True,
+                )
             elif args.verify_live:
                 active = read_active(runtime)
                 if active is None:

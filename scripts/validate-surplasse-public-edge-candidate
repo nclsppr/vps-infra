@@ -9,12 +9,12 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import stat
 import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from typing import Any
-
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SCRIPT_DIRECTORY.parent
@@ -22,27 +22,35 @@ BASE_VALIDATOR_PATH = SCRIPT_DIRECTORY / "validate-compose"
 EXPECTED_IMAGES_PATH = (
     REPOSITORY_ROOT / "platform/public-static-edge/expected-images.json"
 )
-TLS_SNIPPET_PATH = (
-    REPOSITORY_ROOT / "platform/public-static-edge/surplasse-tls.caddy"
-)
-APPROVED_ROUTE_PATH = (
-    REPOSITORY_ROOT / "platform/caddy/routes/surplasse.caddy.disabled"
+TLS_SNIPPET_PATH = REPOSITORY_ROOT / "platform/public-static-edge/surplasse-tls.caddy"
+APPROVED_ROUTE_PATH = REPOSITORY_ROOT / "platform/caddy/routes/surplasse.caddy.disabled"
+APPROVED_MONFLORIAN_ROUTE_PATH = (
+    REPOSITORY_ROOT / "platform/caddy/routes/monflorian.caddy.disabled"
 )
 
 PROJECT = "vps-public-static-edge"
 APPLICATION_NETWORK = "app_surplasse"
 APPLICATION_ADDRESS = "172.30.10.254"
+MONFLORIAN_NETWORK = "app_monflorian"
+MONFLORIAN_ADDRESS = "172.30.40.254"
 RUNTIME_ROUTE_SOURCE = "/srv/vps/runtime/public-static-edge/routes"
 RUNTIME_ROUTE_PATH = f"{RUNTIME_ROUTE_SOURCE}/surplasse.caddy"
 CONTAINER_ROUTE_TARGET = "/etc/caddy/routes"
 TLS_SNIPPET_SOURCE = "/srv/vps/runtime/public-static-edge/surplasse-tls.caddy"
 TLS_SNIPPET_TARGET = "/etc/caddy/surplasse-tls.caddy"
 DNS_CREDENTIAL_ROOT_PATH = "/etc/vps/secrets/dns/surplasse"
+PRIVATE_ACCESS_SOURCE_RE = re.compile(
+    r"^/srv/vps/releases/public-static-edge-surplasse/[0-9a-f]{64}/"
+    r"private/monflorian-private-access\.caddy$"
+)
+PRIVATE_ACCESS_TARGET = "/etc/caddy/monflorian-private-access.caddy"
 MAX_ROUTE_SIZE = 128 * 1024
 APPROVED_ROUTE_SHA256 = (
     "645931a03bd1c80ab5b3982d6a285e673906d68fb010adbd1756d43d8a0cd306"
 )
-
+APPROVED_MONFLORIAN_ROUTE_SHA256 = (
+    "331a405bf3f5a9be2e943fbebe2cca633461d754e0f42a001940d11bdfa8f7bc"
+)
 DNS_CREDENTIAL_SOURCES = {
     "surplasse_ovh_application_key": "ovh-application-key",
     "surplasse_ovh_application_secret": "ovh-application-secret",
@@ -73,7 +81,9 @@ def fail(message: str) -> None:
 
 
 def load_base_validator() -> Any:
-    loader = SourceFileLoader("surplasse_candidate_base_policy", str(BASE_VALIDATOR_PATH))
+    loader = SourceFileLoader(
+        "surplasse_candidate_base_policy", str(BASE_VALIDATOR_PATH)
+    )
     spec = importlib.util.spec_from_loader(loader.name, loader)
     if spec is None or spec.loader is None:
         fail("cannot load the base Compose validator")
@@ -149,7 +159,9 @@ def validate_route_bytes(
     installed_route: Path | None,
     approved_route: Path = APPROVED_ROUTE_PATH,
 ) -> None:
-    route = strict_regular_file(attested_route, "attested Surplasse route", MAX_ROUTE_SIZE)
+    route = strict_regular_file(
+        attested_route, "attested Surplasse route", MAX_ROUTE_SIZE
+    )
     approved = strict_regular_file(
         approved_route, "approved vps-infra Surplasse route", MAX_ROUTE_SIZE
     )
@@ -160,7 +172,9 @@ def validate_route_bytes(
     validate_route_content(route)
     if installed_route is None:
         return
-    installed = strict_regular_file(installed_route, "installed Surplasse route", MAX_ROUTE_SIZE)
+    installed = strict_regular_file(
+        installed_route, "installed Surplasse route", MAX_ROUTE_SIZE
+    )
     if installed != route:
         fail("installed Surplasse route differs from the attested route")
 
@@ -182,6 +196,51 @@ def validate_tls_snippet(installed_path: Path | None = None) -> None:
         fail("installed Atlas Surplasse TLS snippet differs from the approved snippet")
 
 
+def validate_monflorian_route_bytes(
+    attested_route: Path,
+    installed_route: Path | None,
+    approved_route: Path = APPROVED_MONFLORIAN_ROUTE_PATH,
+    *,
+    allow_placeholder: bool = False,
+) -> str:
+    route = strict_regular_file(
+        attested_route, "attested Mon Florian route", MAX_ROUTE_SIZE
+    )
+    approved = strict_regular_file(
+        approved_route, "approved vps-infra Mon Florian route", MAX_ROUTE_SIZE
+    )
+    if hashlib.sha256(approved).hexdigest() != APPROVED_MONFLORIAN_ROUTE_SHA256:
+        fail("approved vps-infra Mon Florian route differs from its reviewed digest")
+    placeholder = b"__SOURCE_REVISION__"
+    if approved.count(placeholder) != 1:
+        fail("approved Mon Florian route has an invalid revision placeholder")
+    prefix, suffix = approved.split(placeholder)
+    if not route.startswith(prefix) or not route.endswith(suffix):
+        fail("attested Mon Florian route differs from the approved route")
+    revision_end = len(route) - len(suffix) if suffix else len(route)
+    revision = route[len(prefix) : revision_end]
+    if revision == placeholder and allow_placeholder:
+        parsed_revision = placeholder.decode("ascii")
+    else:
+        try:
+            parsed_revision = revision.decode("ascii")
+        except UnicodeDecodeError as exc:
+            fail(f"attested Mon Florian route revision is not ASCII: {exc}")
+        if re.fullmatch(r"[0-9a-f]{40}", parsed_revision) is None:
+            fail("attested Mon Florian route revision is invalid")
+    if route != prefix + revision + suffix:
+        fail("attested Mon Florian route framing is invalid")
+    if route.count(b"import /etc/caddy/monflorian-private-access.caddy") != 1:
+        fail("attested Mon Florian route must import the private access snippet once")
+    if installed_route is not None:
+        installed = strict_regular_file(
+            installed_route, "installed Mon Florian route", MAX_ROUTE_SIZE
+        )
+        if installed != route:
+            fail("installed Mon Florian route differs from the attested route")
+    return parsed_revision
+
+
 def find_volume(service: dict[str, Any], target: str) -> dict[str, Any]:
     matching = [
         volume
@@ -193,7 +252,7 @@ def find_volume(service: dict[str, Any], target: str) -> dict[str, Any]:
     return matching[0]
 
 
-def validate_candidate_compose(document: Any) -> None:
+def validate_candidate_compose(document: Any, *, composite: bool = False) -> None:
     if not isinstance(document, dict):
         fail("rendered Compose candidate must be an object")
     if set(document) != {"name", "networks", "secrets", "services", "volumes"}:
@@ -220,11 +279,18 @@ def validate_candidate_compose(document: Any) -> None:
         fail("services.caddy.environment differs from the exact file-variable contract")
     if caddy.get("secrets") != expected_credential_mounts:
         fail("services.caddy.secrets differs from the exact scoped credential contract")
-    if caddy.get("networks") != {
+    expected_caddy_networks = {
         APPLICATION_NETWORK: {"ipv4_address": APPLICATION_ADDRESS},
         "edge": {},
-    }:
-        fail("services.caddy.networks differs from the exact edge and application attachment")
+    }
+    if composite:
+        expected_caddy_networks[MONFLORIAN_NETWORK] = {
+            "ipv4_address": MONFLORIAN_ADDRESS
+        }
+    if caddy.get("networks") != expected_caddy_networks:
+        fail(
+            "services.caddy.networks differs from the exact edge and application attachment"
+        )
 
     route_mount = find_volume(caddy, CONTAINER_ROUTE_TARGET)
     if route_mount != {
@@ -244,16 +310,45 @@ def validate_candidate_compose(document: Any) -> None:
         "bind": {"create_host_path": False},
     }:
         fail("Atlas Surplasse TLS snippet mount differs from the exact contract")
+    if composite:
+        private_access_mount = find_volume(caddy, PRIVATE_ACCESS_TARGET)
+        private_access_source = private_access_mount.get("source")
+        if (
+            private_access_mount
+            != {
+                "type": "bind",
+                "source": private_access_source,
+                "target": PRIVATE_ACCESS_TARGET,
+                "read_only": True,
+                "bind": {"create_host_path": False},
+            }
+            or not isinstance(private_access_source, str)
+            or PRIVATE_ACCESS_SOURCE_RE.fullmatch(private_access_source) is None
+        ):
+            fail("Mon Florian private access snippet mount differs from the contract")
 
     networks = document.get("networks")
-    if not isinstance(networks, dict) or set(networks) != {"edge", APPLICATION_NETWORK}:
-        fail("top-level networks must contain exactly edge and app_surplasse")
+    expected_networks = {"edge", APPLICATION_NETWORK}
+    if composite:
+        expected_networks.add(MONFLORIAN_NETWORK)
+    if not isinstance(networks, dict) or set(networks) != expected_networks:
+        fail("top-level networks differ from the exact edge composition")
     if networks[APPLICATION_NETWORK] != {
         "name": APPLICATION_NETWORK,
         "ipam": {},
         "external": True,
     }:
-        fail("top-level app_surplasse network differs from the managed external network")
+        fail(
+            "top-level app_surplasse network differs from the managed external network"
+        )
+    if composite and networks[MONFLORIAN_NETWORK] != {
+        "name": MONFLORIAN_NETWORK,
+        "ipam": {},
+        "external": True,
+    }:
+        fail(
+            "top-level app_monflorian network differs from the managed external network"
+        )
 
     secrets = document.get("secrets")
     expected_credential_definitions = {
@@ -271,12 +366,14 @@ def validate_candidate_compose(document: Any) -> None:
     base_caddy.pop("environment", None)
     base_caddy.pop("secrets", None)
     base_caddy["networks"].pop(APPLICATION_NETWORK, None)
+    base_caddy["networks"].pop(MONFLORIAN_NETWORK, None)
     base_caddy["volumes"] = [
         volume
         for volume in volumes
-        if volume.get("target") != TLS_SNIPPET_TARGET
+        if volume.get("target") not in {TLS_SNIPPET_TARGET, PRIVATE_ACCESS_TARGET}
     ]
     base["networks"].pop(APPLICATION_NETWORK, None)
+    base["networks"].pop(MONFLORIAN_NETWORK, None)
     base.pop("secrets", None)
 
     base_validator = load_base_validator()
@@ -294,7 +391,9 @@ def validate_candidate_compose(document: Any) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("compose_json", help="rendered candidate from docker compose config")
+    parser.add_argument(
+        "compose_json", help="rendered candidate from docker compose config"
+    )
     parser.add_argument(
         "--approved-route",
         required=True,
@@ -313,19 +412,33 @@ def main() -> int:
         help="active Atlas TLS snippet to compare with the approved snippet",
     )
     parser.add_argument(
+        "--approved-monflorian-route",
+        help="Mon Florian route approved by the reviewed vps-infra revision",
+    )
+    parser.add_argument(
         "--candidate-only",
         action="store_true",
         help="validate repository inputs only; this mode cannot prove a live route",
     )
     args = parser.parse_args()
+    composite = args.approved_monflorian_route is not None
+    if composite and not args.candidate_only:
+        parser.error("--approved-monflorian-route requires --candidate-only")
     if args.candidate_only:
-        if args.attested_route or args.installed_route or args.installed_tls_snippet:
+        if (
+            args.attested_route
+            or args.installed_route
+            or args.installed_tls_snippet
+        ):
             parser.error(
                 "--candidate-only cannot be combined with live route or TLS inputs"
             )
         route_to_validate = Path(args.approved_route)
         installed_route = None
         installed_tls_snippet = None
+        monflorian_route_to_validate = (
+            Path(args.approved_monflorian_route) if composite else None
+        )
     else:
         if (
             not args.attested_route
@@ -345,19 +458,31 @@ def main() -> int:
         route_to_validate = Path(args.attested_route)
         installed_route = Path(args.installed_route)
         installed_tls_snippet = Path(args.installed_tls_snippet)
+        monflorian_route_to_validate = None
     try:
         compose_path = Path(args.compose_json)
-        raw = strict_regular_file(compose_path, "rendered Compose candidate", 2 * 1024 * 1024)
+        raw = strict_regular_file(
+            compose_path, "rendered Compose candidate", 2 * 1024 * 1024
+        )
         document = json.loads(raw.decode("utf-8"))
-        validate_candidate_compose(document)
+        validate_candidate_compose(document, composite=composite)
         validate_tls_snippet(installed_tls_snippet)
         validate_route_bytes(
             route_to_validate,
             installed_route,
             Path(args.approved_route),
         )
+        if monflorian_route_to_validate is not None:
+            validate_monflorian_route_bytes(
+                monflorian_route_to_validate,
+                None,
+                Path(args.approved_monflorian_route),
+                allow_placeholder=args.candidate_only,
+            )
     except (CandidateError, json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
-        print(f"Surplasse public edge candidate validation failed: {exc}", file=sys.stderr)
+        print(
+            f"Surplasse public edge candidate validation failed: {exc}", file=sys.stderr
+        )
         return 1
     route_evidence = (
         "repository candidate only; no installed route was inspected"
