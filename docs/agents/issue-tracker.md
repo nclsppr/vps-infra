@@ -5,8 +5,8 @@ Issues and specifications for this repository live in GitHub Issues. Use the `gh
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for a multiline body.
-- **Read an issue**: `gh issue view <number> --comments`. Fetch labels and use `jq` when the output needs filtering.
-- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'`. Add `--label` and `--state` filters as needed.
+- **Read an issue**: `gh issue view <number> --json number,title,body,author,createdAt,updatedAt,state,labels,comments`.
+- **List issues**: `gh issue list --state open --limit 1000 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'`. Add `--label` and `--state` filters as needed.
 - **Comment on an issue**: `gh issue comment <number> --body "..."`.
 - **Apply or remove labels**: `gh issue edit <number> --add-label "..."` or `gh issue edit <number> --remove-label "..."`.
 - **Close an issue**: `gh issue close <number> --comment "..."`.
@@ -20,7 +20,7 @@ Infer the repository from `git remote -v`. The `gh` CLI does this when it runs i
 When the value is `yes`, process pull requests with the same labels and states as issues:
 
 - **Read a pull request**: `gh pr view <number> --comments` and `gh pr diff <number>`.
-- **List external pull requests for triage**: `gh pr list --state open --json number,title,body,labels,author,authorAssociation,comments`. Keep `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, and `NONE`. Drop `OWNER`, `MEMBER`, and `COLLABORATOR`.
+- **List external pull requests for triage**: `gh api --paginate 'repos/{owner}/{repo}/pulls?state=open&per_page=100' | jq -s 'add | map(select(.author_association == "CONTRIBUTOR" or .author_association == "FIRST_TIME_CONTRIBUTOR" or .author_association == "NONE"))'`.
 - **Comment, label, or close**: use `gh pr comment`, `gh pr edit --add-label` or `--remove-label`, and `gh pr close`.
 
 GitHub uses one number sequence for issues and pull requests. Resolve a bare `#42` with `gh pr view 42`, then fall back to `gh issue view 42`.
