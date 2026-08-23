@@ -54,6 +54,7 @@
       mode: "0755"
     - path: /usr/local/share/vps-infra/contracts
       mode: "0755"
+  when: vps_parkventory_postgres_state == 'prepare'
 
 - name: Install the exact Parkventory PostgreSQL contract
   ansible.builtin.copy:
@@ -62,6 +63,7 @@
     owner: root
     group: root
     mode: "0444"
+  when: vps_parkventory_postgres_state == 'prepare'
 
 - name: Install the root-only Parkventory database helpers
   ansible.builtin.copy:
@@ -71,6 +73,114 @@
     group: root
     mode: "0500"
   loop: "{{ vps_parkventory_postgres_helpers }}"
+  when: vps_parkventory_postgres_state == 'prepare'
+
+- name: Inspect protected Parkventory artifact directories without changing them
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+  loop:
+    - path: /usr/local/libexec/vps
+      mode: "0755"
+    - path: /usr/local/share/vps-infra/contracts
+      mode: "0755"
+  register: vps_parkventory_postgres_directory_inspections
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Prove protected Parkventory artifact directories without changing them
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isdir
+      - not item.stat.islnk
+      - item.stat.pw_name == 'root'
+      - item.stat.gr_name == 'root'
+      - item.stat.mode == item.item.mode
+    fail_msg: >-
+      Installed Parkventory artifact directory metadata differs from the
+      reviewed source contract.
+  loop: "{{ vps_parkventory_postgres_directory_inspections.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Inspect the installed Parkventory PostgreSQL contract without changing it
+  ansible.builtin.stat:
+    path: "{{ vps_parkventory_postgres_contract }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: vps_parkventory_postgres_contract_inspection
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Prove the installed Parkventory PostgreSQL contract without changing it
+  ansible.builtin.assert:
+    that:
+      - vps_parkventory_postgres_contract_inspection.stat.exists
+      - vps_parkventory_postgres_contract_inspection.stat.isreg
+      - not vps_parkventory_postgres_contract_inspection.stat.islnk
+      - vps_parkventory_postgres_contract_inspection.stat.nlink == 1
+      - vps_parkventory_postgres_contract_inspection.stat.pw_name == 'root'
+      - vps_parkventory_postgres_contract_inspection.stat.gr_name == 'root'
+      - vps_parkventory_postgres_contract_inspection.stat.mode == '0444'
+      - >-
+        vps_parkventory_postgres_contract_inspection.stat.checksum ==
+        (lookup(
+          'ansible.builtin.file',
+          playbook_dir ~ '/../../applications/parkventory/postgres.json',
+          rstrip=false
+        ) | hash('sha256'))
+    fail_msg: >-
+      Installed Parkventory PostgreSQL contract bytes or metadata differ from
+      the reviewed source.
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Inspect installed Parkventory database helpers without changing them
+  ansible.builtin.stat:
+    path: "/usr/local/libexec/vps/{{ item }}"
+    follow: false
+    get_checksum: true
+    checksum_algorithm: sha256
+  loop: "{{ vps_parkventory_postgres_helpers }}"
+  register: vps_parkventory_postgres_helper_inspections
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
+
+- name: Prove installed Parkventory database helpers without changing them
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+      - item.stat.nlink == 1
+      - item.stat.pw_name == 'root'
+      - item.stat.gr_name == 'root'
+      - item.stat.mode == '0500'
+      - >-
+        item.stat.checksum ==
+        (lookup(
+          'ansible.builtin.file',
+          playbook_dir ~ '/../../scripts/' ~ item.item,
+          rstrip=false
+        ) | hash('sha256'))
+    fail_msg: >-
+      Installed Parkventory database helper bytes or metadata differ from the
+      reviewed source.
+  loop: "{{ vps_parkventory_postgres_helper_inspections.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - vps_parkventory_postgres_state in ['check', 'dry-run']
+    - not ansible_check_mode
 
 - name: Read the internal platform and Docker service state
   ansible.builtin.service_facts:

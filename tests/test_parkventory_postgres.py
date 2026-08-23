@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -796,6 +798,49 @@ class ParkventoryPostgresTests(unittest.TestCase):
         self.assertNotIn("Caddyfile", role)
         self.assertNotIn("OVH", role)
         self.assertNotIn("dig\n", role)
+
+    def test_role_check_proves_installed_artifacts_without_rewriting_them(
+        self,
+    ) -> None:
+        tasks = yaml.safe_load(
+            (
+                ROOT / "ansible/roles/parkventory_postgres/tasks/main.yml"
+            ).read_text(encoding="utf-8")
+        )
+        by_name = {task["name"]: task for task in tasks}
+        copy_tasks = [task for task in tasks if "ansible.builtin.copy" in task]
+        self.assertEqual(len(copy_tasks), 2)
+        for task in copy_tasks:
+            self.assertEqual(
+                task["when"],
+                "vps_parkventory_postgres_state == 'prepare'",
+            )
+
+        contract_inspection = by_name[
+            "Inspect the installed Parkventory PostgreSQL contract without changing it"
+        ]
+        self.assertEqual(
+            contract_inspection["ansible.builtin.stat"]["checksum_algorithm"],
+            "sha256",
+        )
+        helper_inspection = by_name[
+            "Inspect installed Parkventory database helpers without changing them"
+        ]
+        self.assertEqual(
+            helper_inspection["ansible.builtin.stat"]["checksum_algorithm"],
+            "sha256",
+        )
+        for name in (
+            "Prove the installed Parkventory PostgreSQL contract without changing it",
+            "Prove installed Parkventory database helpers without changing them",
+        ):
+            task = by_name[name]
+            proof = "\n".join(task["ansible.builtin.assert"]["that"])
+            self.assertIn(".stat.checksum ==", proof)
+            self.assertIn(".stat.nlink == 1", proof)
+            self.assertIn(".stat.pw_name == 'root'", proof)
+            self.assertIn(".stat.gr_name == 'root'", proof)
+            self.assertIn("not ansible_check_mode", task["when"])
 
 
 if __name__ == "__main__":
