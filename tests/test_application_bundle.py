@@ -48,24 +48,35 @@ def components(profile):
 
 def fixture_files(profile):
     component_references = components(profile)
-    probes = BUNDLE._expected_probes(profile)
-    migrations = {
-        "contract": profile.migration_contract,
-        "database": profile.application,
-        "migrations": [
-            {
-                "path": "backend/src/main/resources/db/migration/V1__baseline.sql",
-                "sha256": "a" * 64,
-                "version": 1,
-            }
-        ],
-        "runtime_auto_migrate": False,
-        "schema": 1,
-        "source_repository": profile.source_repository,
-        "source_revision": REVISION,
-    }
-    if profile.application == "surplasse":
-        migrations["runner"] = profile.migration_runner
+    probes = BUNDLE._expected_probes(profile, REVISION)
+    if profile.migration_strategy == "none":
+        migrations = {
+            "contract": profile.migration_contract,
+            "migrations": [],
+            "runtime_auto_migrate": False,
+            "schema": 1,
+            "source_repository": profile.source_repository,
+            "source_revision": REVISION,
+            "strategy": "none",
+        }
+    else:
+        migrations = {
+            "contract": profile.migration_contract,
+            "database": profile.application,
+            "migrations": [
+                {
+                    "path": "backend/src/main/resources/db/migration/V1__baseline.sql",
+                    "sha256": "a" * 64,
+                    "version": 1,
+                }
+            ],
+            "runtime_auto_migrate": False,
+            "schema": 1,
+            "source_repository": profile.source_repository,
+            "source_revision": REVISION,
+        }
+        if profile.application == "surplasse":
+            migrations["runner"] = profile.migration_runner
     raw: dict[str, bytes] = {}
     for path in profile.runtime_paths:
         raw[path] = f"fixture for {path}\n".encode()
@@ -99,21 +110,23 @@ def fixture_files(profile):
     )
     raw["migrations.json"] = BUNDLE.canonical_json(migrations)
     raw["probes.json"] = BUNDLE.canonical_json(probes)
-    if profile.application == "surplasse":
-        raw["pilot-bootstrap.schema.json"] = (
-            ROOT / "schemas/surplasse-pilot-bootstrap.schema.json"
-        ).read_bytes()
+    if "expected-images.json" in profile.runtime_paths:
+        expected_images = dict(component_references)
+        if profile.migration_strategy == "dedicated":
+            expected_images["migrator"] = component_references["backend"]
+        if profile.application == "surplasse":
+            expected_images["pilot-bootstrap"] = component_references["backend"]
         raw["expected-images.json"] = BUNDLE.canonical_json(
             {
-                "images": {
-                    **component_references,
-                    "migrator": component_references["backend"],
-                    "pilot-bootstrap": component_references["backend"],
-                },
+                "images": expected_images,
                 "schema": 1,
                 "source_revision": REVISION,
             }
         )
+    if profile.application == "surplasse":
+        raw["pilot-bootstrap.schema.json"] = (
+            ROOT / "schemas/surplasse-pilot-bootstrap.schema.json"
+        ).read_bytes()
     return raw, component_references
 
 
@@ -231,6 +244,46 @@ class ApplicationBundleTests(unittest.TestCase):
                 )
                 self.assertEqual(parsed.application, profile.application)
                 self.assertEqual(tuple(sorted(parsed.files)), profile.runtime_paths)
+
+    def test_monflorian_profile_has_no_database_or_migration_runner(self):
+        profile = BUNDLE.PROFILES["monflorian"]
+        self.assertEqual(tuple(profile.component_repositories), ("backend",))
+        self.assertEqual(profile.migration_strategy, "none")
+        self.assertIsNone(profile.migration_runner)
+        self.assertEqual(
+            profile.credential_files,
+            {
+                "monflorian_openai_api_key": (
+                    "/etc/vps/secrets/monflorian/monflorian-openai-api-key"
+                )
+            },
+        )
+        self.assertEqual(
+            BUNDLE._expected_contract(profile, REVISION)["networks"],
+            ["app_monflorian"],
+        )
+        files, component_references = fixture_files(profile)
+        migrations = json.loads(files["migrations.json"])
+        migrations["database"] = "monflorian"
+        files["migrations.json"] = BUNDLE.canonical_json(migrations)
+        with self.assertRaisesRegex(
+            BUNDLE.ApplicationBundleError,
+            "exact no-migration policy",
+        ):
+            BUNDLE.validate_bundle(
+                build_archive(profile, files),
+                build_inventory(profile, files),
+                profile=profile,
+                revision=REVISION,
+                created=CREATED,
+                component_references=component_references,
+                migration_inventory_digest=BUNDLE.content_digest(
+                    files["migrations.json"]
+                ),
+                probe_inventory_digest=BUNDLE.content_digest(
+                    files["probes.json"]
+                ),
+            )
 
     def test_release_inventory_hashes_bind_exact_canonical_bytes(self):
         profile = BUNDLE.PROFILES["parkventory"]

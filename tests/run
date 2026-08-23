@@ -17,6 +17,7 @@ readonly PLATFORM_INTEGRATION="ghcr.io/nclsppr/vps-infra/platform-integration@sh
 readonly CADDY_IMAGE="ghcr.io/nclsppr/vps-infra/caddy:sha-$VALID_SHA@sha256:$VALID_DIGEST"
 readonly SURPLASSE_RELEASE="ghcr.io/nclsppr/surplasse/application-release@sha256:$VALID_DIGEST"
 readonly PARKVENTORY_RELEASE="ghcr.io/nclsppr/parkventory/application-release@sha256:$VALID_DIGEST"
+readonly MONFLORIAN_RELEASE="ghcr.io/nclsppr/monflorian/application-release@sha256:$VALID_DIGEST"
 
 if [[ $EUID -eq 0 ]]; then
   command -v setpriv >/dev/null 2>&1 || {
@@ -104,6 +105,7 @@ papersempire_command="deploy-static-live papersempire $VALID_SHA $PAPERSEMPIRE_S
 parkventory_command="deploy-static-live parkventory $VALID_SHA $PARKVENTORY_SITE $PARKVENTORY_ROUTES $VALID_SHA $PLATFORM_INTEGRATION ghcr.io/nclsppr/vps-infra/caddy:release_1.2-3@sha256:$VALID_DIGEST"
 surplasse_application_command="deploy-application-live surplasse $VALID_SHA $SURPLASSE_RELEASE"
 parkventory_application_command="deploy-application-live parkventory $VALID_SHA $PARKVENTORY_RELEASE"
+monflorian_application_command="deploy-application-live monflorian $VALID_SHA $MONFLORIAN_RELEASE"
 
 for valid in \
   "$personal_command" \
@@ -115,7 +117,8 @@ done
 
 for valid in \
   "$surplasse_application_command" \
-  "$parkventory_application_command"; do
+  "$parkventory_application_command" \
+  "$monflorian_application_command"; do
   parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "$valid")
   [[ $parsed == "$valid" ]]
 done
@@ -146,6 +149,7 @@ for invalid in \
   "deploy-application-live unknown $VALID_SHA $SURPLASSE_RELEASE" \
   "deploy-application-live surplasse 0123456789ABCDEF0123456789ABCDEF01234567 $SURPLASSE_RELEASE" \
   "deploy-application-live surplasse $VALID_SHA $PARKVENTORY_RELEASE" \
+  "deploy-application-live monflorian $VALID_SHA $SURPLASSE_RELEASE" \
   "deploy-application-live surplasse $VALID_SHA ghcr.io/nclsppr/surplasse/application-release:latest@sha256:$VALID_DIGEST" \
   "deploy-application-live surplasse $VALID_SHA ghcr.io/nclsppr/surplasse/application-release@sha256:${VALID_DIGEST%?}" \
   "${surplasse_application_command}; id" \

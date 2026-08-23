@@ -652,7 +652,11 @@ class ApplicationControllerTests(unittest.TestCase):
         recover.assert_not_called()
         self.assertEqual(
             cleanup.call_args_list,
-            [mock.call("parkventory"), mock.call("surplasse")],
+            [
+                mock.call("monflorian"),
+                mock.call("parkventory"),
+                mock.call("surplasse"),
+            ],
         )
 
     def test_boot_recovery_with_a_journal_requires_the_full_runtime(self):
@@ -677,7 +681,11 @@ class ApplicationControllerTests(unittest.TestCase):
         runtime.assert_called_once_with()
         self.assertEqual(
             recover.call_args_list,
-            [mock.call("parkventory"), mock.call("surplasse")],
+            [
+                mock.call("monflorian"),
+                mock.call("parkventory"),
+                mock.call("surplasse"),
+            ],
         )
 
     def test_parkventory_static_owner_refuses_compose_before_state_changes(self):
@@ -1242,6 +1250,67 @@ class ApplicationControllerTests(unittest.TestCase):
         )
         self.assertIn(["--profile", "migration"], [prefix[index:index + 2] for index in range(len(prefix) - 1)])
         self.assertIn(["--profile", "pilot-bootstrap"], [prefix[index:index + 2] for index in range(len(prefix) - 1)])
+
+    def test_monflorian_has_one_backend_and_no_migration_execution(self):
+        candidate = state("monflorian")
+        profile = CONTROLLER.PROFILES["monflorian"]
+        self.assertEqual(
+            CONTROLLER.expected_service_images(candidate),
+            {"backend": candidate.component_references["backend"]},
+        )
+        prefix = CONTROLLER.compose_prefix(Path("/release"), profile)
+        self.assertNotIn("--profile", prefix)
+        rendered = {
+            "services": {
+                "backend": {
+                    "environment": {"MONFLORIAN_ACCESS_MODE": "public"},
+                    "secrets": [
+                        {
+                            "source": "monflorian_openai_api_key",
+                            "target": "monflorian_openai_api_key",
+                        }
+                    ],
+                    "user": "10001:10001",
+                }
+            }
+        }
+        CONTROLLER.validate_application_compose_semantics(profile, rendered)
+        with (
+            mock.patch.object(CONTROLLER, "_compose_for_state") as compose,
+            mock.patch.object(CONTROLLER, "_run_bounded") as docker,
+        ):
+            CONTROLLER.run_migration(candidate)
+            CONTROLLER.require_migration_container_absent(candidate)
+            CONTROLLER.remove_migration_container(candidate)
+        compose.assert_not_called()
+        docker.assert_not_called()
+
+    def test_monflorian_openai_secret_metadata_is_exact(self):
+        profile = CONTROLLER.PROFILES["monflorian"]
+        rendered = {
+            "secrets": {
+                "monflorian_openai_api_key": {
+                    "file": (
+                        "/etc/vps/secrets/monflorian/"
+                        "monflorian-openai-api-key"
+                    )
+                }
+            }
+        }
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_directory"),
+            mock.patch.object(CONTROLLER, "require_protected_file") as secret,
+        ):
+            CONTROLLER.validate_secret_metadata(profile, rendered)
+        secret.assert_called_once_with(
+            Path(
+                "/etc/vps/secrets/monflorian/monflorian-openai-api-key"
+            ),
+            "monflorian secret monflorian_openai_api_key",
+            allowed_modes=frozenset({0o440}),
+            maximum_size=64 * 1024,
+            expected_gid=10001,
+        )
 
     def test_file_secrets_are_host_private_and_container_readable(self):
         profile = CONTROLLER.PROFILES["parkventory"]

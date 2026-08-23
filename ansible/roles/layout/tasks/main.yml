@@ -7,7 +7,7 @@
         ['papersempire', 'parkventory', 'personal']
       - >-
         vps_docker_networks | map(attribute='name') | list | sort ==
-        ['app_parkventory', 'app_surplasse', 'db_monitoring',
+        ['app_monflorian', 'app_parkventory', 'app_surplasse', 'db_monitoring',
          'db_parkventory', 'db_surplasse', 'edge', 'ops']
       - >-
         vps_docker_networks | map(attribute='name') | unique | length ==
@@ -26,6 +26,9 @@
         vps_docker_networks | selectattr('name', 'equalto', 'db_parkventory') |
         map(attribute='subnet') | list == ['172.30.21.0/24']
       - >-
+        vps_docker_networks | selectattr('name', 'equalto', 'app_monflorian') |
+        map(attribute='subnet') | list == ['172.30.40.0/24']
+      - >-
         vps_docker_networks | selectattr('name', 'equalto', 'ops') |
         map(attribute='subnet') | list == ['172.30.30.0/24']
       - >-
@@ -41,7 +44,7 @@
       - >-
         vps_docker_networks | selectattr('internal', 'equalto', false) |
         map(attribute='name') | list | sort ==
-        ['app_parkventory', 'app_surplasse', 'edge', 'ops']
+        ['app_monflorian', 'app_parkventory', 'app_surplasse', 'edge', 'ops']
       - vps_static_jobs_backing_path == '/run/private/vps-static-jobs'
       - >-
         vps_static_jobs_mount_unit ==
@@ -49,7 +52,7 @@
       - vps_static_jobs_tmpfs_size_mib | int == 384
       - vps_static_jobs_tmpfs_inodes | int == 16384
     fail_msg: >-
-      The static roots and seven external networks are a platform contract. A
+      The static roots and eight external networks are a platform contract. A
       change requires an explicit decision.
 
 - name: Create stable platform directories

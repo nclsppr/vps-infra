@@ -66,6 +66,10 @@ vps_docker_networks:
     driver: bridge
     internal: true
     subnet: 172.30.21.0/24
+  - name: app_monflorian
+    driver: bridge
+    internal: false
+    subnet: 172.30.40.0/24
   - name: ops
     driver: bridge
     internal: false

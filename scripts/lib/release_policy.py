@@ -31,6 +31,7 @@ EXPECTED_APPLICATIONS = {
     "papersempire": ("static", "nclsppr/papersempire", "main", None),
     "surplasse": ("compose", "nclsppr/surplasse", "main", "surplasse"),
     "parkventory": ("compose", "nclsppr/parkventory", "main", "parkventory"),
+    "monflorian": ("compose", "nclsppr/monflorian", "main", "monflorian"),
 }
 
 PLATFORM_IMAGE_REPOSITORIES = {
@@ -69,11 +70,15 @@ COMPOSE_COMPONENT_REPOSITORIES = {
         "backend": "ghcr.io/nclsppr/parkventory/backend",
         "frontend": "ghcr.io/nclsppr/parkventory/frontend",
     },
+    "monflorian": {
+        "backend": "ghcr.io/nclsppr/monflorian/backend",
+    },
 }
 
 INTEGRATION_REPOSITORIES = {
     "surplasse": "ghcr.io/nclsppr/surplasse/vps-integration",
     "parkventory": "ghcr.io/nclsppr/parkventory/vps-integration",
+    "monflorian": "ghcr.io/nclsppr/monflorian/vps-integration",
 }
 
 SURPLASSE_READINESS_GATES = frozenset(
@@ -113,6 +118,21 @@ PARKVENTORY_READINESS_GATES = frozenset(
         "separated-migrations",
         "structured-logs",
         "tenant-isolation-and-rls",
+        "vps-integration-bundle",
+    }
+)
+
+MONFLORIAN_READINESS_GATES = frozenset(
+    {
+        "application-release",
+        "domain-and-dns",
+        "edge-network-attachment",
+        "file-based-secrets",
+        "openai-api-access",
+        "private-edge-access",
+        "protected-main",
+        "public-smoke",
+        "recovery-policy",
         "vps-integration-bundle",
     }
 )
@@ -356,12 +376,19 @@ def _validate_migrations(
     enabled: bool,
     repository: str,
     allowed_revisions: set[str],
+    expected_strategy: str,
 ) -> None:
     migrations = _expect_dict(value, path)
     required = {"strategy", "runtime_auto_migrate", "proven"}
     optional = {"evidence"} if enabled else set()
     _expect_exact_keys(migrations, path, required, optional)
     _expect_literal(migrations["runtime_auto_migrate"], False, f"{path}.runtime_auto_migrate")
+    if expected_strategy == "none":
+        if "evidence" in migrations:
+            _fail(path, "no-migration application must not declare migration evidence")
+        _expect_literal(migrations["strategy"], "none", f"{path}.strategy")
+        _expect_literal(migrations["proven"], True, f"{path}.proven")
+        return
     if enabled:
         _expect_literal(migrations["strategy"], "dedicated", f"{path}.strategy")
         _expect_literal(migrations["proven"], True, f"{path}.proven")
@@ -603,9 +630,12 @@ def _validate_compose_application(name: str, app: dict[str, Any], enabled: bool)
         f"{app_path}.blocked_by",
         required_nonempty=not enabled,
     )
-    expected_gates = (
-        PARKVENTORY_READINESS_GATES if name == "parkventory" else SURPLASSE_READINESS_GATES
-    )
+    expected_gates = {
+        "surplasse": SURPLASSE_READINESS_GATES,
+        "parkventory": PARKVENTORY_READINESS_GATES,
+        "monflorian": MONFLORIAN_READINESS_GATES,
+    }[name]
+    migration_strategy = "none" if name == "monflorian" else "dedicated"
 
     if not enabled:
         unexpected = release_keys & app.keys()
@@ -626,6 +656,7 @@ def _validate_compose_application(name: str, app: dict[str, Any], enabled: bool)
             enabled=False,
             repository=app["source_repository"],
             allowed_revisions=set(),
+            expected_strategy=migration_strategy,
         )
         return
 
@@ -683,6 +714,7 @@ def _validate_compose_application(name: str, app: dict[str, Any], enabled: bool)
         enabled=True,
         repository=app["source_repository"],
         allowed_revisions=declared_revisions,
+        expected_strategy=migration_strategy,
     )
     if name == "surplasse":
         _fail(

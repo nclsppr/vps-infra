@@ -406,7 +406,13 @@
       mode: "0755"
     - path: "{{ vps_application_root }}/parkventory/releases"
       mode: "0755"
+    - path: "{{ vps_application_root }}/monflorian"
+      mode: "0755"
+    - path: "{{ vps_application_root }}/monflorian/releases"
+      mode: "0755"
     - path: "{{ vps_application_config_dir }}"
+      mode: "0700"
+    - path: /etc/vps/secrets/monflorian
       mode: "0700"
     - path: "{{ vps_application_state_dir }}"
       mode: "0700"
@@ -422,6 +428,54 @@
       mode: "0755"
   loop_control:
     label: "{{ item.path }}"
+
+- name: Validate the private Mon Florian OpenAI secret input contract
+  ansible.builtin.assert:
+    that:
+      - vps_monflorian_openai_api_key_source is string
+      - "'\n' not in vps_monflorian_openai_api_key_source"
+      - "'\r' not in vps_monflorian_openai_api_key_source"
+      - >-
+        vps_monflorian_openai_api_key_path ==
+        '/etc/vps/secrets/monflorian/monflorian-openai-api-key'
+    fail_msg: The private Mon Florian OpenAI secret input contract is invalid.
+  no_log: true
+
+- name: Materialize the Mon Florian OpenAI secret from private operator input
+  ansible.builtin.copy:
+    src: "{{ vps_monflorian_openai_api_key_source }}"
+    dest: "{{ vps_monflorian_openai_api_key_path }}"
+    owner: root
+    group: "10001"
+    mode: "0440"
+    force: true
+    backup: false
+  when: vps_monflorian_openai_api_key_source | length > 0
+  no_log: true
+
+- name: Inspect the Mon Florian OpenAI secret without reading its value
+  ansible.builtin.stat:
+    path: "{{ vps_monflorian_openai_api_key_path }}"
+    follow: false
+    get_checksum: false
+    get_mime: false
+  register: vps_monflorian_openai_api_key_stat
+  no_log: true
+
+- name: Prove the Mon Florian OpenAI secret metadata when present
+  ansible.builtin.assert:
+    that:
+      - vps_monflorian_openai_api_key_stat.stat.isreg
+      - not vps_monflorian_openai_api_key_stat.stat.islnk
+      - vps_monflorian_openai_api_key_stat.stat.uid == 0
+      - vps_monflorian_openai_api_key_stat.stat.gid == 10001
+      - vps_monflorian_openai_api_key_stat.stat.mode == '0440'
+      - vps_monflorian_openai_api_key_stat.stat.nlink == 1
+      - vps_monflorian_openai_api_key_stat.stat.size > 0
+      - vps_monflorian_openai_api_key_stat.stat.size <= 65536
+    fail_msg: The Mon Florian OpenAI secret metadata is outside its contract.
+  when: vps_monflorian_openai_api_key_stat.stat.exists
+  no_log: true
 
 - name: Select the pinned GitHub CLI archive for this architecture
   ansible.builtin.set_fact:

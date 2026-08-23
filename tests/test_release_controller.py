@@ -190,6 +190,32 @@ def enable_surplasse(manifest: dict) -> None:
     }
 
 
+def enable_monflorian(manifest: dict) -> None:
+    enable_platform(manifest)
+    app = manifest["applications"]["monflorian"]
+    app["enabled"] = True
+    app["blocked_by"] = []
+    app["components"] = {
+        "backend": {
+            "source_revision": SHA_A,
+            "image": image("ghcr.io/nclsppr/monflorian/backend"),
+        }
+    }
+    app["integration"] = {
+        "source_revision": SHA_A,
+        "artifact": image("ghcr.io/nclsppr/monflorian/vps-integration"),
+    }
+    app["migrations"] = {
+        "strategy": "none",
+        "runtime_auto_migrate": False,
+        "proven": True,
+    }
+    app["readiness_evidence"] = {
+        gate: evidence("nclsppr/monflorian")
+        for gate in RELEASE_POLICY.MONFLORIAN_READINESS_GATES
+    }
+
+
 def enable_static(manifest: dict, name: str) -> None:
     enable_platform(manifest)
     app = manifest["applications"][name]
@@ -446,6 +472,23 @@ class ReleasePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "locked forbids"):
             RELEASE_POLICY.validate_manifest(manifest)
 
+    def test_monflorian_candidate_has_no_database_or_migrator_evidence(self) -> None:
+        manifest = sample_manifest()
+        enable_monflorian(manifest)
+        with self.assertRaisesRegex(RELEASE_POLICY.PolicyError, "locked forbids"):
+            RELEASE_POLICY.validate_manifest(manifest)
+
+        for field, value in (
+            ("database", "monflorian"),
+            ("runner", "/bin/true"),
+            ("evidence", evidence("nclsppr/monflorian")),
+        ):
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(manifest)
+                candidate["applications"]["monflorian"]["migrations"][field] = value
+                with self.assertRaises(RELEASE_POLICY.PolicyError):
+                    RELEASE_POLICY.validate_manifest(candidate)
+
     def test_missing_parkventory_readiness_gate_is_rejected(self) -> None:
         manifest = sample_manifest()
         enable_parkventory(manifest)
@@ -553,11 +596,12 @@ def healthcheck() -> dict:
 
 
 def external_networks(project: str) -> dict:
-    names = (
-        COMPOSE_POLICY.PLATFORM_NETWORKS
-        if project == "vps-platform"
-        else {f"app_{project}", f"db_{project}"}
-    )
+    if project == "vps-platform":
+        names = COMPOSE_POLICY.PLATFORM_NETWORKS
+    elif COMPOSE_POLICY.APPLICATION_MIGRATION_STRATEGIES.get(project) == "none":
+        names = {f"app_{project}"}
+    else:
+        names = {f"app_{project}", f"db_{project}"}
     return {name: {"name": name, "external": True} for name in names}
 
 
@@ -604,11 +648,12 @@ def apply_platform_runtime(service_name: str, service: dict) -> None:
 
 def app_document(project: str = "surplasse") -> dict:
     components = COMPOSE_POLICY.APPLICATION_COMPONENTS[project]
+    migration_strategy = COMPOSE_POLICY.APPLICATION_MIGRATION_STRATEGIES[project]
     services = {}
     for component in components:
         networks = (
             {f"app_{project}", f"db_{project}"}
-            if component == "backend"
+            if component == "backend" and migration_strategy == "dedicated"
             else {f"app_{project}"}
         )
         services[component] = hardened_service(
@@ -618,14 +663,15 @@ def app_document(project: str = "surplasse") -> dict:
         services[component]["networks"][f"app_{project}"] = {
             "aliases": [f"{project}-{component}"]
         }
-    migrator = hardened_service(
-        services["backend"]["image"],
-        {f"db_{project}"},
-    )
-    migrator["profiles"] = ["migration"]
-    migrator["restart"] = "no"
-    migrator.pop("healthcheck")
-    services["migrator"] = migrator
+    if migration_strategy == "dedicated":
+        migrator = hardened_service(
+            services["backend"]["image"],
+            {f"db_{project}"},
+        )
+        migrator["profiles"] = ["migration"]
+        migrator["restart"] = "no"
+        migrator.pop("healthcheck")
+        services["migrator"] = migrator
     return {
         "name": project,
         "services": services,
@@ -1013,6 +1059,41 @@ class ComposePolicyTests(unittest.TestCase):
     def test_application_without_host_ports_is_valid(self) -> None:
         document = app_document()
         validate_app_document(document)
+
+    def test_monflorian_compose_has_one_backend_and_one_file_secret(self) -> None:
+        document = app_document("monflorian")
+        backend = document["services"]["backend"]
+        backend["environment"] = {
+            "OPENAI_API_KEY_FILE": "/run/secrets/monflorian_openai_api_key"
+        }
+        backend["secrets"] = [
+            {
+                "source": "monflorian_openai_api_key",
+                "target": "monflorian_openai_api_key",
+            }
+        ]
+        document["secrets"] = {
+            "monflorian_openai_api_key": {
+                "name": "monflorian_openai_api_key",
+                "file": (
+                    "/etc/vps/secrets/monflorian/"
+                    "monflorian-openai-api-key"
+                ),
+            }
+        }
+        validate_app_document(document)
+        self.assertEqual(set(document["services"]), {"backend"})
+        self.assertEqual(set(document["networks"]), {"app_monflorian"})
+
+        changed = copy.deepcopy(document)
+        changed["services"]["backend"]["secrets"][0]["target"] = (
+            "/run/secrets/monflorian_openai_api_key"
+        )
+        with self.assertRaisesRegex(
+            COMPOSE_POLICY.ComposePolicyError,
+            "must equal monflorian_openai_api_key",
+        ):
+            validate_app_document(changed)
 
     def test_surplasse_adapter_enforces_the_one_shot_migration_boundary(self) -> None:
         document = surplasse_adapter_document()

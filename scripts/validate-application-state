@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 
-APPLICATIONS = ("personal", "papersempire", "surplasse", "parkventory")
+APPLICATIONS = (
+    "personal",
+    "papersempire",
+    "surplasse",
+    "parkventory",
+    "monflorian",
+)
 PLATFORM_TARGETS = frozenset({"caddy.yml", "node-exporter.yml", "postgres-exporter.yml"})
 PLATFORM_RULES = frozenset({"platform.yml"})
 SURPLASSE_TARGET_REFERENCE = "/etc/prometheus/targets/surplasse.yml"

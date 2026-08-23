@@ -230,7 +230,7 @@ records the active tuples without making them a mutable configuration source.
 
 ## Network boundaries
 
-Ansible creates seven external Docker networks. The isolated public static
+Ansible creates eight external Docker networks. The isolated public static
 edge joins only `edge`. The internal platform uses `ops`, `db_monitoring`, and
 the private Surplasse database network:
 
@@ -243,6 +243,7 @@ the private Surplasse database network:
 | `db_surplasse` | `172.30.11.0/24` | PostgreSQL |
 | `app_parkventory` | `172.30.20.0/24` | None |
 | `db_parkventory` | `172.30.21.0/24` | None |
+| `app_monflorian` | `172.30.40.0/24` | None |
 
 A reviewed application integration package attaches only the required
 services to an application network. It must use a unique alias such as

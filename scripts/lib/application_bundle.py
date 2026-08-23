@@ -87,8 +87,9 @@ class BundleProfile:
     archive_directories: tuple[str, ...]
     contract_name: str
     migration_contract: str
+    migration_strategy: str
+    migration_runner: str | None
     probe_contract: str
-    migration_runner: str
     default_public_host: str
     public_hosts: tuple[str, ...]
     runtime_configuration_keys: tuple[str, ...]
@@ -157,6 +158,18 @@ PARKVENTORY_PATHS = tuple(
         )
     )
 )
+MONFLORIAN_PATHS = tuple(
+    sorted(
+        (
+            "caddy/monflorian.caddy",
+            "compose.yaml",
+            "contract.json",
+            "expected-images.json",
+            "migrations.json",
+            "probes.json",
+        )
+    )
+)
 
 PROFILES: Mapping[str, BundleProfile] = {
     "surplasse": BundleProfile(
@@ -189,8 +202,9 @@ PROFILES: Mapping[str, BundleProfile] = {
         ),
         contract_name="surplasse.vps-integration",
         migration_contract="surplasse.flyway-migrations",
-        probe_contract="surplasse.probes",
+        migration_strategy="dedicated",
         migration_runner="/opt/surplasse/scripts/backend-migrate.sh",
+        probe_contract="surplasse.probes",
         default_public_host="surplasse.com",
         public_hosts=(
             "surplasse.com",
@@ -267,8 +281,9 @@ PROFILES: Mapping[str, BundleProfile] = {
         ),
         contract_name="parkventory.vps-integration",
         migration_contract="parkventory.flyway-migrations",
-        probe_contract="parkventory.probes",
+        migration_strategy="dedicated",
         migration_runner="/opt/parkventory/bin/backend-migrate",
+        probe_contract="parkventory.probes",
         default_public_host="parkventory.com",
         public_hosts=("parkventory.com", "www.parkventory.com"),
         runtime_configuration_keys=(
@@ -300,6 +315,43 @@ PROFILES: Mapping[str, BundleProfile] = {
         },
         credential_gid=10001,
         image_version_prefix="sha-",
+    ),
+    "monflorian": BundleProfile(
+        application="monflorian",
+        source_repository="nclsppr/monflorian",
+        integration_repository="ghcr.io/nclsppr/monflorian/vps-integration",
+        release_signer_workflow=(
+            "nclsppr/monflorian/.github/workflows/vps-integration.yml"
+        ),
+        integration_signer_workflow=(
+            "nclsppr/monflorian/.github/workflows/vps-integration.yml"
+        ),
+        component_signer_workflow=(
+            "nclsppr/monflorian/.github/workflows/images.yml"
+        ),
+        component_repositories={
+            "backend": "ghcr.io/nclsppr/monflorian/backend",
+        },
+        runtime_paths=MONFLORIAN_PATHS,
+        archive_directories=("integration", "integration/caddy"),
+        contract_name="monflorian.vps-integration",
+        migration_contract="monflorian.migrations",
+        migration_strategy="none",
+        migration_runner=None,
+        probe_contract="monflorian.probes",
+        default_public_host="monflorian.com",
+        public_hosts=("monflorian.com", "www.monflorian.com"),
+        runtime_configuration_keys=(),
+        credential_files={
+            "monflorian_openai_api_key": (
+                "/etc/vps/secrets/monflorian/monflorian-openai-api-key"
+            )
+        },
+        service_credentials={
+            "backend": ("monflorian_openai_api_key",),
+        },
+        credential_gid=10001,
+        image_version_prefix="",
     ),
 }
 
@@ -575,23 +627,32 @@ def _archive_files(
 
 
 def _expected_contract(profile: BundleProfile, revision: str) -> dict[str, object]:
+    dedicated_migrations = profile.migration_strategy == "dedicated"
     common: dict[str, object] = {
         "application": profile.application,
         "compose_project": profile.application,
         "compose_file": "compose.yaml",
         "contract": profile.contract_name,
-        "migration": {
-            "entrypoint": profile.migration_runner,
-            "published_in_backend_image": True,
-            "runtime_auto_migrate": False,
-        },
-        "networks": [f"app_{profile.application}", f"db_{profile.application}"],
+        "migration": (
+            {
+                "entrypoint": profile.migration_runner,
+                "published_in_backend_image": True,
+                "runtime_auto_migrate": False,
+            }
+            if dedicated_migrations
+            else {"runtime_auto_migrate": False, "strategy": "none"}
+        ),
+        "networks": (
+            [f"app_{profile.application}", f"db_{profile.application}"]
+            if dedicated_migrations
+            else [f"app_{profile.application}"]
+        ),
         "public_hosts": list(profile.public_hosts),
         "runtime_services": sorted(profile.component_repositories),
         "schema": 1,
         "source_repository": profile.source_repository,
         "source_revision": revision,
-        "transient_services": ["migrator"],
+        "transient_services": ["migrator"] if dedicated_migrations else [],
     }
     if profile.application == "surplasse":
         common.update(
@@ -638,13 +699,23 @@ def _expected_contract(profile: BundleProfile, revision: str) -> dict[str, objec
                 "transient_services": ["migrator", "pilot-bootstrap"],
             }
         )
-    else:
+    elif profile.application == "parkventory":
         common.update(
             {
                 "image_variables": {
                     "backend": "PARKVENTORY_BACKEND_IMAGE",
                     "frontend": "PARKVENTORY_FRONTEND_IMAGE",
                 },
+                "route_owner": "compose",
+                "secrets": [
+                    name.replace("_", "-") for name in profile.credential_files
+                ],
+            }
+        )
+    else:
+        common.update(
+            {
+                "image_variables": {"backend": "MONFLORIAN_BACKEND_IMAGE"},
                 "route_owner": "compose",
                 "secrets": [
                     name.replace("_", "-") for name in profile.credential_files
@@ -669,7 +740,9 @@ def _validate_expected_images(
     components: Mapping[str, str],
 ) -> None:
     value = _object(strict_json(raw, "expected image inventory", maximum=MAX_FILE_BYTES), "expected image inventory")
-    expected_images = {**components, "migrator": components["backend"]}
+    expected_images = dict(components)
+    if profile.migration_strategy == "dedicated":
+        expected_images["migrator"] = components["backend"]
     if profile.application == "surplasse":
         expected_images["pilot-bootstrap"] = components["backend"]
     expected = {"images": expected_images, "schema": 1, "source_revision": revision}
@@ -727,6 +800,19 @@ def _validate_migrations(raw: bytes, profile: BundleProfile, revision: str) -> d
     value = _object(strict_json(raw, "migration inventory", maximum=MAX_FILE_BYTES), "migration inventory")
     if raw != canonical_json(value):
         _fail("migration inventory", "must be canonical JSON")
+    if profile.migration_strategy == "none":
+        expected = {
+            "contract": profile.migration_contract,
+            "migrations": [],
+            "runtime_auto_migrate": False,
+            "schema": 1,
+            "source_repository": profile.source_repository,
+            "source_revision": revision,
+            "strategy": "none",
+        }
+        if value != expected:
+            _fail("migration inventory", "differs from the exact no-migration policy")
+        return value
     expected_keys = {
         "contract",
         "database",
@@ -790,7 +876,10 @@ def _validate_probe_url(
         _fail(path, "must target the exact internal service alias on port 8080")
 
 
-def _expected_probes(profile: BundleProfile) -> dict[str, object]:
+def _expected_probes(
+    profile: BundleProfile,
+    revision: str | None = None,
+) -> dict[str, object]:
     if profile.application == "surplasse":
         return {
             "contract": "surplasse.probes",
@@ -849,36 +938,69 @@ def _expected_probes(profile: BundleProfile) -> dict[str, object]:
             ],
             "schema": 1,
         }
+    if profile.application == "parkventory":
+        return {
+            "contract": "parkventory.probes",
+            "internal": [
+                {
+                    "body_contains": "UP",
+                    "service": "backend",
+                    "status": 200,
+                    "url": "http://parkventory-backend:8080/q/health/ready",
+                },
+                {
+                    "body_contains": "parkventory-frontend-v1",
+                    "service": "frontend",
+                    "status": 200,
+                    "url": "http://parkventory-frontend:8080/__health",
+                },
+            ],
+            "public": [
+                {"body_contains": "Parkventory", "path": "/", "status": 200},
+                {
+                    "body_contains": "Parkventory",
+                    "path": "/app",
+                    "status": 200,
+                },
+                {
+                    "body_contains": "parkventory-compose-v1",
+                    "path": "/.well-known/parkventory-release",
+                    "status": 200,
+                },
+            ],
+            "schema": 1,
+        }
+    if revision is None or SHA40_RE.fullmatch(revision) is None:
+        _fail("probe inventory", "Mon Florian probes require one source revision")
     return {
-        "contract": "parkventory.probes",
+        "contract": "monflorian.probes",
         "internal": [
             {
-                "body_contains": "UP",
+                "body_contains": '"status":"ok"',
                 "service": "backend",
                 "status": 200,
-                "url": "http://parkventory-backend:8080/q/health/ready",
-            },
-            {
-                "body_contains": "parkventory-frontend-v1",
-                "service": "frontend",
-                "status": 200,
-                "url": "http://parkventory-frontend:8080/__health",
-            },
+                "url": "http://monflorian-backend:8080/api/health",
+            }
         ],
         "public": [
-            {"body_contains": "Parkventory", "path": "/", "status": 200},
-            {"body_contains": "Parkventory", "path": "/app", "status": 200},
             {
-                "body_contains": "parkventory-compose-v1",
-                "path": "/.well-known/parkventory-release",
+                "body_contains": revision,
+                "host": "monflorian.com",
+                "path": "/.well-known/monflorian-release",
                 "status": 200,
             },
+            {"host": "monflorian.com", "path": "/", "status": 401},
+            {"host": "www.monflorian.com", "path": "/", "status": 308},
         ],
         "schema": 1,
     }
 
 
-def _validate_probes(raw: bytes, profile: BundleProfile) -> dict[str, Any]:
+def _validate_probes(
+    raw: bytes,
+    profile: BundleProfile,
+    revision: str,
+) -> dict[str, Any]:
     value = _object(strict_json(raw, "probe inventory", maximum=MAX_FILE_BYTES), "probe inventory")
     if raw != canonical_json(value):
         _fail("probe inventory", "must be canonical JSON")
@@ -951,7 +1073,7 @@ def _validate_probes(raw: bytes, profile: BundleProfile) -> dict[str, Any]:
             or not 1 <= len(probe["body_contains"].encode("utf-8")) <= 256
         ):
             _fail(f"probe inventory.public[{index}].body_contains", "is invalid")
-    if value != _expected_probes(profile):
+    if value != _expected_probes(profile, revision):
         _fail("probe inventory", "differs from the exact application profile")
     return value
 
@@ -978,7 +1100,7 @@ def validate_bundle(
     files = _archive_files(archive_raw, expected, profile)
     contract = _validate_contract(files["contract.json"], profile, revision)
     migrations = _validate_migrations(files["migrations.json"], profile, revision)
-    probes = _validate_probes(files["probes.json"], profile)
+    probes = _validate_probes(files["probes.json"], profile, revision)
     if content_digest(files["migrations.json"]) != _digest(
         migration_inventory_digest, "application release migration digest"
     ):
@@ -987,13 +1109,14 @@ def validate_bundle(
         probe_inventory_digest, "application release probe digest"
     ):
         _fail("probe inventory", "digest does not match the application release")
-    if profile.application == "surplasse":
+    if "expected-images.json" in files:
         _validate_expected_images(
             files["expected-images.json"],
             profile,
             revision,
             component_references,
         )
+    if profile.application == "surplasse":
         _validate_pilot_bootstrap_schema(files["pilot-bootstrap.schema.json"])
         _validate_surplasse_pilot_source_compose(files["compose.yaml"])
     compose = files["compose.yaml"].decode("utf-8")

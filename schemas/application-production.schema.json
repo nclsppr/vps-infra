@@ -10,10 +10,11 @@
     "applications": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["surplasse", "parkventory"],
+      "required": ["surplasse", "parkventory", "monflorian"],
       "properties": {
         "surplasse": { "$ref": "#/$defs/surplasse" },
-        "parkventory": { "$ref": "#/$defs/parkventory" }
+        "parkventory": { "$ref": "#/$defs/parkventory" },
+        "monflorian": { "$ref": "#/$defs/monflorian" }
       }
     }
   },
@@ -95,6 +96,43 @@
           "properties": {
             "backend": { "const": "ghcr.io/nclsppr/parkventory/backend" },
             "frontend": { "const": "ghcr.io/nclsppr/parkventory/frontend" }
+          }
+        },
+        "required_checks": {
+          "const": ["Publish immutable application release", "verify"]
+        }
+      }
+    },
+    "monflorian": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "mode",
+        "source_repository",
+        "source_branch",
+        "release_repository",
+        "integration_repository",
+        "component_repositories",
+        "required_checks"
+      ],
+      "properties": {
+        "enabled": { "$ref": "#/$defs/baseProperties/enabled" },
+        "mode": { "$ref": "#/$defs/baseProperties/mode" },
+        "source_repository": { "const": "nclsppr/monflorian" },
+        "source_branch": { "$ref": "#/$defs/baseProperties/source_branch" },
+        "release_repository": {
+          "const": "ghcr.io/nclsppr/monflorian/application-release"
+        },
+        "integration_repository": {
+          "const": "ghcr.io/nclsppr/monflorian/vps-integration"
+        },
+        "component_repositories": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["backend"],
+          "properties": {
+            "backend": { "const": "ghcr.io/nclsppr/monflorian/backend" }
           }
         },
         "required_checks": {

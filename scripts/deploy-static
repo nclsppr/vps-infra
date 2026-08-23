@@ -146,12 +146,14 @@ APPLICATION_RELEASE_REPOSITORIES = frozenset(
     {
         "ghcr.io/nclsppr/parkventory/application-release",
         "ghcr.io/nclsppr/surplasse/application-release",
+        "ghcr.io/nclsppr/monflorian/application-release",
     }
 )
 APPLICATION_INTEGRATION_REPOSITORIES = frozenset(
     {
         "ghcr.io/nclsppr/parkventory/vps-integration",
         "ghcr.io/nclsppr/surplasse/vps-integration",
+        "ghcr.io/nclsppr/monflorian/vps-integration",
     }
 )
 APPLICATION_COMPONENT_REPOSITORIES = frozenset(
@@ -163,6 +165,7 @@ APPLICATION_COMPONENT_REPOSITORIES = frozenset(
         "ghcr.io/nclsppr/surplasse/dashboard",
         "ghcr.io/nclsppr/surplasse/docs",
         "ghcr.io/nclsppr/surplasse/onboarding",
+        "ghcr.io/nclsppr/monflorian/backend",
     }
 )
 PROVENANCE_SUBJECT_MAXIMUM_SIZES = frozenset(

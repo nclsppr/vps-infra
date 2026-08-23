@@ -14,7 +14,13 @@
     "applications": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["personal", "papersempire", "surplasse", "parkventory"],
+      "required": [
+        "personal",
+        "papersempire",
+        "surplasse",
+        "parkventory",
+        "monflorian"
+      ],
       "properties": {
         "personal": {
           "$ref": "#/$defs/staticApplication",
@@ -44,6 +50,14 @@
             "source_repository": { "const": "nclsppr/parkventory" },
             "source_branch": { "const": "main" },
             "compose_project": { "const": "parkventory" }
+          }
+        },
+        "monflorian": {
+          "$ref": "#/$defs/composeApplication",
+          "properties": {
+            "source_repository": { "const": "nclsppr/monflorian" },
+            "source_branch": { "const": "main" },
+            "compose_project": { "const": "monflorian" }
           }
         }
       }
@@ -182,7 +196,7 @@
       "additionalProperties": false,
       "required": ["strategy", "runtime_auto_migrate", "proven"],
       "properties": {
-        "strategy": { "enum": ["blocked", "dedicated"] },
+        "strategy": { "enum": ["blocked", "dedicated", "none"] },
         "runtime_auto_migrate": { "const": false },
         "proven": { "type": "boolean" },
         "evidence": { "$ref": "#/$defs/evidence" }
@@ -355,7 +369,9 @@
         "type": { "const": "compose" },
         "source_repository": { "type": "string" },
         "source_branch": { "type": "string" },
-        "compose_project": { "enum": ["surplasse", "parkventory"] },
+        "compose_project": {
+          "enum": ["surplasse", "parkventory", "monflorian"]
+        },
         "published_ports": { "type": "array", "maxItems": 0 },
         "blocked_by": { "$ref": "#/$defs/blockedBy" },
         "components": {

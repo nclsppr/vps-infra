@@ -419,9 +419,18 @@ static demo must release `parkventory.com` under the shared lock before any
 Compose preflight or migration. Mailpit, Vite development mode, and the Maven
 development image never join the production VPS.
 
+### Mon Florian
+
+Mon Florian has one backend image and one immutable integration bundle. Its
+admission profile remains disabled. It uses only `app_monflorian`, publishes no
+host port, and has migration strategy `none`: there is no application database,
+migration runner, or migrator service. The only runtime secret is the OpenAI
+API key allocated to the backend through a file-backed secret. The inactive
+Caddy route requires a separately materialized private-access snippet.
+
 ## Network isolation
 
-Ansible creates seven external Docker networks. The isolated public edge and
+Ansible creates eight external Docker networks. The isolated public edge and
 the locked complete platform definition use these memberships:
 
 ```text
@@ -429,6 +438,7 @@ app_surplasse       empty
 db_surplasse        PostgreSQL
 app_parkventory     empty
 db_parkventory      empty
+app_monflorian      empty
 edge                isolated public static edge Caddy
 db_monitoring       PostgreSQL, PostgreSQL Exporter
 ops                 locked complete platform Caddy, Prometheus, Grafana, exporters

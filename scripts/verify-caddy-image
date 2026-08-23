@@ -70,7 +70,13 @@ fi
 
 secrets=$(mktemp -d)
 candidate_routes=$(mktemp -d)
-trap 'rm -rf -- "$secrets" "$candidate_routes"' EXIT
+monflorian_private_access=$(mktemp)
+trap 'rm -rf -- "$secrets" "$candidate_routes" "$monflorian_private_access"' EXIT
+
+# The repository contains no Basic Auth hash. This rejecting snippet exists
+# only for syntax validation of the disabled route candidate.
+printf '%s\n' 'respond "private access is not materialized" 503' \
+  >"$monflorian_private_access"
 
 route_sources=("$repository_root"/platform/caddy/routes/*.caddy.disabled)
 [[ -f ${route_sources[0]} ]] || fail "no Caddy route candidate exists"
@@ -106,6 +112,7 @@ done
   --volume "$secrets/consumer-key:/run/secrets/ovh-consumer-key:ro" \
   --volume "$repository_root/platform/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
   --volume "$repository_root/platform/public-static-edge/surplasse-tls.caddy:/etc/caddy/surplasse-tls.caddy:ro" \
+  --volume "$monflorian_private_access:/etc/caddy/monflorian-private-access.caddy:ro" \
   --volume "$candidate_routes:/etc/caddy/routes:ro" \
   "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
   || fail "candidate Caddy configuration is invalid"

@@ -139,6 +139,9 @@ case "$original_command" in
       parkventory)
         release_repository=ghcr.io/nclsppr/parkventory/application-release
         ;;
+      monflorian)
+        release_repository=ghcr.io/nclsppr/monflorian/application-release
+        ;;
       *) fail "application is outside the Compose allowlist" ;;
     esac
 

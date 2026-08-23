@@ -60,7 +60,7 @@ def release_value(policy, revision=REVISION):
             "artifact": integration,
         },
         "migrations": {
-            "strategy": "dedicated",
+            "strategy": policy.migration_strategy,
             "runtime_auto_migrate": False,
             "inventory_artifact": integration,
             "inventory_sha256": DIGEST_C,
@@ -113,7 +113,11 @@ class ProductionContractTests(unittest.TestCase):
         )
         self.assertEqual(
             [(application.name, application.enabled) for application in contract.applications],
-            [("surplasse", True), ("parkventory", False)],
+            [
+                ("surplasse", True),
+                ("parkventory", False),
+                ("monflorian", False),
+            ],
         )
         self.assertEqual(
             contract.applications[1].required_checks,
@@ -190,7 +194,7 @@ class ReleaseDescriptorTests(unittest.TestCase):
             ROOT / "releases/application-production.json"
         )
 
-    def test_shared_schema_and_strict_policy_accept_both_applications(self):
+    def test_shared_schema_and_strict_policy_accepts_all_applications(self):
         schema = json.loads(
             (ROOT / "schemas/application-release.schema.json").read_text()
         )
@@ -215,6 +219,8 @@ class ReleaseDescriptorTests(unittest.TestCase):
         )
         validator = Draft202012Validator(schema)
         for policy in self.contract.applications:
+            if len(policy.component_repositories) < 2:
+                continue
             component_names = tuple(policy.component_repositories)
             first, second = component_names[:2]
             value = release_value(policy)

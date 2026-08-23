@@ -593,6 +593,8 @@ def deployment_lock(timeout_seconds: int = 60) -> Iterator[None]:
 
 
 def runtime_configuration(profile: BundleProfile) -> dict[str, str]:
+    if not profile.runtime_configuration_keys:
+        return {}
     if profile.application == "surplasse":
         validate_surplasse_input_commit()
     path = RUNTIME_CONFIG_ROOT / f"{profile.application}.env"
@@ -918,7 +920,8 @@ def fetch_and_validate_candidate(
 
 def expected_service_images(state: ApplicationState) -> dict[str, str]:
     result = dict(state.component_references)
-    result["migrator"] = result["backend"]
+    if PROFILES[state.application].migration_strategy == "dedicated":
+        result["migrator"] = result["backend"]
     if state.application == "surplasse":
         result["pilot-bootstrap"] = result["backend"]
     return result
@@ -994,7 +997,7 @@ def materialized_runtime_configuration(
 
 def canonical_runtime_environment(configuration: Mapping[str, str]) -> bytes:
     if not configuration:
-        fail("application runtime configuration cannot be empty")
+        return b"\n"
     return "".join(
         f"{key}={configuration[key]}\n" for key in sorted(configuration)
     ).encode("ascii")
@@ -1020,7 +1023,8 @@ def compose_prefix(
     ]
     if precommit:
         command.extend(("--file", str(release / "precommit-compose.json")))
-    command.extend(("--profile", "migration"))
+    if profile.migration_strategy == "dedicated":
+        command.extend(("--profile", "migration"))
     if profile.application == "surplasse":
         command.extend(("--profile", "pilot-bootstrap"))
     return command
@@ -1313,22 +1317,32 @@ def validate_application_compose_semantics(
     services = rendered.get("services")
     if not isinstance(services, dict):
         fail("rendered Compose services are invalid")
-    migrator = services.get("migrator")
     backend = services.get("backend")
-    if not isinstance(migrator, dict) or not isinstance(backend, dict):
-        fail("rendered Compose migration services are invalid")
-    if migrator.get("entrypoint") != [profile.migration_runner]:
-        fail("rendered Compose migrator entrypoint differs from the inventory")
+    if not isinstance(backend, dict):
+        fail("rendered Compose backend service is invalid")
+    if profile.migration_strategy == "dedicated":
+        migrator = services.get("migrator")
+        if not isinstance(migrator, dict):
+            fail("rendered Compose migrator service is invalid")
+        if migrator.get("entrypoint") != [profile.migration_runner]:
+            fail("rendered Compose migrator entrypoint differs from the inventory")
+    elif "migrator" in services:
+        fail("rendered Compose declares a migrator for a no-migration application")
     environment = backend.get("environment")
     if not isinstance(environment, dict):
         fail("rendered Compose backend environment is invalid")
-    if environment.get("QUARKUS_FLYWAY_MIGRATE_AT_START") != "false":
+    if (
+        profile.migration_strategy == "dedicated"
+        and environment.get("QUARKUS_FLYWAY_MIGRATE_AT_START") != "false"
+    ):
         fail("rendered Compose backend can perform automatic migrations")
     if profile.application == "parkventory" and environment.get(
         "PARKVENTORY_MIGRATION_ONLY"
     ) != "false":
         fail("rendered Parkventory backend can enter migration-only mode")
-    expected_services = {*profile.component_repositories, "migrator"}
+    expected_services = set(profile.component_repositories)
+    if profile.migration_strategy == "dedicated":
+        expected_services.add("migrator")
     if profile.application == "surplasse":
         expected_services.add("pilot-bootstrap")
     if set(profile.service_credentials) != expected_services:
@@ -1344,9 +1358,25 @@ def validate_application_compose_semantics(
             fail(f"rendered Compose service {service_name} secrets are invalid")
         sources: list[str] = []
         for item in raw_credentials:
-            if not isinstance(item, dict) or not isinstance(item.get("source"), str):
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"source", "target"}
+                or not isinstance(item.get("source"), str)
+                or not isinstance(item.get("target"), str)
+            ):
                 fail(f"rendered Compose service {service_name} secret is invalid")
-            sources.append(item["source"])
+            source = item["source"]
+            expected_target = (
+                source
+                if profile.application == "monflorian"
+                else f"/run/secrets/{source}"
+            )
+            if item["target"] != expected_target:
+                fail(
+                    f"rendered Compose service {service_name} secret target "
+                    "differs from the exact application profile"
+                )
+            sources.append(source)
         if tuple(sorted(sources)) != tuple(sorted(expected_sources)):
             fail(
                 f"rendered Compose service {service_name} secrets differ from "
@@ -2187,6 +2217,8 @@ def pull_and_verify_images(state: ApplicationState) -> None:
 
 
 def migration_container_name(state: ApplicationState) -> str:
+    if PROFILES[state.application].migration_strategy != "dedicated":
+        fail("application migration strategy does not use a container")
     digest = parse_digest_reference(
         state.release_reference,
         f"ghcr.io/nclsppr/{state.application}/application-release",
@@ -2196,6 +2228,8 @@ def migration_container_name(state: ApplicationState) -> str:
 
 
 def migration_container_id(state: ApplicationState) -> str | None:
+    if PROFILES[state.application].migration_strategy != "dedicated":
+        return None
     name = migration_container_name(state)
     result = _run_bounded(
         [
@@ -2231,6 +2265,8 @@ def validate_migration_container_identity(
     state: ApplicationState,
     container_id: str,
 ) -> bool:
+    if PROFILES[state.application].migration_strategy != "dedicated":
+        fail("no-migration application cannot own a migration container")
     if CONTAINER_ID_RE.fullmatch(container_id) is None:
         fail("dedicated migration container identifier is invalid")
     name = migration_container_name(state)
@@ -2268,6 +2304,8 @@ def validate_migration_container_identity(
 
 def remove_migration_container(state: ApplicationState) -> None:
     """Stop one interrupted migrator and observe stable absence before rollback."""
+    if PROFILES[state.application].migration_strategy != "dedicated":
+        return
     consecutive_absent = 0
     for _attempt in range(8):
         container_id = migration_container_id(state)
@@ -2307,6 +2345,8 @@ def remove_migration_container(state: ApplicationState) -> None:
 
 
 def run_migration(state: ApplicationState) -> None:
+    if PROFILES[state.application].migration_strategy != "dedicated":
+        return
     require_migration_container_absent(state)
     _compose_for_state(
         state,
@@ -2633,11 +2673,7 @@ def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
     profile = PROFILES[state.application]
     release = state_release(state)
     bundle = bundle_from_release(release, state)
-    route_relative = (
-        "caddy/surplasse.caddy"
-        if state.application == "surplasse"
-        else "caddy/parkventory.caddy"
-    )
+    route_relative = f"caddy/{state.application}.caddy"
     route_path = PUBLIC_EDGE_RUNTIME_ROOT / "routes" / f"{state.application}.caddy"
     require_protected_file(
         route_path,
@@ -2969,11 +3005,15 @@ def activate_candidate(state: ApplicationState, work: Path) -> None:
     try:
         pull_and_verify_images(state)
         validate_public_edge_cutover(state, work)
-        transaction = dataclasses.replace(transaction, phase="migration-running")
-        write_transaction(transaction)
-        run_migration(state)
-        transaction = dataclasses.replace(transaction, phase="migrated")
-        write_transaction(transaction)
+        if PROFILES[application].migration_strategy == "dedicated":
+            transaction = dataclasses.replace(
+                transaction,
+                phase="migration-running",
+            )
+            write_transaction(transaction)
+            run_migration(state)
+            transaction = dataclasses.replace(transaction, phase="migrated")
+            write_transaction(transaction)
         start_runtime(state, precommit=True)
         transaction = dataclasses.replace(transaction, phase="started")
         write_transaction(transaction)
@@ -3074,7 +3114,7 @@ def deploy(
             if activate_live:
                 activate_candidate(state, temporary)
                 print(
-                    f"application release activated after migrations and probes: "
+                    f"application release activated after policy and probes: "
                     f"{application} {release_reference}"
                 )
             else:

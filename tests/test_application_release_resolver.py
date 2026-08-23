@@ -92,7 +92,7 @@ def release_bytes(policy):
             "artifact": integration,
         },
         "migrations": {
-            "strategy": "dedicated",
+            "strategy": policy.migration_strategy,
             "runtime_auto_migrate": False,
             "inventory_artifact": integration,
             "inventory_sha256": DIGEST_C,

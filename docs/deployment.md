@@ -618,7 +618,7 @@ which Atlas `sudo-rs` does not provide.
 The Compose application boundary uses the parallel canonical record:
 
 ```text
-deploy-application-live <surplasse|parkventory> <source-sha40> \
+deploy-application-live <surplasse|parkventory|monflorian> <source-sha40> \
   <application-release@sha256>
 ```
 
@@ -631,9 +631,11 @@ probe inventories, source ancestry, and the canonical source HEAD. It never
 stores secret bytes. It refuses migration until the immutable public-edge route
 equals the attested route and Caddy is healthy on the exact application network.
 Canonical Surplasse tester admission is enabled, but no application workflow
-invokes this boundary. Parkventory remains disabled and stops before runtime
-validation or network access. Surplasse still requires the explicit forced
-command and every runtime gate above.
+invokes this boundary. Parkventory and Mon Florian remain disabled and stop
+before runtime validation or network access. Mon Florian admits one backend,
+one `app_monflorian` network, migration strategy `none`, and one file-backed
+OpenAI key contract. Surplasse still requires the explicit forced command and
+every runtime gate above.
 
 For Surplasse, the immutable integration contract contains the exact tester
 payment profile. Materialization and the first activation preflight both bind
@@ -892,7 +894,8 @@ commands, guarantees, and remaining disaster-recovery decision.
 
 ## Deploy a Compose application
 
-The canonical Surplasse entry is `enabled: true`; Parkventory remains disabled.
+The canonical Surplasse entry is `enabled: true`; Parkventory and Mon Florian
+remain disabled.
 Admission does not invoke the gate, and no live application release follows from
 this repository change alone. A deliberate Surplasse activation must keep this
 order:
