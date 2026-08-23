@@ -635,10 +635,12 @@ enabled. Parkventory has a manual workflow that resolves no deployment matrix
 while its canonical entry is disabled; no active runtime follows from admission.
 
 The versioned secret registry contains public metadata only. It records the
-expected path, permissions, consumer, generation, and last observed host state.
-It separates the target generation from the observed generation and separates
-planned, materialized, and runtime-loaded states. A materialized file is not
-runtime proof.
+expected path, permissions, consumer, target generation, generation binding,
+and last observed host state. It separates planned, materialized, and
+runtime-loaded states. A metadata audit can mark a file materialized, but only
+a non-secret marker written by the bounded materializer can bind that file set
+to a generation. No current materializer writes such a marker. A materialized
+file is not runtime proof.
 
 The repository has no SOPS payload, no `.sops.yaml` policy, and no proved age
 recovery identity. SOPS recovery remains blocked. Until a later reviewed change

@@ -134,11 +134,13 @@ not transfer or store the Access Key for SMTP. Revoke an exposed value before
 use.
 
 Update `secrets/registry.json` in two separate steps. First, review the planned
-contract and target generation before materialization. Then, after a read-only
-Atlas metadata check, set the observed generation to the target and set
-`host_state` to `materialized` in a dedicated commit. Use `runtime-loaded` only
-after the Backend is recreated and passes its probes. Never add a value-derived
-hash to Git.
+contract and target generation before materialization. The current Surplasse
+materializer has no non-secret generation marker. A read-only metadata check
+can set `host_state` to `materialized`, but `generation` must stay `0` and
+`generation_binding` must stay `unlinked`. Do not use `runtime-loaded`. A later
+materializer change must publish the marker last with the exact file set and
+add a read-only marker check before any generation can advance. Never add a
+value-derived hash to Git.
 
 The materializer input must use port `587`. Its FQDN must equal the reviewed
 public provider contract. The rendered adapter requires
@@ -188,10 +190,11 @@ affect application state.
 
 Rotation for an active release is not implemented. Do not recreate the Backend
 manually. The future rotation path must create a new identity, validate it
-without logging it, recreate only the Backend with an explicit generation
-binding, pass its probes, and then revoke the old identity. It must restore the
-previous generation after failure. An atomic host-file rename does not update a
-Docker file bind mount that is already open.
+without logging it, publish and verify the non-secret generation marker,
+recreate only the Backend with explicit marker-bound runtime evidence, pass its
+probes, and then revoke the old identity. It must restore the previous
+generation after failure. An atomic host-file rename does not update a Docker
+file bind mount that is already open.
 
 Revoking an IAM API key does not change the TEM domain verification or the
 published DKIM records. Do not remove or replace DNS records as part of an API

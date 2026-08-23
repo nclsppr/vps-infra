@@ -17,7 +17,8 @@ SMTP inputs.
 
 These contracts are distributed across documentation, Ansible, Python helpers,
 Compose files, and tests. Git did not contain one complete inventory. Git also
-did not record which generation a read-only Atlas audit had observed.
+did not define evidence that connects an installed file set to an authorized
+generation.
 
 The Surplasse application and DNS helpers publish local root-only manifests.
 Those manifests contain content-derived SHA-256 values. They prove that one
@@ -42,6 +43,7 @@ The registry records only non-secret metadata:
 - the source and recovery method;
 - declared, host, and provider states;
 - the last observed generation and the next target generation;
+- whether a materializer marker binds the observed generation to the file set;
 - the audit time and installed controller revision;
 - the recovery-system state for the complete registry.
 
@@ -49,21 +51,28 @@ The registry must never contain a secret value, private key, project ID, API
 identifier, private source path, decrypted payload, or content-derived digest.
 The public credential-set name is metadata. It is not a provider credential.
 
-Register a value before materialization. Before a rotation, increment its target
-generation. After the operation, run a read-only metadata audit and update the
-observed generation. A materialized state proves only the file path and
-metadata observed during that audit. A runtime-loaded state requires separate
-proof that the current consumer loaded the declared generation and passed its
-probes.
+Register a value before materialization. Before a rotation, increment its
+target generation. The bounded materializer must publish a non-secret
+generation marker last, after it installs and synchronizes the exact file set.
+The marker must identify the materializer, exact registered secret set, and
+target generation. After the operation, a read-only audit must verify file
+metadata and the marker separately. Only that marker can bind the observed
+generation to the installed set. A metadata-only audit can mark a file
+materialized, but its generation stays `0` and its binding stays `unlinked`.
+
+A runtime-loaded state requires evidence that the current consumer loaded the
+marker-bound generation and passed its probes. A successful probe without this
+generation binding is not sufficient.
 
 Git history records each reviewed registry update. Atlas keeps no Git write
 credential. An operator performs the audit from a trusted workstation and
 submits the metadata change through the normal reviewed Git path.
 
-Keep local content digests in the existing root-only manifests on Atlas. Each
-registry generation is an opaque counter. It is not derived from a secret. The
-target can exceed the observed generation by one while an authorized operation
-is pending.
+Keep local content digests in the existing root-only manifests on Atlas. Those
+manifests contain no registry generation, so they do not satisfy the generation
+marker requirement. Each registry generation is an opaque counter. It is not
+derived from a secret. The target can exceed the observed generation by one
+while an authorized operation is pending.
 
 ## Baseline observation
 
@@ -73,12 +82,14 @@ The read-only audit on 23 August 2026 found exactly six materialized files:
 - the Surplasse PostgreSQL migrator password;
 - the Surplasse PostgreSQL runtime password.
 
-No other registered file was present. No entry had runtime-loaded evidence.
-All Scaleway Transactional Email entries were absent.
+No other registered file was present. All six materialized files have
+generation `0` and binding `unlinked` because no current materializer writes a
+generation marker. No entry had runtime-loaded evidence. All Scaleway
+Transactional Email entries were absent.
 
 The three files for the temporary Surplasse OVH cutover identity were absent.
-Their shared provider generation is recorded as revoked and must not be
-restored.
+Their provider state is revoked. They have no marker-bound host generation and
+must not be restored.
 
 ## Transactional email metadata
 
@@ -132,7 +143,10 @@ implemented control.
 - Git can show the last reviewed metadata observation for every known Atlas
   secret and protected input.
 - Git cannot prove that the observation is still current after its audit time.
-- A local manifest remains the file-set commit marker. It is not a Git record.
+- Existing local manifests commit a file-set write, but they contain no
+  registry generation and do not provide the required binding.
+- No current materializer writes the required generation marker. All registry
+  entries remain `unlinked`, and no generation can advance yet.
 - A planned entry does not authorize provider provisioning or host mutation.
 - A materialized entry does not authorize application activation.
 - Secret recovery remains dependent on an external store or an explicit
@@ -147,7 +161,8 @@ do not recover a value or prove runtime use.
 
 ### Use only local manifests
 
-Rejected. A lost VPS would also lose the only generation record.
+Rejected. The current manifests contain content digests but no registry
+generation. A lost VPS would also lose their local evidence.
 
 ### Add SOPS files now
 

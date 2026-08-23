@@ -99,12 +99,14 @@ prove OVH API access or replace the required full zone export.
 - [x] record every current Scaleway TEM entry as absent. No TEM credential has
       been materialized or loaded by a runtime;
 - [x] document planned, materialized, and runtime-loaded states. Require a new
-      target generation before each materialization or rotation, then record
-      the observed generation after the read-only audit;
+      target generation before each materialization or rotation. Keep the
+      observed generation at `0` while no audited materializer marker binds the
+      file set to that target;
 - [x] mark value recovery as `not-configured`. The registry is an inventory,
       not a backup;
-- [ ] connect each materializer and read-only audit to the registry generation
-      contract. Do not mark runtime-loaded without consumer proof;
+- [ ] make each materializer publish a non-secret generation marker last with
+      the exact file set. Make the read-only audit verify it. Do not advance a
+      generation or mark runtime-loaded without marker-bound consumer proof;
 - [ ] implement Parkventory SMTP secret materialization and its runtime
       contract;
 - [ ] add the Mon Florian SMTP producer, runtime, and materializer contracts;

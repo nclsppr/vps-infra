@@ -37,7 +37,7 @@ déjà à rendre la configuration du système reproductible après l’accès SS
 | jeton GHCR en lecture | gestionnaire de secrets ou procédure de régénération |
 | accès Git en lecture à `vps-infra` | HTTPS public ; deploy key seulement si la visibilité devient privée |
 | static SSH trigger key | secret of the GitHub `static-production` environment, separately revocable |
-| secret paths, permissions, consumers, target and observed generations, and last observed states | `secrets/registry.json` in Git, without values or content-derived digests |
+| secret paths, permissions, consumers, target generations, generation bindings, and last observed states | `secrets/registry.json` in Git, without values or content-derived digests |
 | DNS, JWT, Stripe, SMTP, Grafana, and database secret values | approved external secret store or the declared regeneration procedure |
 | sauvegardes métier | étape locale testée sur Atlas ; cible chiffrée hors VPS encore à sélectionner |
 | inventaire DNS, MX, SPF, DKIM et DMARC | export versionné sans secrets et copie opérateur |
@@ -49,9 +49,11 @@ therefore blocked. If a later reviewed change adds SOPS, the private age key
 must remain outside Git and Atlas with a tested recovery copy.
 
 The baseline read-only audit on 23 August 2026 found only the four platform
-secrets and two Surplasse database passwords. All six were materialized. No
-entry had runtime-loaded evidence. All Scaleway Transactional Email entries
-were absent. Registry value recovery is `not-configured`.
+secrets and two Surplasse database passwords. All six were materialized, but
+their generation is `0` and their binding is `unlinked`. No current
+materializer writes a generation marker. No entry had runtime-loaded evidence.
+All Scaleway Transactional Email entries were absent. Registry value recovery
+is `not-configured`.
 
 ## Contrat de commandes livré
 
@@ -206,11 +208,14 @@ l’état canonique.
 
 Before a service starts, compare its required entries with the registry. Create
 or recover each value through its declared materializer. Commit the target
-generation before the operation. Run a read-only metadata audit, then set the
-observed generation to that target and mark it materialized. Do not mark it
-runtime-loaded until the current service has loaded that generation and passed
-its probes. A Docker file bind mount can retain the old inode after an atomic
-host-file replacement, so a rotation must recreate the affected service.
+generation before the operation. The materializer must publish a non-secret
+generation marker last with the exact file set. Run a read-only audit of the
+file metadata and marker. Mark the file materialized after the metadata audit.
+Advance the generation only after the marker audit. Do not mark it
+runtime-loaded until the current service has loaded that marker-bound
+generation and passed its probes. A Docker file bind mount can retain the old
+inode after an atomic host-file replacement, so a rotation must recreate the
+affected service. No current materializer can complete this generation step.
 
 La plateforme est restaurée avant les applications :
 
@@ -335,8 +340,9 @@ La reconstruction est prouvée lorsque :
   reprovisionnement ;
 - une restauration PostgreSQL isolée a été testée lorsque les sauvegardes sont
   livrées ;
-- the registry matches a fresh read-only Atlas metadata audit, and each active
-  consumer has runtime-loaded evidence for its declared generation;
+- the registry matches a fresh read-only Atlas file and generation-marker
+  audit, and each active consumer has runtime-loaded evidence for its
+  marker-bound generation;
 - every `restore-from-external-store` entry has a tested recovery source, and no
   step claims SOPS recovery while the age gate remains open;
 - registry `value_recovery_state` is `verified`;

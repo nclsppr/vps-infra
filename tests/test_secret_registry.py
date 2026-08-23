@@ -206,6 +206,26 @@ class SecretRegistryTests(unittest.TestCase):
                 secret["id"],
             )
 
+    def test_schema_rejects_unbounded_secret_paths(self) -> None:
+        unsafe_paths = (
+            "/etc/vps/secrets/../shadow",
+            "/etc/vps/secrets/a/../../shadow",
+            "/etc/vps/secrets/a/./value",
+            "/etc/vps/secrets/a//value",
+        )
+        for path in unsafe_paths:
+            with self.subTest(path=path):
+                candidate = copy.deepcopy(self.registry)
+                candidate["secrets"][0]["path"] = path
+                self.assert_invalid(candidate)
+
+        registry_root = Path(self.registry["secret_root"]).resolve()
+        for secret in self.registry["secrets"]:
+            with self.subTest(secret=secret["id"]):
+                self.assertTrue(
+                    Path(secret["path"]).resolve().is_relative_to(registry_root)
+                )
+
     def test_state_and_generation_are_consistent(self) -> None:
         for secret in self.registry["secrets"]:
             with self.subTest(secret=secret["id"]):
@@ -218,45 +238,61 @@ class SecretRegistryTests(unittest.TestCase):
                     secret["target_generation"] - secret["generation"],
                     1,
                 )
-                if secret["generation"] == 0:
-                    self.assertEqual(secret["host_state"], "absent")
-                if secret["host_state"] != "absent":
+                if secret["generation_binding"] == "unlinked":
+                    self.assertEqual(secret["generation"], 0)
+                    self.assertNotEqual(secret["host_state"], "runtime-loaded")
+                else:
                     self.assertGreaterEqual(secret["generation"], 1)
                 if secret["declared_state"] == "planned":
                     self.assertEqual(secret["generation"], 0)
                     self.assertEqual(secret["target_generation"], 1)
                     self.assertEqual(secret["host_state"], "absent")
                 if secret["provider_state"] == "revoked":
-                    self.assertGreaterEqual(secret["generation"], 1)
                     self.assertEqual(secret["host_state"], "absent")
                     self.assertEqual(secret["rebuild"], "do-not-restore")
                 if secret["source"] in {"provider-identifier", "provider-secret"}:
                     self.assertNotEqual(secret["provider_state"], "not-applicable")
 
-        materialized = next(
+        materialized_entries = [
             secret
             for secret in self.registry["secrets"]
             if secret["host_state"] == "materialized"
+        ]
+        self.assertEqual(len(materialized_entries), 6)
+        self.assertEqual(
+            {secret["generation_binding"] for secret in self.registry["secrets"]},
+            {"unlinked"},
         )
+        self.assertEqual(
+            {secret["generation"] for secret in materialized_entries},
+            {0},
+        )
+
+        materialized = materialized_entries[0]
+        materialized_index = self.registry["secrets"].index(materialized)
         candidate = copy.deepcopy(self.registry)
-        candidate["secrets"][
-            self.registry["secrets"].index(materialized)
-        ]["generation"] = 0
+        candidate["secrets"][materialized_index]["generation"] = 1
         self.assert_invalid(candidate)
+
+        candidate = copy.deepcopy(self.registry)
+        candidate["secrets"][materialized_index]["generation_binding"] = (
+            "materializer-marker"
+        )
+        self.assert_invalid(candidate)
+
+        candidate = copy.deepcopy(self.registry)
+        candidate["secrets"][materialized_index]["host_state"] = "runtime-loaded"
+        self.assert_invalid(candidate)
+
+        candidate = copy.deepcopy(self.registry)
+        candidate["secrets"][materialized_index]["generation"] = 1
+        candidate["secrets"][materialized_index]["generation_binding"] = (
+            "materializer-marker"
+        )
+        self.validator.validate(candidate)
 
         candidate = copy.deepcopy(self.registry)
         candidate["secrets"][0]["target_generation"] = 0
-        self.assert_invalid(candidate)
-
-        revoked = next(
-            secret
-            for secret in self.registry["secrets"]
-            if secret["provider_state"] == "revoked"
-        )
-        candidate = copy.deepcopy(self.registry)
-        candidate["secrets"][self.registry["secrets"].index(revoked)][
-            "generation"
-        ] = 0
         self.assert_invalid(candidate)
 
     def test_three_scaleway_tem_credential_contracts_are_separate(self) -> None:

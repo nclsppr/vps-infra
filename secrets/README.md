@@ -27,17 +27,30 @@ The registry separates policy, host evidence, and provider evidence.
   with the declared path, owner, group, mode, type, and link count. This state
   does not prove that a service loaded the value.
 - `host_state: runtime-loaded` requires separate runtime proof for the current
-  consumer and generation. A file on disk or a Compose declaration is not
-  enough.
+  consumer and a marker-bound generation. A file on disk, a Compose
+  declaration, or a successful probe by itself is not enough.
 - `provider_state` records only reviewed lifecycle metadata. It does not test a
   provider credential.
+- `generation_binding: unlinked` means that no audited marker connects the
+  installed file set to the target generation. `materializer-marker` means
+  that the last read-only audit verified such a marker.
 
-`generation` is the last generation observed on the host. Generation `0` means
-that no host generation has been materialized. `target_generation` is the next
-generation required by Git. It must equal `generation` or exceed it by one. A
-task must increment `target_generation` before a first materialization or a
-rotation. After a successful read-only audit, set `generation` to the target.
-Do not derive either number from the secret value.
+`generation` is the last target generation bound to the installed file set by
+an audited materializer marker. Generation `0` means that no such binding
+exists. A file can therefore be `materialized` with generation `0`.
+`target_generation` is the next generation required by Git. It must equal
+`generation` or exceed it by one. A task must increment `target_generation`
+before a first materialization or a rotation. Do not derive either number from
+the secret value.
+
+The bounded materializer must publish the non-secret generation marker last,
+after it installs and synchronizes the exact file set. The marker must contain
+only public contract identifiers, the exact registered secret identifiers, and
+the target generation. A read-only audit must verify that marker before Git can
+set `generation_binding` to `materializer-marker` and advance `generation`.
+No current materializer writes this marker. Existing root-only manifests bind
+files through private content digests, but they do not contain a registry
+generation. They do not satisfy this requirement.
 
 `observed_at` and `controller_revision` bind the registry to one audit. A Git
 commit preserves that reviewed observation. It is not permanent proof of the
@@ -56,14 +69,14 @@ files:
 - `surplasse-postgres-migrator-password`;
 - `surplasse-postgres-runtime-password`.
 
-The audit found no other registered file. No entry has runtime-loaded evidence.
-All Scaleway Transactional Email credentials are absent. The registry records
-their intended contracts only.
+The audit found no other registered file. The six files have generation `0`
+and binding `unlinked` because the materializers did not write a generation
+marker. No entry has runtime-loaded evidence. All Scaleway Transactional Email
+credentials are absent. The registry records their intended contracts only.
 
-The registry also preserves the known generation of the temporary Surplasse
-OVH cutover identity. That provider credential is revoked and its three host
-files are absent. A revoked generation is historical evidence, not a recovery
-input.
+The registry preserves the revoked provider state of the temporary Surplasse
+OVH cutover identity. Its three host files are absent. It has no marker-bound
+host generation and it is not a recovery input.
 
 ## Required update sequence
 
@@ -72,18 +85,25 @@ input.
    `target_generation` before the operation.
 2. Create or recover the value outside Git. Do not send it through chat, an
    issue, a pull request, a command argument, or a shared log.
-3. Use the exact bounded materializer named by the registry. Leave the entry
-   planned if no materializer exists.
-4. Run a read-only metadata audit on Atlas.
-5. Set `generation` to `target_generation`. Update the host state, audit time,
-   and controller revision. Review and commit this metadata change.
+3. Use the exact bounded materializer named by the registry. The materializer
+   must publish the non-secret generation marker atomically with the file set.
+   Leave the entry planned if no materializer exists. Keep the binding
+   `unlinked` when the materializer has no generation marker.
+4. Run a read-only audit on Atlas. Verify file metadata separately from the
+   generation marker.
+5. Set `host_state` from the file audit. Set `generation` to
+   `target_generation` and set the binding to `materializer-marker` only when
+   the audit verified the exact marker. Update the audit time and controller
+   revision. Review and commit this metadata change.
 6. Recreate and probe each consumer when the value must enter a running
-   service. Set `runtime-loaded` only after that proof.
+   service. Bind the runtime evidence to the verified marker generation. Set
+   `runtime-loaded` only after that proof.
 
-For a rotation, commit the new target generation before use. Materialize and
-verify it, recreate the affected consumer, then revoke the old provider
-generation. Record the final provider and host states in Git. A failed rotation
-must keep or restore the last proved runtime generation.
+For a rotation, commit the new target generation before use. Materialize the
+new file set and publish its marker, verify both, recreate the affected
+consumer, and then revoke the old provider generation. Record the final
+provider and host states in Git. A failed rotation must keep or restore the
+last proved runtime generation.
 
 The local Surplasse and OVH DNS manifests contain secret digests so that Atlas
 can detect partial writes. They remain root-only on Atlas. Never copy those
