@@ -37,13 +37,21 @@ déjà à rendre la configuration du système reproductible après l’accès SS
 | jeton GHCR en lecture | gestionnaire de secrets ou procédure de régénération |
 | accès Git en lecture à `vps-infra` | HTTPS public ; deploy key seulement si la visibilité devient privée |
 | static SSH trigger key | secret of the GitHub `static-production` environment, separately revocable |
-| secrets DNS, JWT, Stripe, SMTP, Grafana et bases | fichiers SOPS chiffrés et clé age externe |
+| secret paths, permissions, consumers, target and observed generations, and last observed states | `secrets/registry.json` in Git, without values or content-derived digests |
+| DNS, JWT, Stripe, SMTP, Grafana, and database secret values | approved external secret store or the declared regeneration procedure |
 | sauvegardes métier | étape locale testée sur Atlas ; cible chiffrée hors VPS encore à sélectionner |
 | inventaire DNS, MX, SPF, DKIM et DMARC | export versionné sans secrets et copie opérateur |
 
-Une clé uniquement stockée sur le VPS n’est pas une stratégie de
-reconstruction. Les secrets peuvent être chiffrés dans Git avec SOPS/age, mais
-la clé privée age ne rejoint jamais le dépôt.
+A value stored only on Atlas is not a recovery method. The registry can rebuild
+its path and permissions, but not its bytes. The repository has no SOPS payload,
+no `.sops.yaml` policy, and no proved age recovery identity. SOPS recovery is
+therefore blocked. If a later reviewed change adds SOPS, the private age key
+must remain outside Git and Atlas with a tested recovery copy.
+
+The baseline read-only audit on 23 August 2026 found only the four platform
+secrets and two Surplasse database passwords. All six were materialized. No
+entry had runtime-loaded evidence. All Scaleway Transactional Email entries
+were absent. Registry value recovery is `not-configured`.
 
 ## Contrat de commandes livré
 
@@ -85,7 +93,8 @@ Avant la destruction ou la création :
 
 1. vérifier que `vps-infra/main` et la release à restaurer sont accessibles ;
 2. vérifier que tous les digests du manifeste existent dans GHCR ;
-3. tester le déchiffrement SOPS depuis le poste de récupération ;
+3. compare every required registry entry with its external recovery source or
+   declared regeneration procedure; do not assume that SOPS is available;
 4. exporter les zones DNS, surtout les enregistrements mail ;
 5. noter les empreintes des clés SSH attendues ;
 6. vérifier la disponibilité des sauvegardes métier lorsqu’elles existeront ;
@@ -131,7 +140,8 @@ Le playbook `site.yml` :
 7. installe le wrapper de déploiement root-owned depuis un SHA `vps-infra`
    prouvé sur `origin/main` ;
 8. installs the attestation client used for static sites;
-9. installe les fichiers déchiffrés avec les propriétaires et modes attendus ;
+9. materializes only a secret with an implemented and authorized input path; it
+   does not decrypt SOPS;
 10. configure la clé GHCR en lecture seule ;
 11. configure l’origine HTTPS publique de `vps-infra`, ou une deploy key si sa
     visibilité a changé ;
@@ -177,10 +187,13 @@ exact source ref and workflow. It does not prove branch protection. Restore the
 repository rulesets as a separate reconstruction step before production
 activation.
 
-The role creates the private secret root but does not materialize a secret. A
-GHCR credential for private application images, decrypted secrets, the live
-applicator, and their validations remain explicit gates. `site.yml` does not
-activate a platform service or an application.
+Normal host convergence creates the private secret root. It copies the Mon
+Florian OpenAI key only when the operator supplies an explicit private source.
+It has no general secret restore step. The internal platform and Surplasse
+preparation playbooks separately generated the six values in the baseline
+audit. A GHCR credential for private application images, recovered operator
+secrets, the live applicator, and their validations remain explicit gates.
+`site.yml` does not activate a platform service or an application.
 
 Le compte de livraison n’entre pas dans le groupe `docker`. Une règle restreinte
 autorise seulement le wrapper root-owned, par chemin absolu et sans `SETENV`.
@@ -190,6 +203,14 @@ peut utiliser sudo, mais ses actions manuelles ne remplacent jamais Ansible dans
 l’état canonique.
 
 ## Phase 3 — démarrer la plateforme
+
+Before a service starts, compare its required entries with the registry. Create
+or recover each value through its declared materializer. Commit the target
+generation before the operation. Run a read-only metadata audit, then set the
+observed generation to that target and mark it materialized. Do not mark it
+runtime-loaded until the current service has loaded that generation and passed
+its probes. A Docker file bind mount can retain the old inode after an atomic
+host-file replacement, so a rotation must recreate the affected service.
 
 La plateforme est restaurée avant les applications :
 
@@ -314,6 +335,11 @@ La reconstruction est prouvée lorsque :
   reprovisionnement ;
 - une restauration PostgreSQL isolée a été testée lorsque les sauvegardes sont
   livrées ;
+- the registry matches a fresh read-only Atlas metadata audit, and each active
+  consumer has runtime-loaded evidence for its declared generation;
+- every `restore-from-external-store` entry has a tested recovery source, and no
+  step claims SOPS recovery while the age gate remains open;
+- registry `value_recovery_state` is `verified`;
 - le compte rendu contient la durée réelle et les interventions manuelles.
 
 Les objectifs RTO et RPO restent à fixer après le chantier sauvegarde. Une
@@ -328,7 +354,9 @@ Au moins à chaque changement structurel de l’infrastructure :
 3. utiliser des secrets et données de test ;
 4. couper puis redémarrer la machine ;
 5. mesurer la durée et relever toute étape manuelle non documentée ;
-6. détruire uniquement l’hôte jetable après vérification de ses identifiants.
+6. compare the resulting secret metadata with the registry and record any new
+   test generation outside the production registry;
+7. détruire uniquement l’hôte jetable après vérification de ses identifiants.
 
 Lorsqu’il existe sur l’offre retenue, un snapshot fournisseur accélère une
 récupération mais ne prouve pas que le socle est reconstruisible. L’exercice

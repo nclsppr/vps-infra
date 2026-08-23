@@ -1,9 +1,10 @@
 # Prepare the Surplasse SMTP relay
 
 This runbook defines the evidence required for the Surplasse email channel.
-Atlas does not run a mail transfer agent. This runbook does not authorize a
-provider purchase, a DNS change, a secret change, remote execution, or
-production activation.
+Scaleway Transactional Email (TEM) is the selected outbound relay. Atlas does
+not run a mail transfer agent. This runbook does not authorize a DNS change,
+credential creation, secret materialization, remote execution, or production
+activation.
 
 [ADR-0007](../decisions/0007-relais-email-transactionnel-surplasse.md)
 defines the architecture. The
@@ -30,40 +31,62 @@ change.
 
 The operator must supply these items outside Git:
 
-- explicit provider selection;
 - acceptance of current service limits, costs, data residency, DPA, support,
   and SLA terms;
-- a provider account or project dedicated to Surplasse;
+- access to Scaleway project `Pieper Atlas`;
 - authorization to verify `surplasse.com` and to change its SPF, DKIM, and DMARC
   records;
 - an operated DMARC report mailbox;
-- dedicated SMTP credentials through the approved private channel;
+- the Project ID and the Secret Key for IAM application
+  `surplasse-prod-smtp`, through the approved private channel;
 - the exact Atlas target and separate authority for any remote execution.
 
 The selected service must support authenticated SMTP submission on port `587`
 with required STARTTLS. It must provide exact sender-authentication values and
-delivery, bounce, and complaint events. Provider selection and provisioning are
-separate reviewed changes.
+delivery, bounce, and complaint events. Provider selection is complete.
+Credential provisioning and materialization remain separate controlled
+changes.
 
 ## Current repository boundary
 
-The repository does not contain a public provider contract or an accepted
-external evidence format. It cannot bind an SMTP host to a provider, validate
-provider DNS values, or satisfy an external email gate. Surplasse therefore
-stays disabled.
+The public provider contract uses `smtp.tem.scaleway.com` on port `587` with
+STARTTLS. The SMTP username is the Scaleway Project ID. The SMTP password is the
+API Secret Key. The Access Key is not an SMTP input. Git must not contain the
+Project ID, Secret Key, Access Key, test recipient, or message content.
 
-A later change can define the public provider contract only after selection.
-The contract must contain no username, password, token, test recipient, or
-message content. It must bind the release to the exact public relay FQDN, port,
-sender, and provider-supplied DNS values.
+The required paths and their observed state are in
+[`secrets/registry.json`](../../secrets/registry.json). The registry declares
+the three IAM application names:
+
+- `surplasse-prod-smtp`;
+- `parkventory-prod-smtp`;
+- `monflorian-prod-smtp`.
+
+Each application must have one API key and one policy scoped to project
+`Pieper Atlas`. The policy must grant only
+`TransactionalEmailEmailSmtpCreate`. The three keys separate storage, rotation,
+and revocation. They do not enforce a domain boundary. TEM does not appear in
+Scaleway's documented products that support resource-level conditions. This
+repository therefore infers that a project-scoped key can send from any
+verified TEM domain in the project.
+
+Surplasse has a strict full-bundle materializer. Parkventory declares its SMTP
+paths but has no SMTP materializer. Mon Florian has planned registry entries
+but no runtime SMTP contract. Do not create orphan files for Parkventory or Mon
+Florian. Their implementation must land before their credential state can move
+from `planned`.
+
+Repository admission and tester-order authorization do not prove this email
+channel. The credentials remain `planned`, and technical activation remains
+incomplete.
 
 ## Provider review
 
-Review these properties before provider selection:
+Review these properties before credential activation:
 
 - SMTP submission on port `587` with required STARTTLS and normal certificate
   validation;
-- an account boundary and submission identity dedicated to Surplasse;
+- the exact project-scoped IAM policy and dedicated application;
 - exact domain-verification and DKIM values;
 - the exact SPF requirement, including whether the provider needs no SPF
   mechanism;
@@ -73,9 +96,8 @@ Review these properties before provider selection:
 - credential rotation and immediate revocation;
 - a tested service-status and operator-alert path.
 
-Do not select a provider from an undocumented connectivity test. A successful
-TLS handshake does not prove account eligibility, delivery, event processing,
-or contractual acceptance.
+A successful TLS handshake does not prove account eligibility, delivery, event
+processing, or contractual acceptance.
 
 ## Review DNS before a change
 
@@ -95,13 +117,28 @@ DNS propagation does not satisfy the release gates by itself. Evidence must
 bind the observed records to the reviewed provider contract and collection
 time.
 
+Scaleway TEM sends transactional email. It does not replace the inbound OVH
+mail service. Keep the MX records on OVH. An address such as
+`contact@surplasse.com` needs an OVH mailbox, alias, or redirect only when the
+MVP must receive messages at that address. A `no-reply@surplasse.com` sender
+does not require an inbound mailbox.
+
 ## Materialize the credentials
 
-Create a dedicated submission identity with the minimum permissions. Transfer
-the username and password through the private channel defined by the
+Create the `surplasse-prod-smtp` IAM application, policy, and API key. Grant
+only `TransactionalEmailEmailSmtpCreate` in project `Pieper Atlas`. Transfer
+the Project ID and Secret Key through the private channel defined by the
 [adapter input contract](../../applications/surplasse/README.md#operator-input-contract).
-Do not put either value in a contract, command, log, issue, or pull request.
-Revoke an exposed value before use.
+Do not put either value in a contract, command, log, issue, or pull request. Do
+not transfer or store the Access Key for SMTP. Revoke an exposed value before
+use.
+
+Update `secrets/registry.json` in two separate steps. First, review the planned
+contract and target generation before materialization. Then, after a read-only
+Atlas metadata check, set the observed generation to the target and set
+`host_state` to `materialized` in a dedicated commit. Use `runtime-loaded` only
+after the Backend is recreated and passes its probes. Never add a value-derived
+hash to Git.
 
 The materializer input must use port `587`. Its FQDN must equal the reviewed
 public provider contract. The rendered adapter requires
@@ -155,6 +192,10 @@ without logging it, recreate only the Backend with an explicit generation
 binding, pass its probes, and then revoke the old identity. It must restore the
 previous generation after failure. An atomic host-file rename does not update a
 Docker file bind mount that is already open.
+
+Revoking an IAM API key does not change the TEM domain verification or the
+published DKIM records. Do not remove or replace DNS records as part of an API
+key rotation or revocation.
 
 ## Roll back
 

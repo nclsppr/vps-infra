@@ -119,6 +119,15 @@ readiness rechecks, and digest-bound off-site restore evidence. The
 provider, credential, evidence digest, static-to-Compose handoff, and Atlas
 activation outside this repository-only change.
 
+The public [Atlas secret registry](secrets/registry.json) records paths,
+permissions, consumers, generations, and the last read-only host observation.
+It contains no value or content-derived digest. The 23 August 2026 baseline
+found six materialized files, no runtime-loaded generation, and no Scaleway TEM
+credential. Value recovery is not configured yet, so this registry makes the
+gap visible but does not by itself recover a fresh host. See the
+[secret contract](secrets/README.md) and
+[ADR-0017](docs/decisions/0017-versioned-atlas-secret-registry.md).
+
 The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
 controlled operator rollout recorded this live state:
@@ -277,7 +286,7 @@ Cette décision est détaillée dans
 - [Sauvegarde PostgreSQL et répétition de restauration](docs/operations/postgresql-backup.md)
 - [Static release reconciliation operations](docs/operations/static-release-reconciliation.md)
 - [Static reconciliation rollout evidence, 2026-08-18](docs/evidence/2026-08-18-static-reconciliation-rollout.md)
-- [Contrat des secrets](secrets/README.md)
+- [Atlas secret registry contract](secrets/README.md)
 - [Sources et preuves d’audit](docs/references.md)
 - [Plan de mise en œuvre](VPS-SETUP.md)
 - [ADR-0001 — Ansible et Compose](docs/decisions/0001-ansible-compose-plateforme-partagee.md)
@@ -295,6 +304,8 @@ Cette décision est détaillée dans
 - [ADR-0013 - canonical Surplasse tester application admission](docs/decisions/0013-surplasse-tester-application-admission.md)
 - [ADR-0014 - bounded Surplasse pilot bootstrap](docs/decisions/0014-bounded-surplasse-pilot-bootstrap.md)
 - [ADR-0015 - ready Surplasse tester DNS cutover policy](docs/decisions/0015-surplasse-tester-dns-cutover-policy.md)
+- [ADR-0016 - dormant Mon Florian application admission](docs/decisions/0016-dormant-monflorian-application-admission.md)
+- [ADR-0017 - versioned Atlas secret registry](docs/decisions/0017-versioned-atlas-secret-registry.md)
 
 L’ancien runbook est conservé pour l’historique dans
 [`docs/archive/VPS-SETUP-v0.md`](docs/archive/VPS-SETUP-v0.md). Il ne doit pas

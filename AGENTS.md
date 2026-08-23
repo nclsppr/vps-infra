@@ -28,6 +28,15 @@ production inventory, or business data to this repository.
   Bound each target. Reject each missing variable.
 - Never create a real inventory, a `.env` file, a key, a token, or a decrypted
   file in Git.
+- Any task that plans or requires deployment, rotation, or revocation of a
+  product or platform secret on Atlas must update `secrets/registry.json` before
+  completion. This rule also applies when the task starts in a product
+  repository. If the task cannot update `vps-infra`, report the blocker and do
+  not claim completion. Commit the target generation before the operation.
+  After the operation, use a read-only metadata audit to update the observed
+  generation and host state. Never record a value, a content-derived digest, or
+  a private source path. Mark `runtime-loaded` only after the current consumer
+  and generation have runtime proof.
 - Run `make check` before each commit.
 
 ## External State
