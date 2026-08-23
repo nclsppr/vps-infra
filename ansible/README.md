@@ -204,10 +204,32 @@ quarantine state lives under `/srv/applications` and
 `/var/lib/vps-application`; runtime configuration lives under the root-only
 `/etc/vps/applications` directory. Secret bytes remain in
 `/etc/vps/secrets/<application>` and are never copied into state.
-Mon Florian's OpenAI key is copied only when the operator supplies
-`vps_monflorian_openai_api_key_source` through a private variables file. The
-destination is a regular `root:10001` file in mode `0440`; metadata validation
-does not read or log the value.
+The Mon Florian role accepts two independent private source variables:
+`vps_monflorian_openai_api_key_source` and
+`vps_monflorian_private_access_source`. Each variable is empty by default. When
+an operator supplies one or both absolute paths through a private variables
+file, the role stages each source separately and invokes the closed
+`materialize-monflorian-secret` helper. The helper validates the exact file
+contract and publishes one singleton generation marker after each atomic file
+write. The role uses `no_log` for every source task. It removes each transient
+source directory in an `always` task.
+
+`vps_monflorian_adopt_existing_ids` is an empty list by default. An
+operator can add one of the two closed identifiers to adopt an initial file
+that already exists on Atlas. Adoption and a private source are mutually
+exclusive for the same identifier. First run a normal convergence with the
+empty list. This installs and audits the helper without adoption. Then add the
+identifier in a separate private variables update. The role runs
+`--check-adopt-existing` during normal and predictive convergence. Only normal
+convergence runs the mutating command. Adoption validates and synchronizes the
+existing file, then writes only its public generation marker. It never replaces
+the file and it refuses an observed generation greater than `0`.
+
+The role always runs the helper's explicit `--check` mode after normal
+convergence steps. The same audit runs during Ansible check mode. It does not
+change the secret tree and it returns public metadata and marker state only.
+Run a normal convergence before the first predictive check so that the helper
+and the proved repository mirror exist on the host.
 For Surplasse, the root-only input helper derives `surplasse.env` atomically
 from the validated JWT key identifier and SMTP host. The file contains exactly
 those two keys. The same helper commit marker binds the source inputs, runtime

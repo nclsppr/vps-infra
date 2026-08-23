@@ -23,8 +23,12 @@ vps_application_root: /srv/applications
 vps_application_config_dir: /etc/vps/applications
 vps_application_state_dir: /var/lib/vps-application
 vps_application_recovery_unit: vps-application-recover.service
+vps_monflorian_secret_materializer_path: /usr/local/libexec/vps/materialize-monflorian-secret
+vps_monflorian_adopt_existing_ids: []
 vps_monflorian_openai_api_key_source: ""
 vps_monflorian_openai_api_key_path: /etc/vps/secrets/monflorian/monflorian-openai-api-key
+vps_monflorian_private_access_source: ""
+vps_monflorian_private_access_path: /etc/vps/secrets/monflorian/monflorian-private-access.caddy
 vps_deploy_production_marker: /etc/vps/production-enabled
 vps_gh_version: "2.97.0"
 vps_gh_install_path: /usr/local/bin/gh
@@ -55,6 +59,7 @@ vps_deploy_executables:
   - verify-github-evidence
   - verify-state
 vps_deploy_root_helpers:
+  - materialize-monflorian-secret
   - materialize-surplasse-dns-secrets
   - materialize-surplasse-pilot-manifest
   - surplasse-pilot-bootstrap

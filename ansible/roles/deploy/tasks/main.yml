@@ -26,6 +26,9 @@
       - >-
         vps_surplasse_pilot_controller_path ==
         '/usr/local/libexec/vps/surplasse-pilot-bootstrap'
+      - >-
+        vps_monflorian_secret_materializer_path ==
+        '/usr/local/libexec/vps/materialize-monflorian-secret'
       - vps_deploy_schema_root == '/usr/local/share/vps-infra/schemas'
       - vps_deploy_repository_dir == '/srv/vps/repository'
       - vps_deploy_repository_url == 'https://github.com/nclsppr/vps-infra.git'
@@ -67,7 +70,8 @@
          'verify-state']
       - >-
         vps_deploy_root_helpers ==
-        ['materialize-surplasse-dns-secrets',
+        ['materialize-monflorian-secret',
+         'materialize-surplasse-dns-secrets',
          'materialize-surplasse-pilot-manifest',
          'surplasse-pilot-bootstrap']
       - not (vps_live_apply_enabled | bool)
@@ -429,52 +433,46 @@
   loop_control:
     label: "{{ item.path }}"
 
-- name: Validate the private Mon Florian OpenAI secret input contract
+- name: Validate the private Mon Florian secret input contracts
   ansible.builtin.assert:
     that:
+      - vps_monflorian_adopt_existing_ids is sequence
+      - vps_monflorian_adopt_existing_ids is not string
+      - vps_monflorian_adopt_existing_ids is not mapping
+      - >-
+        vps_monflorian_adopt_existing_ids | unique | length ==
+        vps_monflorian_adopt_existing_ids | length
+      - >-
+        vps_monflorian_adopt_existing_ids |
+        difference(['monflorian.openai-api-key',
+                    'monflorian.private-access']) | length == 0
+      - >-
+        'monflorian.openai-api-key' not in
+        vps_monflorian_adopt_existing_ids or
+        vps_monflorian_openai_api_key_source == ''
+      - >-
+        'monflorian.private-access' not in
+        vps_monflorian_adopt_existing_ids or
+        vps_monflorian_private_access_source == ''
       - vps_monflorian_openai_api_key_source is string
       - "'\n' not in vps_monflorian_openai_api_key_source"
       - "'\r' not in vps_monflorian_openai_api_key_source"
       - >-
+        vps_monflorian_openai_api_key_source == '' or
+        vps_monflorian_openai_api_key_source is match('^/')
+      - vps_monflorian_private_access_source is string
+      - "'\n' not in vps_monflorian_private_access_source"
+      - "'\r' not in vps_monflorian_private_access_source"
+      - >-
+        vps_monflorian_private_access_source == '' or
+        vps_monflorian_private_access_source is match('^/')
+      - >-
         vps_monflorian_openai_api_key_path ==
         '/etc/vps/secrets/monflorian/monflorian-openai-api-key'
-    fail_msg: The private Mon Florian OpenAI secret input contract is invalid.
-  no_log: true
-
-- name: Materialize the Mon Florian OpenAI secret from private operator input
-  ansible.builtin.copy:
-    src: "{{ vps_monflorian_openai_api_key_source }}"
-    dest: "{{ vps_monflorian_openai_api_key_path }}"
-    owner: root
-    group: "10001"
-    mode: "0440"
-    force: true
-    backup: false
-  when: vps_monflorian_openai_api_key_source | length > 0
-  no_log: true
-
-- name: Inspect the Mon Florian OpenAI secret without reading its value
-  ansible.builtin.stat:
-    path: "{{ vps_monflorian_openai_api_key_path }}"
-    follow: false
-    get_checksum: false
-    get_mime: false
-  register: vps_monflorian_openai_api_key_stat
-  no_log: true
-
-- name: Prove the Mon Florian OpenAI secret metadata when present
-  ansible.builtin.assert:
-    that:
-      - vps_monflorian_openai_api_key_stat.stat.isreg
-      - not vps_monflorian_openai_api_key_stat.stat.islnk
-      - vps_monflorian_openai_api_key_stat.stat.uid == 0
-      - vps_monflorian_openai_api_key_stat.stat.gid == 10001
-      - vps_monflorian_openai_api_key_stat.stat.mode == '0440'
-      - vps_monflorian_openai_api_key_stat.stat.nlink == 1
-      - vps_monflorian_openai_api_key_stat.stat.size > 0
-      - vps_monflorian_openai_api_key_stat.stat.size <= 65536
-    fail_msg: The Mon Florian OpenAI secret metadata is outside its contract.
-  when: vps_monflorian_openai_api_key_stat.stat.exists
+      - >-
+        vps_monflorian_private_access_path ==
+        '/etc/vps/secrets/monflorian/monflorian-private-access.caddy'
+    fail_msg: The private Mon Florian secret input contract is invalid.
   no_log: true
 
 - name: Select the pinned GitHub CLI archive for this architecture
@@ -982,6 +980,68 @@
   loop_control:
     label: "{{ item.item }}"
   when: not ansible_check_mode
+
+- name: Preflight each selected Mon Florian existing-file adoption
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_monflorian_secret_materializer_path }}"
+      - --check-adopt-existing
+      - "{{ item }}"
+  register: vps_monflorian_secret_adoption_preflight
+  loop: "{{ vps_monflorian_adopt_existing_ids }}"
+  loop_control:
+    label: "{{ item }}"
+  check_mode: false
+  changed_when: false
+
+- name: Adopt each explicitly selected existing Mon Florian secret
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_monflorian_secret_materializer_path }}"
+      - --adopt-existing
+      - "{{ item }}"
+  register: vps_monflorian_secret_adoption
+  loop: "{{ vps_monflorian_adopt_existing_ids }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+  changed_when: >-
+    (vps_monflorian_secret_adoption.stdout | from_json).changed | bool
+
+- name: Materialize each supplied Mon Florian singleton secret
+  ansible.builtin.include_tasks: materialize-monflorian-secret.yml
+  loop:
+    - identifier: monflorian.openai-api-key
+      source: "{{ vps_monflorian_openai_api_key_source }}"
+    - identifier: monflorian.private-access
+      source: "{{ vps_monflorian_private_access_source }}"
+  loop_control:
+    loop_var: vps_monflorian_secret_input
+    label: "{{ vps_monflorian_secret_input.identifier }}"
+  when:
+    - not ansible_check_mode
+    - vps_monflorian_secret_input.source | length > 0
+  no_log: true
+
+- name: Audit Mon Florian secret metadata and generation markers
+  ansible.builtin.command:
+    argv:
+      - "{{ vps_monflorian_secret_materializer_path }}"
+      - --check
+  register: vps_monflorian_secret_audit
+  check_mode: false
+  changed_when: false
+
+- name: Prove the public Mon Florian secret audit contract
+  ansible.builtin.assert:
+    that:
+      - not ((vps_monflorian_secret_audit.stdout | from_json).changed | bool)
+      - (vps_monflorian_secret_audit.stdout | from_json).mode == 'check'
+      - >-
+        (vps_monflorian_secret_audit.stdout | from_json).entries.keys() |
+        list | sort ==
+        ['monflorian.openai-api-key', 'monflorian.private-access']
+    fail_msg: The public Mon Florian secret audit contract is invalid.
 
 - name: Enable static transaction recovery at boot
   ansible.builtin.systemd_service:

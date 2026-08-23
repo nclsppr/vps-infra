@@ -49,9 +49,10 @@ only public contract identifiers, the exact registered secret identifiers, and
 the target generation. A read-only audit must verify that marker before Git can
 set `generation_binding` to `materializer-marker` and advance `generation`.
 The two Parkventory materializers write separate markers for the four generated
-files and the three provider files. Other root-only manifests bind files
-through private content digests, but they do not contain a registry generation.
-They do not satisfy this requirement.
+files and the three provider files. The `materialize-monflorian-secret` helper
+writes singleton markers for its two closed identifiers. Other root-only
+manifests bind files through private content digests, but they do not contain a
+registry generation. They do not satisfy this requirement.
 
 `observed_at` and `controller_revision` bind the registry to one audit. A Git
 commit preserves that reviewed observation. It is not permanent proof of the
@@ -198,10 +199,67 @@ Auth0 and Scaleway TEM credentials.
 
 ## Mon Florian
 
-The application contract admits one OpenAI API key. Normal convergence copies
-it only when the operator supplies an explicit private source. Its SMTP pair is
-planned in the registry but has no admitted runtime contract or materializer.
-The baseline audit found no Mon Florian secret file.
+The registry requires two independent singleton file sets. One contains the
+OpenAI API key for the backend. The other contains the private-access Caddy
+snippet. Both entries have target generation `1`. They remain at generation
+`0`, with binding `unlinked` and state `absent` in the historical registry
+snapshot. This is not a current absence claim. A separate post-operation audit
+must update the complete host observation. The OpenAI provider state is
+`active` after a read-only API check on 23 August 2026. This provider result
+does not prove host state or runtime use.
+
+The `materialize-monflorian-secret` helper accepts only these identifiers:
+
+- `monflorian.openai-api-key`;
+- `monflorian.private-access`.
+
+One invocation installs one source and one marker. Ansible can invoke the
+helper once or twice, so an operator can supply either source or both sources.
+It stages each supplied source in a separate root-only transient directory. It
+does not log the source path or value. An empty source variable causes no
+materialization.
+
+The `--check-adopt-existing` mode validates an initial file without changing
+the tree. The matching `--adopt-existing` mode does not accept a source and
+does not replace the file. Its first marker write requires generation `0`,
+target generation `1`, no marker, and one installed file with the exact
+metadata and content format. A matching target marker makes the operation a
+no-op while Git still records generation `0`. Both modes refuse the operation
+after the observed generation advances. An install source can resume an
+unlinked initial write only when its content equals the installed file. It
+cannot replace different unlinked content.
+
+The helper stores each public marker at
+`/etc/vps/secrets/monflorian/.generations/<secret-id>.json`. Each marker is a
+regular `root:root` file in mode `0400`. It contains this canonical JSON object:
+
+```json
+{"materializer":"materialize-monflorian-secret","schema":1,"secret_ids":["<secret-id>"],"target_generation":1}
+```
+
+The helper synchronizes the secret file before it publishes the marker. For a
+rotation, it removes and synchronizes the old marker before it replaces the
+secret. It rejects a rotation source that equals the marker-bound file. It then
+publishes and synchronizes the new marker. A failure can leave an installed
+file without a marker. The read-only audit reports that state as unlinked and
+refuses an observed generation that has no marker. A source install also
+refuses that interrupted rotation state. A separate reviewed recovery procedure
+must resolve it.
+
+A read-only mode refuses every leftover `.pending` file without deleting it. A
+mutating mode validates all bounded pending files before it deletes any of
+them. It checks the name, file type, owner, group, mode, link count, device,
+size, and content contract. It then deletes the valid set and synchronizes each
+affected directory before it continues.
+
+The explicit `--check` mode does not create a directory, temporary file, secret
+file, or marker. It verifies file metadata and marker content. Its JSON output
+contains public states and generation numbers only. The future rotation of the
+private-access file remains tracked in
+[issue #104](https://github.com/nclsppr/vps-infra/issues/104).
+
+The SMTP pair is still planned. It has no admitted runtime contract or
+materializer. The baseline audit found no Mon Florian secret file.
 
 ## Scaleway Transactional Email
 

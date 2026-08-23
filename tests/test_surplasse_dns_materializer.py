@@ -159,6 +159,7 @@ class SurplasseDnsMaterializerTests(unittest.TestCase):
         self.assertEqual(
             defaults["vps_deploy_root_helpers"],
             [
+                "materialize-monflorian-secret",
                 "materialize-surplasse-dns-secrets",
                 "materialize-surplasse-pilot-manifest",
                 "surplasse-pilot-bootstrap",

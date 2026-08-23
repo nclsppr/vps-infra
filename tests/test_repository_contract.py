@@ -1081,10 +1081,24 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             defaults["vps_application_recovery_unit"],
             "vps-application-recover.service",
         )
+        self.assertEqual(
+            defaults["vps_monflorian_secret_materializer_path"],
+            "/usr/local/libexec/vps/materialize-monflorian-secret",
+        )
+        self.assertEqual(defaults["vps_monflorian_adopt_existing_ids"], [])
         self.assertEqual(defaults["vps_monflorian_openai_api_key_source"], "")
         self.assertEqual(
             defaults["vps_monflorian_openai_api_key_path"],
             "/etc/vps/secrets/monflorian/monflorian-openai-api-key",
+        )
+        self.assertEqual(defaults["vps_monflorian_private_access_source"], "")
+        self.assertEqual(
+            defaults["vps_monflorian_private_access_path"],
+            "/etc/vps/secrets/monflorian/monflorian-private-access.caddy",
+        )
+        self.assertIn(
+            "materialize-monflorian-secret",
+            defaults["vps_deploy_root_helpers"],
         )
         self.assertIn("deploy-application", defaults["vps_deploy_executables"])
         self.assertIn(
@@ -1126,40 +1140,151 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             )
         self.assertEqual(directories["/etc/vps/secrets/monflorian"], "0700")
 
-        materialized_copy = by_name[
-            "Materialize the Mon Florian OpenAI secret from private operator input"
-        ]["ansible.builtin.copy"]
+        input_contract = by_name[
+            "Validate the private Mon Florian secret input contracts"
+        ]
+        self.assertTrue(input_contract["no_log"])
+        input_assertions = input_contract["ansible.builtin.assert"]["that"]
+        normalized_input_assertions = {
+            " ".join(assertion.split()) for assertion in input_assertions
+        }
+        self.assertIn(
+            "vps_monflorian_openai_api_key_source == '' or "
+            "vps_monflorian_openai_api_key_source is match('^/')",
+            input_assertions,
+        )
+        self.assertIn(
+            "vps_monflorian_private_access_source == '' or "
+            "vps_monflorian_private_access_source is match('^/')",
+            input_assertions,
+        )
+        self.assertIn(
+            "vps_monflorian_adopt_existing_ids | "
+            "difference(['monflorian.openai-api-key', "
+            "'monflorian.private-access']) | length == 0",
+            normalized_input_assertions,
+        )
+
+        adoption_preflight = by_name[
+            "Preflight each selected Mon Florian existing-file adoption"
+        ]
         self.assertEqual(
-            materialized_copy,
-            {
-                "src": "{{ vps_monflorian_openai_api_key_source }}",
-                "dest": "{{ vps_monflorian_openai_api_key_path }}",
-                "owner": "root",
-                "group": "10001",
-                "mode": "0440",
-                "force": True,
-                "backup": False,
-            },
+            adoption_preflight["ansible.builtin.command"]["argv"],
+            [
+                "{{ vps_monflorian_secret_materializer_path }}",
+                "--check-adopt-existing",
+                "{{ item }}",
+            ],
         )
-        metadata_stat = by_name[
-            "Inspect the Mon Florian OpenAI secret without reading its value"
-        ]["ansible.builtin.stat"]
-        self.assertEqual(metadata_stat["get_checksum"], False)
-        self.assertEqual(metadata_stat["get_mime"], False)
-        metadata_assertions = by_name[
-            "Prove the Mon Florian OpenAI secret metadata when present"
-        ]["ansible.builtin.assert"]["that"]
-        self.assertIn(
-            "vps_monflorian_openai_api_key_stat.stat.gid == 10001",
-            metadata_assertions,
+        self.assertFalse(adoption_preflight["check_mode"])
+        self.assertFalse(adoption_preflight["changed_when"])
+        self.assertNotIn("when", adoption_preflight)
+        self.assertNotIn("no_log", adoption_preflight)
+
+        adoption = by_name[
+            "Adopt each explicitly selected existing Mon Florian secret"
+        ]
+        self.assertEqual(
+            adoption["ansible.builtin.command"]["argv"],
+            [
+                "{{ vps_monflorian_secret_materializer_path }}",
+                "--adopt-existing",
+                "{{ item }}",
+            ],
         )
-        self.assertIn(
-            "vps_monflorian_openai_api_key_stat.stat.mode == '0440'",
-            metadata_assertions,
+        self.assertEqual(
+            adoption["loop"],
+            "{{ vps_monflorian_adopt_existing_ids }}",
         )
+        self.assertEqual(adoption["when"], "not ansible_check_mode")
+        self.assertNotIn("check_mode", adoption)
+        self.assertNotIn("no_log", adoption)
+
+        materialize = by_name[
+            "Materialize each supplied Mon Florian singleton secret"
+        ]
+        self.assertEqual(
+            materialize["ansible.builtin.include_tasks"],
+            "materialize-monflorian-secret.yml",
+        )
+        self.assertEqual(
+            materialize["loop"],
+            [
+                {
+                    "identifier": "monflorian.openai-api-key",
+                    "source": "{{ vps_monflorian_openai_api_key_source }}",
+                },
+                {
+                    "identifier": "monflorian.private-access",
+                    "source": "{{ vps_monflorian_private_access_source }}",
+                },
+            ],
+        )
+        self.assertTrue(materialize["no_log"])
+        self.assertEqual(
+            materialize["when"],
+            [
+                "not ansible_check_mode",
+                "vps_monflorian_secret_input.source | length > 0",
+            ],
+        )
+
+        materializer_tasks = yaml.safe_load(
+            (
+                ROOT
+                / "ansible/roles/deploy/tasks/materialize-monflorian-secret.yml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(materializer_tasks), 1)
+        materializer_block = materializer_tasks[0]
+        self.assertTrue(materializer_block["no_log"])
+        materializer_by_name = {
+            task["name"]: task for task in materializer_block["block"]
+        }
+        staged_copy = materializer_by_name[
+            "Stage the private Mon Florian source"
+        ]["ansible.builtin.copy"]
+        self.assertEqual(staged_copy["group"], "root")
+        self.assertEqual(staged_copy["mode"], "0400")
+        install_command = materializer_by_name[
+            "Materialize the staged Mon Florian singleton file set"
+        ]
+        self.assertNotIn("check_mode", install_command)
+        self.assertEqual(
+            install_command["ansible.builtin.command"]["argv"],
+            [
+                "{{ vps_monflorian_secret_materializer_path }}",
+                "--install-from",
+                "{{ vps_monflorian_secret_stage.path }}/source",
+                "{{ vps_monflorian_secret_input.identifier }}",
+            ],
+        )
+        cleanup = materializer_block["always"][0]
+        self.assertEqual(
+            cleanup["ansible.builtin.file"]["state"],
+            "absent",
+        )
+
+        audit = by_name[
+            "Audit Mon Florian secret metadata and generation markers"
+        ]
+        self.assertEqual(
+            audit["ansible.builtin.command"]["argv"],
+            ["{{ vps_monflorian_secret_materializer_path }}", "--check"],
+        )
+        self.assertFalse(audit["check_mode"])
+        self.assertFalse(audit["changed_when"])
+        self.assertNotIn("no_log", audit)
+        self.assertTrue(
+            by_name["Prove the public Mon Florian secret audit contract"]
+            ["ansible.builtin.assert"]["that"]
+        )
+
+        helper = ROOT / "scripts/materialize-monflorian-secret"
+        self.assertTrue(os.access(helper, os.X_OK))
         self.assertIn(
-            "vps_monflorian_openai_api_key_stat.stat.nlink == 1",
-            metadata_assertions,
+            'MATERIALIZER = "materialize-monflorian-secret"',
+            helper.read_text(encoding="utf-8"),
         )
         recovery_install = by_name[
             "Install the application transaction recovery unit"
@@ -3352,6 +3477,21 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "/usr/bin/getent",
                 "passwd",
                 "{{ vps_deploy_user }}",
+            ],
+            (
+                "deploy",
+                "Preflight each selected Mon Florian existing-file adoption",
+            ): [
+                "{{ vps_monflorian_secret_materializer_path }}",
+                "--check-adopt-existing",
+                "{{ item }}",
+            ],
+            (
+                "deploy",
+                "Audit Mon Florian secret metadata and generation markers",
+            ): [
+                "{{ vps_monflorian_secret_materializer_path }}",
+                "--check",
             ],
             ("docker", "Read the Docker key fingerprints"): [
                 "/usr/bin/gpg",

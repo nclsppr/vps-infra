@@ -367,6 +367,54 @@ class SecretRegistryTests(unittest.TestCase):
             any("access-key" in entry["id"] for entry in tem_entries)
         )
 
+    def test_monflorian_secret_targets_are_required_but_not_observed(self) -> None:
+        by_id = {entry["id"]: entry for entry in self.registry["secrets"]}
+        expected = {
+            "monflorian.openai-api-key": {
+                "classification": "secret",
+                "consumers": ["monflorian-backend"],
+                "group": 10001,
+                "mode": "0440",
+                "path": (
+                    "/etc/vps/secrets/monflorian/"
+                    "monflorian-openai-api-key"
+                ),
+                "provider": "openai",
+                "provider_state": "active",
+                "source": "provider-secret",
+            },
+            "monflorian.private-access": {
+                "classification": "secret",
+                "consumers": ["caddy"],
+                "group": 0,
+                "mode": "0400",
+                "path": (
+                    "/etc/vps/secrets/monflorian/"
+                    "monflorian-private-access.caddy"
+                ),
+                "provider": "local",
+                "provider_state": "not-applicable",
+                "source": "operator-file",
+            },
+        }
+        for identifier, fields in expected.items():
+            with self.subTest(identifier=identifier):
+                entry = by_id[identifier]
+                for field, value in fields.items():
+                    self.assertEqual(entry[field], value)
+                self.assertEqual(entry["scope"], "monflorian")
+                self.assertEqual(
+                    entry["materializer"],
+                    "materialize-monflorian-secret",
+                )
+                self.assertEqual(entry["owner"], 0)
+                self.assertEqual(entry["rebuild"], "restore-from-external-store")
+                self.assertEqual(entry["declared_state"], "required")
+                self.assertEqual(entry["generation"], 0)
+                self.assertEqual(entry["target_generation"], 1)
+                self.assertEqual(entry["generation_binding"], "unlinked")
+                self.assertEqual(entry["host_state"], "absent")
+
     def test_registry_paths_match_existing_executable_contracts(self) -> None:
         bundle = load_script_module(
             "secret_registry_application_bundle",
@@ -388,6 +436,10 @@ class SecretRegistryTests(unittest.TestCase):
             "secret_registry_dns_materializer",
             ROOT / "scripts/materialize-surplasse-dns-secrets",
         )
+        monflorian_materializer = load_script_module(
+            "secret_registry_monflorian_materializer",
+            ROOT / "scripts/materialize-monflorian-secret",
+        )
         registry_paths = {secret["path"] for secret in self.registry["secrets"]}
 
         for application, profile in bundle.PROFILES.items():
@@ -404,6 +456,7 @@ class SecretRegistryTests(unittest.TestCase):
             }
             for materializer in (
                 "materialize-internal-platform-secrets",
+                "materialize-monflorian-secret",
                 "materialize-parkventory-provider-secrets",
                 "materialize-parkventory-secrets",
                 "materialize-surplasse-dns-secrets",
@@ -413,6 +466,13 @@ class SecretRegistryTests(unittest.TestCase):
         self.assertEqual(
             paths_by_materializer["materialize-internal-platform-secrets"],
             EXPECTED_PLATFORM_PATHS,
+        )
+        self.assertEqual(
+            paths_by_materializer["materialize-monflorian-secret"],
+            {
+                str(monflorian_materializer.PRODUCTION_ROOT / spec.filename)
+                for spec in monflorian_materializer.SPECS.values()
+            },
         )
         self.assertEqual(
             paths_by_materializer["materialize-parkventory-provider-secrets"],
