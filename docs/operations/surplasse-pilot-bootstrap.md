@@ -42,7 +42,7 @@ make status-surplasse-pilot \
   ANSIBLE_EXTRA_VARS=/private/path/bootstrap-public.yml
 ```
 
-The first status must observe the exact empty Flyway V14 state. Its durable
+The first status must observe the exact empty Flyway V15 state. Its durable
 confirmation expires after 15 minutes. Apply never accepts the release or
 Backend digest from the command line. It leaves `applied-unverified` until the
 last status proves the exact tester graph with order intake paused.
