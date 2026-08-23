@@ -39,12 +39,16 @@ PARKVENTORY_POSTGRES_READINESS_CONTRACT = (
 PARKVENTORY_POSTGRES_READINESS_PATH = (
     "/var/lib/vps-readiness/parkventory/postgres.json"
 )
-PARKVENTORY_OFFSITE_READINESS_CONTRACT = (
-    "vps-infra.parkventory-offsite-backup-readiness.v1"
+PARKVENTORY_LOCAL_BACKUP_READINESS_CONTRACT = (
+    "vps-postgres-local-restore-readiness-v1"
 )
-PARKVENTORY_OFFSITE_READINESS_PATH = (
-    "/var/lib/vps-readiness/parkventory/offsite-backup.json"
+PARKVENTORY_LOCAL_BACKUP_READINESS_PATH = (
+    "/var/lib/vps-readiness/postgresql/local-restore.json"
 )
+PARKVENTORY_OFFSITE_DEFERRAL = {
+    "required": False,
+    "status": "deferred-for-public-launch",
+}
 RFC3339_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
@@ -300,7 +304,7 @@ def load_production_contract(
             )
             _exact_keys(
                 readiness,
-                {"postgres", "encrypted_offsite_backup"},
+                {"postgres", "local_backup", "encrypted_offsite_backup"},
                 f"{path_prefix}.readiness_evidence",
             )
             postgres = _object(
@@ -328,33 +332,43 @@ def load_production_contract(
                     postgres_digest,
                     f"{path_prefix}.readiness_evidence.postgres.sha256",
                 )
+            local_backup = _object(
+                readiness["local_backup"],
+                f"{path_prefix}.readiness_evidence.local_backup",
+            )
+            _exact_keys(
+                local_backup,
+                {"contract", "path", "sha256"},
+                f"{path_prefix}.readiness_evidence.local_backup",
+            )
+            _literal(
+                local_backup["contract"],
+                PARKVENTORY_LOCAL_BACKUP_READINESS_CONTRACT,
+                f"{path_prefix}.readiness_evidence.local_backup.contract",
+            )
+            _literal(
+                local_backup["path"],
+                PARKVENTORY_LOCAL_BACKUP_READINESS_PATH,
+                f"{path_prefix}.readiness_evidence.local_backup.path",
+            )
+            local_backup_digest = local_backup["sha256"]
+            if local_backup_digest is not None:
+                _sha256(
+                    local_backup_digest,
+                    f"{path_prefix}.readiness_evidence.local_backup.sha256",
+                )
             offsite = _object(
                 readiness["encrypted_offsite_backup"],
                 f"{path_prefix}.readiness_evidence.encrypted_offsite_backup",
             )
-            _exact_keys(
+            _literal(
                 offsite,
-                {"contract", "path", "sha256"},
+                PARKVENTORY_OFFSITE_DEFERRAL,
                 f"{path_prefix}.readiness_evidence.encrypted_offsite_backup",
             )
-            _literal(
-                offsite["contract"],
-                PARKVENTORY_OFFSITE_READINESS_CONTRACT,
-                f"{path_prefix}.readiness_evidence.encrypted_offsite_backup.contract",
-            )
-            _literal(
-                offsite["path"],
-                PARKVENTORY_OFFSITE_READINESS_PATH,
-                f"{path_prefix}.readiness_evidence.encrypted_offsite_backup.path",
-            )
-            offsite_digest = offsite["sha256"]
-            if offsite_digest is not None:
-                _sha256(
-                    offsite_digest,
-                    f"{path_prefix}.readiness_evidence.encrypted_offsite_backup.sha256",
-                )
             readiness_evidence = {
                 "postgres": dict(postgres),
+                "local_backup": dict(local_backup),
                 "encrypted_offsite_backup": dict(offsite),
             }
         parsed.append(
@@ -391,13 +405,13 @@ def load_production_contract(
                 "readiness_evidence.postgres.sha256",
                 "must bind enabled Parkventory to exact PostgreSQL readiness evidence",
             )
-        offsite = parkventory.readiness_evidence["encrypted_offsite_backup"]
-        assert isinstance(offsite, dict)
-        if offsite["sha256"] is None:
+        local_backup = parkventory.readiness_evidence["local_backup"]
+        assert isinstance(local_backup, dict)
+        if local_backup["sha256"] is None:
             _fail(
                 "application production contract.applications.parkventory."
-                "readiness_evidence.encrypted_offsite_backup.sha256",
-                "must bind enabled Parkventory to verified encrypted off-site backup evidence",
+                "readiness_evidence.local_backup.sha256",
+                "must bind enabled Parkventory to verified local restore evidence",
             )
     return result
 

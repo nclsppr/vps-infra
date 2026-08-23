@@ -40,10 +40,14 @@
           "path": "/var/lib/vps-readiness/parkventory/postgres.json",
           "sha256": null
         },
-        "encrypted_offsite_backup": {
-          "contract": "vps-infra.parkventory-offsite-backup-readiness.v1",
-          "path": "/var/lib/vps-readiness/parkventory/offsite-backup.json",
+        "local_backup": {
+          "contract": "vps-postgres-local-restore-readiness-v1",
+          "path": "/var/lib/vps-readiness/postgresql/local-restore.json",
           "sha256": null
+        },
+        "encrypted_offsite_backup": {
+          "required": false,
+          "status": "deferred-for-public-launch"
         }
       }
     },

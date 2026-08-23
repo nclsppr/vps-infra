@@ -105,6 +105,7 @@ ACTIVE_STATE_ROOT = APPLICATION_STATE_ROOT / "active"
 INVENTORY_STATE_ROOT = APPLICATION_STATE_ROOT / "inventories"
 QUARANTINE_ROOT = APPLICATION_STATE_ROOT / "quarantine"
 TRANSACTION_ROOT = APPLICATION_STATE_ROOT / "transactions"
+HANDOFF_ROOT = APPLICATION_STATE_ROOT / "handoffs"
 RUNTIME_CONFIG_ROOT = Path("/etc/vps/applications")
 CREDENTIAL_ROOT = Path("/etc/vps/secrets")
 STATIC_ACTIVE_STATE_ROOT = Path("/var/lib/vps-static/active")
@@ -114,11 +115,35 @@ PARKVENTORY_POSTGRES_READINESS = Path(
     "/var/lib/vps-readiness/parkventory/postgres.json"
 )
 PARKVENTORY_POSTGRES_VALIDATOR = SCRIPT_DIRECTORY / "provision-parkventory-postgres"
-PARKVENTORY_OFFSITE_READINESS = Path(
-    "/var/lib/vps-readiness/parkventory/offsite-backup.json"
+PARKVENTORY_DATABASE_INPUT_VALIDATOR_PATH = (
+    SCRIPT_DIRECTORY / "materialize-parkventory-secrets"
 )
+PARKVENTORY_PROVIDER_INPUT_VALIDATOR_PATH = (
+    SCRIPT_DIRECTORY / "materialize-parkventory-provider-secrets"
+)
+PARKVENTORY_LOCAL_BACKUP_READINESS = Path(
+    "/var/lib/vps-readiness/postgresql/local-restore.json"
+)
+PARKVENTORY_LOCAL_BACKUP_ROOT = Path("/srv/vps/backups/postgresql")
+POSTGRES_BACKUP_VALIDATOR = SCRIPT_DIRECTORY / "postgres-backup"
 PUBLIC_EDGE_RUNTIME_ROOT = Path("/srv/vps/runtime/public-static-edge")
 PUBLIC_EDGE_CONTAINER = "vps-public-static-edge-caddy-1"
+PUBLIC_EDGE_UNIT = "vps-public-static-edge.service"
+PUBLIC_EDGE_UNIT_PATH = Path("/etc/systemd/system") / PUBLIC_EDGE_UNIT
+PARKVENTORY_PUBLIC_EDGE_STATE_ROOT = Path(
+    "/var/lib/vps-public-edge-parkventory"
+)
+PARKVENTORY_PUBLIC_EDGE_ROUTE = (
+    PARKVENTORY_PUBLIC_EDGE_STATE_ROOT / "route.caddy"
+)
+PUBLIC_EDGE_BASE_TRANSACTION = (
+    PARKVENTORY_PUBLIC_EDGE_STATE_ROOT / "base-transaction.json"
+)
+PUBLIC_EDGE_RELEASE_ROOT = Path("/srv/vps/releases/public-static-edge")
+PUBLIC_EDGE_SURPLASSE_STATE_ROOT = Path("/var/lib/vps-public-edge-surplasse")
+PARKVENTORY_PUBLIC_EDGE_NETWORK = "app_parkventory"
+PARKVENTORY_PUBLIC_EDGE_SUBNET = "172.30.20.0/24"
+PARKVENTORY_PUBLIC_EDGE_ADDRESS = "172.30.20.254"
 SURPLASSE_PUBLIC_EDGE_NETWORK = "app_surplasse"
 SURPLASSE_PUBLIC_EDGE_SUBNET = "172.30.10.0/24"
 SURPLASSE_PUBLIC_EDGE_ADDRESS = "172.30.10.254"
@@ -149,6 +174,7 @@ SURPLASSE_OPERATOR_INPUT_NAMES = frozenset(
     }
 )
 DOCKER_PATH = Path("/usr/bin/docker")
+SYSTEMCTL_PATH = Path("/usr/bin/systemctl")
 GIT_PATH = Path("/usr/bin/git")
 CURL_PATH = Path("/usr/bin/curl")
 LOCK_PATH = Path("/run/lock/vps-static.lock")
@@ -214,6 +240,53 @@ class ApplicationTransaction:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class ParkventoryHandoff:
+    candidate: ApplicationState
+    static_state: Any
+    static_target: str
+    static_route: str
+    static_route_digest: str
+    candidate_route_digest: str
+    phase: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "application": "parkventory",
+            "candidate": self.candidate.as_dict(),
+            "candidate_route_digest": self.candidate_route_digest,
+            "phase": self.phase,
+            "schema": 1,
+            "static_route": self.static_route,
+            "static_route_digest": self.static_route_digest,
+            "static_state": self.static_state.as_dict(),
+            "static_target": self.static_target,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class PublicEdgeBaseTransaction:
+    candidate_release: str
+    previous_release: str | None
+    candidate_route: str
+    previous_route: str | None
+    previous_unit_active: bool
+    previous_unit_enabled: bool
+    phase: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "candidate_release": self.candidate_release,
+            "candidate_route": self.candidate_route,
+            "phase": self.phase,
+            "previous_release": self.previous_release,
+            "previous_route": self.previous_route,
+            "previous_unit_active": self.previous_unit_active,
+            "previous_unit_enabled": self.previous_unit_enabled,
+            "schema": 1,
+        }
+
+
 TRANSACTION_PHASES = frozenset(
     {
         "prepared",
@@ -223,11 +296,26 @@ TRANSACTION_PHASES = frozenset(
         "started",
         "probe-rejected",
         "probed",
+        "rollback",
     }
 )
 
 PARKVENTORY_UNTRUSTED_DATABASE_PHASES = frozenset(
     {"migration-running", "postgres-unverified"}
+)
+
+PARKVENTORY_HANDOFF_PHASES = frozenset(
+    {
+        "prepared",
+        "route-switched",
+        "edge-verified",
+        "static-released",
+        "restoring-static",
+    }
+)
+
+PUBLIC_EDGE_BASE_TRANSACTION_PHASES = frozenset(
+    {"prepared", "reconciled", "rollback"}
 )
 
 
@@ -406,6 +494,178 @@ def canonical_transaction(transaction: ApplicationTransaction) -> bytes:
     return canonical_json(transaction.as_dict())
 
 
+def validate_parkventory_route_bytes(route: bytes, label: str) -> str:
+    if not 1 <= len(route) <= MAX_CONFIG_BYTES:
+        fail(f"{label} size is outside the Parkventory route contract")
+    try:
+        text = route.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ApplicationDeploymentError(f"{label} is not UTF-8") from exc
+    if not text.endswith("\n") or "\r" in text or "\x00" in text:
+        fail(f"{label} must be canonical LF-terminated text")
+    return text
+
+
+def parkventory_handoff_from_value(
+    value: object,
+    label: str,
+) -> ParkventoryHandoff:
+    if not isinstance(value, dict) or set(value) != {
+        "application",
+        "candidate",
+        "candidate_route_digest",
+        "phase",
+        "schema",
+        "static_route",
+        "static_route_digest",
+        "static_state",
+        "static_target",
+    }:
+        fail(f"{label} has an invalid shape")
+    if (
+        value["schema"] != 1
+        or isinstance(value["schema"], bool)
+        or value["application"] != "parkventory"
+        or not isinstance(value["phase"], str)
+        or value["phase"] not in PARKVENTORY_HANDOFF_PHASES
+        or not isinstance(value["static_target"], str)
+        or not isinstance(value["static_route"], str)
+        or not isinstance(value["static_route_digest"], str)
+        or not isinstance(value["candidate_route_digest"], str)
+        or SHA256_RE.fullmatch(value["static_route_digest"]) is None
+        or SHA256_RE.fullmatch(value["candidate_route_digest"]) is None
+    ):
+        fail(f"{label} contains invalid values")
+    candidate = state_from_value(value["candidate"], f"{label} candidate")
+    if candidate.application != "parkventory":
+        fail(f"{label} candidate is not Parkventory")
+    static_state = STATIC.deployment_state_from_value(
+        value["static_state"],
+        f"{label} static state",
+    )
+    if static_state.application != "parkventory":
+        fail(f"{label} static state is not Parkventory")
+    if value["static_target"] != STATIC.release_target_for_state(static_state):
+        fail(f"{label} static target differs from its state")
+    static_route = validate_parkventory_route_bytes(
+        value["static_route"].encode("utf-8"),
+        f"{label} static route",
+    )
+    if content_digest(static_route.encode("utf-8")) != value["static_route_digest"]:
+        fail(f"{label} static route digest differs from its bytes")
+    handoff = ParkventoryHandoff(
+        candidate=candidate,
+        static_state=static_state,
+        static_target=value["static_target"],
+        static_route=static_route,
+        static_route_digest=value["static_route_digest"],
+        candidate_route_digest=value["candidate_route_digest"],
+        phase=value["phase"],
+    )
+    return handoff
+
+
+def canonical_parkventory_handoff(handoff: ParkventoryHandoff) -> bytes:
+    parsed = parkventory_handoff_from_value(
+        handoff.as_dict(),
+        "Parkventory handoff",
+    )
+    if parsed != handoff:
+        fail("Parkventory handoff does not round-trip through its contract")
+    return canonical_json(handoff.as_dict())
+
+
+def public_edge_base_release_from_value(value: object, label: str) -> Path:
+    if not isinstance(value, str):
+        fail(f"{label} is not a string")
+    release = Path(value)
+    if (
+        not release.is_absolute()
+        or release.parent != PUBLIC_EDGE_RELEASE_ROOT
+        or re.fullmatch(
+            r"[0-9a-f]{40}-(?:prepare|precutover|activate)", release.name
+        )
+        is None
+    ):
+        fail(f"{label} is outside the immutable public edge release root")
+    return release
+
+
+def public_edge_base_transaction_from_value(
+    value: object,
+    label: str,
+) -> PublicEdgeBaseTransaction:
+    if not isinstance(value, dict) or set(value) != {
+        "candidate_release",
+        "candidate_route",
+        "phase",
+        "previous_release",
+        "previous_route",
+        "previous_unit_active",
+        "previous_unit_enabled",
+        "schema",
+    }:
+        fail(f"{label} has an invalid shape")
+    if value["schema"] != 1 or isinstance(value["schema"], bool):
+        fail(f"{label} schema is invalid")
+    candidate = public_edge_base_release_from_value(
+        value["candidate_release"], f"{label} candidate release"
+    )
+    previous_value = value["previous_release"]
+    previous = (
+        None
+        if previous_value is None
+        else public_edge_base_release_from_value(
+            previous_value, f"{label} previous release"
+        )
+    )
+    candidate_route = value["candidate_route"]
+    previous_route = value["previous_route"]
+    if not isinstance(candidate_route, str):
+        fail(f"{label} candidate route is invalid")
+    validate_parkventory_route_bytes(
+        candidate_route.encode("utf-8"), f"{label} candidate route"
+    )
+    if previous_route is not None:
+        if not isinstance(previous_route, str):
+            fail(f"{label} previous route is invalid")
+        validate_parkventory_route_bytes(
+            previous_route.encode("utf-8"), f"{label} previous route"
+        )
+    if (
+        not isinstance(value["previous_unit_active"], bool)
+        or not isinstance(value["previous_unit_enabled"], bool)
+        or not isinstance(value["phase"], str)
+        or value["phase"] not in PUBLIC_EDGE_BASE_TRANSACTION_PHASES
+    ):
+        fail(f"{label} service state or phase is invalid")
+    if (
+        value["previous_unit_active"] or value["previous_unit_enabled"]
+    ) and previous is None:
+        fail(f"{label} cannot restore service ownership without a release")
+    transaction = PublicEdgeBaseTransaction(
+        candidate_release=str(candidate),
+        previous_release=None if previous is None else str(previous),
+        candidate_route=candidate_route,
+        previous_route=previous_route,
+        previous_unit_active=value["previous_unit_active"],
+        previous_unit_enabled=value["previous_unit_enabled"],
+        phase=value["phase"],
+    )
+    return transaction
+
+
+def canonical_public_edge_base_transaction(
+    transaction: PublicEdgeBaseTransaction,
+) -> bytes:
+    parsed = public_edge_base_transaction_from_value(
+        transaction.as_dict(), "public edge base transaction"
+    )
+    if parsed != transaction:
+        fail("public edge base transaction does not round-trip")
+    return canonical_json(transaction.as_dict())
+
+
 def _state_bytes(directory: Path, name: str, label: str) -> bytes | None:
     if STATE_NAME_RE.fullmatch(name) is None:
         fail(f"{label} name is invalid")
@@ -415,6 +675,61 @@ def _state_bytes(directory: Path, name: str, label: str) -> bytes | None:
         label,
         maximum_size=MAX_STATE_BYTES,
     )
+
+
+def public_edge_base_transaction_path_present() -> bool:
+    try:
+        PUBLIC_EDGE_BASE_TRANSACTION.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        fail(f"cannot inspect public edge base transaction: {exc}")
+    return True
+
+
+def read_public_edge_base_transaction() -> PublicEdgeBaseTransaction | None:
+    raw = STATIC.read_protected_state_bytes(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        PUBLIC_EDGE_BASE_TRANSACTION.name,
+        "public edge base transaction",
+        maximum_size=MAX_STATE_BYTES,
+    )
+    if raw is None:
+        return None
+    value = strict_json(raw, "public edge base transaction", maximum=MAX_STATE_BYTES)
+    if raw != canonical_json(value):
+        fail("public edge base transaction is not canonical JSON")
+    return public_edge_base_transaction_from_value(
+        value, "public edge base transaction"
+    )
+
+
+def write_public_edge_base_transaction(
+    transaction: PublicEdgeBaseTransaction,
+) -> None:
+    STATIC.write_protected_state_bytes(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        PUBLIC_EDGE_BASE_TRANSACTION.name,
+        canonical_public_edge_base_transaction(transaction),
+        "public edge base transaction",
+        maximum_size=MAX_STATE_BYTES,
+    )
+
+
+def remove_public_edge_base_transaction() -> None:
+    STATIC.remove_protected_state_file(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        PUBLIC_EDGE_BASE_TRANSACTION.name,
+        "public edge base transaction",
+    )
+
+
+def refuse_public_edge_base_transaction() -> None:
+    if public_edge_base_transaction_path_present():
+        fail(
+            "an unfinished public edge base transaction owns the shared runtime; "
+            "run application recovery first"
+        )
 
 
 def read_state(directory: Path, name: str, label: str) -> ApplicationState | None:
@@ -463,6 +778,53 @@ def write_transaction(transaction: ApplicationTransaction) -> None:
 
 def remove_state(directory: Path, name: str, label: str) -> None:
     STATIC.remove_protected_state_file(directory, name, label)
+
+
+def parkventory_handoff_path_present() -> bool:
+    path = HANDOFF_ROOT / "parkventory.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        fail(f"cannot inspect Parkventory handoff journal: {exc}")
+    return True
+
+
+def read_parkventory_handoff() -> ParkventoryHandoff | None:
+    raw = _state_bytes(
+        HANDOFF_ROOT,
+        "parkventory.json",
+        "Parkventory handoff journal",
+    )
+    if raw is None:
+        return None
+    value = strict_json(
+        raw,
+        "Parkventory handoff journal",
+        maximum=MAX_STATE_BYTES,
+    )
+    if raw != canonical_json(value):
+        fail("Parkventory handoff journal is not canonical JSON")
+    return parkventory_handoff_from_value(value, "Parkventory handoff journal")
+
+
+def write_parkventory_handoff(handoff: ParkventoryHandoff) -> None:
+    STATIC.write_protected_state_bytes(
+        HANDOFF_ROOT,
+        "parkventory.json",
+        canonical_parkventory_handoff(handoff),
+        "Parkventory handoff journal",
+        maximum_size=MAX_STATE_BYTES,
+    )
+
+
+def remove_parkventory_handoff() -> None:
+    remove_state(
+        HANDOFF_ROOT,
+        "parkventory.json",
+        "Parkventory handoff journal",
+    )
 
 
 def quarantine_name(state: ApplicationState) -> str:
@@ -522,6 +884,7 @@ def validate_runtime() -> None:
         (INVENTORY_STATE_ROOT, "application inventory directory"),
         (QUARANTINE_ROOT, "application quarantine directory"),
         (TRANSACTION_ROOT, "application transaction directory"),
+        (HANDOFF_ROOT, "application handoff directory"),
         (RUNTIME_CONFIG_ROOT, "application runtime configuration directory"),
     ):
         require_protected_directory(path, label)
@@ -628,129 +991,233 @@ def validate_parkventory_readiness(policy: ApplicationPolicy) -> None:
         fail("Parkventory PostgreSQL readiness evidence differs from admission")
     validate_parkventory_postgres_live()
 
-    validate_parkventory_offsite_readiness(policy)
+    validate_parkventory_local_backup_readiness(policy)
 
 
-def validate_parkventory_offsite_readiness(policy: ApplicationPolicy) -> None:
+def validate_parkventory_local_backup_readiness(
+    policy: ApplicationPolicy,
+) -> None:
     if policy.name != "parkventory":
         return
     readiness = policy.readiness_evidence
     if not isinstance(readiness, Mapping):
-        fail("Parkventory encrypted off-site backup evidence is absent")
+        fail("Parkventory local backup evidence is absent")
 
-    offsite = readiness.get("encrypted_offsite_backup")
-    if not isinstance(offsite, Mapping):
-        fail("Parkventory encrypted off-site backup evidence is absent")
-    offsite_digest = offsite.get("sha256")
+    local_backup = readiness.get("local_backup")
+    if not isinstance(local_backup, Mapping):
+        fail("Parkventory local backup evidence is absent")
+    local_digest = local_backup.get("sha256")
     if (
-        offsite.get("contract")
-        != "vps-infra.parkventory-offsite-backup-readiness.v1"
-        or offsite.get("path") != str(PARKVENTORY_OFFSITE_READINESS)
-        or not isinstance(offsite_digest, str)
-        or SHA256_RE.fullmatch(offsite_digest) is None
+        local_backup.get("contract")
+        != "vps-postgres-local-restore-readiness-v1"
+        or local_backup.get("path") != str(PARKVENTORY_LOCAL_BACKUP_READINESS)
+        or not isinstance(local_digest, str)
+        or SHA256_RE.fullmatch(local_digest) is None
     ):
-        fail("Parkventory encrypted off-site backup binding is incomplete")
+        fail("Parkventory local backup binding is incomplete")
     require_protected_file(
-        PARKVENTORY_OFFSITE_READINESS,
-        "Parkventory encrypted off-site backup evidence",
+        PARKVENTORY_LOCAL_BACKUP_READINESS,
+        "Parkventory local backup evidence",
         allowed_modes=frozenset({0o400}),
         maximum_size=MAX_STATE_BYTES,
     )
-    offsite_raw = STATIC.read_bounded_file(
-        PARKVENTORY_OFFSITE_READINESS,
+    local_raw = STATIC.read_bounded_file(
+        PARKVENTORY_LOCAL_BACKUP_READINESS,
         MAX_STATE_BYTES,
-        "Parkventory encrypted off-site backup evidence",
+        "Parkventory local backup evidence",
     )
     document = strict_json(
-        offsite_raw,
-        "Parkventory encrypted off-site backup evidence",
+        local_raw,
+        "Parkventory local backup evidence",
         maximum=MAX_STATE_BYTES,
     )
     if (
-        offsite_raw != canonical_json(document)
-        or content_digest(offsite_raw) != offsite_digest
+        local_raw != canonical_json(document)
+        or content_digest(local_raw) != local_digest
         or not isinstance(document, dict)
         or set(document)
         != {
             "backup_id",
+            "completed_at",
             "contract",
-            "database",
-            "provider_gates",
-            "restore_rehearsal",
-            "upload_receipt",
+            "manifest_sha256",
+            "restored_databases",
+            "scope",
         }
         or document.get("contract")
-        != "vps-infra.parkventory-offsite-backup-readiness.v1"
-        or document.get("database") != "parkventory"
+        != "vps-postgres-local-restore-readiness-v1"
         or not isinstance(document.get("backup_id"), str)
         or PARKVENTORY_BACKUP_ID_RE.fullmatch(document["backup_id"]) is None
     ):
-        fail("Parkventory encrypted off-site backup evidence differs from policy")
-    upload = document.get("upload_receipt")
-    restore = document.get("restore_rehearsal")
-    gates = document.get("provider_gates")
-    expected_gates = {
-        "bucket_object_lock_verified": True,
-        "bucket_versioning_verified": True,
-        "failure_domain_independence_reviewed": True,
-        "recovery_key_off_host_verified": True,
-        "restore_identity_separate_verified": True,
-    }
+        fail("Parkventory local backup evidence differs from policy")
+    restored_databases = document.get("restored_databases")
+    manifest_digest = document.get("manifest_sha256")
     if (
-        not isinstance(upload, dict)
-        or set(upload)
-        != {
-            "age_recipient_sha256",
-            "contract",
-            "receipt_sha256",
-            "recorded_at",
-            "source_manifest_sha256",
-        }
-        or upload.get("contract") != "vps-postgres-offsite-receipt-v2"
+        not isinstance(manifest_digest, str)
+        or SHA256_RE.fullmatch(manifest_digest) is None
+        or not isinstance(restored_databases, list)
+        or not 1 <= len(restored_databases) <= 128
         or any(
-            not isinstance(upload.get(key), str)
-            or SHA256_RE.fullmatch(upload[key]) is None
-            for key in (
-                "age_recipient_sha256",
-                "receipt_sha256",
-                "source_manifest_sha256",
-            )
+            not isinstance(database, str)
+            or not database
+            or len(database) > 256
+            or any(character in database for character in "\x00\r\n")
+            for database in restored_databases
         )
-        or not isinstance(restore, dict)
-        or set(restore)
-        != {
-            "completed_at",
-            "evidence_sha256",
-            "performed_off_atlas",
-            "rehearsed",
-            "source_manifest_sha256",
-        }
-        or restore.get("performed_off_atlas") is not True
-        or restore.get("rehearsed") is not True
-        or not isinstance(restore.get("evidence_sha256"), str)
-        or SHA256_RE.fullmatch(restore["evidence_sha256"]) is None
-        or restore.get("source_manifest_sha256")
-        != upload.get("source_manifest_sha256")
-        or gates != expected_gates
+        or "parkventory" not in restored_databases
+        or document.get("scope") != {"encrypted": False, "offsite": False}
     ):
-        fail("Parkventory encrypted off-site backup proof is incomplete")
-    recorded_at = _parkventory_evidence_time(
-        upload.get("recorded_at"),
-        "off-site upload receipt",
-    )
-    restored_at = _parkventory_evidence_time(
-        restore.get("completed_at"),
-        "off-host restore rehearsal",
+        fail("Parkventory local backup and restore proof is incomplete")
+    if restored_databases != sorted(set(restored_databases)):
+        fail("Parkventory restored database inventory is not canonical")
+    completed_at = _parkventory_evidence_time(
+        document.get("completed_at"),
+        "local restore rehearsal",
     )
     now = dt.datetime.now(dt.timezone.utc)
     if (
-        recorded_at > now + dt.timedelta(minutes=5)
-        or now - recorded_at > dt.timedelta(hours=36)
-        or restored_at > now + dt.timedelta(minutes=5)
-        or now - restored_at > dt.timedelta(days=31)
-        or restored_at < recorded_at - dt.timedelta(minutes=5)
+        completed_at > now + dt.timedelta(minutes=5)
+        or now - completed_at > dt.timedelta(hours=36)
     ):
-        fail("Parkventory encrypted off-site backup proof is stale")
+        fail("Parkventory local backup and restore proof is stale")
+
+    backup_id = document["backup_id"]
+    backup_root = PARKVENTORY_LOCAL_BACKUP_ROOT / backup_id
+    require_protected_directory(
+        PARKVENTORY_LOCAL_BACKUP_ROOT,
+        "PostgreSQL local backup root",
+    )
+    require_protected_directory(
+        backup_root,
+        "Parkventory source backup",
+    )
+    manifest_path = backup_root / "manifest.json"
+    require_protected_file(
+        manifest_path,
+        "Parkventory source backup manifest",
+        allowed_modes=frozenset({0o600}),
+        maximum_size=MAX_STATE_BYTES,
+    )
+    manifest_raw = STATIC.read_bounded_file(
+        manifest_path,
+        MAX_STATE_BYTES,
+        "Parkventory source backup manifest",
+    )
+    if content_digest(manifest_raw) != manifest_digest:
+        fail("Parkventory source backup manifest differs from restore evidence")
+    manifest = strict_json(
+        manifest_raw,
+        "Parkventory source backup manifest",
+        maximum=MAX_STATE_BYTES,
+    )
+    if (
+        manifest_raw != canonical_json(manifest)
+        or not isinstance(manifest, dict)
+        or manifest.get("contract") != "vps-postgres-logical-backup-v1"
+        or manifest.get("backup_id") != backup_id
+        or not isinstance(manifest.get("files"), list)
+    ):
+        fail("Parkventory source backup manifest contract is invalid")
+    manifest_created_at = _parkventory_evidence_time(
+        manifest.get("created_at"),
+        "source backup manifest",
+    )
+    source = manifest.get("source")
+    if (
+        manifest_created_at > completed_at
+        or manifest_created_at > now + dt.timedelta(minutes=5)
+        or now - manifest_created_at > dt.timedelta(hours=36)
+        or not isinstance(source, dict)
+        or source.get("compose_project") != "vps-platform"
+        or source.get("compose_service") != "postgresql"
+        or not isinstance(source.get("system_identifier"), str)
+        or re.fullmatch(r"[0-9]{10,32}", source["system_identifier"]) is None
+    ):
+        fail("Parkventory source backup is stale or has an invalid cluster identity")
+    manifest_databases: list[str] = []
+    for entry in manifest["files"]:
+        if not isinstance(entry, dict) or entry.get("kind") != "database":
+            continue
+        encoded_name = entry.get("database_name_hex")
+        if not isinstance(encoded_name, str) or not encoded_name:
+            fail("Parkventory source backup database inventory is invalid")
+        try:
+            database_name = bytes.fromhex(encoded_name).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ApplicationDeploymentError(
+                "Parkventory source backup database inventory is invalid"
+            ) from exc
+        manifest_databases.append(database_name)
+    if sorted(manifest_databases) != restored_databases:
+        fail("Parkventory restored database inventory differs from its backup")
+
+    require_protected_file(
+        POSTGRES_BACKUP_VALIDATOR,
+        "PostgreSQL local backup validator",
+        allowed_modes=frozenset({0o500}),
+        maximum_size=2 * 1024 * 1024,
+    )
+    verified = _run_bounded(
+        [str(POSTGRES_BACKUP_VALIDATOR), "verify", "--backup-id", backup_id],
+        environment=safe_environment(Path("/root")),
+        timeout=300,
+        maximum_stdout=4096,
+    )
+    if (
+        verified.stdout != f"local PostgreSQL backup verified: {backup_id}\n"
+        or verified.stderr
+    ):
+        fail("Parkventory local backup verification returned an unexpected result")
+    if parkventory_postgres_system_identifier() != source["system_identifier"]:
+        fail("Parkventory source backup belongs to another PostgreSQL cluster")
+
+
+def parkventory_postgres_system_identifier() -> str:
+    listed = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "ps",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            "label=com.docker.compose.project=vps-platform",
+            "--filter",
+            "label=com.docker.compose.service=postgresql",
+        ],
+        environment=safe_environment(Path("/root")),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    identifiers = listed.stdout.splitlines()
+    if (
+        len(identifiers) != 1
+        or CONTAINER_ID_RE.fullmatch(identifiers[0]) is None
+        or listed.stderr
+    ):
+        fail("live PostgreSQL container inventory is not exact")
+    identifier = identifiers[0]
+    queried = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "exec",
+            identifier,
+            "psql",
+            "-X",
+            "--host=/var/run/postgresql",
+            "--username=platform_admin",
+            "--dbname=postgres",
+            "--no-align",
+            "--tuples-only",
+            "--set=ON_ERROR_STOP=on",
+            "--command=SELECT system_identifier::text FROM pg_control_system();",
+        ],
+        environment=safe_environment(Path("/root")),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    if re.fullmatch(r"[0-9]{10,32}\n", queried.stdout) is None or queried.stderr:
+        fail("live PostgreSQL system identifier is invalid")
+    return queried.stdout.removesuffix("\n")
 
 
 def current_parkventory_policy() -> ApplicationPolicy:
@@ -766,8 +1233,39 @@ def current_parkventory_policy() -> ApplicationPolicy:
     return policy
 
 
-def revalidate_parkventory_offsite_before_runtime() -> None:
-    validate_parkventory_offsite_readiness(current_parkventory_policy())
+def validate_parkventory_secret_materializers() -> None:
+    expected = canonical_json(
+        {"changed": False, "mode": "check", "ready": True}
+    ).decode("ascii")
+    for path, label in (
+        (
+            PARKVENTORY_DATABASE_INPUT_VALIDATOR_PATH,
+            "Parkventory database secret materializer",
+        ),
+        (
+            PARKVENTORY_PROVIDER_INPUT_VALIDATOR_PATH,
+            "Parkventory provider secret materializer",
+        ),
+    ):
+        require_protected_file(
+            path,
+            label,
+            allowed_modes=frozenset({0o500}),
+            maximum_size=2 * 1024 * 1024,
+        )
+        checked = _run_bounded(
+            [str(path), "--check"],
+            environment=safe_environment(Path("/root")),
+            timeout=120,
+            maximum_stdout=4096,
+        )
+        if checked.stdout != expected or checked.stderr:
+            fail(f"{label} returned an unexpected result")
+
+
+def revalidate_parkventory_backup_before_runtime() -> None:
+    validate_parkventory_secret_materializers()
+    validate_parkventory_local_backup_readiness(current_parkventory_policy())
 
 
 def validate_recovery_state_runtime() -> None:
@@ -783,8 +1281,26 @@ def validate_recovery_state_runtime() -> None:
         "application transaction directory",
     )
     require_protected_directory(
+        HANDOFF_ROOT,
+        "application handoff directory",
+    )
+    require_protected_directory(
         APPLICATION_ROOT,
         "application release root",
+        mode=0o755,
+    )
+    require_protected_directory(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        "Parkventory public edge state root",
+    )
+    require_protected_directory(
+        PUBLIC_EDGE_RELEASE_ROOT,
+        "public edge immutable release root",
+        mode=0o755,
+    )
+    require_protected_directory(
+        PUBLIC_EDGE_RUNTIME_ROOT.parent,
+        "public edge runtime parent",
         mode=0o755,
     )
     for application in sorted(PROFILES):
@@ -816,6 +1332,7 @@ def deployment_lock(timeout_seconds: int = 60) -> Iterator[None]:
         if (
             metadata.st_uid != 0
             or metadata.st_gid != 0
+            or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
             fail("shared deployment lock is not protected")
@@ -3023,12 +3540,87 @@ def validate_surplasse_public_edge_attachment(release: Path) -> None:
         )
 
 
+def validate_parkventory_public_edge_attachment(release: Path) -> None:
+    network_inspection = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "network",
+            "inspect",
+            "--format",
+            (
+                "{{.Id}}\t{{.Name}}\t{{.Driver}}\t{{.Scope}}\t"
+                "{{.Internal}}\t{{.Attachable}}\t{{.Ingress}}\t"
+                "{{index .Labels \"com.nclsppr.vps-infra.managed\"}}\t"
+                "{{len .IPAM.Config}}\t"
+                "{{range .IPAM.Config}}{{.Subnet}}{{end}}"
+            ),
+            PARKVENTORY_PUBLIC_EDGE_NETWORK,
+        ],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    fields = network_inspection.stdout.removesuffix("\n").split("\t")
+    expected_identity = [
+        PARKVENTORY_PUBLIC_EDGE_NETWORK,
+        "bridge",
+        "local",
+        "false",
+        "false",
+        "false",
+        "true",
+        "1",
+        PARKVENTORY_PUBLIC_EDGE_SUBNET,
+    ]
+    if (
+        len(fields) != 10
+        or CONTAINER_ID_RE.fullmatch(fields[0]) is None
+        or fields[1:] != expected_identity
+        or network_inspection.stderr
+        or not network_inspection.stdout.endswith("\n")
+    ):
+        fail("app_parkventory network identity differs from the managed host contract")
+    network_id = fields[0]
+    edge_inspection = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            (
+                "{{.State.Status}}\t"
+                "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
+                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+                f"{{{{with index .NetworkSettings.Networks \"{PARKVENTORY_PUBLIC_EDGE_NETWORK}\"}}}}"
+                "{{.NetworkID}}\t{{.IPAddress}}\t{{.IPPrefixLen}}{{end}}"
+            ),
+            PUBLIC_EDGE_CONTAINER,
+        ],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    expected_edge = (
+        "running\thealthy\tvps-public-static-edge\t"
+        f"{network_id}\t{PARKVENTORY_PUBLIC_EDGE_ADDRESS}\t24\n"
+    )
+    if edge_inspection.stdout != expected_edge or edge_inspection.stderr:
+        fail(
+            "public edge is not healthy and attached to the exact app_parkventory "
+            "network identity at 172.30.20.254"
+        )
+
+
 def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
     profile = PROFILES[state.application]
     release = state_release(state)
     bundle = bundle_from_release(release, state)
     route_relative = f"caddy/{state.application}.caddy"
-    route_path = PUBLIC_EDGE_RUNTIME_ROOT / "routes" / f"{state.application}.caddy"
+    route_path = (
+        PARKVENTORY_PUBLIC_EDGE_ROUTE
+        if state.application == "parkventory"
+        else PUBLIC_EDGE_RUNTIME_ROOT / "routes" / f"{state.application}.caddy"
+    )
     require_protected_file(
         route_path,
         f"{state.application} public edge route",
@@ -3043,6 +3635,8 @@ def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
         fail("public edge route is not the attested application route")
     if state.application == "surplasse":
         validate_surplasse_public_edge_attachment(release)
+    elif state.application == "parkventory":
+        validate_parkventory_public_edge_attachment(release)
     else:
         network = f"app_{state.application}"
         inspected = _run_bounded(
@@ -3099,6 +3693,1067 @@ def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
     )
 
 
+def read_parkventory_public_edge_route() -> bytes:
+    require_protected_directory(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        "Parkventory public edge state root",
+    )
+    metadata = require_protected_file(
+        PARKVENTORY_PUBLIC_EDGE_ROUTE,
+        "Parkventory public edge route",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    route = STATIC.read_bounded_file(
+        PARKVENTORY_PUBLIC_EDGE_ROUTE,
+        MAX_CONFIG_BYTES,
+        "Parkventory public edge route",
+    )
+    if len(route) != metadata.st_size:
+        fail("Parkventory public edge route changed while it was read")
+    validate_parkventory_route_bytes(route, "Parkventory public edge route")
+    return route
+
+
+def write_parkventory_public_edge_route(route: bytes) -> None:
+    validate_parkventory_route_bytes(route, "Parkventory public edge route")
+    require_protected_directory(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        "Parkventory public edge state root",
+    )
+    directory_fd = os.open(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    temporary_name = f".route.caddy-{secrets.token_hex(8)}"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o444,
+            dir_fd=directory_fd,
+        )
+        view = memoryview(route)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary_name,
+            PARKVENTORY_PUBLIC_EDGE_ROUTE.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except OSError as exc:
+        fail(f"cannot atomically replace the Parkventory public edge route: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        os.close(directory_fd)
+
+
+def read_optional_parkventory_public_edge_route() -> bytes | None:
+    try:
+        PARKVENTORY_PUBLIC_EDGE_ROUTE.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        fail(f"cannot inspect the Parkventory public edge route: {exc}")
+    return read_parkventory_public_edge_route()
+
+
+def remove_parkventory_public_edge_route() -> None:
+    require_protected_directory(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        "Parkventory public edge state root",
+    )
+    directory_fd = os.open(
+        PARKVENTORY_PUBLIC_EDGE_STATE_ROOT,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        try:
+            metadata = os.stat(
+                PARKVENTORY_PUBLIC_EDGE_ROUTE.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o444
+        ):
+            fail("Parkventory public edge route is not safe to remove")
+        os.unlink(PARKVENTORY_PUBLIC_EDGE_ROUTE.name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except OSError as exc:
+        fail(f"cannot remove the Parkventory public edge route: {exc}")
+    finally:
+        os.close(directory_fd)
+
+
+def validate_public_edge_base_release(release: Path) -> None:
+    parsed = public_edge_base_release_from_value(
+        str(release), "public edge base release"
+    )
+    if parsed != release:
+        fail("public edge base release path is not canonical")
+    require_protected_directory(
+        PUBLIC_EDGE_RELEASE_ROOT,
+        "public edge immutable release root",
+        mode=0o755,
+    )
+    require_protected_directory(
+        release,
+        "public edge immutable release",
+        mode=0o555,
+    )
+    require_protected_directory(
+        release / "routes",
+        "public edge immutable route directory",
+        mode=0o555,
+    )
+    for path, label, modes in (
+        (release / "Caddyfile", "public edge Caddyfile", frozenset({0o444})),
+        (release / "compose.yaml", "public edge Compose file", frozenset({0o444})),
+        (
+            release / "routes" / "parkventory.caddy",
+            "public edge Parkventory static route",
+            frozenset({0o444}),
+        ),
+    ):
+        require_protected_file(
+            path,
+            label,
+            allowed_modes=modes,
+            maximum_size=MAX_CONFIG_BYTES,
+        )
+
+
+def public_edge_compose_document(release: Path) -> dict[str, object]:
+    validate_public_edge_base_release(release)
+    rendered = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "compose",
+            "--project-directory",
+            str(release),
+            "--file",
+            str(release / "compose.yaml"),
+            "config",
+            "--format",
+            "json",
+        ],
+        environment=safe_environment(release),
+        timeout=60,
+        maximum_stdout=MAX_RENDERED_COMPOSE_BYTES,
+    )
+    if rendered.stderr:
+        fail("public edge Compose rendering returned unexpected diagnostics")
+    value = strict_json(
+        rendered.stdout.encode("utf-8"),
+        "public edge rendered Compose document",
+        maximum=MAX_RENDERED_COMPOSE_BYTES,
+    )
+    if not isinstance(value, dict):
+        fail("public edge rendered Compose document is not an object")
+    return value
+
+
+def public_edge_release_has_route_selector(release: Path) -> bool:
+    document = public_edge_compose_document(release)
+    services = document.get("services")
+    caddy = services.get("caddy") if isinstance(services, dict) else None
+    volumes = caddy.get("volumes") if isinstance(caddy, dict) else None
+    if not isinstance(volumes, list):
+        fail("public edge rendered Caddy volumes are invalid")
+    selectors = [
+        item
+        for item in volumes
+        if isinstance(item, dict)
+        and item.get("target") == "/etc/caddy/routes/parkventory.caddy"
+    ]
+    if len(selectors) > 1:
+        fail("public edge rendered Caddy route selector is ambiguous")
+    if not selectors:
+        return False
+    selector = selectors[0]
+    if (
+        selector.get("type") != "bind"
+        or selector.get("source") != str(PARKVENTORY_PUBLIC_EDGE_ROUTE)
+        or selector.get("read_only") is not True
+    ):
+        fail("public edge rendered Caddy route selector differs from policy")
+    return True
+
+
+def read_public_edge_runtime_release() -> Path | None:
+    require_protected_directory(
+        PUBLIC_EDGE_RUNTIME_ROOT.parent,
+        "public edge runtime parent",
+        mode=0o755,
+    )
+    try:
+        metadata = PUBLIC_EDGE_RUNTIME_ROOT.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        fail(f"cannot inspect the public edge runtime link: {exc}")
+    if (
+        not stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+    ):
+        fail("public edge runtime path is not one protected symbolic link")
+    try:
+        raw_target = os.readlink(PUBLIC_EDGE_RUNTIME_ROOT)
+    except OSError as exc:
+        fail(f"cannot read the public edge runtime link: {exc}")
+    target = Path(raw_target)
+    if not target.is_absolute():
+        target = PUBLIC_EDGE_RUNTIME_ROOT.parent / target
+    target = public_edge_base_release_from_value(
+        str(target), "public edge runtime release"
+    )
+    validate_public_edge_base_release(target)
+    return target
+
+
+def switch_public_edge_runtime_release(release: Path | None) -> None:
+    if release is not None:
+        validate_public_edge_base_release(release)
+    parent = PUBLIC_EDGE_RUNTIME_ROOT.parent
+    require_protected_directory(parent, "public edge runtime parent", mode=0o755)
+    directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = f".public-static-edge-{secrets.token_hex(8)}"
+    try:
+        if release is None:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(PUBLIC_EDGE_RUNTIME_ROOT.name, dir_fd=directory_fd)
+        else:
+            os.symlink(str(release), temporary, dir_fd=directory_fd)
+            os.replace(
+                temporary,
+                PUBLIC_EDGE_RUNTIME_ROOT.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        os.fsync(directory_fd)
+    except OSError as exc:
+        fail(f"cannot switch the public edge runtime release: {exc}")
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory_fd)
+        os.close(directory_fd)
+
+
+def public_edge_unit_state(release: Path) -> tuple[bool, bool]:
+    active = _run_bounded_status(
+        [str(SYSTEMCTL_PATH), "is-active", PUBLIC_EDGE_UNIT],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    if active.returncode == 0 and active.stdout == "active\n" and not active.stderr:
+        is_active = True
+    elif (
+        active.returncode == 3
+        and active.stdout == "inactive\n"
+        and not active.stderr
+    ):
+        is_active = False
+    else:
+        fail("public edge systemd unit returned an unexpected active state")
+    enabled = _run_bounded_status(
+        [str(SYSTEMCTL_PATH), "is-enabled", PUBLIC_EDGE_UNIT],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    if (
+        enabled.returncode == 0
+        and enabled.stdout == "enabled\n"
+        and not enabled.stderr
+    ):
+        is_enabled = True
+    elif (
+        enabled.returncode == 1
+        and enabled.stdout == "disabled\n"
+        and not enabled.stderr
+    ):
+        is_enabled = False
+    else:
+        fail("public edge systemd unit returned an unexpected enablement state")
+    return is_active, is_enabled
+
+
+def run_public_edge_systemctl(release: Path, *arguments: str) -> None:
+    command = [str(SYSTEMCTL_PATH)]
+    if arguments in {("start",), ("restart",)}:
+        # These starts run while the controller owns the shared recovery lock.
+        # Scheduling the unit's recovery dependencies would make them wait on
+        # that same lock. Their journals are proved absent before the durable
+        # base transaction is created, so only this controller-owned job is
+        # admitted here; ordinary boot still runs every recovery dependency.
+        command.append("--job-mode=ignore-dependencies")
+    command.extend(arguments)
+    if arguments != ("daemon-reload",):
+        command.append(PUBLIC_EDGE_UNIT)
+    _run_bounded(
+        command,
+        environment=safe_environment(release),
+        timeout=300,
+        maximum_stdout=64 * 1024,
+    )
+
+
+def validate_public_edge_bind_identities(
+    release: Path,
+    *,
+    include_route_selector: bool,
+) -> None:
+    inspected = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            (
+                "{{.State.Status}}\t"
+                "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
+                "{{.State.Pid}}\t"
+                "{{index .Config.Labels \"com.docker.compose.project\"}}"
+            ),
+            PUBLIC_EDGE_CONTAINER,
+        ],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    fields = inspected.stdout.removesuffix("\n").split("\t")
+    if (
+        len(fields) != 4
+        or fields[0] != "running"
+        or fields[1] != "healthy"
+        or not fields[2].isdigit()
+        or int(fields[2]) <= 0
+        or fields[3] != "vps-public-static-edge"
+        or inspected.stderr
+        or not inspected.stdout.endswith("\n")
+    ):
+        fail("public edge Caddy process identity is invalid")
+    pid = int(fields[2])
+    sources = [release / "Caddyfile", release / "routes"]
+    targets = [
+        Path(f"/proc/{pid}/root/etc/caddy/Caddyfile"),
+        Path(f"/proc/{pid}/root/etc/caddy/routes"),
+    ]
+    if include_route_selector:
+        sources.append(PARKVENTORY_PUBLIC_EDGE_ROUTE)
+        targets.append(
+            Path(f"/proc/{pid}/root/etc/caddy/routes/parkventory.caddy")
+        )
+    for source, target in zip(sources, targets):
+        try:
+            source_metadata = source.stat()
+            target_metadata = target.stat()
+        except OSError as exc:
+            fail(f"cannot inspect public edge bind identity: {exc}")
+        if (
+            source_metadata.st_dev != target_metadata.st_dev
+            or source_metadata.st_ino != target_metadata.st_ino
+        ):
+            fail("public edge Caddy uses a stale or foreign bind identity")
+
+
+def validate_public_edge_base_live(release: Path) -> None:
+    include_route_selector = public_edge_release_has_route_selector(release)
+    validate_public_edge_bind_identities(
+        release,
+        include_route_selector=include_route_selector,
+    )
+    if include_route_selector:
+        validate_parkventory_public_edge_attachment(release)
+
+
+def refuse_surplasse_public_edge_owner() -> None:
+    for path in (
+        PUBLIC_EDGE_SURPLASSE_STATE_ROOT / "active.json",
+        PUBLIC_EDGE_SURPLASSE_STATE_ROOT / "transaction.json",
+    ):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            fail(f"cannot inspect Surplasse public edge ownership: {exc}")
+        fail(
+            "base edge convergence cannot replace an active or interrupted "
+            "Surplasse extension"
+        )
+
+
+def parkventory_base_route_for_candidate(release: Path) -> bytes:
+    if read_transaction("parkventory") is not None:
+        fail("Parkventory application transaction must recover before a base switch")
+    if parkventory_handoff_path_present():
+        fail("Parkventory public handoff must recover before a base switch")
+    refuse_static_deployment_transactions()
+    active = read_state(
+        ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "active Parkventory application state",
+    )
+    if active is not None:
+        route = read_optional_parkventory_public_edge_route()
+        if route is None:
+            fail("dynamic Parkventory ownership has no durable public route")
+        return route
+    static_state = STATIC.read_deployment_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "Parkventory static active state",
+    )
+    static_releases = STATIC_PARKVENTORY_CURRENT.parent / "releases"
+    static_target = STATIC.get_current_target(
+        STATIC_PARKVENTORY_CURRENT,
+        static_releases,
+    )
+    if (
+        static_state is None
+        or static_target != STATIC.release_target_for_state(static_state)
+    ):
+        fail("Parkventory has no complete static or dynamic public owner")
+    STATIC.validate_persisted_release(static_state, static_releases)
+    route_path = release / "routes" / "parkventory.caddy"
+    route = STATIC.read_bounded_file(
+        route_path,
+        MAX_CONFIG_BYTES,
+        "candidate Parkventory static route",
+    )
+    validate_parkventory_route_bytes(route, "candidate Parkventory static route")
+    return route
+
+
+def restore_public_edge_service_state(
+    transaction: PublicEdgeBaseTransaction,
+    previous: Path | None,
+) -> None:
+    environment_release = previous or Path("/root")
+    if previous is not None and transaction.previous_unit_active:
+        run_public_edge_systemctl(previous, "daemon-reload")
+        run_public_edge_systemctl(previous, "start")
+        force_recreate_public_edge_for_parkventory(previous)
+        validate_public_edge_base_live(previous)
+    else:
+        run_public_edge_systemctl(environment_release, "stop")
+    run_public_edge_systemctl(
+        environment_release,
+        "enable" if transaction.previous_unit_enabled else "disable",
+    )
+
+
+def public_edge_unit_installed() -> bool:
+    try:
+        PUBLIC_EDGE_UNIT_PATH.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        fail(f"cannot inspect the public edge systemd unit: {exc}")
+    require_protected_file(
+        PUBLIC_EDGE_UNIT_PATH,
+        "public edge systemd unit",
+        allowed_modes=frozenset({0o644}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    return True
+
+
+def public_edge_project_container_ids(
+    release: Path,
+    *,
+    include_stopped: bool,
+) -> tuple[str, ...]:
+    command = [str(DOCKER_PATH), "ps"]
+    if include_stopped:
+        command.append("--all")
+    command.extend(
+        (
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            "label=com.docker.compose.project=vps-public-static-edge",
+        )
+    )
+    listed = _run_bounded(
+        command,
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=64 * 1024,
+    )
+    identifiers = tuple(listed.stdout.splitlines())
+    if (
+        listed.stderr
+        or (listed.stdout and not listed.stdout.endswith("\n"))
+        or len(identifiers) > 64
+        or len(set(identifiers)) != len(identifiers)
+        or any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in identifiers)
+    ):
+        fail("public edge project container inventory is invalid")
+    return identifiers
+
+
+def refuse_public_edge_stop_journals_locked() -> None:
+    if read_public_edge_base_transaction() is not None:
+        fail("public edge base recovery must finish before stopping the edge")
+    for application in sorted(PROFILES):
+        if read_transaction(application) is not None:
+            fail(
+                f"{application} application recovery must finish before "
+                "stopping the edge"
+            )
+    if parkventory_handoff_path_present():
+        fail("Parkventory handoff recovery must finish before stopping the edge")
+    refuse_static_deployment_transactions()
+    surplasse_transaction = PUBLIC_EDGE_SURPLASSE_STATE_ROOT / "transaction.json"
+    try:
+        surplasse_transaction.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        fail(f"cannot inspect the Surplasse public edge transaction: {exc}")
+    else:
+        fail("Surplasse public edge recovery must finish before stopping the edge")
+
+
+def stop_public_edge_base_locked() -> None:
+    refuse_public_edge_stop_journals_locked()
+    release = read_public_edge_runtime_release()
+    environment_release = release or Path("/root")
+    if public_edge_unit_installed():
+        # Disable first so a crash cannot make a partially stopped edge return
+        # automatically at boot. The immutable runtime link remains available
+        # to ExecStop and to a later controlled start.
+        run_public_edge_systemctl(environment_release, "disable")
+        run_public_edge_systemctl(environment_release, "stop")
+        active, enabled = public_edge_unit_state(environment_release)
+        if active or enabled:
+            fail("public edge systemd unit remained active or enabled")
+    for identifier in public_edge_project_container_ids(
+        environment_release,
+        include_stopped=True,
+    ):
+        stopped = _run_bounded(
+            [str(DOCKER_PATH), "stop", "--time", "30", identifier],
+            environment=safe_environment(environment_release),
+            timeout=60,
+            maximum_stdout=1024,
+        )
+        if stopped.stdout != f"{identifier}\n" or stopped.stderr:
+            fail("public edge residual container stop returned an invalid result")
+    if public_edge_project_container_ids(
+        environment_release,
+        include_stopped=False,
+    ):
+        fail("public edge project still owns a running container")
+
+
+def rollback_public_edge_base_locked(
+    transaction: PublicEdgeBaseTransaction,
+) -> None:
+    if transaction.phase != "rollback":
+        transaction = dataclasses.replace(transaction, phase="rollback")
+        write_public_edge_base_transaction(transaction)
+    candidate = Path(transaction.candidate_release)
+    validate_public_edge_base_release(candidate)
+    previous = (
+        None
+        if transaction.previous_release is None
+        else Path(transaction.previous_release)
+    )
+    if previous is not None:
+        validate_public_edge_base_release(previous)
+    current = read_public_edge_runtime_release()
+    if current not in {candidate, previous}:
+        fail("public edge base rollback found a foreign runtime release")
+    current_route = read_optional_parkventory_public_edge_route()
+    allowed_routes = {
+        transaction.candidate_route.encode("utf-8"),
+        (
+            None
+            if transaction.previous_route is None
+            else transaction.previous_route.encode("utf-8")
+        ),
+    }
+    if current_route not in allowed_routes:
+        fail("public edge base rollback found a foreign Parkventory route")
+    if previous is None:
+        # Keep the candidate link available to the unit's ExecStop command.
+        # A first-activation rollback may remove it only after Caddy is down.
+        restore_public_edge_service_state(transaction, None)
+        if transaction.previous_route is None:
+            remove_parkventory_public_edge_route()
+        else:
+            write_parkventory_public_edge_route(
+                transaction.previous_route.encode("utf-8")
+            )
+        switch_public_edge_runtime_release(None)
+    else:
+        if transaction.previous_route is None:
+            remove_parkventory_public_edge_route()
+        else:
+            write_parkventory_public_edge_route(
+                transaction.previous_route.encode("utf-8")
+            )
+        switch_public_edge_runtime_release(previous)
+        restore_public_edge_service_state(transaction, previous)
+    remove_public_edge_base_transaction()
+
+
+def recover_public_edge_base_locked() -> None:
+    transaction = read_public_edge_base_transaction()
+    if transaction is None:
+        return
+    rollback_public_edge_base_locked(transaction)
+
+
+def prepare_public_edge_base_locked(candidate: Path) -> None:
+    if read_public_edge_base_transaction() is not None:
+        fail("a public edge base transaction already exists")
+    refuse_public_edge_stop_journals_locked()
+    validate_public_edge_base_release(candidate)
+    if not public_edge_release_has_route_selector(candidate):
+        fail("candidate public edge release has no durable Parkventory selector")
+    refuse_surplasse_public_edge_owner()
+    previous = read_public_edge_runtime_release()
+    previous_route = read_optional_parkventory_public_edge_route()
+    candidate_route = parkventory_base_route_for_candidate(candidate)
+    active, enabled = public_edge_unit_state(candidate)
+    transaction = PublicEdgeBaseTransaction(
+        candidate_release=str(candidate),
+        previous_release=None if previous is None else str(previous),
+        candidate_route=candidate_route.decode("utf-8"),
+        previous_route=(
+            None if previous_route is None else previous_route.decode("utf-8")
+        ),
+        previous_unit_active=active,
+        previous_unit_enabled=enabled,
+        phase="prepared",
+    )
+    write_public_edge_base_transaction(transaction)
+    try:
+        write_parkventory_public_edge_route(candidate_route)
+        switch_public_edge_runtime_release(candidate)
+        run_public_edge_systemctl(candidate, "daemon-reload")
+        run_public_edge_systemctl(candidate, "enable")
+        run_public_edge_systemctl(candidate, "restart")
+        force_recreate_public_edge_for_parkventory(candidate)
+        validate_public_edge_base_live(candidate)
+        write_public_edge_base_transaction(
+            dataclasses.replace(transaction, phase="reconciled")
+        )
+    except BaseException as switch_error:
+        try:
+            persisted = read_public_edge_base_transaction()
+            if persisted is not None:
+                rollback_public_edge_base_locked(persisted)
+        except BaseException as rollback_error:
+            raise ApplicationDeploymentError(
+                "public edge base switch and rollback both failed: "
+                f"{switch_error}; {rollback_error}"
+            ) from rollback_error
+        raise
+
+
+def commit_public_edge_base_locked(candidate: Path) -> None:
+    transaction = read_public_edge_base_transaction()
+    if transaction is None:
+        fail("public edge base commit has no durable transaction")
+    if (
+        transaction.phase != "reconciled"
+        or transaction.candidate_release != str(candidate)
+    ):
+        fail("public edge base commit differs from its reconciled candidate")
+    if read_public_edge_runtime_release() != candidate:
+        fail("public edge base commit found a different runtime release")
+    route = read_parkventory_public_edge_route()
+    if route != transaction.candidate_route.encode("utf-8"):
+        fail("public edge base commit found a different Parkventory route")
+    active, enabled = public_edge_unit_state(candidate)
+    if not active or not enabled:
+        fail("public edge base commit found an inactive systemd unit")
+    validate_public_edge_base_live(candidate)
+    remove_public_edge_base_transaction()
+
+
+def public_edge_unit_is_active(release: Path) -> bool:
+    active = _run_bounded_status(
+        [str(SYSTEMCTL_PATH), "is-active", PUBLIC_EDGE_UNIT],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    if active.returncode == 0 and active.stdout == "active\n" and not active.stderr:
+        return True
+    if active.returncode == 3 and active.stdout == "inactive\n" and not active.stderr:
+        return False
+    fail("public edge systemd unit returned an unexpected active state")
+
+
+def validate_public_edge_compose_configuration(release: Path) -> None:
+    configured = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "compose",
+            "--project-directory",
+            str(PUBLIC_EDGE_RUNTIME_ROOT),
+            "--file",
+            str(PUBLIC_EDGE_RUNTIME_ROOT / "compose.yaml"),
+            "config",
+            "--quiet",
+        ],
+        environment=safe_environment(release),
+        timeout=60,
+        maximum_stdout=1024,
+    )
+    if configured.stdout or configured.stderr:
+        fail("public edge Compose validation returned unexpected output")
+
+
+def parkventory_public_edge_container_is_live(release: Path) -> bool:
+    listed = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "ps",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            "label=com.docker.compose.project=vps-public-static-edge",
+            "--filter",
+            "label=com.docker.compose.service=caddy",
+        ],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=1024,
+    )
+    if not listed.stdout and not listed.stderr:
+        return False
+    identifiers = listed.stdout.splitlines()
+    if (
+        len(identifiers) != 1
+        or CONTAINER_ID_RE.fullmatch(identifiers[0]) is None
+        or listed.stderr
+    ):
+        fail("public edge running container inventory is not exact")
+    identifier = identifiers[0]
+    inspected = _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "container",
+            "inspect",
+            "--format",
+            (
+                "{{.Id}}\t{{.Name}}\t{{.State.Status}}\t"
+                "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
+                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
+                "{{index .Config.Labels \"com.docker.compose.service\"}}\t"
+                "{{range .Mounts}}"
+                "{{if eq .Destination \"/etc/caddy/routes/parkventory.caddy\"}}"
+                "{{.Type}}\t{{.Source}}\t{{.RW}}{{end}}{{end}}"
+            ),
+            identifier,
+        ],
+        environment=safe_environment(release),
+        timeout=30,
+        maximum_stdout=2048,
+    )
+    expected = (
+        f"{identifier}\t/{PUBLIC_EDGE_CONTAINER}\trunning\thealthy\t"
+        "vps-public-static-edge\tcaddy\tbind\t"
+        f"{PARKVENTORY_PUBLIC_EDGE_ROUTE}\tfalse\n"
+    )
+    if inspected.stdout != expected or inspected.stderr:
+        fail("live public edge does not use the protected Parkventory route bind")
+    return True
+
+
+def force_recreate_public_edge_for_parkventory(release: Path) -> None:
+    _run_bounded(
+        [
+            str(DOCKER_PATH),
+            "compose",
+            "--project-directory",
+            str(PUBLIC_EDGE_RUNTIME_ROOT),
+            "--file",
+            str(PUBLIC_EDGE_RUNTIME_ROOT / "compose.yaml"),
+            "up",
+            "--detach",
+            "--wait",
+            "--no-build",
+            "--pull",
+            "never",
+            "--force-recreate",
+            "--remove-orphans",
+            "caddy",
+        ],
+        environment=safe_environment(release),
+        timeout=300,
+        maximum_stdout=64 * 1024,
+    )
+
+
+def reconcile_public_edge_for_parkventory(release: Path) -> None:
+    if not public_edge_unit_is_active(release):
+        fail("public edge systemd unit is not active")
+    force_recreate_public_edge_for_parkventory(release)
+
+
+def begin_parkventory_handoff(
+    state: ApplicationState,
+    work: Path,
+) -> ParkventoryHandoff:
+    if state.application != "parkventory":
+        fail("only Parkventory can release its static public identity")
+    if parkventory_handoff_path_present():
+        fail("a Parkventory handoff journal already exists")
+    if STATIC.read_deployment_transaction("parkventory") is not None:
+        fail("Parkventory static deployment has an unfinished transaction")
+    static_state = STATIC.read_deployment_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "Parkventory static active state",
+    )
+    releases = STATIC_PARKVENTORY_CURRENT.parent / "releases"
+    static_target = STATIC.get_current_target(
+        STATIC_PARKVENTORY_CURRENT,
+        releases,
+    )
+    if static_state is None or static_target is None:
+        fail("Parkventory static ownership is incomplete before handoff")
+    if static_target != STATIC.release_target_for_state(static_state):
+        fail("Parkventory static active state differs from its current link")
+    STATIC.validate_persisted_release(static_state, releases)
+    static_route = read_parkventory_public_edge_route()
+    runtime_static_route_path = (
+        PUBLIC_EDGE_RUNTIME_ROOT / "routes" / "parkventory.caddy"
+    )
+    require_protected_file(
+        runtime_static_route_path,
+        "Parkventory retained static edge route",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    retained_static_route = STATIC.read_bounded_file(
+        runtime_static_route_path,
+        MAX_CONFIG_BYTES,
+        "Parkventory retained static edge route",
+    )
+    if static_route != retained_static_route:
+        fail("Parkventory stable route does not match the retained static route")
+    release = state_release(state)
+    bundle = bundle_from_release(release, state)
+    candidate_route = bundle.files.get("caddy/parkventory.caddy")
+    if not isinstance(candidate_route, bytes):
+        fail("Parkventory application bundle has no exact Caddy route")
+    validate_parkventory_route_bytes(candidate_route, "attested Parkventory route")
+    handoff = ParkventoryHandoff(
+        candidate=state,
+        static_state=static_state,
+        static_target=static_target,
+        static_route=static_route.decode("utf-8"),
+        static_route_digest=content_digest(static_route),
+        candidate_route_digest=content_digest(candidate_route),
+        phase="prepared",
+    )
+    if handoff.static_route_digest == handoff.candidate_route_digest:
+        fail("Parkventory static and application routes are not distinguishable")
+    write_parkventory_handoff(handoff)
+    write_parkventory_public_edge_route(candidate_route)
+    handoff = dataclasses.replace(handoff, phase="route-switched")
+    write_parkventory_handoff(handoff)
+    reconcile_public_edge_for_parkventory(release)
+    validate_public_edge_cutover(state, work)
+    handoff = dataclasses.replace(handoff, phase="edge-verified")
+    write_parkventory_handoff(handoff)
+    STATIC.remove_protected_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "Parkventory static active state",
+    )
+    STATIC.restore_current_target(
+        STATIC_PARKVENTORY_CURRENT,
+        None,
+        releases,
+    )
+    handoff = dataclasses.replace(handoff, phase="static-released")
+    write_parkventory_handoff(handoff)
+    return handoff
+
+
+def restore_parkventory_static_handoff(handoff: ParkventoryHandoff) -> None:
+    app_root = APPLICATION_ROOT / "parkventory"
+    app_releases = app_root / "releases"
+    active = read_state(
+        ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "active application state",
+    )
+    target = current_target(app_root / "current", app_releases)
+    expected_target = release_target(handoff.candidate)
+    if (active, target) not in (
+        (handoff.candidate, expected_target),
+        (None, expected_target),
+        (None, None),
+    ):
+        fail("Parkventory handoff found an unexpected Compose active tuple")
+    static_releases = STATIC_PARKVENTORY_CURRENT.parent / "releases"
+    static_transaction = STATIC.read_deployment_transaction("parkventory")
+    if static_transaction is not None:
+        fail("Parkventory handoff found an unexpected static transaction")
+    static_active = STATIC.read_deployment_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "Parkventory static active state",
+    )
+    static_target = STATIC.get_current_target(
+        STATIC_PARKVENTORY_CURRENT,
+        static_releases,
+    )
+    if (static_active, static_target) not in (
+        (handoff.static_state, handoff.static_target),
+        (None, handoff.static_target),
+        (None, None),
+    ):
+        fail("Parkventory handoff found an unexpected static active tuple")
+    STATIC.validate_persisted_release(handoff.static_state, static_releases)
+    inventory = STATIC.read_persisted_inventory(handoff.static_state)
+    release = state_release(handoff.candidate)
+    validate_public_edge_compose_configuration(release)
+    if handoff.phase != "restoring-static":
+        handoff = dataclasses.replace(handoff, phase="restoring-static")
+        write_parkventory_handoff(handoff)
+
+    # The rollback journal is durable before ownership changes. Remove the
+    # Compose state before its current link, so recovery can distinguish every
+    # reachable partial tuple and can never observe candidate state with no
+    # candidate link.
+    remove_state(
+        ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "active application state",
+    )
+    switch_current(app_root / "current", None, app_releases)
+    STATIC.restore_current_target(
+        STATIC_PARKVENTORY_CURRENT,
+        handoff.static_target,
+        static_releases,
+    )
+    static_route = handoff.static_route.encode("utf-8")
+    write_parkventory_public_edge_route(static_route)
+    force_recreate_public_edge_for_parkventory(release)
+    validate_parkventory_public_edge_attachment(release)
+    with tempfile.TemporaryDirectory(
+        prefix="vps-parkventory-static-restore-",
+        dir="/var/tmp",
+    ) as temporary_name:
+        work = Path(temporary_name)
+        work.chmod(0o755)
+        STATIC.probe_live_health(
+            inventory,
+            STATIC.PROFILES["parkventory"],
+            work,
+            STATIC.PROFILES["parkventory"].probe_timeout_seconds,
+        )
+    # Publish static ownership only after the restored route has passed its
+    # public probe. The candidate runtime keeps running until that boundary.
+    STATIC.write_deployment_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        handoff.static_state,
+        "Parkventory static active state",
+    )
+    stop_runtime(handoff.candidate)
+    write_state(
+        QUARANTINE_ROOT,
+        quarantine_name(handoff.candidate),
+        handoff.candidate,
+        "quarantined application state",
+    )
+    remove_parkventory_handoff()
+
+
+def recover_parkventory_handoff(*, preserve_forward_journal: bool = False) -> None:
+    if not parkventory_handoff_path_present():
+        return
+    handoff = read_parkventory_handoff()
+    if handoff is None:
+        fail("Parkventory handoff journal disappeared during recovery")
+    app_root = APPLICATION_ROOT / "parkventory"
+    releases = app_root / "releases"
+    active = read_state(
+        ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "active application state",
+    )
+    target = current_target(app_root / "current", releases)
+    if handoff.phase == "restoring-static" or static_parkventory_owner_present():
+        # A restored static state, transaction, or current link is a durable
+        # rollback signal. Finish that rollback even if the Compose tuple is
+        # still complete and would otherwise look eligible for forward repair.
+        restore_parkventory_static_handoff(handoff)
+        return
+    if active == handoff.candidate and target == release_target(handoff.candidate):
+        try:
+            revalidate_parkventory_backup_before_runtime()
+            with tempfile.TemporaryDirectory(
+                prefix="vps-parkventory-handoff-forward-",
+                dir="/var/tmp",
+            ) as temporary_name:
+                work = Path(temporary_name)
+                work.chmod(0o755)
+                validate_public_edge_cutover(handoff.candidate, work)
+                probe_runtime(handoff.candidate, work)
+        except BaseException:
+            restore_parkventory_static_handoff(handoff)
+            return
+        if not preserve_forward_journal:
+            remove_parkventory_handoff()
+        return
+    expected_target = release_target(handoff.candidate)
+    if (active, target) in ((None, expected_target), (None, None)):
+        restore_parkventory_static_handoff(handoff)
+        return
+    fail("Parkventory handoff found a foreign Compose active tuple")
+
+
+def complete_parkventory_handoff(state: ApplicationState) -> None:
+    if not parkventory_handoff_path_present():
+        return
+    handoff = read_parkventory_handoff()
+    if (
+        handoff is None
+        or handoff.candidate != state
+        or handoff.phase != "static-released"
+    ):
+        fail("Parkventory committed tuple differs from its public handoff")
+    route = read_parkventory_public_edge_route()
+    if content_digest(route) != handoff.candidate_route_digest:
+        fail("Parkventory committed route differs from its public handoff")
+    remove_parkventory_handoff()
+
+
 def static_parkventory_owner_present() -> bool:
     for path in (
         STATIC_ACTIVE_STATE_ROOT / "parkventory.json",
@@ -3115,12 +4770,71 @@ def static_parkventory_owner_present() -> bool:
     return False
 
 
-def prepare_transaction(state: ApplicationState) -> tuple[bool, ApplicationState | None]:
+def refuse_static_deployment_transactions() -> None:
+    for application in sorted(STATIC.PROFILES):
+        if STATIC.read_deployment_transaction(application) is not None:
+            fail(
+                f"{application} static deployment recovery must finish before "
+                "the public edge can change"
+            )
+
+
+def parkventory_static_handoff_preflight() -> bool:
+    """Prove the complete static tuple before fetch or database mutation."""
+    refuse_static_deployment_transactions()
+    if parkventory_handoff_path_present():
+        fail("Parkventory handoff recovery must finish before a new activation")
+    static_state = STATIC.read_deployment_state_file(
+        STATIC_ACTIVE_STATE_ROOT,
+        "parkventory.json",
+        "Parkventory static active state",
+    )
+    releases = STATIC_PARKVENTORY_CURRENT.parent / "releases"
+    static_target = STATIC.get_current_target(
+        STATIC_PARKVENTORY_CURRENT,
+        releases,
+    )
+    if static_state is None and static_target is None:
+        return False
+    if (
+        static_state is None
+        or static_target is None
+        or static_target != STATIC.release_target_for_state(static_state)
+    ):
+        fail("Parkventory static ownership is incomplete before handoff")
+    STATIC.validate_persisted_release(static_state, releases)
+    static_route = read_parkventory_public_edge_route()
+    retained_route_path = PUBLIC_EDGE_RUNTIME_ROOT / "routes" / "parkventory.caddy"
+    require_protected_file(
+        retained_route_path,
+        "Parkventory retained static edge route",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    retained_route = STATIC.read_bounded_file(
+        retained_route_path,
+        MAX_CONFIG_BYTES,
+        "Parkventory retained static edge route",
+    )
+    if static_route != retained_route:
+        fail("Parkventory stable route does not match the retained static route")
+    return True
+
+
+def prepare_transaction(
+    state: ApplicationState,
+    *,
+    allow_static_handoff: bool = False,
+) -> tuple[bool, ApplicationState | None]:
     application = state.application
     app_root = APPLICATION_ROOT / application
     releases = app_root / "releases"
     recover_application(application)
-    if application == "parkventory" and static_parkventory_owner_present():
+    if (
+        application == "parkventory"
+        and static_parkventory_owner_present()
+        and not allow_static_handoff
+    ):
         fail("Parkventory static state still owns the public application identity")
     quarantined = read_state(
         QUARANTINE_ROOT,
@@ -3137,7 +4851,11 @@ def prepare_transaction(state: ApplicationState) -> tuple[bool, ApplicationState
         "active application state",
     )
     target = current_target(app_root / "current", releases)
-    if application == "parkventory" and static_parkventory_owner_present():
+    if (
+        application == "parkventory"
+        and static_parkventory_owner_present()
+        and not allow_static_handoff
+    ):
         fail("Parkventory static state still owns the public application identity")
     if active is None and target is not None:
         fail("application current link exists without active state")
@@ -3156,26 +4874,32 @@ def prepare_transaction(state: ApplicationState) -> tuple[bool, ApplicationState
 
 
 def restore_previous(transaction: ApplicationTransaction) -> None:
+    if transaction.phase != "rollback":
+        transaction = dataclasses.replace(transaction, phase="rollback")
+        # Persist the one-way rollback decision before starting, stopping, or
+        # switching any runtime. Recovery must never reinterpret a partially
+        # restored tuple as permission to forward-commit the candidate.
+        write_transaction(transaction)
     application = transaction.candidate.application
     app_root = APPLICATION_ROOT / application
     releases = app_root / "releases"
     if transaction.previous_state is None:
-        stop_runtime(transaction.candidate)
-        switch_current(app_root / "current", None, releases)
         remove_state(ACTIVE_STATE_ROOT, f"{application}.json", "active application state")
+        switch_current(app_root / "current", None, releases)
+        stop_runtime(transaction.candidate)
     else:
         validate_materialized_release(
             state_release(transaction.previous_state), transaction.previous_state
         )
         start_runtime(transaction.previous_state)
-        switch_current(
-            app_root / "current", transaction.previous_target, releases
-        )
         write_state(
             ACTIVE_STATE_ROOT,
             f"{application}.json",
             transaction.previous_state,
             "active application state",
+        )
+        switch_current(
+            app_root / "current", transaction.previous_target, releases
         )
 
 
@@ -3237,7 +4961,7 @@ def application_tuple_is_active(transaction: ApplicationTransaction) -> bool:
     return active == transaction.candidate and target == transaction.expected_target
 
 
-def recover_application(application: str) -> None:
+def _recover_application_transaction(application: str) -> None:
     if application not in PROFILES:
         fail("application recovery target is outside the allowlist")
     transaction = read_transaction(application)
@@ -3261,6 +4985,26 @@ def recover_application(application: str) -> None:
         "active application state",
     )
     target = current_target(app_root / "current", releases)
+    if transaction.phase == "rollback":
+        if (active, target) not in (
+            (transaction.candidate, transaction.expected_target),
+            (transaction.previous_state, transaction.expected_target),
+            (transaction.previous_state, transaction.previous_target),
+        ):
+            fail("application rollback found an unreachable active tuple")
+        restore_previous(transaction)
+        write_state(
+            QUARANTINE_ROOT,
+            quarantine_name(transaction.candidate),
+            transaction.candidate,
+            "quarantined application state",
+        )
+        remove_state(
+            TRANSACTION_ROOT,
+            f"{application}.json",
+            "application transaction",
+        )
+        return
     if application == "parkventory" and static_parkventory_owner_present():
         if (
             active is not None
@@ -3322,8 +5066,10 @@ def recover_application(application: str) -> None:
         )
         if application == "parkventory":
             try:
-                revalidate_parkventory_offsite_before_runtime()
+                revalidate_parkventory_backup_before_runtime()
             except BaseException:
+                if parkventory_handoff_path_present():
+                    raise
                 rollback_and_quarantine_candidate(transaction)
                 return
         start_runtime(transaction.candidate, precommit=True)
@@ -3340,8 +5086,10 @@ def recover_application(application: str) -> None:
         )
         if application == "parkventory":
             try:
-                revalidate_parkventory_offsite_before_runtime()
+                revalidate_parkventory_backup_before_runtime()
             except BaseException:
+                if parkventory_handoff_path_present():
+                    raise
                 rollback_and_quarantine_candidate(transaction)
                 return
         start_runtime(transaction.candidate, precommit=True)
@@ -3379,6 +5127,33 @@ def recover_application(application: str) -> None:
         f"{application}.json",
         "application transaction",
     )
+
+
+def recover_application(application: str) -> None:
+    if application != "parkventory":
+        _recover_application_transaction(application)
+        return
+
+    recover_parkventory_handoff(preserve_forward_journal=True)
+    try:
+        _recover_application_transaction(application)
+    except BaseException as transaction_error:
+        if not parkventory_handoff_path_present():
+            raise
+        handoff = read_parkventory_handoff()
+        if handoff is None:
+            fail("Parkventory handoff journal disappeared during rollback")
+        try:
+            restore_parkventory_static_handoff(handoff)
+            _recover_application_transaction(application)
+        except BaseException as rollback_error:
+            raise ApplicationDeploymentError(
+                "Parkventory transaction recovery and static rollback both failed: "
+                f"{transaction_error}; {rollback_error}"
+            ) from rollback_error
+        return
+    if parkventory_handoff_path_present():
+        recover_parkventory_handoff()
 
 
 def commit_probed_candidate(transaction: ApplicationTransaction) -> None:
@@ -3419,9 +5194,23 @@ def commit_probed_candidate(transaction: ApplicationTransaction) -> None:
         raise commit_error
 
 
-def activate_candidate(state: ApplicationState, work: Path) -> None:
+def activate_candidate(
+    state: ApplicationState,
+    work: Path,
+    *,
+    static_handoff_required: bool | None = None,
+) -> None:
+    application = state.application
+    if application == "parkventory" and static_handoff_required is None:
+        static_handoff_required = parkventory_static_handoff_preflight()
+    if application == "parkventory":
+        validate_parkventory_secret_materializers()
     validate_materialized_runtime_policy(state)
-    proceed, previous = prepare_transaction(state)
+    static_handoff_required = bool(static_handoff_required)
+    proceed, previous = prepare_transaction(
+        state,
+        allow_static_handoff=static_handoff_required,
+    )
     if not proceed:
         probe_runtime(state, work)
         print(
@@ -3429,7 +5218,6 @@ def activate_candidate(state: ApplicationState, work: Path) -> None:
             f"{state.release_reference}"
         )
         return
-    application = state.application
     app_root = APPLICATION_ROOT / application
     releases = app_root / "releases"
     transaction = ApplicationTransaction(
@@ -3442,7 +5230,8 @@ def activate_candidate(state: ApplicationState, work: Path) -> None:
     write_transaction(transaction)
     try:
         pull_and_verify_images(state)
-        validate_public_edge_cutover(state, work)
+        if not static_handoff_required:
+            validate_public_edge_cutover(state, work)
         if PROFILES[application].migration_strategy == "dedicated":
             transaction = dataclasses.replace(
                 transaction,
@@ -3462,14 +5251,16 @@ def activate_candidate(state: ApplicationState, work: Path) -> None:
             transaction = dataclasses.replace(transaction, phase="migrated")
             write_transaction(transaction)
             if application == "parkventory":
-                revalidate_parkventory_offsite_before_runtime()
+                revalidate_parkventory_backup_before_runtime()
         start_runtime(state, precommit=True)
         transaction = dataclasses.replace(transaction, phase="started")
         write_transaction(transaction)
+        if static_handoff_required:
+            begin_parkventory_handoff(state, work)
         probe_runtime(state, work)
         assert_exact_source_head(PROFILES[application], state.source_revision)
         if application == "parkventory":
-            revalidate_parkventory_offsite_before_runtime()
+            revalidate_parkventory_backup_before_runtime()
     except BaseException as activation_error:
         try:
             current = read_transaction(application)
@@ -3483,6 +5274,8 @@ def activate_candidate(state: ApplicationState, work: Path) -> None:
             ) from recovery_error
         raise
     commit_probed_candidate(dataclasses.replace(transaction, phase="probed"))
+    if application == "parkventory":
+        complete_parkventory_handoff(state)
 
 
 def deployment_temporary_root(application: str, activate_live: bool) -> Path:
@@ -3543,6 +5336,10 @@ def deploy(
         fail("application is disabled by the protected production contract")
     validate_runtime()
     with deployment_lock():
+        refuse_public_edge_base_transaction()
+        static_handoff_required: bool | None = None
+        if application == "parkventory":
+            static_handoff_required = parkventory_static_handoff_preflight()
         validate_smtp_input_commit(application)
         cleanup_application_filesystem_residue(application)
         STATIC.refuse_isolated_worker_residue_locked()
@@ -3566,7 +5363,11 @@ def deploy(
             )
             release = materialize_candidate(state, profile, bundle, evidence)
             if activate_live:
-                activate_candidate(state, temporary)
+                activate_candidate(
+                    state,
+                    temporary,
+                    static_handoff_required=static_handoff_required,
+                )
                 print(
                     f"application release activated after policy and probes: "
                     f"{application} {release_reference}"
@@ -3586,11 +5387,58 @@ def recover_live(application: str | None) -> None:
     with deployment_lock():
         for item in applications:
             cleanup_application_filesystem_residue(item)
-        if not any(read_transaction(item) is not None for item in applications):
+        has_public_edge_base_transaction = (
+            public_edge_base_transaction_path_present()
+        )
+        has_transaction = any(
+            read_transaction(item) is not None for item in applications
+        )
+        has_parkventory_handoff = (
+            "parkventory" in applications and parkventory_handoff_path_present()
+        )
+        if (
+            not has_public_edge_base_transaction
+            and not has_transaction
+            and not has_parkventory_handoff
+        ):
             return
         validate_runtime()
+        if has_public_edge_base_transaction:
+            recover_public_edge_base_locked()
+            STATIC.recover_live_deployments_locked()
         for item in applications:
             recover_application(item)
+
+
+def control_public_edge_base(action: str, candidate_value: str) -> None:
+    candidate = public_edge_base_release_from_value(
+        candidate_value, "public edge base candidate"
+    )
+    validate_runtime()
+    with deployment_lock():
+        if action == "prepare":
+            prepare_public_edge_base_locked(candidate)
+            print(f"public edge base prepared for external probes: {candidate}")
+            return
+        transaction = read_public_edge_base_transaction()
+        if transaction is None or transaction.candidate_release != str(candidate):
+            fail("public edge base action differs from its durable transaction")
+        if action == "commit":
+            commit_public_edge_base_locked(candidate)
+            print(f"public edge base committed after revalidation: {candidate}")
+            return
+        if action == "rollback":
+            rollback_public_edge_base_locked(transaction)
+            print(f"public edge base rollback complete: {candidate}")
+            return
+        fail("public edge base action is invalid")
+
+
+def stop_public_edge_base() -> None:
+    validate_runtime()
+    with deployment_lock():
+        stop_public_edge_base_locked()
+    print("public edge base stopped under the shared deployment lock")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3619,6 +5467,23 @@ def main(argv: list[str] | None = None) -> int:
             if len(arguments) not in {1, 2}:
                 fail("application recovery argument count is invalid")
             recover_live(None if len(arguments) == 1 else arguments[1])
+            return 0
+        if arguments and arguments[0] == "--stop-public-edge-base":
+            if len(arguments) != 1:
+                fail("public edge base stop argument count is invalid")
+            stop_public_edge_base()
+            return 0
+        public_edge_base_modes = {
+            "--prepare-public-edge-base": "prepare",
+            "--commit-public-edge-base": "commit",
+            "--rollback-public-edge-base": "rollback",
+        }
+        if arguments and arguments[0] in public_edge_base_modes:
+            if len(arguments) != 2:
+                fail("public edge base action argument count is invalid")
+            control_public_edge_base(
+                public_edge_base_modes[arguments[0]], arguments[1]
+            )
             return 0
         parsed = build_parser().parse_args(arguments)
         deploy(

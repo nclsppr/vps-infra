@@ -2,6 +2,8 @@
 vps_postgres_backup_state: installed
 vps_postgres_backup_root: /srv/vps/backups/postgresql
 vps_postgres_backup_script: /usr/local/libexec/vps/postgres-backup
+vps_postgres_local_restore_readiness: >-
+  /var/lib/vps-readiness/postgresql/local-restore.json
 vps_postgres_backup_service: vps-postgres-backup.service
 vps_postgres_backup_timer: vps-postgres-backup.timer
 vps_postgres_restore_service: vps-postgres-restore-rehearsal.service

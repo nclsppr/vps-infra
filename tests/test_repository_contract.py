@@ -1724,9 +1724,28 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertNotIn("environment", caddy)
         self.assertNotIn("secrets", caddy)
-        self.assertEqual(set(compose["networks"]), {"edge"})
-        self.assertEqual(set(caddy["networks"]), {"edge"})
+        self.assertEqual(
+            set(compose["networks"]),
+            {"app_parkventory", "edge"},
+        )
+        self.assertEqual(
+            set(caddy["networks"]),
+            {"app_parkventory", "edge"},
+        )
+        self.assertEqual(
+            caddy["networks"]["app_parkventory"],
+            {"ipv4_address": "172.30.20.254"},
+        )
         self.assertNotIn("ops", caddy["networks"])
+        route_mounts = {
+            volume["target"]: volume
+            for volume in caddy["volumes"]
+            if volume.get("type") == "bind"
+        }
+        self.assertEqual(
+            route_mounts["/etc/caddy/routes/parkventory.caddy"]["source"],
+            "/var/lib/vps-public-edge-parkventory/route.caddy",
+        )
         self.assertEqual(
             {
                 (port["host_ip"], int(port["published"]), port["protocol"])
@@ -1932,7 +1951,9 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertIn("Remove an interrupted public edge staging tree", role_text)
         self.assertIn("Atomically install the immutable public edge release", role_text)
-        self.assertIn("Atomically activate the staged public edge release", role_text)
+        self.assertIn("Prepare the locked public edge base transaction", role_text)
+        self.assertIn("Commit the probed public edge base transaction", role_text)
+        self.assertIn("Roll back the durable public edge base transaction", role_text)
         self.assertIn(
             "Verify the switched public static edge from host and operator networks",
             role_text,
@@ -1942,36 +1963,25 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         rescue_position = role_text.index("      rescue:", verification_position)
         self.assertLess(verification_position, rescue_position)
-        self.assertIn(
+        self.assertNotIn(
             "Unconditionally reconcile the public static edge Compose project",
             role_text,
         )
-        self.assertIn(
-            "Detect a switched or stale public edge release",
+        self.assertNotIn("- --force-recreate", role_text)
+        self.assertNotIn("vps_public_static_edge_previous_release", role_text)
+        self.assertNotIn(
+            "Install the selected static Parkventory route before handoff",
             role_text,
         )
-        self.assertIn(
-            "vps_public_static_edge_release_changed or",
-            role_text,
-        )
-        self.assertIn(
-            "when: vps_public_static_edge_requires_recreate",
-            role_text,
-        )
-        self.assertIn(
-            "Force Caddy recreation after restoring the previous release",
-            role_text,
-        )
-        self.assertEqual(role_text.count("- --force-recreate"), 2)
-        forward_recreate_position = role_text.index(
-            "Force Caddy recreation for a switched or stale release"
-        )
-        self.assertLess(forward_recreate_position, verification_position)
-        self.assertGreater(forward_recreate_position, role_text.index("      block:"))
-        self.assertIn("inspect-bind-identities.yml", role_text)
-        self.assertIn("not (vps_public_static_edge_bind_identities_match | bool)", role_text)
         self.assertNotIn("map(attribute='Source')", role_text)
-        self.assertIn("Stop every residual public edge project container", role_text)
+        self.assertIn(
+            "Stop the public edge through the shared locked controller",
+            role_text,
+        )
+        self.assertNotIn(
+            "Stop every residual public edge project container",
+            role_text,
+        )
         self.assertIn("failed_when: false", role_text)
         self.assertNotIn("production-enabled", role_text)
         self.assertNotIn("apply-release", role_text)
@@ -1980,6 +1990,29 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("172.30.32.0/24", role_text)
 
         role_tasks = yaml.safe_load(role_text)
+        stopped_task = next(
+            task
+            for task in role_tasks
+            if task["name"]
+            == "Stop and prove the isolated public static edge is absent"
+        )
+        stopped_mutator = stopped_task["block"][0]
+        self.assertEqual(
+            stopped_mutator["ansible.builtin.command"]["argv"],
+            [
+                "{{ vps_public_static_edge_application_controller }}",
+                "--stop-public-edge-base",
+            ],
+        )
+        self.assertFalse(
+            any(
+                "ansible.builtin.systemd_service" in task
+                or task.get("ansible.builtin.command", {})
+                .get("argv", [None, None])[1:2]
+                == ["stop"]
+                for task in stopped_task["block"]
+            )
+        )
         stage_task = next(
             task
             for task in role_tasks
@@ -1990,88 +2023,72 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             for task in stage_task["block"]
             if task["name"] == "Switch and reconcile the public static edge"
         )
-        forward_tasks = {task["name"]: task for task in switch_task["block"]}
-        recreate_expression = forward_tasks[
-            "Detect a switched or stale public edge release"
-        ]["ansible.builtin.set_fact"]["vps_public_static_edge_requires_recreate"]
-        for release_changed, identities_match, expected in (
-            (False, True, False),
-            (False, False, True),
-            (True, True, True),
-            (True, False, True),
-        ):
-            rendered = Templar(
-                loader=DataLoader(),
-                variables={
-                    "vps_public_static_edge_release_changed": release_changed,
-                    "vps_public_static_edge_bind_identities_match": identities_match,
-                },
-            ).template(trust_as_template(recreate_expression))
-            self.assertIs(rendered, expected)
-
-        recreate_task = forward_tasks[
-            "Force Caddy recreation for a switched or stale release"
-        ]
+        forward_names = [task["name"] for task in switch_task["block"]]
         self.assertEqual(
-            recreate_task["when"],
-            "vps_public_static_edge_requires_recreate",
+            forward_names,
+            [
+                "Prepare the locked public edge base transaction",
+                "Verify the switched public static edge from host and operator networks",
+                "Commit the probed public edge base transaction",
+            ],
+        )
+        forward_tasks = {task["name"]: task for task in switch_task["block"]}
+        self.assertEqual(
+            forward_tasks["Prepare the locked public edge base transaction"]
+            ["ansible.builtin.command"]["argv"][1],
+            "--prepare-public-edge-base",
+        )
+        self.assertEqual(
+            forward_tasks["Commit the probed public edge base transaction"]
+            ["ansible.builtin.command"]["argv"][1],
+            "--commit-public-edge-base",
         )
         rescue_tasks = {task["name"]: task for task in switch_task["rescue"]}
-        rollback_recreate = rescue_tasks[
-            "Force Caddy recreation after restoring the previous release"
-        ]
-        self.assertIn(
-            "--force-recreate",
-            rollback_recreate["ansible.builtin.command"]["argv"],
-        )
+        rollback = rescue_tasks["Roll back the durable public edge base transaction"]
         self.assertEqual(
-            rollback_recreate["when"],
-            "vps_public_static_edge_previous_release | length > 0",
+            rollback["ansible.builtin.command"]["argv"][1],
+            "--rollback-public-edge-base",
         )
         rescue_names = [task["name"] for task in switch_task["rescue"]]
-        restore_position = rescue_names.index(
-            "Atomically restore the previous public edge release"
+        self.assertEqual(
+            rescue_names,
+            [
+                "Roll back the durable public edge base transaction",
+                "Refuse the failed public edge reconciliation",
+            ],
         )
-        rollback_recreate_position = rescue_names.index(
-            "Force Caddy recreation after restoring the previous release"
+        self.assertEqual(
+            rollback["when"],
+            [
+                "vps_public_static_edge_base_prepare is defined",
+                "vps_public_static_edge_base_prepare is succeeded",
+            ],
         )
-        self.assertEqual(rollback_recreate_position, restore_position + 1)
-        rollback_inspect_position = rescue_names.index(
-            "Inspect Caddy after forced rollback recreation"
+
+        application_controller = (ROOT / "scripts/deploy-application").read_text(
+            encoding="utf-8"
         )
-        rollback_bind_position = rescue_names.index(
-            "Compare restored Caddy bind identities"
-        )
-        rollback_health_position = rescue_names.index(
-            "Require healthy Caddy with restored bind identities"
-        )
-        rollback_systemd_position = rescue_names.index(
-            "Re-register the restored public edge with systemd"
-        )
-        self.assertEqual(rollback_inspect_position, rollback_recreate_position + 1)
-        self.assertEqual(rollback_bind_position, rollback_inspect_position + 1)
-        self.assertEqual(rollback_health_position, rollback_bind_position + 1)
-        self.assertEqual(rollback_systemd_position, rollback_health_position + 1)
-        rollback_bind_vars = rescue_tasks[
-            "Compare restored Caddy bind identities"
-        ]["vars"]
-        self.assertIn(
-            "vps_public_static_edge_previous_release",
-            rollback_bind_vars["vps_public_static_edge_bind_release_dir"],
-        )
-        rollback_assertions = rescue_tasks[
-            "Require healthy Caddy with restored bind identities"
-        ]["ansible.builtin.assert"]["that"]
-        self.assertTrue(
-            any(
-                "Health.Status == 'healthy'" in item
-                for item in rollback_assertions
-            )
-        )
-        self.assertIn(
-            "vps_public_static_edge_bind_identities_match | bool",
-            rollback_assertions,
-        )
+        for token in (
+            "PUBLIC_EDGE_BASE_TRANSACTION",
+            "previous_route",
+            "previous_release",
+            "previous_unit_active",
+            "previous_unit_enabled",
+            "write_public_edge_base_transaction(transaction)",
+            "with deployment_lock():",
+            "--prepare-public-edge-base",
+            "--commit-public-edge-base",
+            "--rollback-public-edge-base",
+            "--stop-public-edge-base",
+        ):
+            self.assertIn(token, application_controller)
+        for writer in (
+            ROOT / "scripts/deploy-static",
+            ROOT / "scripts/deploy-surplasse-public-edge",
+        ):
+            writer_text = writer.read_text(encoding="utf-8")
+            self.assertIn("base-transaction.json", writer_text)
+            self.assertIn("refuse_public_edge_base_transaction", writer_text)
 
         runtime_verification = (
             ROOT / "ansible/roles/public_static_edge/tasks/verify-runtime.yml"
@@ -2095,8 +2112,8 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("get_attributes: false", bind_verification)
         self.assertIn("get_checksum: false", bind_verification)
         self.assertIn("get_mime: false", bind_verification)
-        self.assertEqual(bind_verification.count(".stat.dev =="), 2)
-        self.assertEqual(bind_verification.count(".stat.inode =="), 2)
+        self.assertEqual(bind_verification.count(".stat.dev =="), 3)
+        self.assertEqual(bind_verification.count(".stat.inode =="), 3)
         self.assertIn("State.Pid | int) > 0", bind_verification)
         self.assertNotIn("map(attribute='Source')", bind_verification)
 
@@ -3213,6 +3230,134 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             )
         )
         self.assertEqual(deploy_defaults["vps_deploy_key_recovery_nonce"], "")
+
+    def test_deployment_key_identity_filters_use_real_ansible_backreferences(
+        self,
+    ) -> None:
+        role_tasks = yaml.safe_load(
+            (ROOT / "ansible/roles/deploy/tasks/main.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        playbook = yaml.safe_load(
+            (ROOT / "ansible/playbooks/site.yml").read_text(encoding="utf-8")
+        )
+        pre_tasks = playbook[0]["pre_tasks"]
+
+        def task_named(tasks: list[dict[str, object]], name: str) -> dict[str, object]:
+            return next(task for task in tasks if task["name"] == name)
+
+        def render(expression: str, variables: dict[str, object]) -> object:
+            return Templar(
+                loader=DataLoader(),
+                variables=variables,
+            ).template(trust_as_template(expression))
+
+        site_normalization = task_named(
+            pre_tasks,
+            "Normalize desired deployment key identities before any role",
+        )["ansible.builtin.set_fact"]["site_deploy_key_identities"]
+        role_normalization = task_named(
+            role_tasks,
+            "Normalize installed and desired deployment key records",
+        )["ansible.builtin.set_fact"]["deploy_desired_key_identities"]
+        site_duplicate_condition = task_named(
+            pre_tasks,
+            "Refuse duplicate deployment key identities before any role",
+        )["ansible.builtin.assert"]["that"][0]
+        role_duplicate_condition = task_named(
+            role_tasks,
+            "Refuse duplicate desired deployment key identities",
+        )["ansible.builtin.assert"]["that"][0]
+
+        distinct_keys = [
+            "ssh-ed25519 AAAA1111 first deploy key",
+            "sk-ssh-ed25519@openssh.com BBBB2222 second deploy key",
+        ]
+        distinct_identities = [
+            "ssh-ed25519 AAAA1111",
+            "sk-ssh-ed25519@openssh.com BBBB2222",
+        ]
+        duplicate_keys = [
+            "ssh-ed25519 CCCC3333 old comment",
+            "ssh-ed25519 CCCC3333 new comment",
+        ]
+        duplicate_identities = [
+            "ssh-ed25519 CCCC3333",
+            "ssh-ed25519 CCCC3333",
+        ]
+
+        for expression in (site_normalization, role_normalization):
+            self.assertEqual(
+                render(
+                    expression,
+                    {"vps_deploy_authorized_keys": distinct_keys},
+                ),
+                distinct_identities,
+            )
+            self.assertEqual(
+                render(
+                    expression,
+                    {"vps_deploy_authorized_keys": duplicate_keys},
+                ),
+                duplicate_identities,
+            )
+
+        self.assertIs(
+            render(
+                "{{ " + site_duplicate_condition + " }}",
+                {"site_deploy_key_identities": distinct_identities},
+            ),
+            True,
+        )
+        self.assertIs(
+            render(
+                "{{ " + role_duplicate_condition + " }}",
+                {"deploy_desired_key_identities": distinct_identities},
+            ),
+            True,
+        )
+        self.assertIs(
+            render(
+                "{{ " + site_duplicate_condition + " }}",
+                {"site_deploy_key_identities": duplicate_identities},
+            ),
+            False,
+        )
+        self.assertIs(
+            render(
+                "{{ " + role_duplicate_condition + " }}",
+                {"deploy_desired_key_identities": duplicate_identities},
+            ),
+            False,
+        )
+
+        installed_extraction = task_named(
+            role_tasks,
+            "Extract only exact installed forced-command key identities",
+        )["ansible.builtin.set_fact"]["deploy_installed_key_identities"]
+        forced_command = (
+            'restrict,command="/usr/local/libexec/vps/forced-command" '
+        )
+        installed_lines = [
+            f"{forced_command}{distinct_keys[0]}",
+            f"{forced_command}{distinct_keys[1]}",
+            (
+                'restrict,command="/usr/local/libexec/vps/forced-command-extra" '
+                "ssh-ed25519 DDDD4444 wrong command"
+            ),
+            (
+                'no-port-forwarding,command="/usr/local/libexec/vps/forced-command" '
+                "ssh-ed25519 EEEE5555 wrong options"
+            ),
+        ]
+        self.assertEqual(
+            render(
+                installed_extraction,
+                {"deploy_installed_key_lines": installed_lines},
+            ),
+            distinct_identities,
+        )
 
     def test_total_loss_recovery_uses_one_nonce_and_a_negative_auth_probe(
         self,

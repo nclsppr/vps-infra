@@ -36,12 +36,21 @@
             playbook_dir ~ '/../../releases/application-production.json'
           ) | from_json
         ).applications.parkventory.readiness_evidence[
-          'encrypted_offsite_backup'
+          'local_backup'
         ].sha256 == none
+      - >-
+        (
+          lookup(
+            'ansible.builtin.file',
+            playbook_dir ~ '/../../releases/application-production.json'
+          ) | from_json
+        ).applications.parkventory.readiness_evidence[
+          'encrypted_offsite_backup'
+        ] == {'required': false, 'status': 'deferred-for-public-launch'}
     fail_msg: >-
       Parkventory database preparation requires the static owner to remain
-      active, the Compose contract to remain disabled, and encrypted off-site
-      backup evidence to remain explicitly unbound.
+      active and the Compose contract to remain disabled. Local restore
+      evidence must remain unbound until the backup rehearsal completes.
 
 - name: Create protected helper and contract directories
   ansible.builtin.file:
@@ -427,5 +436,5 @@
       disabled. No application container, Caddy route, DNS record, or static
       ownership state changed. Readiness requires PostgreSQL to remain attached
       to db_parkventory, so a temporary preparation attachment is not current
-      readiness after cleanup. Encrypted off-site backup evidence is still a
-      separate activation blocker.
+      readiness after cleanup. The launch contract requires a fresh local
+      backup and restore rehearsal. It explicitly defers off-site proof.

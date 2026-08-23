@@ -919,17 +919,27 @@ deliberate Surplasse activation must keep this order:
 9. run internal probes and strict public TLS probes resolved directly to Atlas;
 10. persist active state only after the complete transaction is `probed`.
 
-Parkventory has stricter public-beta prerequisites than the retained Surplasse
-tester exception. [ADR-0015](decisions/0015-parkventory-public-beta-readiness.md)
-and the [Parkventory PostgreSQL runbook](operations/parkventory-postgresql.md)
-require exact non-`BYPASSRLS` roles, both digest-bound readiness files, a fresh
-encrypted receipt and matching off-Atlas restore rehearsal, OIDC and SMTP
-credentials, active scraping and delivered alerts, structured logs, and the
-explicit static-to-Compose ownership handoff before this order can start.
+Parkventory requires exact non-`BYPASSRLS` roles, both digest-bound readiness
+files, OIDC and SMTP credentials, network integration, and the explicit
+static-to-Compose ownership handoff. The public-launch contract accepts a fresh
+local backup and tested isolated restore. It records encrypted off-site backup
+proof as deferred until the product has real user signal.
 
-The application controller does not rewrite the platform edge. Route and
-network preparation is a separate reviewed platform cutover and must precede
-migration.
+Run `make prepare-parkventory-public-edge` first. It retains the static route,
+mounts a durable Parkventory route selector, and attaches Caddy to the exact
+managed `app_parkventory` address. During activation, the static site remains
+live through the dedicated migration and while the candidate runtime becomes
+healthy. The application controller then journals the previous static state and
+route, atomically installs the attested application route, recreates and probes
+Caddy while the static link still exists, and only then releases the static
+state and link. On rollback, it restores and validates the static release, link,
+state, route, and offline Compose configuration before stopping or quarantining
+the candidate. If the Caddy container is already live, recovery recreates it
+with the restored route and proves public static health even when its oneshot
+systemd unit reports inactive. If no edge container is live, recovery leaves
+the restored state ready and lets systemd start Caddy after offline validation.
+The handoff journal remains until the application transaction is durably
+finalized.
 
 Compose recrée seulement les services dont l’image ou la configuration a
 changé. Les digests Surplasse restent indépendants, mais son workflow publie

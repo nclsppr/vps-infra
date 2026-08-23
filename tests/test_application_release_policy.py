@@ -168,12 +168,12 @@ class ProductionContractTests(unittest.TestCase):
             application_path.write_text(json.dumps(application), encoding="utf-8")
             with self.assertRaisesRegex(
                 POLICY.ApplicationReleaseError,
-                "verified encrypted off-site backup evidence",
+                "verified local restore evidence",
             ):
                 POLICY.load_production_contract(application_path, static_path)
 
             application["applications"]["parkventory"]["readiness_evidence"][
-                "encrypted_offsite_backup"
+                "local_backup"
             ]["sha256"] = "sha256:" + "b" * 64
             application_path.write_text(json.dumps(application), encoding="utf-8")
             admitted = POLICY.load_production_contract(
@@ -201,6 +201,13 @@ class ProductionContractTests(unittest.TestCase):
                     "enabled", 0
                 ),
                 "must be a boolean",
+            ),
+            (
+                "offsite-required",
+                lambda value: value["applications"]["parkventory"][
+                    "readiness_evidence"
+                ]["encrypted_offsite_backup"].__setitem__("required", True),
+                "must equal",
             ),
         )
         for name, mutate, message in cases:

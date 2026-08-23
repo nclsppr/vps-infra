@@ -35,6 +35,10 @@ case $# in
         playbook=playbooks/public-static-edge.yml
         ansible_extra_options=(--extra-vars vps_public_static_edge_state=activate)
         ;;
+      --prepare-parkventory-public-edge)
+        playbook=playbooks/public-static-edge.yml
+        ansible_extra_options=(--extra-vars vps_public_static_edge_state=activate)
+        ;;
       --precutover-public-static-edge)
         playbook=playbooks/public-static-edge.yml
         ansible_extra_options=(--extra-vars vps_public_static_edge_state=precutover)

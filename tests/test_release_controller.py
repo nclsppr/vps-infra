@@ -989,7 +989,10 @@ def platform_document(*, include_grafana: bool = True) -> dict:
 
 def public_static_edge_document() -> dict:
     caddy = platform_caddy()
-    caddy["networks"] = {"edge": {}}
+    caddy["networks"] = {
+        "app_parkventory": {"ipv4_address": "172.30.20.254"},
+        "edge": {},
+    }
     caddy["healthcheck"] = copy.deepcopy(
         COMPOSE_POLICY.PUBLIC_STATIC_EDGE_HEALTHCHECK
     )
@@ -1005,7 +1008,10 @@ def public_static_edge_document() -> dict:
     for target, contract in COMPOSE_POLICY.PUBLIC_STATIC_EDGE_VOLUME_CONTRACTS[
         "caddy"
     ].items():
-        volume = by_target[target]
+        volume = by_target.get(target)
+        if volume is None:
+            volume = {"target": target}
+            caddy["volumes"].append(volume)
         volume_type, source, read_only, options = contract
         volume.update(type=volume_type, source=source)
         if read_only:
@@ -1017,7 +1023,13 @@ def public_static_edge_document() -> dict:
     return {
         "name": "vps-public-static-edge",
         "services": {"caddy": caddy},
-        "networks": {"edge": {"external": True, "name": "edge"}},
+        "networks": {
+            "app_parkventory": {
+                "external": True,
+                "name": "app_parkventory",
+            },
+            "edge": {"external": True, "name": "edge"},
+        },
         "secrets": {},
         "volumes": {
             name: {"name": stable_name}
@@ -1485,7 +1497,7 @@ class ComposePolicyTests(unittest.TestCase):
                 lambda document: document["services"]["caddy"].update(
                     networks={"ops": {}}
                 ),
-                "networks: expected edge",
+                "networks: expected app_parkventory, edge",
             ),
         )
         for mutation, message in cases:

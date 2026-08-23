@@ -45,6 +45,9 @@ IMAGE_DIGEST_RE = re.compile(
 APP_NETWORK = "app_surplasse"
 APP_SUBNET = "172.30.10.0/24"
 APP_ADDRESS = "172.30.10.254"
+PARKVENTORY_NETWORK = "app_parkventory"
+PARKVENTORY_SUBNET = "172.30.20.0/24"
+PARKVENTORY_ADDRESS = "172.30.20.254"
 EDGE_NETWORK = "edge"
 ROUTE_SHA256 = "645931a03bd1c80ab5b3982d6a285e673906d68fb010adbd1756d43d8a0cd306"
 ROUTE_NAMES = ("papersempire.caddy", "parkventory.caddy", "personal.caddy")
@@ -90,6 +93,9 @@ class RuntimePaths:
     )
     dns_bundle_root: Path = Path("/etc/vps/secrets/dns/surplasse")
     deployment_lock: Path = Path("/run/lock/vps-static.lock")
+    base_transaction: Path = Path(
+        "/var/lib/vps-public-edge-parkventory/base-transaction.json"
+    )
     docker: Path = Path("/usr/bin/docker")
     systemctl: Path = Path("/usr/bin/systemctl")
     expected_uid: int = 0
@@ -1396,9 +1402,37 @@ def verify_live_runtime(paths: RuntimePaths, state: EdgeState | None = None) -> 
         or not isinstance(networks, dict)
     ):
         fail("public edge Caddy container identity or health differs")
-    expected_networks = {EDGE_NETWORK} if state is None else {EDGE_NETWORK, APP_NETWORK}
+    expected_networks = {EDGE_NETWORK, PARKVENTORY_NETWORK}
+    if state is not None:
+        expected_networks.add(APP_NETWORK)
     if set(networks) != expected_networks:
         fail("public edge Caddy network set differs from the expected composition")
+    parkventory_network_id, parkventory_network = network_identity(
+        PARKVENTORY_NETWORK,
+        paths,
+    )
+    parkventory_ipam = parkventory_network.get("IPAM", {}).get("Config", [])
+    if (
+        parkventory_network.get("Name") != PARKVENTORY_NETWORK
+        or parkventory_network.get("Driver") != "bridge"
+        or parkventory_network.get("Scope") != "local"
+        or parkventory_network.get("Internal") is not False
+        or parkventory_network.get("Labels", {}).get(
+            "com.nclsppr.vps-infra.managed"
+        )
+        != "true"
+        or not isinstance(parkventory_ipam, list)
+        or len(parkventory_ipam) != 1
+        or parkventory_ipam[0].get("Subnet") != PARKVENTORY_SUBNET
+    ):
+        fail("app_parkventory network differs from the managed host contract")
+    parkventory_attachment = networks.get(PARKVENTORY_NETWORK, {})
+    if (
+        parkventory_attachment.get("NetworkID") != parkventory_network_id
+        or parkventory_attachment.get("IPAddress") != PARKVENTORY_ADDRESS
+        or parkventory_attachment.get("IPPrefixLen") != 24
+    ):
+        fail("public edge Caddy does not own the exact app_parkventory address")
     if state is not None:
         network_id, network = network_identity(APP_NETWORK, paths)
         ipam = network.get("IPAM", {}).get("Config", [])
@@ -1596,6 +1630,19 @@ def assert_base_switch_safe(paths: RuntimePaths) -> None:
         )
 
 
+def refuse_public_edge_base_transaction(paths: RuntimePaths) -> None:
+    try:
+        paths.base_transaction.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        fail(f"cannot inspect the public edge base transaction: {exc}")
+    fail(
+        "an unfinished public edge base transaction owns the shared runtime; "
+        "run application recovery first"
+    )
+
+
 def parse_release_path(value: str, paths: RuntimePaths) -> Path:
     path = Path(value)
     if not path.is_absolute() or path.parent != paths.extension_release_root:
@@ -1620,6 +1667,7 @@ def main(argv: list[str] | None = None, *, paths: RuntimePaths | None = None) ->
     try:
         require_runtime(runtime, recovery=args.recover)
         with deployment_lock(runtime):
+            refuse_public_edge_base_transaction(runtime)
             if args.recover:
                 recover_locked(runtime)
                 print("Surplasse public edge recovery complete")
