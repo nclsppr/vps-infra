@@ -76,7 +76,8 @@
         "release_repository",
         "integration_repository",
         "component_repositories",
-        "required_checks"
+        "required_checks",
+        "readiness_evidence"
       ],
       "properties": {
         "enabled": { "$ref": "#/$defs/baseProperties/enabled" },
@@ -100,6 +101,51 @@
         },
         "required_checks": {
           "const": ["Publish immutable application release", "verify"]
+        },
+        "readiness_evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["postgres", "encrypted_offsite_backup"],
+          "properties": {
+            "postgres": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["contract", "path", "sha256"],
+              "properties": {
+                "contract": {
+                  "const": "vps-infra.parkventory-postgres-readiness.v1"
+                },
+                "path": {
+                  "const": "/var/lib/vps-readiness/parkventory/postgres.json"
+                },
+                "sha256": {
+                  "oneOf": [
+                    { "type": "null" },
+                    { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                  ]
+                }
+              }
+            },
+            "encrypted_offsite_backup": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["contract", "path", "sha256"],
+              "properties": {
+                "contract": {
+                  "const": "vps-infra.parkventory-offsite-backup-readiness.v1"
+                },
+                "path": {
+                  "const": "/var/lib/vps-readiness/parkventory/offsite-backup.json"
+                },
+                "sha256": {
+                  "oneOf": [
+                    { "type": "null" },
+                    { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                  ]
+                }
+              }
+            }
+          }
         }
       }
     },

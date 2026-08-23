@@ -96,6 +96,27 @@ def surplasse_operator_manifest(
     }
 
 
+def parkventory_logging():
+    return {
+        "driver": "local",
+        "options": {"max-file": "3", "max-size": "10m"},
+    }
+
+
+def parkventory_oidc_file_environment():
+    return {
+        "PARKVENTORY_OIDC_CLIENT_SECRET_FILE": (
+            "/run/secrets/parkventory_oidc_client_secret"
+        ),
+        "PARKVENTORY_OIDC_STATE_SECRET_FILE": (
+            "/run/secrets/parkventory_oidc_state_secret"
+        ),
+        "PARKVENTORY_OIDC_TOKEN_ENCRYPTION_SECRET_FILE": (
+            "/run/secrets/parkventory_oidc_token_encryption_secret"
+        ),
+    }
+
+
 def surplasse_pilot_service(profile):
     return {
         "entrypoint": ["/opt/surplasse/scripts/backend-pilot-bootstrap.sh"],
@@ -1116,13 +1137,19 @@ class ApplicationControllerTests(unittest.TestCase):
                     "environment": {
                         "PARKVENTORY_MIGRATION_ONLY": "false",
                         "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+                        **parkventory_oidc_file_environment(),
                     },
+                    "logging": parkventory_logging(),
                     "secrets": service_credentials["backend"],
                     "user": "10001:10001",
                 },
-                "frontend": {"secrets": service_credentials["frontend"]},
+                "frontend": {
+                    "logging": parkventory_logging(),
+                    "secrets": service_credentials["frontend"],
+                },
                 "migrator": {
                     "entrypoint": [profile.migration_runner],
+                    "logging": parkventory_logging(),
                     "secrets": service_credentials["migrator"],
                     "user": "10001:10001",
                 },
@@ -1163,9 +1190,12 @@ class ApplicationControllerTests(unittest.TestCase):
                 for service, sources in profile.service_credentials.items()
             }
         }
+        for service in rendered["services"].values():
+            service["logging"] = parkventory_logging()
         rendered["services"]["backend"]["environment"] = {
             "PARKVENTORY_MIGRATION_ONLY": "false",
             "QUARKUS_FLYWAY_MIGRATE_AT_START": "false",
+            **parkventory_oidc_file_environment(),
         }
         rendered["services"]["migrator"]["entrypoint"] = [
             profile.migration_runner
@@ -1184,6 +1214,156 @@ class ApplicationControllerTests(unittest.TestCase):
             "least-privilege profile",
         ):
             CONTROLLER.validate_application_compose_semantics(profile, rendered)
+
+    def test_parkventory_runtime_configuration_binds_database_and_auth0_eu(self):
+        configuration = {
+            "PARKVENTORY_DB_MIGRATOR_USER": "parkventory_migrator",
+            "PARKVENTORY_DB_RUNTIME_USER": "parkventory_runtime",
+            "PARKVENTORY_JDBC_URL": (
+                "jdbc:postgresql://postgresql:5432/parkventory"
+            ),
+            "PARKVENTORY_OIDC_AUTH_SERVER_URL": (
+                "https://parkventory.eu.auth0.com/"
+            ),
+            "PARKVENTORY_OIDC_CLIENT_ID": "parkventory-client",
+            "PARKVENTORY_OIDC_ISSUER": "https://parkventory.eu.auth0.com/",
+            "PARKVENTORY_SMTP_PORT": "587",
+            "PARKVENTORY_WEB_BASE_URL": "https://parkventory.com",
+        }
+        CONTROLLER.validate_parkventory_runtime_configuration(configuration)
+        invalid_values = (
+            "http://identity.local/",
+            "https://parkventory.eu.auth0.com",
+            "https://parkventory.eu.auth0.com:invalid/",
+        )
+        for value in invalid_values:
+            with self.subTest(auth_server=value):
+                invalid = dict(configuration)
+                invalid["PARKVENTORY_OIDC_AUTH_SERVER_URL"] = value
+                with self.assertRaisesRegex(
+                    CONTROLLER.ApplicationDeploymentError,
+                    "Auth0 EU issuer",
+                ):
+                    CONTROLLER.validate_parkventory_runtime_configuration(invalid)
+
+    def test_parkventory_readiness_is_digest_bound_and_live_checked(self):
+        contract = CONTROLLER.load_production_contract(
+            ROOT / "releases/application-production.json"
+        )
+        current = next(
+            item for item in contract.applications if item.name == "parkventory"
+        )
+        evidence = CONTROLLER.canonical_json(
+            {
+                "contract": "vps-infra.parkventory-postgres-readiness.v1",
+                "proof": {"runtime_bypasses_rls": False},
+            }
+        )
+        now = CONTROLLER.dt.datetime.now(CONTROLLER.dt.timezone.utc).replace(
+            microsecond=0
+        )
+        timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        offsite_evidence = CONTROLLER.canonical_json(
+            {
+                "backup_id": "20260823T120000000000Z-012345abcdef",
+                "contract": (
+                    "vps-infra.parkventory-offsite-backup-readiness.v1"
+                ),
+                "database": "parkventory",
+                "provider_gates": {
+                    "bucket_object_lock_verified": True,
+                    "bucket_versioning_verified": True,
+                    "failure_domain_independence_reviewed": True,
+                    "recovery_key_off_host_verified": True,
+                    "restore_identity_separate_verified": True,
+                },
+                "restore_rehearsal": {
+                    "completed_at": timestamp,
+                    "evidence_sha256": "sha256:" + "c" * 64,
+                    "performed_off_atlas": True,
+                    "rehearsed": True,
+                    "source_manifest_sha256": "sha256:" + "d" * 64,
+                },
+                "upload_receipt": {
+                    "age_recipient_sha256": "sha256:" + "e" * 64,
+                    "contract": "vps-postgres-offsite-receipt-v2",
+                    "receipt_sha256": "sha256:" + "f" * 64,
+                    "recorded_at": timestamp,
+                    "source_manifest_sha256": "sha256:" + "d" * 64,
+                },
+            }
+        )
+        policy = CONTROLLER.dataclasses.replace(
+            current,
+            enabled=True,
+            readiness_evidence={
+                "postgres": {
+                    "contract": "vps-infra.parkventory-postgres-readiness.v1",
+                    "path": str(CONTROLLER.PARKVENTORY_POSTGRES_READINESS),
+                    "sha256": CONTROLLER.content_digest(evidence),
+                },
+                "encrypted_offsite_backup": {
+                    "contract": (
+                        "vps-infra.parkventory-offsite-backup-readiness.v1"
+                    ),
+                    "path": str(CONTROLLER.PARKVENTORY_OFFSITE_READINESS),
+                    "sha256": CONTROLLER.content_digest(offsite_evidence),
+                },
+            },
+        )
+        completed = subprocess.CompletedProcess(
+            [str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR), "--check"],
+            0,
+            '{"changed":false,"mode":"check","ready":true}\n',
+            "",
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file") as protected,
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_bounded_file",
+                side_effect=[evidence, offsite_evidence],
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "_run_bounded",
+                return_value=completed,
+            ) as live_check,
+        ):
+            CONTROLLER.validate_parkventory_readiness(policy)
+        self.assertEqual(protected.call_count, 3)
+        live_check.assert_called_once_with(
+            [str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR), "--check"],
+            environment=CONTROLLER.safe_environment(Path("/root")),
+            timeout=120,
+            maximum_stdout=4096,
+        )
+
+        rejected = CONTROLLER.dataclasses.replace(
+            policy,
+            readiness_evidence={
+                "postgres": {
+                    **policy.readiness_evidence["postgres"],
+                    "sha256": "sha256:" + "f" * 64,
+                },
+                "encrypted_offsite_backup": policy.readiness_evidence[
+                    "encrypted_offsite_backup"
+                ],
+            },
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(
+                CONTROLLER.STATIC,
+                "read_bounded_file",
+                return_value=evidence,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                CONTROLLER.ApplicationDeploymentError,
+                "differs from admission",
+            ):
+                CONTROLLER.validate_parkventory_readiness(rejected)
 
     def test_surplasse_pilot_service_contract_is_exact(self):
         profile = CONTROLLER.PROFILES["surplasse"]
@@ -2050,6 +2230,44 @@ class ApplicationControllerTests(unittest.TestCase):
         start.assert_called_once_with(candidate, precommit=True)
         committed_transaction = commit.call_args.args[0]
         self.assertEqual(committed_transaction.phase, "probed")
+
+    def test_parkventory_rechecks_exact_access_after_migration(self):
+        candidate = state("parkventory")
+        events: list[str] = []
+        with (
+            mock.patch.object(CONTROLLER, "validate_materialized_runtime_policy"),
+            mock.patch.object(
+                CONTROLLER,
+                "prepare_transaction",
+                return_value=(True, None),
+            ),
+            mock.patch.object(CONTROLLER, "current_target", return_value=None),
+            mock.patch.object(CONTROLLER, "write_transaction"),
+            mock.patch.object(CONTROLLER, "pull_and_verify_images"),
+            mock.patch.object(CONTROLLER, "validate_public_edge_cutover"),
+            mock.patch.object(
+                CONTROLLER,
+                "run_migration",
+                side_effect=lambda _state: events.append("migration"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "validate_parkventory_postgres_live",
+                side_effect=lambda: events.append("postgres-proof"),
+            ),
+            mock.patch.object(
+                CONTROLLER,
+                "start_runtime",
+                side_effect=lambda _state, *, precommit: events.append(
+                    f"runtime-{precommit}"
+                ),
+            ),
+            mock.patch.object(CONTROLLER, "probe_runtime"),
+            mock.patch.object(CONTROLLER, "assert_exact_source_head"),
+            mock.patch.object(CONTROLLER, "commit_probed_candidate"),
+        ):
+            CONTROLLER.activate_candidate(candidate, Path("/unused"))
+        self.assertEqual(events, ["migration", "postgres-proof", "runtime-True"])
 
     def test_restart_promotion_preserves_exact_container_identities(self):
         candidate = state("parkventory")

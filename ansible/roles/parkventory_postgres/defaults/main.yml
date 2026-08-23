@@ -1,0 +1,10 @@
+---
+vps_parkventory_postgres_state: check
+vps_parkventory_postgres_contract: /usr/local/share/vps-infra/contracts/parkventory-postgres.json
+vps_parkventory_postgres_network:
+  name: db_parkventory
+  subnet: 172.30.21.0/24
+  internal: true
+vps_parkventory_postgres_helpers:
+  - materialize-parkventory-secrets
+  - provision-parkventory-postgres

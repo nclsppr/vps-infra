@@ -47,6 +47,46 @@ APPLICATION_STATE = load_script_module(
 
 
 class SupplyChainContractTests(unittest.TestCase):
+    def test_parkventory_application_workflow_is_manual_inert_and_gated(self) -> None:
+        path = ROOT / ".github/workflows/deploy-parkventory-application.yml"
+        workflow_text = path.read_text(encoding="utf-8")
+        workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
+        self.assertIn(workflow["on"]["workflow_dispatch"], {None, ""})
+        self.assertEqual(workflow["concurrency"]["group"], "production-vps")
+        self.assertEqual(workflow["concurrency"]["cancel-in-progress"], "false")
+        self.assertEqual(
+            workflow["jobs"]["deploy"]["environment"]["name"],
+            "application-production",
+        )
+        self.assertEqual(
+            workflow["jobs"]["deploy"]["strategy"]["max-parallel"],
+            "1",
+        )
+        self.assertIn("github.ref == 'refs/heads/main'", workflow_text)
+        self.assertIn("--application parkventory", workflow_text)
+        self.assertIn("VPS_APPLICATION_DEPLOY_ENABLED != 'true'", workflow_text)
+        self.assertIn("VPS_APPLICATION_DEPLOY_ENABLED == 'true'", workflow_text)
+        self.assertIn(
+            "deploy-application-live parkventory ${SOURCE_REVISION} "
+            "${RELEASE_REFERENCE}",
+            workflow_text,
+        )
+        self.assertNotIn("schedule:", workflow_text)
+        self.assertNotIn("pull_request:", workflow_text)
+        self.assertNotIn("push:", workflow_text)
+
+        application_contract = json.loads(
+            (ROOT / "releases/application-production.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        static_contract = json.loads(
+            (ROOT / "releases/static-production.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(application_contract["applications"]["parkventory"]["enabled"])
+        self.assertTrue(static_contract["applications"]["parkventory"]["enabled"])
+
     def test_surplasse_public_edge_adversarial_tests_are_canonical(self) -> None:
         runner = (ROOT / "tests/run").read_text(encoding="utf-8")
         for invocation in (
@@ -610,6 +650,8 @@ class SupplyChainContractTests(unittest.TestCase):
                 "check-public-static-edge",
                 "check-surplasse-public-edge-candidate",
                 "check-surplasse-adapter",
+                "check-parkventory-postgres",
+                "check-parkventory-monitoring-candidate",
                 "check-prometheus",
                 "check-caddy",
                 "check-postgres-image",
@@ -2038,7 +2080,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertEqual(
             set(defaults["vps_internal_platform_network_contract"]["postgresql"]),
-            {"db_monitoring", "db_surplasse"},
+            {"db_monitoring", "db_parkventory", "db_surplasse"},
         )
 
         role = (
@@ -2092,7 +2134,9 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("RepoDigests", runtime)
         self.assertIn("regex_replace('^docker\\\\.io/', '')", runtime)
         self.assertIn("'db_surplasse'].Aliases", runtime)
+        self.assertIn("'db_parkventory'].Aliases", runtime)
         self.assertIn("172.30.11.0/24", role)
+        self.assertIn("172.30.21.0/24", role)
 
         materializer_helper = ROOT / "scripts/materialize-internal-platform-secrets"
         helper_text = materializer_helper.read_text(encoding="utf-8")
@@ -3274,6 +3318,15 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "inspect",
                 "{{ item.name }}",
             ],
+            (
+                "parkventory_postgres",
+                "Inspect the exact private Parkventory database network",
+            ): [
+                "/usr/bin/docker",
+                "network",
+                "inspect",
+                "db_parkventory",
+            ],
             ("layout", "Inspect an active static job backing mount"): [
                 "/usr/bin/findmnt",
                 "--json",
@@ -3959,6 +4012,35 @@ fi
                     r"playbooks/surplasse\.yml$",
                 )
 
+            for mode, state, check_options in (
+                ("--plan-parkventory-postgres", "dry-run", "--check --diff "),
+                ("--verify-parkventory-postgres", "check", ""),
+                ("--prepare-parkventory-postgres", "prepare", ""),
+            ):
+                log.unlink()
+                parkventory_result = subprocess.run(
+                    [converge, mode],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(
+                    parkventory_result.returncode,
+                    0,
+                    parkventory_result.stderr,
+                )
+                parkventory_execution = log.read_text(encoding="utf-8")
+                self.assertRegex(
+                    parkventory_execution,
+                    rf"(?m)^arguments={check_options}.*"
+                    rf"vps_infra_revision={remote_sha} "
+                    rf"--extra-vars vps_parkventory_postgres_state={state} "
+                    r"playbooks/parkventory-postgres\.yml$",
+                )
+
             log.unlink()
             for unsupported_arguments in (
                 ["--check"],
@@ -4108,6 +4190,87 @@ class ApplicationStateContractTests(unittest.TestCase):
                     for name, value in group["labels"].items()
                 )
             )
+
+    def test_parkventory_monitoring_has_one_disabled_end_to_end_path(self) -> None:
+        base = yaml.safe_load(
+            (
+                ROOT / "platform/observability/prometheus/prometheus.yml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertNotIn(
+            "parkventory-backend",
+            {job["job_name"] for job in base["scrape_configs"]},
+        )
+
+        candidate = yaml.safe_load(
+            (
+                ROOT
+                / "applications/parkventory/integration/prometheus/"
+                "prometheus.yml.disabled"
+            ).read_text(encoding="utf-8")
+        )
+        parkventory_jobs = [
+            job
+            for job in candidate["scrape_configs"]
+            if job["job_name"] == "parkventory-backend"
+        ]
+        self.assertEqual(
+            parkventory_jobs,
+            [
+                {
+                    "job_name": "parkventory-backend",
+                    "metrics_path": "/q/metrics",
+                    "file_sd_configs": [
+                        {
+                            "files": [
+                                "/etc/prometheus/targets/parkventory.yml"
+                            ]
+                        }
+                    ],
+                }
+            ],
+        )
+
+        override = yaml.safe_load(
+            (
+                ROOT
+                / "applications/parkventory/integration/"
+                "internal-platform.override.yaml.disabled"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            set(override["services"]["prometheus"]["networks"]),
+            {"ops", "app_parkventory"},
+        )
+        self.assertEqual(
+            override["networks"],
+            {
+                "app_parkventory": {
+                    "external": True,
+                    "name": "app_parkventory",
+                }
+            },
+        )
+        sources = {
+            volume["source"]: volume["target"]
+            for volume in override["services"]["prometheus"]["volumes"]
+        }
+        self.assertEqual(
+            sources,
+            {
+                "/srv/vps/runtime/parkventory/integration/prometheus/"
+                "prometheus.yml": "/etc/prometheus/prometheus.yml",
+                "/srv/vps/runtime/parkventory/integration/prometheus/targets":
+                    "/etc/prometheus/targets",
+                "/srv/vps/runtime/parkventory/integration/prometheus/rules":
+                    "/etc/prometheus/rules",
+            },
+        )
+        rule_text = (
+            ROOT
+            / "platform/observability/prometheus/rules/parkventory.yml.disabled"
+        ).read_text(encoding="utf-8")
+        self.assertIn('absent(up{application="parkventory"})', rule_text)
 
 
 if __name__ == "__main__":

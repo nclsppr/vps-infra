@@ -47,14 +47,40 @@ SURPLASSE_PILOT_MANIFEST_TARGET = "/run/surplasse/pilot-bootstrap.json"
 PUBLIC_CADDY_PORTS = frozenset({(80, 80, "tcp"), (443, 443, "tcp"), (443, 443, "udp")})
 LOOPBACK_GRAFANA_PORT = (3000, 3000, "tcp")
 DANGEROUS_CAPABILITIES = frozenset({"ALL", "SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"})
-PLATFORM_NETWORKS = frozenset({"ops", "db_monitoring", "db_surplasse"})
+PLATFORM_NETWORKS = frozenset(
+    {"ops", "db_monitoring", "db_surplasse", "db_parkventory"}
+)
 PLATFORM_SERVICE_NETWORKS = {
     "caddy": frozenset({"ops"}),
-    "postgresql": frozenset({"db_monitoring", "db_surplasse"}),
+    "postgresql": frozenset(
+        {"db_monitoring", "db_surplasse", "db_parkventory"}
+    ),
     "prometheus": frozenset({"ops"}),
     "grafana": frozenset({"ops"}),
     "node-exporter": frozenset({"ops"}),
     "postgres-exporter": frozenset({"ops", "db_monitoring"}),
+}
+PARKVENTORY_MONITORING_NETWORK = "app_parkventory"
+PARKVENTORY_MONITORING_PROMETHEUS_VOLUMES = {
+    "/etc/prometheus/prometheus.yml": (
+        "bind",
+        "/srv/vps/runtime/parkventory/integration/prometheus/prometheus.yml",
+        True,
+        {"create_host_path": False},
+    ),
+    "/etc/prometheus/targets": (
+        "bind",
+        "/srv/vps/runtime/parkventory/integration/prometheus/targets",
+        True,
+        {"create_host_path": False},
+    ),
+    "/etc/prometheus/rules": (
+        "bind",
+        "/srv/vps/runtime/parkventory/integration/prometheus/rules",
+        True,
+        {"create_host_path": False},
+    ),
+    "/prometheus": ("volume", "prometheus_data", False, {}),
 }
 PLATFORM_SERVICES = frozenset(PLATFORM_SERVICE_NETWORKS)
 PUBLIC_STATIC_EDGE_SERVICES = frozenset({"caddy"})
@@ -506,7 +532,13 @@ def validate_runtime_contract(project: str, service_name: str, service: dict[str
         ):
             fail(f"{path}.tmpfs: only bounded /tmp or /run mounts are allowed")
 
-def service_networks(project: str, service_name: str, service: dict[str, Any]) -> set[str]:
+def service_networks(
+    project: str,
+    service_name: str,
+    service: dict[str, Any],
+    *,
+    parkventory_monitoring_candidate: bool = False,
+) -> set[str]:
     raw_networks = service.get("networks")
     if isinstance(raw_networks, dict):
         networks = set(raw_networks)
@@ -517,6 +549,8 @@ def service_networks(project: str, service_name: str, service: dict[str, Any]) -
 
     if project == "vps-platform":
         expected = PLATFORM_SERVICE_NETWORKS.get(service_name)
+        if parkventory_monitoring_candidate and service_name == "prometheus":
+            expected = frozenset({"ops", PARKVENTORY_MONITORING_NETWORK})
         if expected is None or networks != expected:
             fail(
                 f"services.{service_name}.networks: expected {', '.join(sorted(expected or [])) or 'no networks'}"
@@ -662,6 +696,8 @@ def validate_volumes(
     service_name: str,
     service: dict[str, Any],
     repository_root: Path | None,
+    *,
+    parkventory_monitoring_candidate: bool = False,
 ) -> None:
     volumes = service.get("volumes", [])
     if volumes is None:
@@ -714,6 +750,15 @@ def validate_volumes(
             if project == "vps-platform"
             else PUBLIC_STATIC_EDGE_VOLUME_CONTRACTS
         )
+        if (
+            project == "vps-platform"
+            and parkventory_monitoring_candidate
+            and service_name == "prometheus"
+        ):
+            volume_contracts = {
+                **PLATFORM_VOLUME_CONTRACTS,
+                "prometheus": PARKVENTORY_MONITORING_PROMETHEUS_VOLUMES,
+            }
         writable_volume_targets = (
             PLATFORM_WRITABLE_VOLUME_TARGETS
             if project == "vps-platform"
@@ -958,6 +1003,8 @@ def validate_service(
     service_name: str,
     value: Any,
     repository_root: Path | None,
+    *,
+    parkventory_monitoring_candidate: bool = False,
 ) -> None:
     if not isinstance(value, dict):
         fail(f"services.{service_name}: must be an object")
@@ -972,14 +1019,30 @@ def validate_service(
         fail(f"services.{service_name}.image: must be pinned by sha256 digest")
     validate_security(project, service_name, value)
     validate_runtime_contract(project, service_name, value)
-    service_networks(project, service_name, value)
-    validate_volumes(project, service_name, value, repository_root)
+    service_networks(
+        project,
+        service_name,
+        value,
+        parkventory_monitoring_candidate=parkventory_monitoring_candidate,
+    )
+    validate_volumes(
+        project,
+        service_name,
+        value,
+        repository_root,
+        parkventory_monitoring_candidate=parkventory_monitoring_candidate,
+    )
     validate_secrets(project, service_name, value)
     validate_ports(project, service_name, value)
     validate_healthcheck(project, service_name, value)
 
 
-def validate_top_level_resources(project: str, document: dict[str, Any]) -> None:
+def validate_top_level_resources(
+    project: str,
+    document: dict[str, Any],
+    *,
+    parkventory_monitoring_candidate: bool = False,
+) -> None:
     allowed_top_level = {"name", "services", "networks", "secrets", "volumes", "configs"}
     unknown_top_level = {
         key
@@ -992,6 +1055,8 @@ def validate_top_level_resources(project: str, document: dict[str, Any]) -> None
         fail(f"name: Compose project name must be fixed to {project!r}")
     if project == "vps-platform":
         expected_networks = set(PLATFORM_NETWORKS)
+        if parkventory_monitoring_candidate:
+            expected_networks.add(PARKVENTORY_MONITORING_NETWORK)
     elif project == "vps-public-static-edge":
         expected_networks = set(PUBLIC_STATIC_EDGE_NETWORKS)
     elif APPLICATION_MIGRATION_STRATEGIES[project] == "none":
@@ -1085,11 +1150,14 @@ def validate_compose(
     expected_images: dict[str, str] | None = None,
     repository_root: Path | None = None,
     structural_only: bool = False,
+    parkventory_monitoring_candidate: bool = False,
 ) -> None:
     if project not in PROJECTS:
         fail(f"project must be one of: {', '.join(sorted(PROJECTS))}")
     if structural_only and expected_images is not None:
         fail("expected-images and structural-only validation are mutually exclusive")
+    if parkventory_monitoring_candidate and project != "vps-platform":
+        fail("Parkventory monitoring candidate validation requires vps-platform")
     if not isinstance(document, dict):
         fail("Compose document must be an object")
     services = document.get("services")
@@ -1153,8 +1221,18 @@ def validate_compose(
     for service_name, service in services.items():
         if not isinstance(service_name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", service_name):
             fail(f"services: invalid service name {service_name!r}")
-        validate_service(project, service_name, service, repository_root)
-    validate_top_level_resources(project, document)
+        validate_service(
+            project,
+            service_name,
+            service,
+            repository_root,
+            parkventory_monitoring_candidate=parkventory_monitoring_candidate,
+        )
+    validate_top_level_resources(
+        project,
+        document,
+        parkventory_monitoring_candidate=parkventory_monitoring_candidate,
+    )
     if project in INFRASTRUCTURE_PROJECTS:
         caddy = services.get("caddy")
         if not isinstance(caddy, dict):
@@ -1183,6 +1261,11 @@ def main() -> int:
     parser.add_argument(
         "--repository-root",
         help="exact repository root used to normalize reviewed platform bind sources",
+    )
+    parser.add_argument(
+        "--parkventory-monitoring-candidate",
+        action="store_true",
+        help="validate only the inactive exact Parkventory Prometheus extension",
     )
     validation_mode = parser.add_mutually_exclusive_group()
     validation_mode.add_argument(
@@ -1215,6 +1298,7 @@ def main() -> int:
             expected_images=expected_images,
             repository_root=repository_root,
             structural_only=args.structural_only,
+            parkventory_monitoring_candidate=args.parkventory_monitoring_candidate,
         )
     except (OSError, json.JSONDecodeError, ComposePolicyError) as exc:
         print(f"compose validation failed: {exc}", file=sys.stderr)

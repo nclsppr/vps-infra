@@ -15,7 +15,9 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	check-public-static-edge check-surplasse-public-edge-candidate \
 	check-surplasse-public-edge-controller check-surplasse-dns-cutover-controller \
 	check-surplasse-pilot-controller \
-	check-surplasse-adapter check-prometheus check-caddy check-postgres-image \
+	check-surplasse-adapter check-parkventory-postgres \
+	check-parkventory-monitoring-candidate check-prometheus \
+	check-caddy check-postgres-image \
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	precutover-public-static-edge activate-public-static-edge \
@@ -24,6 +26,8 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	install-postgres-backup stop-postgres-backup-schedule \
 	backup-postgres-now rehearse-postgres-restore \
 	prepare-surplasse activate-surplasse stop-surplasse \
+	plan-parkventory-postgres verify-parkventory-postgres \
+	prepare-parkventory-postgres \
 	materialize-surplasse-pilot status-surplasse-pilot apply-surplasse-pilot \
 	doctor-local
 
@@ -70,6 +74,9 @@ check-ansible: ## Lint Ansible and validate both playbooks.
 	cd ansible && ../.venv/bin/ansible-playbook \
 		--inventory inventories/production/hosts.example.yml \
 		--syntax-check playbooks/surplasse-pilot.yml
+	cd ansible && ../.venv/bin/ansible-playbook \
+		--inventory inventories/production/hosts.example.yml \
+		--syntax-check playbooks/parkventory-postgres.yml
 
 check-controller: ## Test the release manifest, controller, and shell scripts.
 	$(MISE_EXEC) ./scripts/check
@@ -109,9 +116,11 @@ check-json: ## Validate the release manifest and Grafana JSON files.
 		applications/surplasse/expected-images.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool \
 		applications/surplasse/migrations.json >/dev/null
+	$(MISE_EXEC) uv run python -m json.tool \
+		applications/parkventory/postgres.json >/dev/null
 	$(MISE_EXEC) uv run python -m json.tool renovate.json >/dev/null
 
-check-platform: check-platform-config check-public-static-edge check-surplasse-public-edge-candidate check-surplasse-adapter check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, application candidates, and custom images.
+check-platform: check-platform-config check-public-static-edge check-surplasse-public-edge-candidate check-surplasse-adapter check-parkventory-postgres check-parkventory-monitoring-candidate check-prometheus check-caddy check-postgres-image ## Validate the shared platform, public edge, application candidates, and custom images.
 
 check-platform-config: ## Render Compose and apply the production policy.
 	@rendered="$$(mktemp)"; \
@@ -175,6 +184,23 @@ check-surplasse-adapter: ## Validate the locked Surplasse application candidate.
 		surplasse "$$rendered"; \
 	./scripts/validate-surplasse-adapter "$$rendered"
 
+check-parkventory-postgres: ## Validate the locked Parkventory PostgreSQL 17.10 contract.
+	./scripts/provision-parkventory-postgres --validate-contract \
+		--contract applications/parkventory/postgres.json
+
+check-parkventory-monitoring-candidate: check-platform-config ## Validate the inactive exact Parkventory Prometheus network extension.
+	@set -Eeuo pipefail; \
+	rendered="$$(mktemp)"; \
+	trap 'rm -f -- "$$rendered"' EXIT; \
+	$(COMPOSE) --env-file "$(PLATFORM_ENV)" --file platform/compose.yaml \
+		--file applications/parkventory/integration/internal-platform.override.yaml.disabled \
+		config --format json >"$$rendered"; \
+	./scripts/validate-compose \
+		--expected-images platform/expected-images.json \
+		--repository-root "$(CURDIR)" \
+		--parkventory-monitoring-candidate \
+		vps-platform "$$rendered"
+
 check-prometheus: ## Validate active and inactive Prometheus rules in the pinned image.
 	@set -Eeuo pipefail; \
 		image="$$(sed -n 's/^PROMETHEUS_IMAGE=//p' "$(PLATFORM_ENV)")"; \
@@ -189,7 +215,8 @@ check-prometheus: ## Validate active and inactive Prometheus rules in the pinned
 				"$$image" check rules /tmp/candidate.yml; \
 		done; \
 		candidate_root="$$(mktemp -d)"; \
-		trap 'rm -rf -- "$$candidate_root"' EXIT; \
+		parkventory_candidate_root="$$(mktemp -d)"; \
+		trap 'rm -rf -- "$$candidate_root" "$$parkventory_candidate_root"' EXIT; \
 		mkdir -p "$$candidate_root/rules" "$$candidate_root/targets"; \
 		cp applications/surplasse/integration/prometheus/prometheus.yml \
 			"$$candidate_root/prometheus.yml"; \
@@ -210,6 +237,29 @@ check-prometheus: ## Validate active and inactive Prometheus rules in the pinned
 			"$$candidate_root/targets/"*.yml; \
 		docker run --rm --entrypoint promtool \
 			--volume "$$candidate_root:/etc/prometheus:ro" \
+			"$$image" check config /etc/prometheus/prometheus.yml; \
+		mkdir -p "$$parkventory_candidate_root/rules" \
+			"$$parkventory_candidate_root/targets"; \
+		cp applications/parkventory/integration/prometheus/prometheus.yml.disabled \
+			"$$parkventory_candidate_root/prometheus.yml"; \
+		cp platform/observability/prometheus/rules/platform.yml \
+			"$$parkventory_candidate_root/rules/platform.yml"; \
+		cp platform/observability/prometheus/rules/parkventory.yml.disabled \
+			"$$parkventory_candidate_root/rules/parkventory.yml"; \
+		cp platform/observability/prometheus/targets/node-exporter.yml \
+			"$$parkventory_candidate_root/targets/node-exporter.yml"; \
+		cp platform/observability/prometheus/targets/postgres-exporter.yml \
+			"$$parkventory_candidate_root/targets/postgres-exporter.yml"; \
+		cp platform/observability/prometheus/targets/parkventory.yml.disabled \
+			"$$parkventory_candidate_root/targets/parkventory.yml"; \
+		chmod 0755 "$$parkventory_candidate_root" \
+			"$$parkventory_candidate_root/rules" \
+			"$$parkventory_candidate_root/targets"; \
+		chmod 0444 "$$parkventory_candidate_root/prometheus.yml" \
+			"$$parkventory_candidate_root/rules/"*.yml \
+			"$$parkventory_candidate_root/targets/"*.yml; \
+		docker run --rm --entrypoint promtool \
+			--volume "$$parkventory_candidate_root:/etc/prometheus:ro" \
 			"$$image" check config /etc/prometheus/prometheus.yml
 
 check-caddy: ## Build Caddy and validate the inactive and candidate route sets.
@@ -326,6 +376,21 @@ stop-surplasse: ## Stop only Surplasse application containers and preserve state
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --stop-surplasse
+
+plan-parkventory-postgres: ## Inspect the Parkventory database plan without mutation.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --plan-parkventory-postgres
+
+verify-parkventory-postgres: ## Verify existing Parkventory database readiness evidence.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --verify-parkventory-postgres
+
+prepare-parkventory-postgres: ## Provision only Parkventory roles, database, and evidence.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --prepare-parkventory-postgres
 
 materialize-surplasse-pilot: ## Validate and atomically install the private pilot manifest.
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \

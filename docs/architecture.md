@@ -437,7 +437,7 @@ the locked complete platform definition use these memberships:
 app_surplasse       empty
 db_surplasse        PostgreSQL
 app_parkventory     empty
-db_parkventory      empty
+db_parkventory      PostgreSQL
 app_monflorian      empty
 edge                isolated public static edge Caddy
 db_monitoring       PostgreSQL, PostgreSQL Exporter
@@ -450,8 +450,9 @@ and runtime inspection require this one-network membership.
 
 A reviewed integration package attaches a platform service or an application
 service only to the required application network. PostgreSQL joins
-`db_monitoring` and `db_surplasse`. PostgreSQL Exporter joins `db_monitoring`
-and `ops`. Caddy, Grafana, and Prometheus have no direct TCP path to PostgreSQL.
+`db_monitoring`, `db_surplasse`, and `db_parkventory`. PostgreSQL Exporter joins
+`db_monitoring` and `ops`. Caddy, Grafana, and Prometheus have no direct TCP
+path to PostgreSQL.
 The exporter role has only `pg_monitor` and `pg_hba.conf` limits it to the
 `db_monitoring` subnet.
 
@@ -629,7 +630,8 @@ Parkventory no longer has a static owner, and the immutable public edge already
 contains the exact attested route and application-network attachment. Route
 preparation remains a platform responsibility and precedes migration. Both
 legacy entries remain `enabled: false`. The canonical Surplasse tester entry is
-enabled, but no application workflow or active runtime follows from admission.
+enabled. Parkventory has a manual workflow that resolves no deployment matrix
+while its canonical entry is disabled; no active runtime follows from admission.
 
 Les fichiers SOPS sont chiffrés. La clé age privée est conservée hors du VPS et
 hors de Git, avec au moins une copie de récupération dans un gestionnaire de

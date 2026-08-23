@@ -20,6 +20,7 @@ APPLICATIONS = (
 PLATFORM_TARGETS = frozenset({"caddy.yml", "node-exporter.yml", "postgres-exporter.yml"})
 PLATFORM_RULES = frozenset({"platform.yml"})
 SURPLASSE_TARGET_REFERENCE = "/etc/prometheus/targets/surplasse.yml"
+PARKVENTORY_TARGET_REFERENCE = "/etc/prometheus/targets/parkventory.yml"
 
 
 class ApplicationStateError(ValueError):
@@ -86,11 +87,13 @@ def validate_repository(repository_root: Path, manifest_path: Path | None = None
     rule_dir = root / "platform" / "observability" / "prometheus" / "rules"
     _validate_exact_directory(
         target_dir,
-        set(PLATFORM_TARGETS) | {"surplasse.yml.disabled"},
+        set(PLATFORM_TARGETS)
+        | {"parkventory.yml.disabled", "surplasse.yml.disabled"},
     )
     _validate_exact_directory(
         rule_dir,
-        set(PLATFORM_RULES) | {"surplasse.yml.disabled"},
+        set(PLATFORM_RULES)
+        | {"parkventory.yml.disabled", "surplasse.yml.disabled"},
     )
 
     prometheus_config = (
@@ -99,6 +102,10 @@ def validate_repository(repository_root: Path, manifest_path: Path | None = None
     if SURPLASSE_TARGET_REFERENCE in prometheus_config:
         raise ApplicationStateError(
             "Surplasse scrape target reference must be absent from prometheus.yml"
+        )
+    if PARKVENTORY_TARGET_REFERENCE in prometheus_config:
+        raise ApplicationStateError(
+            "Parkventory scrape target reference must be absent from prometheus.yml"
         )
 
 

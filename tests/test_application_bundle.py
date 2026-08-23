@@ -108,6 +108,13 @@ def fixture_files(profile):
     raw["contract.json"] = BUNDLE.canonical_json(
         BUNDLE._expected_contract(profile, REVISION)
     )
+    if profile.application == "parkventory":
+        raw["prometheus/rules.yml"] = BUNDLE.PARKVENTORY_PROMETHEUS_RULES
+        raw["prometheus/targets.json"] = json.dumps(
+            BUNDLE.PARKVENTORY_PROMETHEUS_TARGETS,
+            ensure_ascii=True,
+            indent=2,
+        ).encode("ascii") + b"\n"
     raw["migrations.json"] = BUNDLE.canonical_json(migrations)
     raw["probes.json"] = BUNDLE.canonical_json(probes)
     if "expected-images.json" in profile.runtime_paths:

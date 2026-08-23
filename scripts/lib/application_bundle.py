@@ -290,6 +290,9 @@ PROFILES: Mapping[str, BundleProfile] = {
             "PARKVENTORY_DB_MIGRATOR_USER",
             "PARKVENTORY_DB_RUNTIME_USER",
             "PARKVENTORY_JDBC_URL",
+            "PARKVENTORY_OIDC_AUTH_SERVER_URL",
+            "PARKVENTORY_OIDC_CLIENT_ID",
+            "PARKVENTORY_OIDC_ISSUER",
             "PARKVENTORY_SMTP_FROM",
             "PARKVENTORY_SMTP_HOST",
             "PARKVENTORY_SMTP_PORT",
@@ -300,6 +303,9 @@ PROFILES: Mapping[str, BundleProfile] = {
             for name in (
                 "parkventory_postgres_migrator_password",
                 "parkventory_postgres_runtime_password",
+                "parkventory_oidc_client_secret",
+                "parkventory_oidc_state_secret",
+                "parkventory_oidc_token_encryption_secret",
                 "parkventory_smtp_password",
                 "parkventory_smtp_username",
             )
@@ -307,6 +313,9 @@ PROFILES: Mapping[str, BundleProfile] = {
         service_credentials={
             "backend": (
                 "parkventory_postgres_runtime_password",
+                "parkventory_oidc_client_secret",
+                "parkventory_oidc_state_secret",
+                "parkventory_oidc_token_encryption_secret",
                 "parkventory_smtp_password",
                 "parkventory_smtp_username",
             ),
@@ -354,6 +363,29 @@ PROFILES: Mapping[str, BundleProfile] = {
         image_version_prefix="",
     ),
 }
+
+PARKVENTORY_PROMETHEUS_RULES = b"""groups:
+  - name: parkventory
+    rules:
+      - alert: ParkventoryBackendUnavailable
+        expr: up{application=\"parkventory\"} != 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Parkventory backend is unavailable
+"""
+
+PARKVENTORY_PROMETHEUS_TARGETS: object = [
+    {
+        "labels": {
+            "__metrics_path__": "/q/metrics",
+            "application": "parkventory",
+            "environment": "production",
+        },
+        "targets": ["parkventory-backend:8080"],
+    }
+]
 
 
 def _fail(path: str, message: str) -> None:
@@ -1078,6 +1110,26 @@ def _validate_probes(
     return value
 
 
+def _validate_parkventory_observability(files: Mapping[str, bytes]) -> None:
+    rules = files["prometheus/rules.yml"]
+    if rules != PARKVENTORY_PROMETHEUS_RULES:
+        _fail(
+            "Parkventory Prometheus rules",
+            "must contain the exact backend-unavailable alert",
+        )
+    targets_raw = files["prometheus/targets.json"]
+    targets = strict_json(
+        targets_raw,
+        "Parkventory Prometheus targets",
+        maximum=MAX_FILE_BYTES,
+    )
+    if targets != PARKVENTORY_PROMETHEUS_TARGETS:
+        _fail(
+            "Parkventory Prometheus targets",
+            "must scrape the exact backend metrics endpoint",
+        )
+
+
 def validate_bundle(
     archive_raw: bytes,
     inventory_raw: bytes,
@@ -1101,6 +1153,8 @@ def validate_bundle(
     contract = _validate_contract(files["contract.json"], profile, revision)
     migrations = _validate_migrations(files["migrations.json"], profile, revision)
     probes = _validate_probes(files["probes.json"], profile, revision)
+    if profile.application == "parkventory":
+        _validate_parkventory_observability(files)
     if content_digest(files["migrations.json"]) != _digest(
         migration_inventory_digest, "application release migration digest"
     ):

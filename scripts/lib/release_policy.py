@@ -103,7 +103,9 @@ SURPLASSE_READINESS_GATES = frozenset(
 
 PARKVENTORY_READINESS_GATES = frozenset(
     {
+        "alert-routing-and-delivery",
         "domain-and-dns",
+        "encrypted-offsite-backup",
         "file-based-secrets",
         "postgres-adr-alignment",
         "postgres-compatibility",

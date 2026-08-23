@@ -33,7 +33,19 @@
       "required_checks": [
         "Publish immutable application release",
         "verify"
-      ]
+      ],
+      "readiness_evidence": {
+        "postgres": {
+          "contract": "vps-infra.parkventory-postgres-readiness.v1",
+          "path": "/var/lib/vps-readiness/parkventory/postgres.json",
+          "sha256": null
+        },
+        "encrypted_offsite_backup": {
+          "contract": "vps-infra.parkventory-offsite-backup-readiness.v1",
+          "path": "/var/lib/vps-readiness/parkventory/offsite-backup.json",
+          "sha256": null
+        }
+      }
     },
     "monflorian": {
       "enabled": false,

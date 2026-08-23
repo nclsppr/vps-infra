@@ -1,0 +1,148 @@
+---
+name: Deploy Parkventory application
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-vps
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve canonical Parkventory release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.release.outputs.matrix }}
+      ready_count: ${{ steps.release.outputs.ready_count }}
+    steps:
+      - name: Check out the application admission contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the exact canonical Parkventory candidate
+        id: release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ./scripts/resolve-application-releases \
+            --application parkventory \
+            --contract releases/application-production.json \
+            --static-contract releases/static-production.json \
+            --output "${RUNNER_TEMP}/parkventory-application-release.json" \
+            --github-output "${GITHUB_OUTPUT}" \
+            --step-summary "${GITHUB_STEP_SUMMARY}"
+
+  deploy:
+    name: Deploy Parkventory
+    needs: resolve
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      needs.resolve.result == 'success' &&
+      needs.resolve.outputs.ready_count == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    environment:
+      name: application-production
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Report disabled application deployment
+        if: vars.VPS_APPLICATION_DEPLOY_ENABLED != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "::warning title=Parkventory application deployment::VPS_APPLICATION_DEPLOY_ENABLED is not true"
+          printf '%s\n' \
+            'Parkventory deployment is disabled by the application-production environment.' \
+            >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Request the exact Parkventory deployment
+        if: vars.VPS_APPLICATION_DEPLOY_ENABLED == 'true'
+        shell: bash
+        env:
+          SOURCE_REVISION: ${{ matrix.source_revision }}
+          RELEASE_REFERENCE: ${{ matrix.release_reference }}
+          VPS_APPLICATION_HOST: ${{ secrets.VPS_APPLICATION_HOST }}
+          VPS_APPLICATION_DEPLOY_USER: ${{ vars.VPS_APPLICATION_DEPLOY_USER }}
+          VPS_APPLICATION_DEPLOY_PORT: ${{ vars.VPS_APPLICATION_DEPLOY_PORT }}
+          VPS_APPLICATION_SSH_PRIVATE_KEY: ${{ secrets.VPS_APPLICATION_SSH_PRIVATE_KEY }}
+          VPS_APPLICATION_KNOWN_HOSTS: ${{ secrets.VPS_APPLICATION_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+
+          sha_pattern='^[0-9a-f]{40}$'
+          digest_pattern='^ghcr\.io/nclsppr/parkventory/application-release@sha256:[0-9a-f]{64}$'
+          [[ ${SOURCE_REVISION} =~ ${sha_pattern} ]]
+          [[ ${RELEASE_REFERENCE} =~ ${digest_pattern} ]]
+
+          git_home="${RUNNER_TEMP}/parkventory-application-git-home"
+          install -d -m 0700 "${git_home}"
+          if ! canonical_line=$(
+            /usr/bin/env -i \
+              PATH=/usr/local/bin:/usr/bin:/bin \
+              HOME="${git_home}" \
+              LANG=C \
+              LC_ALL=C \
+              GIT_ALLOW_PROTOCOL=https \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_NOSYSTEM=1 \
+              GIT_TERMINAL_PROMPT=0 \
+              /usr/bin/timeout --signal=TERM --kill-after=5s 30s \
+              /usr/bin/git -C / \
+                -c credential.helper= \
+                -c http.https://github.com/.extraheader= \
+                ls-remote --exit-code --refs \
+                https://github.com/nclsppr/parkventory.git refs/heads/main
+          ); then
+            echo "::warning title=Parkventory application deployment::canonical HEAD could not be confirmed before SSH"
+            exit 0
+          fi
+          expected_line="${SOURCE_REVISION}"$'\t''refs/heads/main'
+          if [[ ${#canonical_line} -gt 256 || ${canonical_line} != "${expected_line}" ]]; then
+            echo "::warning title=Parkventory application deployment::canonical HEAD changed before SSH"
+            exit 0
+          fi
+
+          [[ ${VPS_APPLICATION_DEPLOY_USER} =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+          [[ ${VPS_APPLICATION_HOST} =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]]
+          [[ ${VPS_APPLICATION_DEPLOY_PORT} =~ ^[0-9]{1,5}$ ]]
+          (( 10#${VPS_APPLICATION_DEPLOY_PORT} >= 1 ))
+          (( 10#${VPS_APPLICATION_DEPLOY_PORT} <= 65535 ))
+          test -n "${VPS_APPLICATION_SSH_PRIVATE_KEY}"
+          test -n "${VPS_APPLICATION_KNOWN_HOSTS}"
+          (( ${#VPS_APPLICATION_SSH_PRIVATE_KEY} <= 65536 ))
+          (( ${#VPS_APPLICATION_KNOWN_HOSTS} <= 65536 ))
+
+          ssh_directory="${RUNNER_TEMP}/parkventory-application-ssh"
+          install -d -m 0700 "${ssh_directory}"
+          trap 'rm -f -- "${ssh_directory}/key" "${ssh_directory}/known_hosts"' EXIT
+          printf '%s\n' "${VPS_APPLICATION_SSH_PRIVATE_KEY}" > "${ssh_directory}/key"
+          printf '%s\n' "${VPS_APPLICATION_KNOWN_HOSTS}" > "${ssh_directory}/known_hosts"
+          chmod 0600 "${ssh_directory}/key" "${ssh_directory}/known_hosts"
+
+          remote_command="deploy-application-live parkventory ${SOURCE_REVISION} ${RELEASE_REFERENCE}"
+          ssh \
+            -i "${ssh_directory}/key" \
+            -p "${VPS_APPLICATION_DEPLOY_PORT}" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o ConnectionAttempts=2 \
+            -o IdentitiesOnly=yes \
+            -o ServerAliveCountMax=3 \
+            -o ServerAliveInterval=30 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${ssh_directory}/known_hosts" \
+            "${VPS_APPLICATION_DEPLOY_USER}@${VPS_APPLICATION_HOST}" \
+            "${remote_command}"
+
+          printf 'Atlas accepted the exact Parkventory candidate %s.\n' \
+            "${SOURCE_REVISION}" >> "${GITHUB_STEP_SUMMARY}"

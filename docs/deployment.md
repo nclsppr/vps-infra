@@ -449,7 +449,9 @@ the exact host lock `/run/lock/vps-static.lock` with this path; GitHub
 concurrency alone is not a sufficient exclusion boundary for operator-initiated
 commands. The 2026-08-18 rollout converged the controller and argument-free gate
 from revision `da04a09bfa9788ae8127b63f9f3a6692bef2551b`. Canonical Surplasse
-admission is now enabled, but no application workflow invokes the gate.
+admission is now enabled. The Parkventory application workflow is manual and
+resolves no deployment matrix while Parkventory remains disabled. Future
+dispatch also needs the independent protected-environment activation switch.
 
 Le VPS n’héberge pas de runner GitHub Actions persistant. Un workflow arbitraire
 exécuté directement sur la machine de production aurait accès à ses volumes,
@@ -631,11 +633,12 @@ probe inventories, source ancestry, and the canonical source HEAD. It never
 stores secret bytes. It refuses migration until the immutable public-edge route
 equals the attested route and Caddy is healthy on the exact application network.
 Canonical Surplasse tester admission is enabled, but no application workflow
-invokes this boundary. Parkventory and Mon Florian remain disabled and stop
-before runtime validation or network access. Mon Florian admits one backend,
-one `app_monflorian` network, migration strategy `none`, and one file-backed
-OpenAI key contract. Surplasse still requires the explicit forced command and
-every runtime gate above.
+currently invokes this boundary for Surplasse. Parkventory's manual workflow
+resolves no deployment matrix while its admission entry remains disabled, so it
+stops before runtime validation or network access. Mon Florian also remains
+disabled; it admits one backend, one `app_monflorian` network, migration
+strategy `none`, and one file-backed OpenAI key contract. Surplasse still
+requires the explicit forced command and every runtime gate above.
 
 For Surplasse, the immutable integration contract contains the exact tester
 payment profile. Materialization and the first activation preflight both bind
@@ -897,8 +900,9 @@ commands, guarantees, and remaining disaster-recovery decision.
 The canonical Surplasse entry is `enabled: true`; Parkventory and Mon Florian
 remain disabled.
 Admission does not invoke the gate, and no live application release follows from
-this repository change alone. A deliberate Surplasse activation must keep this
-order:
+this repository change alone. The Parkventory-only manual workflow is inert in
+that state and retains a separate protected-environment activation switch. A
+deliberate Surplasse activation must keep this order:
 
 1. render non-secret configuration from the immutable release;
 2. verify every root-owned secret file and exact service allocation;
@@ -914,6 +918,14 @@ order:
 8. start only the application Compose project and wait for health;
 9. run internal probes and strict public TLS probes resolved directly to Atlas;
 10. persist active state only after the complete transaction is `probed`.
+
+Parkventory has stricter public-beta prerequisites than the retained Surplasse
+tester exception. [ADR-0015](decisions/0015-parkventory-public-beta-readiness.md)
+and the [Parkventory PostgreSQL runbook](operations/parkventory-postgresql.md)
+require exact non-`BYPASSRLS` roles, both digest-bound readiness files, a fresh
+encrypted receipt and matching off-Atlas restore rehearsal, OIDC and SMTP
+credentials, active scraping and delivered alerts, structured logs, and the
+explicit static-to-Compose ownership handoff before this order can start.
 
 The application controller does not rewrite the platform edge. Route and
 network preparation is a separate reviewed platform cutover and must precede

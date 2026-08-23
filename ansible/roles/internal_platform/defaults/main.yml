@@ -26,6 +26,7 @@ vps_internal_platform_all_image_services:
 vps_internal_platform_network_contract:
   postgresql:
     - db_monitoring
+    - db_parkventory
     - db_surplasse
   prometheus:
     - ops
@@ -50,10 +51,12 @@ vps_internal_platform_files:
   - platform/observability/grafana/provisioning/datasources/prometheus.yml
   - platform/observability/prometheus/prometheus.yml
   - platform/observability/prometheus/rules/platform.yml
+  - platform/observability/prometheus/rules/parkventory.yml.disabled
   - platform/observability/prometheus/rules/surplasse.yml.disabled
   - platform/observability/prometheus/targets/caddy.yml
   - platform/observability/prometheus/targets/node-exporter.yml
   - platform/observability/prometheus/targets/postgres-exporter.yml
+  - platform/observability/prometheus/targets/parkventory.yml.disabled
   - platform/observability/prometheus/targets/surplasse.yml.disabled
   - platform/postgres/initdb/10-platform-exporter.sh
   - platform/postgres/pg_hba.conf

@@ -145,7 +145,7 @@ class ProductionContractTests(unittest.TestCase):
             ):
                 POLICY.load_production_contract(contract_path, self.static_path)
 
-    def test_disabled_static_parkventory_allows_compose_admission(self):
+    def test_disabled_static_parkventory_still_requires_readiness_evidence(self):
         application = json.loads(self.contract_path.read_text())
         application["applications"]["parkventory"]["enabled"] = True
         static = json.loads(self.static_path.read_text())
@@ -156,8 +156,34 @@ class ProductionContractTests(unittest.TestCase):
             static_path = root / "static-production.json"
             application_path.write_text(json.dumps(application), encoding="utf-8")
             static_path.write_text(json.dumps(static), encoding="utf-8")
-            parsed = POLICY.load_production_contract(application_path, static_path)
-        self.assertTrue(parsed.applications[1].enabled)
+            with self.assertRaisesRegex(
+                POLICY.ApplicationReleaseError,
+                "must bind enabled Parkventory to exact PostgreSQL readiness evidence",
+            ):
+                POLICY.load_production_contract(application_path, static_path)
+
+            application["applications"]["parkventory"]["readiness_evidence"][
+                "postgres"
+            ]["sha256"] = "sha256:" + "a" * 64
+            application_path.write_text(json.dumps(application), encoding="utf-8")
+            with self.assertRaisesRegex(
+                POLICY.ApplicationReleaseError,
+                "verified encrypted off-site backup evidence",
+            ):
+                POLICY.load_production_contract(application_path, static_path)
+
+            application["applications"]["parkventory"]["readiness_evidence"][
+                "encrypted_offsite_backup"
+            ]["sha256"] = "sha256:" + "b" * 64
+            application_path.write_text(json.dumps(application), encoding="utf-8")
+            admitted = POLICY.load_production_contract(
+                application_path,
+                static_path,
+            )
+            parkventory = next(
+                item for item in admitted.applications if item.name == "parkventory"
+            )
+            self.assertTrue(parkventory.enabled)
 
     def test_contract_rejects_unknown_field_and_non_boolean_enablement(self):
         original = json.loads(self.contract_path.read_text())

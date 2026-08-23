@@ -232,7 +232,7 @@ records the active tuples without making them a mutable configuration source.
 
 Ansible creates eight external Docker networks. The isolated public static
 edge joins only `edge`. The internal platform uses `ops`, `db_monitoring`, and
-the private Surplasse database network:
+the two private application database networks:
 
 | Network | Subnet | Reviewed members |
 |---|---|---|
@@ -242,15 +242,16 @@ the private Surplasse database network:
 | `app_surplasse` | `172.30.10.0/24` | None |
 | `db_surplasse` | `172.30.11.0/24` | PostgreSQL |
 | `app_parkventory` | `172.30.20.0/24` | None |
-| `db_parkventory` | `172.30.21.0/24` | None |
+| `db_parkventory` | `172.30.21.0/24` | PostgreSQL |
 | `app_monflorian` | `172.30.40.0/24` | None |
 
 A reviewed application integration package attaches only the required
 services to an application network. It must use a unique alias such as
 `surplasse-backend`. It must not use a generic alias such as `backend`.
 
-PostgreSQL joins `db_monitoring` and `db_surplasse`, with the stable
-`postgresql` alias on both. It does not join `ops`. Caddy, Grafana, and
+PostgreSQL joins `db_monitoring`, `db_surplasse`, and `db_parkventory`, with the
+stable `postgresql` alias on both private application database networks. It
+does not join `ops`. Caddy, Grafana, and
 Prometheus have no direct TCP path to PostgreSQL. PostgreSQL Exporter joins
 `db_monitoring` for SQL access and `ops` for metrics access. Database roles and
 `pg_hba.conf` enforce the database authorization boundary.

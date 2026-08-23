@@ -28,6 +28,7 @@ from lib.application_release import (  # noqa: E402
     APPLICATION_RELEASE_LAYER_MEDIA_TYPE,
     APPLICATION_RELEASE_TITLE,
     CREATED_ANNOTATION,
+    EXPECTED_APPLICATIONS,
     MAX_RELEASE_BYTES,
     OCI_EMPTY_CONFIG,
     OCI_MANIFEST_MEDIA_TYPE,
@@ -771,6 +772,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="validate local contracts without network access",
     )
+    parser.add_argument(
+        "--application",
+        choices=tuple(sorted(EXPECTED_APPLICATIONS)),
+        help="resolve only one allowlisted application",
+    )
     return parser.parse_args(argv)
 
 
@@ -781,6 +787,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "static-production.json"
         )
         contract = load_production_contract(arguments.contract, static_contract)
+        if arguments.application is not None:
+            contract = ProductionContract(
+                applications=tuple(
+                    item
+                    for item in contract.applications
+                    if item.name == arguments.application
+                )
+            )
         if arguments.validate_contract:
             print(f"application release contract valid: {arguments.contract}")
             return 0
