@@ -63,6 +63,35 @@ class ParkventoryPostgresTests(unittest.TestCase):
             timeout=20,
         )
 
+    def test_materializer_source_exec_accepts_only_real_cli_arguments(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally rejects root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "secrets"
+            root.mkdir(mode=0o700)
+            environment = os.environ.copy()
+            environment["VPS_PARKVENTORY_SECRET_TESTING"] = "1"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (SCRIPTS / "materialize-parkventory-secrets").read_text(
+                        encoding="utf-8"
+                    ),
+                    "--dry-run",
+                    "--test-root",
+                    str(root),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(json.loads(result.stdout)["changed"])
+            self.assertEqual(set(root.iterdir()), set())
+
     def test_database_passwords_are_private_distinct_and_idempotent(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("the helper intentionally rejects root test mode")
@@ -932,11 +961,17 @@ class ParkventoryPostgresTests(unittest.TestCase):
             task = by_name[name]
             self.assertFalse(task["check_mode"])
             self.assertIn("ansible_check_mode", task["when"])
-        self.assertIn(
-            "--embedded-contract",
+        self.assertEqual(
+            by_name[
+                "Run the reviewed-source Parkventory secret plan in check mode"
+            ]["ansible.builtin.command"]["argv"][3:],
+            ["--dry-run"],
+        )
+        self.assertEqual(
             by_name[
                 "Run the reviewed-source Parkventory PostgreSQL plan in check mode"
-            ]["ansible.builtin.command"]["argv"],
+            ]["ansible.builtin.command"]["argv"][3:],
+            ["--dry-run", "--embedded-contract"],
         )
 
         contract_inspection = by_name[
