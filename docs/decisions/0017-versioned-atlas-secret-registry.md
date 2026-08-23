@@ -12,8 +12,8 @@ The repository already defines several strict secret file contracts. The
 platform helper generates four local values. The Surplasse helper manages its
 database and operator files. A separate helper manages the permanent OVH DNS
 identity. Ansible can copy the Mon Florian OpenAI key from a private source.
-Parkventory has a materializer for its two PostgreSQL passwords, but not for
-SMTP inputs.
+Parkventory has one materializer for its two PostgreSQL passwords and two local
+OIDC secrets. A separate materializer imports its three provider inputs.
 
 These contracts are distributed across documentation, Ansible, Python helpers,
 Compose files, and tests. Git did not contain one complete inventory. Git also
@@ -111,9 +111,9 @@ per-domain isolation. Separate Scaleway projects are not required for the MVP.
 
 The registry declares these credential sets as planned or required, but absent.
 It contains no project ID or key. Surplasse has an existing SMTP file contract.
-Parkventory has no SMTP materializer. Mon Florian has neither an admitted SMTP
-runtime contract nor a materializer. Do not claim TEM readiness or create an
-orphan secret file.
+Parkventory has a bounded SMTP materializer. Mon Florian has neither an
+admitted SMTP runtime contract nor a materializer. Do not claim TEM readiness
+until a provider audit verifies the installed Parkventory credential set.
 
 Scaleway TEM sends transactional mail only. OVH MX records and published DKIM
 records are separate. Receiving mail at an address such as
@@ -145,8 +145,9 @@ implemented control.
 - Git cannot prove that the observation is still current after its audit time.
 - Existing local manifests commit a file-set write, but they contain no
   registry generation and do not provide the required binding.
-- No current materializer writes the required generation marker. All registry
-  entries remain `unlinked`, and no generation can advance yet.
+- The Parkventory materializers write the required generation markers for the
+  exact four-file generated set and three-file provider set. The registry stays
+  `unlinked` until a read-only Atlas audit verifies each marker.
 - A planned entry does not authorize provider provisioning or host mutation.
 - A materialized entry does not authorize application activation.
 - Secret recovery remains dependent on an external store or an explicit

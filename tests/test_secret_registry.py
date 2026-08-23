@@ -66,12 +66,12 @@ EXPECTED_TEM_CONTRACTS = {
     },
     "parkventory": {
         "credential_set": "scaleway-tem:parkventory-prod-smtp",
-        "declared_state": "planned",
+        "declared_state": "required",
         "ids": {
             "parkventory.smtp-password",
             "parkventory.smtp-username",
         },
-        "materializer": "not-implemented",
+        "materializer": "materialize-parkventory-provider-secrets",
     },
     "surplasse": {
         "credential_set": "scaleway-tem:surplasse-prod-smtp",
@@ -380,6 +380,10 @@ class SecretRegistryTests(unittest.TestCase):
             "secret_registry_parkventory_materializer",
             ROOT / "scripts/materialize-parkventory-secrets",
         )
+        parkventory_provider_materializer = load_script_module(
+            "secret_registry_parkventory_provider_materializer",
+            ROOT / "scripts/materialize-parkventory-provider-secrets",
+        )
         dns_materializer = load_script_module(
             "secret_registry_dns_materializer",
             ROOT / "scripts/materialize-surplasse-dns-secrets",
@@ -400,6 +404,7 @@ class SecretRegistryTests(unittest.TestCase):
             }
             for materializer in (
                 "materialize-internal-platform-secrets",
+                "materialize-parkventory-provider-secrets",
                 "materialize-parkventory-secrets",
                 "materialize-surplasse-dns-secrets",
                 "materialize-surplasse-secrets",
@@ -408,6 +413,13 @@ class SecretRegistryTests(unittest.TestCase):
         self.assertEqual(
             paths_by_materializer["materialize-internal-platform-secrets"],
             EXPECTED_PLATFORM_PATHS,
+        )
+        self.assertEqual(
+            paths_by_materializer["materialize-parkventory-provider-secrets"],
+            {
+                str(parkventory_provider_materializer.PRODUCTION_CREDENTIAL_ROOT / name)
+                for name in parkventory_provider_materializer.CREDENTIAL_FILES
+            },
         )
         self.assertEqual(
             paths_by_materializer["materialize-parkventory-secrets"],
@@ -429,6 +441,77 @@ class SecretRegistryTests(unittest.TestCase):
                 str(dns_materializer.PRODUCTION_ROOT / spec.name)
                 for spec in dns_materializer.CREDENTIAL_SPECS
             },
+        )
+
+    def test_parkventory_marker_matches_the_registered_generation(self) -> None:
+        materializer = load_script_module(
+            "secret_registry_parkventory_marker",
+            ROOT / "scripts/materialize-parkventory-secrets",
+        )
+        registered = sorted(
+            (
+                secret
+                for secret in self.registry["secrets"]
+                if secret["materializer"] == "materialize-parkventory-secrets"
+            ),
+            key=lambda secret: secret["id"],
+        )
+        marker = json.loads(materializer.generation_marker())
+
+        self.assertEqual(
+            set(marker),
+            {"contract", "materializer", "secrets", "target_generation"},
+        )
+        self.assertEqual(marker["materializer"], "materialize-parkventory-secrets")
+        self.assertEqual(
+            marker["secrets"],
+            [
+                {"file": Path(secret["path"]).name, "id": secret["id"]}
+                for secret in registered
+            ],
+        )
+        self.assertEqual(
+            {secret["target_generation"] for secret in registered},
+            {marker["target_generation"]},
+        )
+        self.assertEqual(
+            {secret["declared_state"] for secret in registered},
+            {"required"},
+        )
+        self.assertTrue(
+            all(secret["generation_binding"] == "unlinked" for secret in registered)
+        )
+
+    def test_parkventory_provider_marker_matches_registered_generation(self) -> None:
+        materializer = load_script_module(
+            "secret_registry_parkventory_provider_marker",
+            ROOT / "scripts/materialize-parkventory-provider-secrets",
+        )
+        registered = sorted(
+            (
+                secret
+                for secret in self.registry["secrets"]
+                if secret["materializer"]
+                == "materialize-parkventory-provider-secrets"
+            ),
+            key=lambda secret: secret["id"],
+        )
+        marker = json.loads(materializer.generation_marker())
+
+        self.assertEqual(
+            marker["secrets"],
+            [
+                {"file": Path(secret["path"]).name, "id": secret["id"]}
+                for secret in registered
+            ],
+        )
+        self.assertEqual(
+            {secret["target_generation"] for secret in registered},
+            {marker["target_generation"]},
+        )
+        self.assertEqual(
+            {secret["declared_state"] for secret in registered},
+            {"required"},
         )
 
 

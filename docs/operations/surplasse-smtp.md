@@ -70,11 +70,10 @@ Scaleway's documented products that support resource-level conditions. This
 repository therefore infers that a project-scoped key can send from any
 verified TEM domain in the project.
 
-Surplasse has a strict full-bundle materializer. Parkventory declares its SMTP
-paths but has no SMTP materializer. Mon Florian has planned registry entries
-but no runtime SMTP contract. Do not create orphan files for Parkventory or Mon
-Florian. Their implementation must land before their credential state can move
-from `planned`.
+Surplasse has a strict full-bundle materializer. Parkventory now has a separate
+strict provider-bundle materializer. Mon Florian has planned registry entries
+but no runtime SMTP contract. Parkventory provider state remains `planned`
+until a separate audit verifies the credential set on Atlas.
 
 Repository admission and tester-order authorization do not prove this email
 channel. The credentials remain `planned`, and technical activation remains

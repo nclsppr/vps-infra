@@ -12,7 +12,8 @@
          'internal': true}
       - >-
         vps_parkventory_postgres_helpers | sort ==
-        ['materialize-parkventory-secrets',
+        ['materialize-parkventory-provider-secrets',
+         'materialize-parkventory-secrets',
          'provision-parkventory-postgres']
       - >-
         not (
@@ -291,7 +292,7 @@
     - vps_parkventory_postgres_state == 'dry-run'
     - ansible_check_mode
 
-- name: Verify the existing Parkventory database secrets
+- name: Verify the existing Parkventory generated secrets
   ansible.builtin.command:
     argv:
       - /usr/local/libexec/vps/materialize-parkventory-secrets
@@ -313,7 +314,7 @@
     - vps_parkventory_postgres_state == 'prepare'
     - not ansible_check_mode
   block:
-    - name: Create only missing Parkventory database passwords
+    - name: Create missing Parkventory generated secrets and publish their marker
       ansible.builtin.command:
         argv:
           - /usr/local/libexec/vps/materialize-parkventory-secrets

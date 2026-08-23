@@ -215,7 +215,8 @@ Advance the generation only after the marker audit. Do not mark it
 runtime-loaded until the current service has loaded that marker-bound
 generation and passed its probes. A Docker file bind mount can retain the old
 inode after an atomic host-file replacement, so a rotation must recreate the
-affected service. No current materializer can complete this generation step.
+affected service. The two Parkventory materializers complete this generation
+step for their exact registered sets. Other materializers remain unlinked.
 
 La plateforme est restaurée avant les applications :
 
