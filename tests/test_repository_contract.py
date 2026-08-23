@@ -3327,6 +3327,31 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "inspect",
                 "db_parkventory",
             ],
+            (
+                "parkventory_postgres",
+                "Run the reviewed-source Parkventory secret plan in check mode",
+            ): [
+                "/usr/bin/python3",
+                "-c",
+                "{{ lookup('ansible.builtin.file', playbook_dir ~ "
+                "'/../../scripts/materialize-parkventory-secrets', "
+                "rstrip=false) }}",
+                "materialize-parkventory-secrets",
+                "--dry-run",
+            ],
+            (
+                "parkventory_postgres",
+                "Run the reviewed-source Parkventory PostgreSQL plan in check mode",
+            ): [
+                "/usr/bin/python3",
+                "-c",
+                "{{ lookup('ansible.builtin.file', playbook_dir ~ "
+                "'/../../scripts/provision-parkventory-postgres', "
+                "rstrip=false) }}",
+                "provision-parkventory-postgres",
+                "--dry-run",
+                "--embedded-contract",
+            ],
             ("layout", "Inspect an active static job backing mount"): [
                 "/usr/bin/findmnt",
                 "--json",

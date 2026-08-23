@@ -54,7 +54,9 @@
       mode: "0755"
     - path: /usr/local/share/vps-infra/contracts
       mode: "0755"
-  when: vps_parkventory_postgres_state == 'prepare'
+  when: >-
+    vps_parkventory_postgres_state == 'prepare' or
+    (vps_parkventory_postgres_state == 'dry-run' and ansible_check_mode)
 
 - name: Install the exact Parkventory PostgreSQL contract
   ansible.builtin.copy:
@@ -63,7 +65,9 @@
     owner: root
     group: root
     mode: "0444"
-  when: vps_parkventory_postgres_state == 'prepare'
+  when: >-
+    vps_parkventory_postgres_state == 'prepare' or
+    (vps_parkventory_postgres_state == 'dry-run' and ansible_check_mode)
 
 - name: Install the root-only Parkventory database helpers
   ansible.builtin.copy:
@@ -73,7 +77,9 @@
     group: root
     mode: "0500"
   loop: "{{ vps_parkventory_postgres_helpers }}"
-  when: vps_parkventory_postgres_state == 'prepare'
+  when: >-
+    vps_parkventory_postgres_state == 'prepare' or
+    (vps_parkventory_postgres_state == 'dry-run' and ansible_check_mode)
 
 - name: Inspect protected Parkventory artifact directories without changing them
   ansible.builtin.stat:
@@ -237,6 +243,21 @@
     - vps_parkventory_postgres_state == 'dry-run'
     - not ansible_check_mode
 
+- name: Run the reviewed-source Parkventory secret plan in check mode
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../scripts/materialize-parkventory-secrets', rstrip=false) }}"
+      - materialize-parkventory-secrets
+      - --dry-run
+  check_mode: false
+  changed_when: false
+  no_log: true
+  when:
+    - vps_parkventory_postgres_state == 'dry-run'
+    - ansible_check_mode
+
 - name: Run the non-mutating Parkventory PostgreSQL plan
   ansible.builtin.command:
     argv:
@@ -246,6 +267,21 @@
   when:
     - vps_parkventory_postgres_state == 'dry-run'
     - not ansible_check_mode
+
+- name: Run the reviewed-source Parkventory PostgreSQL plan in check mode
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/python3
+      - -c
+      - "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../scripts/provision-parkventory-postgres', rstrip=false) }}"
+      - provision-parkventory-postgres
+      - --dry-run
+      - --embedded-contract
+  check_mode: false
+  changed_when: false
+  when:
+    - vps_parkventory_postgres_state == 'dry-run'
+    - ansible_check_mode
 
 - name: Verify the existing Parkventory database secrets
   ansible.builtin.command:

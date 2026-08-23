@@ -1997,6 +1997,7 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(mode="check")
     parser.add_argument("--validate-contract", action="store_true")
     parser.add_argument("--require-rls", action="store_true")
+    parser.add_argument("--embedded-contract", action="store_true")
     parser.add_argument("--contract", type=Path, default=CONTRACT_PATH)
     return parser.parse_args()
 
@@ -2004,7 +2005,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     arguments = parse_args()
     try:
-        contract, contract_digest = load_contract(arguments.contract)
+        embedded_contract = getattr(arguments, "embedded_contract", False)
+        if embedded_contract:
+            if arguments.mode != "dry-run" or arguments.contract != CONTRACT_PATH:
+                raise ProvisionError(
+                    "the embedded contract is restricted to the source dry-run"
+                )
+            contract = EXPECTED_CONTRACT
+            contract_digest = (
+                "sha256:" + hashlib.sha256(canonical_json(contract)).hexdigest()
+            )
+        else:
+            contract, contract_digest = load_contract(arguments.contract)
         if arguments.validate_contract:
             print(f"Parkventory PostgreSQL contract valid: {arguments.contract}")
             return 0

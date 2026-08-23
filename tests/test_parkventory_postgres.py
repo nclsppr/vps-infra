@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import copy
+from contextlib import redirect_stdout
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -106,6 +108,41 @@ class ParkventoryPostgresTests(unittest.TestCase):
             checked = self.run_materializer(root, "--check")
             self.assertEqual(checked.returncode, 0, checked.stderr)
             self.assertTrue(json.loads(checked.stdout)["ready"])
+
+    def test_source_plan_uses_only_the_embedded_contract(self) -> None:
+        original_parse_args = PROVISIONER.parse_args
+        original_geteuid = PROVISIONER.os.geteuid
+        original_load_contract = PROVISIONER.load_contract
+        original_resolve_postgres = PROVISIONER.resolve_postgres
+        calls: list[tuple[object, bool]] = []
+        try:
+            PROVISIONER.parse_args = lambda: SimpleNamespace(
+                mode="dry-run",
+                validate_contract=False,
+                require_rls=False,
+                embedded_contract=True,
+                contract=PROVISIONER.CONTRACT_PATH,
+            )
+            PROVISIONER.os.geteuid = lambda: 0
+            PROVISIONER.load_contract = lambda path: self.fail(
+                "source planning must not read the installed contract"
+            )
+
+            def resolve(contract, *, require_network):
+                calls.append((contract, require_network))
+                return "postgres-container", "postgres-image"
+
+            PROVISIONER.resolve_postgres = resolve
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(PROVISIONER.main(), 0)
+            self.assertEqual(json.loads(output.getvalue())["mode"], "dry-run")
+        finally:
+            PROVISIONER.parse_args = original_parse_args
+            PROVISIONER.os.geteuid = original_geteuid
+            PROVISIONER.load_contract = original_load_contract
+            PROVISIONER.resolve_postgres = original_resolve_postgres
+        self.assertEqual(calls, [(PROVISIONER.EXPECTED_CONTRACT, False)])
 
     def test_secret_check_rejects_unsafe_metadata(self) -> None:
         if os.geteuid() == 0:
@@ -858,10 +895,25 @@ class ParkventoryPostgresTests(unittest.TestCase):
         copy_tasks = [task for task in tasks if "ansible.builtin.copy" in task]
         self.assertEqual(len(copy_tasks), 2)
         for task in copy_tasks:
-            self.assertEqual(
+            self.assertIn(
+                "vps_parkventory_postgres_state == 'prepare' or",
                 task["when"],
-                "vps_parkventory_postgres_state == 'prepare'",
             )
+            self.assertIn("ansible_check_mode", task["when"])
+
+        for name in (
+            "Run the reviewed-source Parkventory secret plan in check mode",
+            "Run the reviewed-source Parkventory PostgreSQL plan in check mode",
+        ):
+            task = by_name[name]
+            self.assertFalse(task["check_mode"])
+            self.assertIn("ansible_check_mode", task["when"])
+        self.assertIn(
+            "--embedded-contract",
+            by_name[
+                "Run the reviewed-source Parkventory PostgreSQL plan in check mode"
+            ]["ansible.builtin.command"]["argv"],
+        )
 
         contract_inspection = by_name[
             "Inspect the installed Parkventory PostgreSQL contract without changing it"
