@@ -46,6 +46,18 @@
       - vps_application_config_dir == '/etc/vps/applications'
       - vps_application_state_dir == '/var/lib/vps-application'
       - vps_application_recovery_unit == 'vps-application-recover.service'
+      - >-
+        vps_parkventory_provider_ingress_revision_path ==
+        '/usr/local/share/vps-infra/parkventory-provider-ingress-revision'
+      - >-
+        vps_parkventory_provider_ingress_ssh_gate_path ==
+        '/usr/local/libexec/vps/materialize-parkventory-providers-ssh-gate'
+      - >-
+        vps_parkventory_provider_ingress_gate_path ==
+        '/usr/local/libexec/vps/materialize-parkventory-providers-live-gate'
+      - >-
+        vps_parkventory_provider_ingress_worker_path ==
+        '/usr/local/libexec/vps/materialize-parkventory-providers-worker'
       - vps_deploy_production_marker == '/etc/vps/production-enabled'
       - vps_deploy_git_sha_length | int == 40
       - vps_infra_revision is match('^[0-9a-f]{40}$')
@@ -78,6 +90,13 @@
          'materialize-surplasse-dns-secrets',
          'materialize-surplasse-pilot-manifest',
          'surplasse-pilot-bootstrap']
+      - >-
+        vps_parkventory_provider_root_helpers ==
+        ['materialize-parkventory-providers-live-gate',
+         'materialize-parkventory-providers-worker']
+      - >-
+        vps_parkventory_provider_ssh_executables ==
+        ['materialize-parkventory-providers-ssh-gate']
       - not (vps_live_apply_enabled | bool)
     fail_msg: "Le contrat du compte ou de la commande de déploiement a dérivé."
 
@@ -119,6 +138,41 @@
   loop: "{{ vps_deploy_authorized_keys }}"
   loop_control:
     label: "clé deploy déclarée"
+
+- name: Validate the temporary Parkventory provider ingress public key
+  ansible.builtin.assert:
+    that:
+      - vps_parkventory_provider_ingress_authorized_key is string
+      - vps_parkventory_provider_ingress_authorized_key | length <= 16384
+      - >-
+        (vps_deploy_authorized_keys | length) +
+        (1 if vps_parkventory_provider_ingress_authorized_key | length > 0
+         else 0) <= 4
+      - "'\n' not in vps_parkventory_provider_ingress_authorized_key"
+      - "'\r' not in vps_parkventory_provider_ingress_authorized_key"
+      - >-
+        vps_parkventory_provider_ingress_authorized_key == '' or
+        vps_parkventory_provider_ingress_authorized_key is
+        match('^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|sk-ecdsa-sha2-nistp256@openssh.com|ssh-rsa) [A-Za-z0-9+/=]+(?: .*)?$')
+    fail_msg: >-
+      The temporary Parkventory provider ingress public key is invalid.
+  no_log: true
+
+- name: Cryptographically parse the Parkventory provider ingress public key
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ssh-keygen
+      - -l
+      - -E
+      - sha256
+      - -f
+      - /dev/stdin
+    stdin: "{{ vps_parkventory_provider_ingress_authorized_key }}\n"
+    stdin_add_newline: false
+  check_mode: false
+  changed_when: false
+  when: vps_parkventory_provider_ingress_authorized_key | length > 0
+  no_log: true
 
 - name: Cryptographically parse deployment public keys
   ansible.builtin.command:
@@ -198,6 +252,11 @@
         deploy_account_lookup.rc == 2 and
         not deploy_authorized_keys_stat.stat.exists
       }}
+    parkventory_provider_ingress_key_identity: >-
+      {{
+        vps_parkventory_provider_ingress_authorized_key | trim |
+        regex_replace('^([^ ]+ [^ ]+)(?: .*)?$', '\1')
+      }}
 
 - name: Extract only exact installed forced-command key identities
   ansible.builtin.set_fact:
@@ -215,6 +274,18 @@
           '\1'
         ) | list
       }}
+
+- name: Refuse reuse of an ordinary deploy key for Parkventory provider ingress
+  ansible.builtin.assert:
+    that:
+      - >-
+        vps_parkventory_provider_ingress_authorized_key | length == 0 or
+        parkventory_provider_ingress_key_identity not in
+        (deploy_desired_key_identities + deploy_installed_key_identities)
+    fail_msg: >-
+      The Parkventory provider ingress key must be distinct from every ordinary
+      deploy key, including a key that this convergence removes.
+  no_log: true
 
 - name: Refuse duplicate desired deployment key identities
   ansible.builtin.assert:
@@ -357,12 +428,22 @@
     validate: >-
       /bin/sh -c 'set -eu;
       file=$1;
-      count=0;
-      prefix="restrict,command=\"/usr/local/libexec/vps/forced-command\" ";
+      deploy_count=0;
+      provider_count=0;
+      deploy_prefix="restrict,command=\"/usr/local/libexec/vps/forced-command\" ";
+      provider_prefix="restrict,command=\"{{ vps_parkventory_provider_ingress_ssh_gate_path }}\" ";
+      total_count=0;
       while IFS= read -r line || [ -n "$line" ]; do
         [ -n "$line" ] || exit 1;
         case "$line" in
-          "$prefix"*) key=${line#"$prefix"} ;;
+          "$deploy_prefix"*)
+            key=${line#"$deploy_prefix"};
+            deploy_count=$((deploy_count + 1));
+            [ "$deploy_count" -le 4 ] || exit 1 ;;
+          "$provider_prefix"*)
+            key=${line#"$provider_prefix"};
+            provider_count=$((provider_count + 1));
+            [ "$provider_count" -le 1 ] || exit 1 ;;
           *) exit 1 ;;
         esac;
         key_type=${key%% *};
@@ -370,10 +451,10 @@
         key_blob=${key_rest%% *};
         printf "%b %b\n" "$key_type" "$key_blob" |
           /usr/bin/ssh-keygen -l -E sha256 -f /dev/stdin >/dev/null;
-        count=$((count + 1));
-        [ "$count" -le 4 ] || exit 1;
+        total_count=$((total_count + 1));
+        [ "$total_count" -le 4 ] || exit 1;
       done < "$file";
-      [ "$count" -ge 1 ]'
+      [ "$deploy_count" -ge 1 ]'
       vps-deploy-authorized-keys-validator %s
 
 - name: Create root-owned controller directories
@@ -421,6 +502,8 @@
     - path: "{{ vps_application_config_dir }}"
       mode: "0700"
     - path: /etc/vps/secrets/monflorian
+      mode: "0700"
+    - path: /etc/vps/secrets/parkventory
       mode: "0700"
     - path: "{{ vps_application_state_dir }}"
       mode: "0700"
@@ -724,6 +807,52 @@
     label: "{{ item.item }}"
   when: not ansible_check_mode
 
+- name: Inspect the Parkventory provider SSH gate source in the proven mirror
+  ansible.builtin.stat:
+    path: "{{ vps_deploy_repository_dir }}/scripts/{{ item }}"
+    follow: false
+  register: vps_parkventory_provider_ssh_gate_sources
+  loop: "{{ vps_parkventory_provider_ssh_executables }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Refuse an unsafe Parkventory provider SSH gate source
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+    fail_msg: >-
+      The Parkventory provider SSH gate source {{ item.item }} is unsafe.
+  loop: "{{ vps_parkventory_provider_ssh_gate_sources.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Inspect Parkventory provider ingress sources in the proven mirror
+  ansible.builtin.stat:
+    path: "{{ vps_deploy_repository_dir }}/scripts/{{ item }}"
+    follow: false
+  register: vps_parkventory_provider_ingress_sources
+  loop: "{{ vps_parkventory_provider_root_helpers }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Refuse unsafe Parkventory provider ingress sources
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - not item.stat.islnk
+    fail_msg: >-
+      The Parkventory provider ingress source {{ item.item }} is unsafe.
+  loop: "{{ vps_parkventory_provider_ingress_sources.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
 - name: Inspect policy and schema sources in the proven mirror
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -772,6 +901,32 @@
     group: root
     mode: "0500"
   loop: "{{ vps_deploy_root_helpers }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Install the Parkventory provider SSH gate from the proven mirror
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/{{ item }}"
+    dest: "{{ vps_deploy_install_root }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ vps_parkventory_provider_ssh_executables }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Install Parkventory provider ingress helpers from the proven mirror
+  ansible.builtin.copy:
+    src: "{{ vps_deploy_repository_dir }}/scripts/{{ item }}"
+    dest: "{{ vps_deploy_install_root }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0500"
+  loop: "{{ vps_parkventory_provider_root_helpers }}"
   loop_control:
     label: "{{ item }}"
   when: not ansible_check_mode
@@ -910,6 +1065,9 @@
     - "{{ vps_deploy_static_gate_path }}"
     - "{{ vps_deploy_application_path }}"
     - "{{ vps_deploy_application_gate_path }}"
+    - "{{ vps_parkventory_provider_ingress_ssh_gate_path }}"
+    - "{{ vps_parkventory_provider_ingress_gate_path }}"
+    - "{{ vps_parkventory_provider_ingress_worker_path }}"
     - "{{ vps_surplasse_dns_materializer_path }}"
     - "{{ vps_surplasse_pilot_materializer_path }}"
     - "{{ vps_surplasse_pilot_controller_path }}"
@@ -983,6 +1141,56 @@
       - item.stat.mode == '0500'
     fail_msg: "The root-only helper {{ item.item }} is not protected."
   loop: "{{ vps_deploy_installed_root_helpers.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Inspect the installed Parkventory provider SSH gate
+  ansible.builtin.stat:
+    path: "{{ vps_deploy_install_root }}/{{ item }}"
+  register: vps_parkventory_provider_ssh_gate_installed
+  loop: "{{ vps_parkventory_provider_ssh_executables }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Prove the Parkventory provider SSH gate is protected
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.executable
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.mode == '0755'
+    fail_msg: >-
+      The Parkventory provider SSH gate {{ item.item }} is not protected.
+  loop: "{{ vps_parkventory_provider_ssh_gate_installed.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not ansible_check_mode
+
+- name: Inspect installed Parkventory provider ingress helpers
+  ansible.builtin.stat:
+    path: "{{ vps_deploy_install_root }}/{{ item }}"
+  register: vps_parkventory_provider_ingress_installed
+  loop: "{{ vps_parkventory_provider_root_helpers }}"
+  loop_control:
+    label: "{{ item }}"
+  when: not ansible_check_mode
+
+- name: Prove Parkventory provider ingress helpers are protected
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+      - item.stat.executable
+      - item.stat.uid == 0
+      - item.stat.gid == 0
+      - item.stat.mode == '0500'
+    fail_msg: >-
+      The Parkventory provider ingress helper {{ item.item }} is not protected.
+  loop: "{{ vps_parkventory_provider_ingress_installed.results }}"
   loop_control:
     label: "{{ item.item }}"
   when: not ansible_check_mode
@@ -1061,4 +1269,37 @@
     name: "{{ vps_application_recovery_unit }}"
     enabled: true
     daemon_reload: true
+  when: not ansible_check_mode
+
+- name: Record the fully converged Parkventory provider ingress revision
+  ansible.builtin.copy:
+    content: "{{ vps_infra_revision }}\n"
+    dest: "{{ vps_parkventory_provider_ingress_revision_path }}"
+    owner: root
+    group: root
+    mode: "0444"
+  when: not ansible_check_mode
+
+- name: Inspect the Parkventory provider ingress convergence marker
+  ansible.builtin.stat:
+    path: "{{ vps_parkventory_provider_ingress_revision_path }}"
+    follow: false
+    checksum_algorithm: sha256
+  register: vps_parkventory_provider_ingress_revision
+  when: not ansible_check_mode
+
+- name: Prove the Parkventory provider ingress convergence marker
+  ansible.builtin.assert:
+    that:
+      - vps_parkventory_provider_ingress_revision.stat.exists
+      - vps_parkventory_provider_ingress_revision.stat.isreg
+      - not vps_parkventory_provider_ingress_revision.stat.islnk
+      - vps_parkventory_provider_ingress_revision.stat.uid == 0
+      - vps_parkventory_provider_ingress_revision.stat.gid == 0
+      - vps_parkventory_provider_ingress_revision.stat.mode == '0444'
+      - >-
+        vps_parkventory_provider_ingress_revision.stat.checksum ==
+        ((vps_infra_revision ~ '\n') | hash('sha256'))
+    fail_msg: >-
+      The Parkventory provider ingress convergence marker is invalid.
   when: not ansible_check_mode

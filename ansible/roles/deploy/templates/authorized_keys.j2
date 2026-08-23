@@ -1,4 +1,5 @@
 {% set declared_keys = vps_deploy_authorized_keys | default([]) %}
+{% set provider_key = vps_parkventory_provider_ingress_authorized_key | default('') %}
 {% set bounded_keys = (
   declared_keys is sequence and
   declared_keys is not string and
@@ -6,6 +7,11 @@
   declared_keys | length > 0 and
   declared_keys | length <= 4 and
   declared_keys | unique | length == declared_keys | length
+) %}
+{% set provider_key_bounded = (
+  provider_key is string and
+  provider_key | length <= 16384 and
+  declared_keys | length + (1 if provider_key | length > 0 else 0) <= 4
 ) %}
 {% set rotation_guard_passed = (
   deploy_key_rotation_guard is defined and
@@ -19,10 +25,13 @@
     deploy_key_recovery_marker_creation.changed | default(false) | bool
   )
 ) %}
-{% if not bounded_keys or not rotation_guard_passed or not recovery_marker_consumed %}
+{% if not bounded_keys or not provider_key_bounded or not rotation_guard_passed or not recovery_marker_consumed %}
 vps-deploy-authorized-keys-render-refused
 {% else %}
 {% for key in declared_keys %}
 restrict,command="{{ vps_deploy_gate_path }}" {{ key | trim }}
 {% endfor %}
+{% if provider_key | length > 0 %}
+restrict,command="{{ vps_parkventory_provider_ingress_ssh_gate_path }}" {{ provider_key | trim }}
+{% endif %}
 {% endif %}

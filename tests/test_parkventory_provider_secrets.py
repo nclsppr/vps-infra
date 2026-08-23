@@ -261,6 +261,76 @@ class ParkventoryProviderMaterializerTests(unittest.TestCase):
                 (target / "parkventory-oidc-client-secret").read_bytes(), installed
             )
 
+    def test_markerless_crash_resume_requires_exact_existing_files(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally rejects root test mode")
+        for location in ("credential", "runtime"):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = self.make_source(root)
+                target = root / "target"
+                runtime = root / "runtime"
+                target.mkdir(mode=0o700)
+                if location == "credential":
+                    existing = target / "parkventory-oidc-client-secret"
+                    existing.write_bytes(
+                        b"auth0-provider-client-value-fedcba9876543210\n"
+                    )
+                    existing.chmod(0o440)
+                else:
+                    runtime.mkdir(mode=0o700)
+                    existing = runtime / "parkventory.env"
+                    existing.write_bytes(
+                        runtime_configuration(
+                            PARKVENTORY_OIDC_CLIENT_ID="different-client"
+                        )
+                    )
+                    existing.chmod(0o600)
+                before = (existing.read_bytes(), existing.stat().st_ino)
+
+                refused = self.run_helper(
+                    target,
+                    runtime,
+                    root / "lock",
+                    "--install-from",
+                    str(source),
+                )
+
+                self.assertEqual(refused.returncode, 78, refused.stderr)
+                self.assertIn("differs without a marker", refused.stderr)
+                self.assertEqual((existing.read_bytes(), existing.stat().st_ino), before)
+                self.assertFalse(
+                    (target / "parkventory-provider-secret-generation.json").exists()
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.make_source(root)
+            target = root / "target"
+            runtime = root / "runtime"
+            target.mkdir(mode=0o700)
+            runtime.mkdir(mode=0o700)
+            credential = target / "parkventory-oidc-client-secret"
+            credential.write_bytes(PROVIDER_VALUES[credential.name])
+            credential.chmod(0o440)
+            runtime_path = runtime / "parkventory.env"
+            runtime_path.write_bytes(runtime_configuration())
+            runtime_path.chmod(0o600)
+
+            resumed = self.run_helper(
+                target,
+                runtime,
+                root / "lock",
+                "--install-from",
+                str(source),
+            )
+
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertTrue(json.loads(resumed.stdout)["changed"])
+            self.assertTrue(
+                (target / "parkventory-provider-secret-generation.json").exists()
+            )
+
     def test_killed_install_recovers_only_expected_pending_files(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("the helper intentionally rejects root test mode")

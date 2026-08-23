@@ -1,0 +1,211 @@
+#!/usr/bin/python3 -I
+
+"""Start one isolated Parkventory provider-ingress worker from canonical stdin."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import signal
+import subprocess
+import sys
+
+
+EXIT_USAGE = 64
+EXIT_RUNTIME = 70
+MAX_INPUT_BYTES = 2048
+INPUT_TIMEOUT_SECONDS = 5
+WORKER_TIMEOUT_SECONDS = 180
+SYSTEMD_RUN_WAIT_TIMEOUT_SECONDS = WORKER_TIMEOUT_SECONDS + 30
+SYSTEMD_RUN_PATH = "/usr/bin/systemd-run"
+WORKER_PATH = "/usr/local/libexec/vps/materialize-parkventory-providers-worker"
+RUNTIME_DIRECTORY_ENV = "VPS_PARKVENTORY_PROVIDER_RUNTIME_DIRECTORY"
+SAFE_ENVIRONMENT = {
+    "HOME": "/root",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+}
+PAYLOAD_KEYS = frozenset(
+    {
+        "INFRA_REVISION",
+        "PARKVENTORY_OIDC_CLIENT_SECRET",
+        "PARKVENTORY_SMTP_PASSWORD",
+        "PARKVENTORY_SMTP_USERNAME",
+    }
+)
+SMTP_USERNAME_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.ASCII,
+)
+OPAQUE_SECRET_RE = re.compile(r"[\x21-\x7e]{16,512}", re.ASCII)
+OIDC_SECRET_RE = re.compile(r"[\x21-\x7e]{32,512}", re.ASCII)
+REVISION_RE = re.compile(r"[0-9a-f]{40}", re.ASCII)
+
+
+class GateError(ValueError):
+    """The request is outside the Parkventory provider-ingress contract."""
+
+
+def fail(message: str, exit_code: int = EXIT_USAGE) -> None:
+    print(f"Parkventory provider ingress gate: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def _read_timed_out(_signum: int, _frame: object) -> None:
+    raise GateError("timed out waiting for a complete request")
+
+
+def read_request() -> bytes:
+    if any(os.isatty(descriptor) for descriptor in (0, 1, 2)):
+        raise GateError("terminal input or output is forbidden")
+    previous_handler = signal.signal(signal.SIGALRM, _read_timed_out)
+    signal.alarm(INPUT_TIMEOUT_SECONDS)
+    try:
+        payload = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    except OSError as exc:
+        raise GateError("could not read the request") from exc
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+    if len(payload) > MAX_INPUT_BYTES:
+        raise GateError("request exceeds the input limit")
+    return payload
+
+
+def parse_request(payload: bytes) -> dict[str, str]:
+    if not payload or len(payload) > MAX_INPUT_BYTES:
+        raise GateError("request size is invalid")
+    if not payload.endswith(b"\n") or payload.count(b"\n") != 1:
+        raise GateError("request must end at exactly one newline")
+    if b"\r" in payload or b"\0" in payload:
+        raise GateError("request framing is invalid")
+    try:
+        document = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GateError("request is not canonical ASCII JSON") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document) != PAYLOAD_KEYS
+        or any(not isinstance(value, str) for value in document.values())
+    ):
+        raise GateError("request key allowlist differs")
+    canonical = (
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+    if payload != canonical:
+        raise GateError("request JSON is not canonical")
+    if SMTP_USERNAME_RE.fullmatch(document["PARKVENTORY_SMTP_USERNAME"]) is None:
+        raise GateError("SMTP username format is invalid")
+    if REVISION_RE.fullmatch(document["INFRA_REVISION"]) is None:
+        raise GateError("infrastructure revision format is invalid")
+    if OPAQUE_SECRET_RE.fullmatch(document["PARKVENTORY_SMTP_PASSWORD"]) is None:
+        raise GateError("SMTP password format is invalid")
+    if OIDC_SECRET_RE.fullmatch(document["PARKVENTORY_OIDC_CLIENT_SECRET"]) is None:
+        raise GateError("OIDC client secret format is invalid")
+    return document
+
+
+def build_worker_command() -> list[str]:
+    random_suffix = secrets.token_hex(12)
+    if re.fullmatch(r"[0-9a-f]{24}", random_suffix, re.ASCII) is None:
+        raise GateError("could not generate a bounded transient unit name")
+    runtime_name = f"vps-parkventory-provider-ingress-{random_suffix}"
+    unit_name = f"{runtime_name}.service"
+    properties = [
+        "KillMode=control-group",
+        "SendSIGKILL=yes",
+        "FinalKillSignal=SIGKILL",
+        "Restart=no",
+        "UMask=0077",
+        "MemoryMax=128M",
+        "MemorySwapMax=0",
+        "TasksMax=32",
+        "LimitFSIZE=1M",
+        "PrivateDevices=yes",
+        "PrivateNetwork=yes",
+        "PrivateTmp=yes",
+        "ProtectClock=yes",
+        "ProtectControlGroups=yes",
+        "ProtectHome=yes",
+        "ProtectHostname=yes",
+        "ProtectKernelLogs=yes",
+        "ProtectKernelModules=yes",
+        "ProtectKernelTunables=yes",
+        "ProtectSystem=strict",
+        "LockPersonality=yes",
+        "NoNewPrivileges=yes",
+        "RestrictRealtime=yes",
+        "RestrictSUIDSGID=yes",
+        "ReadOnlyPaths=/srv/vps/repository",
+        "ReadWritePaths=/etc/vps/secrets/parkventory /etc/vps/applications /run/lock",
+        f"TimeoutStartSec={WORKER_TIMEOUT_SECONDS}s",
+        f"RuntimeMaxSec={WORKER_TIMEOUT_SECONDS}s",
+        "RuntimeRandomizedExtraSec=0",
+        f"RuntimeDirectory={runtime_name}",
+        "RuntimeDirectoryMode=0700",
+        "RuntimeDirectoryPreserve=no",
+        "Environment=HOME=/root",
+        "Environment=LANG=C",
+        "Environment=LC_ALL=C",
+        f"Environment=PATH={SAFE_ENVIRONMENT['PATH']}",
+        f"Environment={RUNTIME_DIRECTORY_ENV}=/run/{runtime_name}",
+    ]
+    command = [
+        SYSTEMD_RUN_PATH,
+        "--system",
+        "--no-ask-password",
+        f"--unit={unit_name}",
+        "--service-type=exec",
+        "--wait",
+        "--collect",
+        "--quiet",
+        "--pipe",
+        "--expand-environment=no",
+        "--uid=root",
+        "--gid=root",
+        "--working-directory=/",
+    ]
+    for property_value in properties:
+        command.extend(("--property", property_value))
+    command.extend(("--", WORKER_PATH))
+    return command
+
+
+def main() -> None:
+    if len(sys.argv) != 1:
+        fail("arguments are forbidden")
+    if os.geteuid() != 0:
+        fail("effective root is required")
+    os.environ.clear()
+    os.environ.update(SAFE_ENVIRONMENT)
+    os.umask(0o077)
+    try:
+        payload = read_request()
+        parse_request(payload)
+        worker_command = build_worker_command()
+    except (GateError, OSError) as exc:
+        fail(str(exc))
+    try:
+        result = subprocess.run(
+            worker_command,
+            check=False,
+            close_fds=True,
+            env=SAFE_ENVIRONMENT,
+            shell=False,
+            input=payload,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=SYSTEMD_RUN_WAIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        fail("isolated worker execution failed", EXIT_RUNTIME)
+    if result.returncode != 0:
+        fail("isolated worker refused the request", EXIT_RUNTIME)
+    print("Parkventory provider ingress completed.")
+
+
+if __name__ == "__main__":
+    main()

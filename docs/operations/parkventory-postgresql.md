@@ -161,6 +161,11 @@ Only the Backend receives these files. The database migrator does not receive
 them. Do not put a value in a workflow variable, Ansible variable, command, or
 Git file.
 
+Use the separate
+[Parkventory provider ingress](parkventory-provider-ingress.md) runbook for the
+manual protected workflow that configures Auth0 SMTP and installs the two
+external provider credential sets on Atlas.
+
 ## Backup and restore gates
 
 Install the existing local backup timers. Before any activation, create a new

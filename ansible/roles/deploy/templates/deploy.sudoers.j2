@@ -4,4 +4,5 @@ Defaults:{{ vps_deploy_user }} !setenv
 Cmnd_Alias VPS_DEPLOY_SHA = {{ vps_deploy_controller_path }}
 Cmnd_Alias VPS_DEPLOY_STATIC_LIVE = {{ vps_deploy_static_gate_path }} ""
 Cmnd_Alias VPS_DEPLOY_APPLICATION_LIVE = {{ vps_deploy_application_gate_path }} ""
-{{ vps_deploy_user }} ALL=(root) NOPASSWD:NOSETENV: VPS_DEPLOY_SHA, VPS_DEPLOY_STATIC_LIVE, VPS_DEPLOY_APPLICATION_LIVE
+Cmnd_Alias VPS_PARKVENTORY_PROVIDER_INGRESS = {{ vps_parkventory_provider_ingress_gate_path }} ""
+{{ vps_deploy_user }} ALL=(root) NOPASSWD:NOSETENV: VPS_DEPLOY_SHA, VPS_DEPLOY_STATIC_LIVE, VPS_DEPLOY_APPLICATION_LIVE, VPS_PARKVENTORY_PROVIDER_INGRESS

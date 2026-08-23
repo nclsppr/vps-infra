@@ -94,7 +94,7 @@ else
   revision_file=/usr/local/share/vps-infra/controller-revision
 fi
 
-for executable in validate-release validate-compose check-public-safe reconcile plan-digests verify-state verify-github-evidence parse-forced-command forced-command deploy deploy-static deploy-static-live-gate deploy-application deploy-application-live-gate; do
+for executable in validate-release validate-compose check-public-safe reconcile plan-digests verify-state verify-github-evidence parse-forced-command forced-command deploy deploy-static deploy-static-live-gate deploy-application deploy-application-live-gate materialize-parkventory-providers-ssh-gate; do
   if [[ -x $SCRIPT_DIR/$executable ]]; then
     pass "executable script: scripts/$executable"
   else

@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+set -f
+
+LANG=C
+LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LANG LC_ALL PATH
+unset CDPATH ENV BASH_ENV
+
+if [ "$#" -ne 0 ]; then
+  echo "Parkventory provider SSH gate: arguments are forbidden" >&2
+  exit 64
+fi
+
+if [ "${SSH_ORIGINAL_COMMAND-}" != "materialize-parkventory-providers-v1" ]; then
+  echo "Parkventory provider SSH gate: command is outside the exact allowlist" >&2
+  exit 64
+fi
+
+unset SSH_ORIGINAL_COMMAND
+exec /usr/bin/sudo -n -- \
+  /usr/local/libexec/vps/materialize-parkventory-providers-live-gate

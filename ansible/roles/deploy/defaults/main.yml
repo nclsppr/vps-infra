@@ -24,6 +24,11 @@ vps_application_root: /srv/applications
 vps_application_config_dir: /etc/vps/applications
 vps_application_state_dir: /var/lib/vps-application
 vps_application_recovery_unit: vps-application-recover.service
+vps_parkventory_provider_ingress_authorized_key: ""
+vps_parkventory_provider_ingress_revision_path: /usr/local/share/vps-infra/parkventory-provider-ingress-revision
+vps_parkventory_provider_ingress_ssh_gate_path: /usr/local/libexec/vps/materialize-parkventory-providers-ssh-gate
+vps_parkventory_provider_ingress_gate_path: /usr/local/libexec/vps/materialize-parkventory-providers-live-gate
+vps_parkventory_provider_ingress_worker_path: /usr/local/libexec/vps/materialize-parkventory-providers-worker
 vps_monflorian_secret_materializer_path: /usr/local/libexec/vps/materialize-monflorian-secret
 vps_monflorian_adopt_existing_ids: []
 vps_monflorian_openai_api_key_source: ""
@@ -65,3 +70,8 @@ vps_deploy_root_helpers:
   - materialize-surplasse-dns-secrets
   - materialize-surplasse-pilot-manifest
   - surplasse-pilot-bootstrap
+vps_parkventory_provider_root_helpers:
+  - materialize-parkventory-providers-live-gate
+  - materialize-parkventory-providers-worker
+vps_parkventory_provider_ssh_executables:
+  - materialize-parkventory-providers-ssh-gate

@@ -9,6 +9,10 @@ vps_admin_authorized_keys:
 vps_deploy_authorized_keys:
   - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIREMPLACER cle-deploiement-github
 
+# Clé publique temporaire et distincte pour l'ingress provider Parkventory.
+# Remettre cette valeur à vide puis reconverger après le bootstrap.
+vps_parkventory_provider_ingress_authorized_key: ""
+
 # Laisser vide. Le runbook de réconciliation décrit l'exception à usage unique
 # réservée à une perte prouvée de toutes les clés de déploiement.
 vps_deploy_key_recovery_nonce: ""

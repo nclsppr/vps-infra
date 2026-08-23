@@ -1001,6 +1001,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "/usr/local/libexec/vps/deploy-application-live-gate",
             wrapper,
         )
+        self.assertNotIn("materialize-parkventory-providers", wrapper)
         self.assertNotIn("/usr/local/libexec/vps/deploy-static \\", wrapper)
         self.assertIn("subprocess.run", gate_source)
         self.assertNotIn("os.execve", gate_source)
@@ -1017,7 +1018,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             for line in rendered.splitlines()
             if line.startswith("Cmnd_Alias ")
         ]
-        self.assertEqual(len(aliases), 3)
+        self.assertEqual(len(aliases), 4)
         self.assertEqual(
             aliases,
             [
@@ -1026,6 +1027,9 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "/usr/local/libexec/vps/deploy-static-live-gate \"\"",
                 "Cmnd_Alias VPS_DEPLOY_APPLICATION_LIVE = "
                 "/usr/local/libexec/vps/deploy-application-live-gate \"\"",
+                "Cmnd_Alias VPS_PARKVENTORY_PROVIDER_INGRESS = "
+                "/usr/local/libexec/vps/"
+                "materialize-parkventory-providers-live-gate \"\"",
             ],
         )
         self.assertNotIn("*", rendered)
@@ -3133,7 +3137,8 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("/bin/sh -c 'set -eu;", validate)
         self.assertIn("restrict,command=", validate)
         self.assertIn("ssh-keygen -l -E sha256", validate)
-        self.assertIn("[ \"$count\" -ge 1 ]", validate)
+        self.assertIn("[ \"$deploy_count\" -ge 1 ]", validate)
+        self.assertIn("[ \"$total_count\" -le 4 ]", validate)
 
         with tempfile.TemporaryDirectory() as temporary:
             temporary_root = Path(temporary)
@@ -3342,6 +3347,11 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         installed_lines = [
             f"{forced_command}{distinct_keys[0]}",
             f"{forced_command}{distinct_keys[1]}",
+            (
+                "restrict,command=\"/usr/local/libexec/vps/"
+                "materialize-parkventory-providers-ssh-gate\" "
+                "ssh-ed25519 FFFF6666 provider ingress"
+            ),
             (
                 'restrict,command="/usr/local/libexec/vps/forced-command-extra" '
                 "ssh-ed25519 DDDD4444 wrong command"
@@ -3611,6 +3621,17 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "{{ vps_deploy_user }}",
             ],
             ("deploy", "Cryptographically parse deployment public keys"): [
+                "/usr/bin/ssh-keygen",
+                "-l",
+                "-E",
+                "sha256",
+                "-f",
+                "/dev/stdin",
+            ],
+            (
+                "deploy",
+                "Cryptographically parse the Parkventory provider ingress public key",
+            ): [
                 "/usr/bin/ssh-keygen",
                 "-l",
                 "-E",
