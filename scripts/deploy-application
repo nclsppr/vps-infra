@@ -559,23 +559,28 @@ def _parkventory_evidence_time(value: object, label: str) -> dt.datetime:
     )
 
 
-def validate_parkventory_postgres_live() -> None:
+def validate_parkventory_postgres_live(
+    *, reconcile_application_schema: bool = False
+) -> None:
     require_protected_file(
         PARKVENTORY_POSTGRES_VALIDATOR,
         "Parkventory PostgreSQL live validator",
         allowed_modes=frozenset({0o500}),
         maximum_size=2 * 1024 * 1024,
     )
+    mode = "reconcile-application-schema" if reconcile_application_schema else "check"
+    command = [str(PARKVENTORY_POSTGRES_VALIDATOR), f"--{mode}"]
     result = _run_bounded(
-        [str(PARKVENTORY_POSTGRES_VALIDATOR), "--check"],
+        command,
         environment=safe_environment(Path("/root")),
         timeout=120,
         maximum_stdout=4096,
     )
-    if (
-        result.stdout != '{"changed":false,"mode":"check","ready":true}\n'
-        or result.stderr
-    ):
+    accepted = {
+        canonical_json({"changed": changed, "mode": mode, "ready": True})
+        for changed in ({False, True} if reconcile_application_schema else {False})
+    }
+    if result.stdout.encode("utf-8") not in accepted or result.stderr:
         fail("Parkventory PostgreSQL live proof returned an unexpected result")
 
 
@@ -3421,7 +3426,9 @@ def activate_candidate(state: ApplicationState, work: Path) -> None:
                     phase="postgres-unverified",
                 )
                 write_transaction(transaction)
-                validate_parkventory_postgres_live()
+                validate_parkventory_postgres_live(
+                    reconcile_application_schema=True
+                )
             transaction = dataclasses.replace(transaction, phase="migrated")
             write_transaction(transaction)
             if application == "parkventory":

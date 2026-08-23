@@ -97,6 +97,7 @@ python3 "$TESTS_DIR/test_surplasse_dns_materializer.py"
 python3 "$TESTS_DIR/test_surplasse_public_edge_controller.py"
 python3 "$TESTS_DIR/test_surplasse_dns_cutover.py"
 python3 "$TESTS_DIR/test_parkventory_postgres.py"
+python3 "$TESTS_DIR/test_parkventory_postgres_integration.py"
 
 parsed=$("$TESTS_DIR/../scripts/parse-forced-command" "deploy $VALID_SHA")
 [[ $parsed == "$VALID_SHA" ]]

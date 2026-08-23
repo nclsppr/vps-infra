@@ -1365,6 +1365,40 @@ class ApplicationControllerTests(unittest.TestCase):
             ):
                 CONTROLLER.validate_parkventory_readiness(rejected)
 
+    def test_parkventory_postmigration_reconciliation_uses_mutating_mode(self):
+        completed = subprocess.CompletedProcess(
+            [
+                str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR),
+                "--reconcile-application-schema",
+            ],
+            0,
+            (
+                '{"changed":true,"mode":"reconcile-application-schema",'
+                '"ready":true}\n'
+            ),
+            "",
+        )
+        with (
+            mock.patch.object(CONTROLLER, "require_protected_file"),
+            mock.patch.object(
+                CONTROLLER,
+                "_run_bounded",
+                return_value=completed,
+            ) as reconcile,
+        ):
+            CONTROLLER.validate_parkventory_postgres_live(
+                reconcile_application_schema=True
+            )
+        reconcile.assert_called_once_with(
+            [
+                str(CONTROLLER.PARKVENTORY_POSTGRES_VALIDATOR),
+                "--reconcile-application-schema",
+            ],
+            environment=CONTROLLER.safe_environment(Path("/root")),
+            timeout=120,
+            maximum_stdout=4096,
+        )
+
     def test_surplasse_pilot_service_contract_is_exact(self):
         profile = CONTROLLER.PROFILES["surplasse"]
         services = {
@@ -2315,8 +2349,10 @@ class ApplicationControllerTests(unittest.TestCase):
             mock.patch.object(
                 CONTROLLER,
                 "validate_parkventory_postgres_live",
-                side_effect=lambda: events.append("postgres-proof"),
-            ),
+                side_effect=lambda *, reconcile_application_schema: events.append(
+                    f"postgres-proof-{reconcile_application_schema}"
+                ),
+            ) as postgres,
             mock.patch.object(
                 CONTROLLER,
                 "revalidate_parkventory_offsite_before_runtime",
@@ -2342,13 +2378,14 @@ class ApplicationControllerTests(unittest.TestCase):
             events,
             [
                 "migration",
-                "postgres-proof",
+                "postgres-proof-True",
                 "offsite-proof",
                 "runtime-True",
                 "offsite-proof",
                 "commit",
             ],
         )
+        postgres.assert_called_once_with(reconcile_application_schema=True)
         self.assertEqual(
             [transaction.phase for transaction in transactions],
             [

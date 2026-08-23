@@ -44,10 +44,60 @@ database passwords in separate `root:10001 0440` files. Write canonical
 root-only readiness evidence only after a live proof of the image, version,
 network, exact incoming and outgoing role memberships, database and schema
 grantees, existing object ownership and ACLs, and default privileges. The
-runtime receives only the reviewed DML, sequence, routine, and type access.
-Column ACLs are forbidden, and the owner-level global defaults explicitly
-remove PostgreSQL's implicit public function execution before schema-local
-runtime defaults are applied.
+runtime object defaults are deny-only: no future table, sequence, routine, or
+type gets access implicitly. Column ACLs are forbidden, and the owner-level
+defaults remove PostgreSQL's implicit public function execution.
+
+The pre-migration readiness check accepts an empty database before the first
+migration. As soon as it finds any application relation, policy, public routine,
+standalone type, or public extension, the same `--check` also requires the
+complete application catalog and runtime ACL proof. `--require-rls` keeps this requirement explicit
+for callers that expect a migrated schema. The controller runs
+`--reconcile-application-schema` only after Flyway has committed every migration
+in the admitted candidate. That post-migration boundary compares the complete
+application-table inventory, both PostgreSQL RLS flags, the exact `pg_policy`
+allowlist, and the seven `app_current_*` helper fingerprints before any runtime
+container can start. It does not pin a Flyway version or migration count; an
+index-only migration is accepted when this final catalog remains exact.
+
+The reviewed current V1-V5 matrix contains eighteen application tables. V5 adds
+only the bounded active-offer index, so the RLS catalog remains unchanged.
+Seventeen tables must
+have both `relrowsecurity` and `relforcerowsecurity` enabled. The sole declared
+exception is the payload-free scheduler index `outbox_dispatch`, with both
+flags disabled and no policy. The policy allowlist contains exactly twenty-four
+tuples, including command, permissive/restrictive mode, roles, `USING`, and
+`WITH CHECK`. V3 created every canonical policy as `PERMISSIVE TO PUBLIC`; this
+is intentional application behavior, not a reason to accept another permissive
+policy. Exact equality rejects an added `USING (true)` policy, a changed
+expression, another role, or another policy name.
+
+After the catalog proof, the controller reconciles database access in one
+transaction. It revokes table, sequence, function, type, column, `PUBLIC`, and
+runtime grants; reapplies deny-only owner defaults; grants CRUD on exactly the
+eighteen declared application tables; and grants `EXECUTE` only on the seven
+RLS context helpers. It grants nothing on sequences or types and no direct
+execution of the V4 trigger helper. The final proof compares every effective
+privilege, including grant options. Therefore `public.flyway_schema_history`
+and any unknown future object remain inaccessible to the runtime without a
+reviewed contract update. Reconciliation is idempotent and completes before any
+runtime container can start. A PostgreSQL 17.10 integration test applies the
+versioned V1-V5 fixture, then proves reconciliation and its no-op second pass.
+
+V1 installs `btree_gist` 1.7 in `public`, owned by `parkventory_owner`.
+PostgreSQL keeps the extension's 188 C routines and six base `gbtreekey*` types
+owned by `platform_admin`. The proof follows `pg_depend` membership and pins
+both member inventories by count and identity fingerprint. Non-extension
+routines and standalone application types must still belong to
+`parkventory_owner`. Each extension routine or type
+may expose an ACL only to its own object owner. `PUBLIC` and
+`parkventory_runtime` receive no extension function or type privilege. The
+seven reviewed context helpers remain the only runtime function exception.
+PostgreSQL array types remain outside the direct ACL inventory because their
+usage follows the element type. The integration test proves that revoking the
+six extension base types also removes runtime usage of their generated arrays,
+while GiST exclusion constraints still accept normal runtime writes.
+
 The application
 contract keeps the evidence digest empty in this change. A later admitted
 digest is not sufficient by itself: the application controller rehashes the

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -130,6 +131,58 @@ class ParkventoryPostgresTests(unittest.TestCase):
         self.assertTrue(contract["network"]["internal"])
         self.assertFalse(contract["network"]["published_postgres_port"])
         self.assertFalse(contract["network"]["tls"])
+        rls = contract["row_level_security"]
+        self.assertEqual(
+            rls["extensions"],
+            [
+                {
+                    "name": "btree_gist",
+                    "version": "1.7",
+                    "schema": "public",
+                    "owner": "parkventory_owner",
+                    "member_owner": "platform_admin",
+                    "routine_members": {
+                        "count": 188,
+                        "identity_sha256": (
+                            "sha256:40dbd8d5fc3f5340d65f078738049ccdc9249a8d63fc2cbb06a470982602142e"
+                        ),
+                    },
+                    "type_members": {
+                        "count": 6,
+                        "identity_sha256": (
+                            "sha256:8866390c21998f6e60995a60fd3edf5fc8ebc480b76b5701628ed4dbf5e86828"
+                        ),
+                    },
+                }
+            ],
+        )
+        self.assertEqual(len(rls["tables"]), 18)
+        self.assertEqual(len(rls["policies"]), 24)
+        self.assertEqual(len(rls["helpers"]), 7)
+        self.assertEqual(len(rls["runtime_access"]["tables"]), 18)
+        self.assertEqual(len(rls["runtime_access"]["functions"]), 7)
+        self.assertEqual(rls["runtime_access"]["sequences"], [])
+        self.assertEqual(rls["runtime_access"]["types"], [])
+        self.assertEqual(
+            [
+                table
+                for table in rls["tables"]
+                if not table["enabled"] or not table["forced"]
+            ],
+            [
+                {
+                    "table": "outbox_dispatch",
+                    "enabled": False,
+                    "forced": False,
+                }
+            ],
+        )
+        self.assertTrue(
+            all(policy["permissive"] for policy in rls["policies"])
+        )
+        self.assertTrue(
+            all(policy["roles"] == ["PUBLIC"] for policy in rls["policies"])
+        )
         self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
 
     def test_apply_sql_separates_owner_migrator_and_runtime(self) -> None:
@@ -171,7 +224,16 @@ class ParkventoryPostgresTests(unittest.TestCase):
             sql,
         )
         self.assertIn("ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner", sql)
-        self.assertIn("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES", sql)
+        self.assertNotIn(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES",
+            sql,
+        )
+        self.assertNotIn(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES",
+            sql,
+        )
+        self.assertNotIn("GRANT EXECUTE ON ALL FUNCTIONS", sql)
+        self.assertNotIn("GRANT USAGE ON TYPES", sql)
         self.assertNotIn("GRANT CREATE ON SCHEMA public TO parkventory_runtime", sql)
 
     def test_observation_is_exact_and_evidence_is_canonical(self) -> None:
@@ -247,12 +309,12 @@ class ParkventoryPostgresTests(unittest.TestCase):
             self.assertFalse(document["proof"][key])
         for key in (
             "all_relations_owned",
-            "runtime_relation_privileges_exact",
-            "runtime_sequence_privileges_exact",
-            "all_routines_owned",
-            "runtime_routine_privileges_exact",
-            "all_types_owned",
-            "runtime_type_privileges_exact",
+            "runtime_relation_privileges_bounded",
+            "runtime_sequence_privileges_bounded",
+            "routine_ownership_bounded",
+            "runtime_routine_privileges_bounded",
+            "type_ownership_bounded",
+            "runtime_type_privileges_bounded",
         ):
             self.assertTrue(document["proof"][key])
         self.assertFalse(document["transport"]["tls"])
@@ -279,6 +341,331 @@ class ParkventoryPostgresTests(unittest.TestCase):
         finally:
             PROVISIONER.psql = original
 
+    def test_postmigration_rls_proof_is_exact_and_catalog_backed(self) -> None:
+        base_sql = PROVISIONER.proof_sql()
+        for fragment in (
+            "extension_dependency.classid='pg_proc'::regclass",
+            "extension_dependency.classid='pg_type'::regclass",
+            "extension.extname<>'btree_gist'",
+            "extension.extversion<>'1.7'",
+            "a.grantee=p.proowner",
+            "a.grantee<>t.typowner",
+        ):
+            self.assertIn(fragment, base_sql)
+        sql = PROVISIONER.rls_proof_sql()
+        for catalog_field in (
+            "relrowsecurity",
+            "relforcerowsecurity",
+            "pg_policy",
+            "polpermissive",
+            "polroles",
+            "pg_get_expr",
+            "pg_get_functiondef",
+            "has_table_privilege",
+            "pg_depend",
+            "pg_extension",
+        ):
+            self.assertIn(catalog_field, sql)
+
+        responses = iter(
+            (
+                json.dumps(PROVISIONER.EXPECTED_PROOF),
+                json.dumps(PROVISIONER.EXPECTED_RLS),
+            )
+        )
+        original_psql = PROVISIONER.psql
+        original_fingerprint = PROVISIONER.fingerprint_rls_helpers
+        original_extension_fingerprint = (
+            PROVISIONER.fingerprint_extension_members
+        )
+        try:
+            PROVISIONER.psql = (
+                lambda container, database, statement: next(responses)
+            )
+            PROVISIONER.fingerprint_rls_helpers = lambda proof: proof
+            PROVISIONER.fingerprint_extension_members = lambda proof: proof
+            proof = PROVISIONER.observe(
+                "postgres-container",
+                require_rls=True,
+            )
+        finally:
+            PROVISIONER.psql = original_psql
+            PROVISIONER.fingerprint_rls_helpers = original_fingerprint
+            PROVISIONER.fingerprint_extension_members = (
+                original_extension_fingerprint
+            )
+        self.assertEqual(proof, PROVISIONER.EXPECTED_PROOF)
+
+    def test_postmigration_rls_proof_rejects_hostile_catalog_changes(self) -> None:
+        def rejects(rls_proof: dict[str, object]) -> None:
+            responses = iter(
+                (
+                    json.dumps(PROVISIONER.EXPECTED_PROOF),
+                    json.dumps(rls_proof),
+                )
+            )
+            original_psql = PROVISIONER.psql
+            original_fingerprint = PROVISIONER.fingerprint_rls_helpers
+            original_extension_fingerprint = (
+                PROVISIONER.fingerprint_extension_members
+            )
+            try:
+                PROVISIONER.psql = (
+                    lambda container, database, statement: next(responses)
+                )
+                PROVISIONER.fingerprint_rls_helpers = lambda proof: proof
+                PROVISIONER.fingerprint_extension_members = lambda proof: proof
+                with self.assertRaisesRegex(
+                    PROVISIONER.ProvisionError,
+                    "row-level security|runtime database access",
+                ):
+                    PROVISIONER.observe(
+                        "postgres-container",
+                        require_rls=True,
+                    )
+            finally:
+                PROVISIONER.psql = original_psql
+                PROVISIONER.fingerprint_rls_helpers = original_fingerprint
+                PROVISIONER.fingerprint_extension_members = (
+                    original_extension_fingerprint
+                )
+
+        disabled = copy.deepcopy(PROVISIONER.EXPECTED_RLS)
+        disabled["tables"][0]["enabled"] = False
+        no_force = copy.deepcopy(PROVISIONER.EXPECTED_RLS)
+        no_force["tables"][0]["forced"] = False
+        weakened = copy.deepcopy(PROVISIONER.EXPECTED_RLS)
+        weakened["policies"][0]["using"] = "true"
+        weakened["policies"][0]["with_check"] = "true"
+        added = copy.deepcopy(PROVISIONER.EXPECTED_RLS)
+        added["policies"].append(
+            {
+                "table": "admin_claim",
+                "name": "admin_claim_permissive_bypass",
+                "command": "ALL",
+                "permissive": True,
+                "roles": ["PUBLIC"],
+                "using": "true",
+                "with_check": "true",
+            }
+        )
+        unexpected_runtime_table = copy.deepcopy(PROVISIONER.EXPECTED_RLS)
+        unexpected_runtime_table["runtime_access"]["tables"].append(
+            {
+                "table": "flyway_schema_history",
+                "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"],
+            }
+        )
+        unexpected_extension_version = copy.deepcopy(PROVISIONER.EXPECTED_RLS)
+        unexpected_extension_version["extensions"][0]["version"] = "1.8"
+
+        for label, proof in (
+            ("disabled RLS", disabled),
+            ("removed FORCE RLS", no_force),
+            ("permissive true policy", weakened),
+            ("additional permissive policy", added),
+            ("undeclared runtime table", unexpected_runtime_table),
+            ("unexpected extension version", unexpected_extension_version),
+        ):
+            with self.subTest(label):
+                rejects(proof)
+
+    def test_rls_helper_fingerprint_rejects_permissive_redefinition(self) -> None:
+        helper = copy.deepcopy(PROVISIONER.EXPECTED_RLS_HELPERS[0])
+        expected_digest = helper.pop("definition_sha256")
+        definition = (
+            "CREATE OR REPLACE FUNCTION public.app_current_identity_user_id()\n"
+            " RETURNS uuid\n"
+            " LANGUAGE sql\n"
+            " STABLE PARALLEL SAFE\n"
+            " SET search_path TO 'pg_catalog'\n"
+            "AS $function$\n"
+            "    SELECT NULLIF(current_setting('app.identity_user_id', true), '')::UUID\n"
+            "$function$\n"
+        )
+        helper["definition"] = definition
+        canonical = PROVISIONER.fingerprint_rls_helpers({"helpers": [helper]})
+        self.assertEqual(
+            canonical["helpers"][0]["definition_sha256"],
+            expected_digest,
+        )
+
+        helper = copy.deepcopy(PROVISIONER.EXPECTED_RLS_HELPERS[0])
+        helper.pop("definition_sha256")
+        helper["definition"] = definition.replace(
+            "SELECT NULLIF(current_setting('app.identity_user_id', true), '')::UUID",
+            "SELECT '00000000-0000-0000-0000-000000000000'::UUID",
+        )
+        permissive = PROVISIONER.fingerprint_rls_helpers({"helpers": [helper]})
+        self.assertNotEqual(
+            permissive["helpers"][0]["definition_sha256"],
+            expected_digest,
+        )
+
+    def test_application_acl_reconciliation_is_default_deny_and_allowlisted(
+        self,
+    ) -> None:
+        before = copy.deepcopy(PROVISIONER.EXPECTED_RLS)
+        before["runtime_access"]["tables"].append(
+            {
+                "table": "flyway_schema_history",
+                "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"],
+            }
+        )
+        statements: list[str] = []
+        original_observe_rls = PROVISIONER.observe_rls
+        original_read_database_proof = PROVISIONER.read_database_proof
+        original_observe = PROVISIONER.observe
+        original_psql = PROVISIONER.psql
+        try:
+            PROVISIONER.observe_rls = (
+                lambda container, *, require_runtime_access: before
+            )
+            PROVISIONER.read_database_proof = (
+                lambda container: copy.deepcopy(PROVISIONER.EXPECTED_PROOF)
+            )
+            PROVISIONER.observe = (
+                lambda container, *, require_rls: copy.deepcopy(
+                    PROVISIONER.EXPECTED_PROOF
+                )
+            )
+            PROVISIONER.psql = (
+                lambda container, database, sql: statements.append(sql) or ""
+            )
+            self.assertTrue(
+                PROVISIONER.reconcile_application_acl("postgres-container")
+            )
+        finally:
+            PROVISIONER.observe_rls = original_observe_rls
+            PROVISIONER.read_database_proof = original_read_database_proof
+            PROVISIONER.observe = original_observe
+            PROVISIONER.psql = original_psql
+        self.assertEqual(len(statements), 1)
+        sql = statements[0]
+        self.assertIn(
+            "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public",
+            sql,
+        )
+        self.assertIn("FROM PUBLIC, parkventory_runtime", sql)
+        self.assertIn(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.admin_claim",
+            sql,
+        )
+        self.assertIn("public.user_email", sql)
+        self.assertNotIn("flyway_schema_history", sql)
+        for helper in PROVISIONER.EXPECTED_RLS_HELPERS:
+            self.assertIn(f"public.{helper['name']}()", sql)
+        self.assertNotIn("app_fill_outbox_dispatch_aggregate()", sql)
+        self.assertNotIn("GRANT EXECUTE ON ALL FUNCTIONS", sql)
+        self.assertNotIn("GRANT USAGE, SELECT, UPDATE", sql)
+
+        original_observe_rls = PROVISIONER.observe_rls
+        original_read_database_proof = PROVISIONER.read_database_proof
+        original_psql = PROVISIONER.psql
+        try:
+            PROVISIONER.observe_rls = (
+                lambda container, *, require_runtime_access: copy.deepcopy(
+                    PROVISIONER.EXPECTED_RLS
+                )
+            )
+            PROVISIONER.read_database_proof = (
+                lambda container: copy.deepcopy(PROVISIONER.EXPECTED_PROOF)
+            )
+            PROVISIONER.psql = lambda *args, **kwargs: self.fail(
+                "idempotent reconciliation must not execute SQL"
+            )
+            self.assertFalse(
+                PROVISIONER.reconcile_application_acl("postgres-container")
+            )
+        finally:
+            PROVISIONER.observe_rls = original_observe_rls
+            PROVISIONER.read_database_proof = original_read_database_proof
+            PROVISIONER.psql = original_psql
+
+    def test_application_acl_reconciliation_repairs_base_acl_only_drift(
+        self,
+    ) -> None:
+        drifted = copy.deepcopy(PROVISIONER.EXPECTED_PROOF)
+        drifted["column_acl_present"] = True
+        statements: list[str] = []
+        original_observe_rls = PROVISIONER.observe_rls
+        original_read_database_proof = PROVISIONER.read_database_proof
+        original_observe = PROVISIONER.observe
+        original_psql = PROVISIONER.psql
+        try:
+            PROVISIONER.observe_rls = (
+                lambda container, *, require_runtime_access: copy.deepcopy(
+                    PROVISIONER.EXPECTED_RLS
+                )
+            )
+            PROVISIONER.read_database_proof = lambda container: drifted
+            PROVISIONER.observe = (
+                lambda container, *, require_rls: copy.deepcopy(
+                    PROVISIONER.EXPECTED_PROOF
+                )
+            )
+            PROVISIONER.psql = (
+                lambda container, database, sql: statements.append(sql) or ""
+            )
+            self.assertTrue(
+                PROVISIONER.reconcile_application_acl("postgres-container")
+            )
+        finally:
+            PROVISIONER.observe_rls = original_observe_rls
+            PROVISIONER.read_database_proof = original_read_database_proof
+            PROVISIONER.observe = original_observe
+            PROVISIONER.psql = original_psql
+        self.assertEqual(len(statements), 1)
+        self.assertIn("DO $column_acl$", statements[0])
+
+    def test_check_auto_requires_rls_for_partial_schema(self) -> None:
+        calls: list[bool] = []
+        original_schema_present = PROVISIONER.application_schema_present
+        original_observe = PROVISIONER.observe
+        try:
+            PROVISIONER.observe = (
+                lambda container, *, require_rls: calls.append(require_rls)
+                or copy.deepcopy(PROVISIONER.EXPECTED_PROOF)
+            )
+            for schema_present, explicit in (
+                (False, False),
+                (False, True),
+                (True, False),
+                (True, True),
+            ):
+                PROVISIONER.application_schema_present = (
+                    lambda container, present=schema_present: present
+                )
+                PROVISIONER.check_database(
+                    "postgres-container",
+                    require_rls=explicit,
+                )
+        finally:
+            PROVISIONER.application_schema_present = original_schema_present
+            PROVISIONER.observe = original_observe
+        self.assertEqual(calls, [False, True, True, True])
+
+    def test_partial_schema_detection_covers_all_public_object_kinds(self) -> None:
+        statements: list[str] = []
+        original_psql = PROVISIONER.psql
+        try:
+            PROVISIONER.psql = (
+                lambda container, database, sql: statements.append(sql) or "false"
+            )
+            self.assertFalse(
+                PROVISIONER.application_schema_present("postgres-container")
+            )
+        finally:
+            PROVISIONER.psql = original_psql
+        self.assertEqual(len(statements), 1)
+        sql = statements[0]
+        self.assertIn("relation.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')", sql)
+        self.assertIn("relation.relname <> 'flyway_schema_history'", sql)
+        self.assertIn("FROM pg_policy policy", sql)
+        self.assertIn("FROM pg_proc routine", sql)
+        self.assertIn("FROM pg_type type", sql)
+        self.assertIn("FROM pg_extension extension", sql)
+
     def test_check_requires_the_effective_postgres_network_attachment(self) -> None:
         calls: list[bool] = []
         original_parse_args = PROVISIONER.parse_args
@@ -289,6 +676,7 @@ class ParkventoryPostgresTests(unittest.TestCase):
             PROVISIONER.parse_args = lambda: SimpleNamespace(
                 mode="check",
                 validate_contract=False,
+                require_rls=False,
                 contract=PROVISIONER.CONTRACT_PATH,
             )
             PROVISIONER.os.geteuid = lambda: 0

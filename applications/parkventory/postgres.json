@@ -18,6 +18,389 @@
     "migrator": "parkventory_migrator",
     "runtime": "parkventory_runtime"
   },
+  "row_level_security": {
+    "extensions": [
+      {
+        "name": "btree_gist",
+        "version": "1.7",
+        "schema": "public",
+        "owner": "parkventory_owner",
+        "member_owner": "platform_admin",
+        "routine_members": {
+          "count": 188,
+          "identity_sha256": "sha256:40dbd8d5fc3f5340d65f078738049ccdc9249a8d63fc2cbb06a470982602142e"
+        },
+        "type_members": {
+          "count": 6,
+          "identity_sha256": "sha256:8866390c21998f6e60995a60fd3edf5fc8ebc480b76b5701628ed4dbf5e86828"
+        }
+      }
+    ],
+    "tables": [
+      {"table": "admin_claim", "enabled": true, "forced": true},
+      {"table": "app_session", "enabled": true, "forced": true},
+      {"table": "audit_event", "enabled": true, "forced": true},
+      {"table": "availability_offer", "enabled": true, "forced": true},
+      {"table": "idempotency_record", "enabled": true, "forced": true},
+      {"table": "invitation", "enabled": true, "forced": true},
+      {"table": "magic_link_request", "enabled": true, "forced": true},
+      {"table": "membership", "enabled": true, "forced": true},
+      {"table": "organization", "enabled": true, "forced": true},
+      {"table": "organization_domain", "enabled": true, "forced": true},
+      {"table": "outbox_dispatch", "enabled": false, "forced": false},
+      {"table": "outbox_event", "enabled": true, "forced": true},
+      {"table": "parking_site", "enabled": true, "forced": true},
+      {"table": "parking_spot", "enabled": true, "forced": true},
+      {"table": "reservation", "enabled": true, "forced": true},
+      {"table": "spot_assignment", "enabled": true, "forced": true},
+      {"table": "user_account", "enabled": true, "forced": true},
+      {"table": "user_email", "enabled": true, "forced": true}
+    ],
+    "policies": [
+      {
+        "table": "admin_claim",
+        "name": "admin_claim_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "app_session",
+        "name": "app_session_create",
+        "command": "INSERT",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": null,
+        "with_check": "((organization_id = app_current_organization_id()) AND (user_account_id = app_current_identity_user_id()))"
+      },
+      {
+        "table": "app_session",
+        "name": "app_session_read",
+        "command": "SELECT",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "((token_hash)::text = app_current_session_hash())",
+        "with_check": null
+      },
+      {
+        "table": "app_session",
+        "name": "app_session_revoke",
+        "command": "UPDATE",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "((token_hash)::text = app_current_session_hash())",
+        "with_check": "((token_hash)::text = app_current_session_hash())"
+      },
+      {
+        "table": "audit_event",
+        "name": "audit_event_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "availability_offer",
+        "name": "availability_offer_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "idempotency_record",
+        "name": "idempotency_record_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "invitation",
+        "name": "invitation_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "invitation",
+        "name": "invitation_verified_bootstrap",
+        "command": "SELECT",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "((normalized_email = app_current_verified_email()) AND (status = 'PENDING'::text) AND (expires_at > now()))",
+        "with_check": null
+      },
+      {
+        "table": "magic_link_request",
+        "name": "magic_link_request_consume",
+        "command": "UPDATE",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "((token_hash)::text = app_current_magic_link_hash())",
+        "with_check": "((token_hash)::text = app_current_magic_link_hash())"
+      },
+      {
+        "table": "magic_link_request",
+        "name": "magic_link_request_create",
+        "command": "INSERT",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": null,
+        "with_check": "(normalized_email = app_current_requested_email())"
+      },
+      {
+        "table": "magic_link_request",
+        "name": "magic_link_request_invalidate",
+        "command": "UPDATE",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(normalized_email = app_current_requested_email())",
+        "with_check": "(normalized_email = app_current_requested_email())"
+      },
+      {
+        "table": "magic_link_request",
+        "name": "magic_link_request_read",
+        "command": "SELECT",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "((normalized_email = app_current_requested_email()) OR ((token_hash)::text = app_current_magic_link_hash()))",
+        "with_check": null
+      },
+      {
+        "table": "membership",
+        "name": "membership_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "organization",
+        "name": "organization_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(id = app_current_organization_id())",
+        "with_check": "(id = app_current_organization_id())"
+      },
+      {
+        "table": "organization_domain",
+        "name": "organization_domain_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "organization_domain",
+        "name": "organization_domain_verified_bootstrap",
+        "command": "SELECT",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "((normalized_domain = app_current_verified_domain()) AND (status = ANY (ARRAY['CLAIMED'::text, 'VERIFIED'::text])))",
+        "with_check": null
+      },
+      {
+        "table": "outbox_event",
+        "name": "outbox_event_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "parking_site",
+        "name": "parking_site_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "parking_spot",
+        "name": "parking_spot_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "reservation",
+        "name": "reservation_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "spot_assignment",
+        "name": "spot_assignment_tenant_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "(organization_id = app_current_organization_id())",
+        "with_check": "(organization_id = app_current_organization_id())"
+      },
+      {
+        "table": "user_account",
+        "name": "user_account_identity_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "((id = app_current_identity_user_id()) OR (EXISTS ( SELECT 1\n   FROM membership\n  WHERE ((membership.user_account_id = user_account.id) AND (membership.organization_id = app_current_organization_id())))))",
+        "with_check": "(id = app_current_identity_user_id())"
+      },
+      {
+        "table": "user_email",
+        "name": "user_email_identity_isolation",
+        "command": "ALL",
+        "permissive": true,
+        "roles": ["PUBLIC"],
+        "using": "((normalized_email = app_current_verified_email()) OR (user_account_id = app_current_identity_user_id()) OR (EXISTS ( SELECT 1\n   FROM membership\n  WHERE ((membership.user_account_id = user_email.user_account_id) AND (membership.organization_id = app_current_organization_id())))))",
+        "with_check": "((normalized_email = app_current_verified_email()) AND (user_account_id = app_current_identity_user_id()))"
+      }
+    ],
+    "helpers": [
+      {
+        "name": "app_current_identity_user_id",
+        "arguments": "",
+        "result": "uuid",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": false,
+        "leakproof": false,
+        "strict": false,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": "sha256:4fb6b06f51d8bb29e1a63442a4841f4f6c35b2e4796b4dddbc4927eac5bcaf0d"
+      },
+      {
+        "name": "app_current_magic_link_hash",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": false,
+        "leakproof": false,
+        "strict": false,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": "sha256:6f181717e75e485bccdf2dd0f095e6fec037c29a9077aa3cea27adeef148e41b"
+      },
+      {
+        "name": "app_current_organization_id",
+        "arguments": "",
+        "result": "uuid",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": false,
+        "leakproof": false,
+        "strict": false,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": "sha256:b5ebd110c387203c5d50397a161a0a00df05e8018d1b8258c935f7b44ff00b50"
+      },
+      {
+        "name": "app_current_requested_email",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": false,
+        "leakproof": false,
+        "strict": false,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": "sha256:3d7a8501edae571f5cf17f8dcf095f5024a280618e06575bef0cecfd450d3047"
+      },
+      {
+        "name": "app_current_session_hash",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": false,
+        "leakproof": false,
+        "strict": false,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": "sha256:06a50bba6e729c8448bacac15fd63785b90a68c95e107804d7ec518ebeda6f89"
+      },
+      {
+        "name": "app_current_verified_domain",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": false,
+        "leakproof": false,
+        "strict": false,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": "sha256:6ae179542fc06b95da0cad50c958a0c77f076d477ede80b6b2e85c6b29b272b1"
+      },
+      {
+        "name": "app_current_verified_email",
+        "arguments": "",
+        "result": "text",
+        "language": "sql",
+        "volatility": "STABLE",
+        "parallel": "SAFE",
+        "security_definer": false,
+        "leakproof": false,
+        "strict": false,
+        "configuration": ["search_path=pg_catalog"],
+        "definition_sha256": "sha256:33f9ebf2bd828befe652852c30c33dd37bca66b4c311971265e1407866963c0c"
+      }
+    ],
+    "runtime_access": {
+      "tables": [
+        {"table": "admin_claim", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "app_session", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "audit_event", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "availability_offer", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "idempotency_record", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "invitation", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "magic_link_request", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "membership", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "organization", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "organization_domain", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "outbox_dispatch", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "outbox_event", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "parking_site", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "parking_spot", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "reservation", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "spot_assignment", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "user_account", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]},
+        {"table": "user_email", "privileges": ["DELETE", "INSERT", "SELECT", "UPDATE"]}
+      ],
+      "sequences": [],
+      "functions": [
+        {"name": "app_current_identity_user_id", "arguments": "", "privileges": ["EXECUTE"]},
+        {"name": "app_current_magic_link_hash", "arguments": "", "privileges": ["EXECUTE"]},
+        {"name": "app_current_organization_id", "arguments": "", "privileges": ["EXECUTE"]},
+        {"name": "app_current_requested_email", "arguments": "", "privileges": ["EXECUTE"]},
+        {"name": "app_current_session_hash", "arguments": "", "privileges": ["EXECUTE"]},
+        {"name": "app_current_verified_domain", "arguments": "", "privileges": ["EXECUTE"]},
+        {"name": "app_current_verified_email", "arguments": "", "privileges": ["EXECUTE"]}
+      ],
+      "types": []
+    }
+  },
   "network": {
     "name": "db_parkventory",
     "subnet": "172.30.21.0/24",
