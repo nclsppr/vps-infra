@@ -370,6 +370,47 @@ SELECT jsonb_build_object(
             )
             self.assertFalse(PROVISIONER.reconcile_application_acl(container))
 
+            PROVISIONER.psql(
+                container,
+                "parkventory",
+                """
+SET ROLE parkventory_owner;
+CREATE VIEW extension_member_probe AS SELECT 1 AS id;
+ALTER EXTENSION btree_gist ADD VIEW extension_member_probe;
+RESET ROLE;
+""",
+            )
+            with self.assertRaisesRegex(
+                PROVISIONER.ProvisionError,
+                "application extension",
+            ):
+                PROVISIONER.observe(container, require_rls=True)
+            PROVISIONER.psql(
+                container,
+                "parkventory",
+                """
+SET ROLE parkventory_owner;
+ALTER EXTENSION btree_gist DROP VIEW extension_member_probe;
+DROP VIEW extension_member_probe;
+RESET ROLE;
+""",
+            )
+            PROVISIONER.observe(container, require_rls=True)
+
+            PROVISIONER.psql(
+                container,
+                "parkventory",
+                "GRANT MAINTAIN ON TABLE flyway_schema_history "
+                "TO parkventory_runtime;",
+            )
+            with self.assertRaisesRegex(
+                PROVISIONER.ProvisionError,
+                "effective database roles or default privileges",
+            ):
+                PROVISIONER.observe(container, require_rls=True)
+            self.assertTrue(PROVISIONER.reconcile_application_acl(container))
+            PROVISIONER.observe(container, require_rls=True)
+
             stale_runtime_auth = "C" * 64
             PROVISIONER.psql(
                 container,
@@ -406,6 +447,59 @@ ALTER ROLE parkventory_runtime IN DATABASE parkventory
                 runtime_auth,
             )
             PROVISIONER.observe(container, require_rls=True)
+
+            PROVISIONER.psql(
+                container,
+                "postgres",
+                "ALTER ROLE ALL SET lock_timeout TO '5s';",
+            )
+            with self.assertRaisesRegex(
+                PROVISIONER.ProvisionError,
+                "effective database roles or default privileges",
+            ):
+                PROVISIONER.observe(container, require_rls=True)
+            PROVISIONER.psql(
+                container,
+                "postgres",
+                "ALTER ROLE ALL RESET ALL;",
+            )
+            PROVISIONER.observe(container, require_rls=True)
+
+            PROVISIONER.psql(
+                container,
+                "postgres",
+                "ALTER ROLE parkventory_runtime IN DATABASE postgres "
+                "SET statement_timeout TO '5s';",
+            )
+            PROVISIONER.observe(container, require_rls=True)
+            PROVISIONER.apply_database(
+                container,
+                migrator_auth,
+                runtime_auth,
+            )
+            self.assertEqual(
+                PROVISIONER.psql(
+                    container,
+                    "postgres",
+                    """
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_db_role_setting setting
+  WHERE setting.setrole = 'parkventory_runtime'::regrole
+    AND setting.setdatabase = (
+      SELECT oid FROM pg_database WHERE datname = 'postgres'
+    )
+    AND setting.setconfig = ARRAY['statement_timeout=5s']::text[]
+);
+""",
+                ),
+                "t",
+            )
+            PROVISIONER.psql(
+                container,
+                "postgres",
+                "ALTER ROLE parkventory_runtime IN DATABASE postgres RESET ALL;",
+            )
 
             PROVISIONER.psql(
                 container,

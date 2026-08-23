@@ -385,6 +385,12 @@ EXPECTED_PUBLIC_EXTENSIONS: list[dict[str, object]] = [
         "schema": "public",
         "owner": "parkventory_owner",
         "member_owner": "platform_admin",
+        "all_members": {
+            "count": 264,
+            "identity_sha256": (
+                "sha256:52b11efe87483725ab571138cf124124deca29c45d114472055e358b2382aa17"
+            ),
+        },
         "routine_members": {
             "count": 188,
             "identity_sha256": (
@@ -397,7 +403,32 @@ EXPECTED_PUBLIC_EXTENSIONS: list[dict[str, object]] = [
                 "sha256:8866390c21998f6e60995a60fd3edf5fc8ebc480b76b5701628ed4dbf5e86828"
             ),
         },
-    }
+    },
+    {
+        "name": "plpgsql",
+        "version": "1.0",
+        "schema": "pg_catalog",
+        "owner": "platform_admin",
+        "member_owner": "platform_admin",
+        "all_members": {
+            "count": 4,
+            "identity_sha256": (
+                "sha256:9daaf0961466e69fdc380fd1c0066b4fa6b37cc60b25fae14ac54b1f26e4a9f8"
+            ),
+        },
+        "routine_members": {
+            "count": 3,
+            "identity_sha256": (
+                "sha256:2872282c187c13d718ea00e72335763abd665dc0f377e0efaa66bebc1362f885"
+            ),
+        },
+        "type_members": {
+            "count": 0,
+            "identity_sha256": (
+                "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+            ),
+        },
+    },
 ]
 EXPECTED_RLS: dict[str, object] = {
     "extensions": EXPECTED_PUBLIC_EXTENSIONS,
@@ -810,29 +841,7 @@ ALTER ROLE parkventory_owner RESET ALL;
 ALTER ROLE parkventory_migrator RESET ALL;
 ALTER ROLE parkventory_runtime RESET ALL;
 ALTER DATABASE parkventory RESET ALL;
-DO $role_settings$
-DECLARE
-  candidate record;
-BEGIN
-  FOR candidate IN
-    SELECT role.rolname, database.datname
-    FROM pg_db_role_setting setting
-    JOIN pg_roles role ON role.oid = setting.setrole
-    JOIN pg_database database ON database.oid = setting.setdatabase
-    WHERE role.rolname IN (
-      'parkventory_owner',
-      'parkventory_migrator',
-      'parkventory_runtime'
-    )
-  LOOP
-    EXECUTE format(
-      'ALTER ROLE %I IN DATABASE %I RESET ALL',
-      candidate.rolname,
-      candidate.datname
-    );
-  END LOOP;
-END
-$role_settings$;
+ALTER ROLE parkventory_owner IN DATABASE parkventory RESET ALL;
 ALTER ROLE parkventory_migrator IN DATABASE parkventory RESET ALL;
 ALTER ROLE parkventory_runtime IN DATABASE parkventory RESET ALL;
 ALTER ROLE parkventory_migrator IN DATABASE parkventory SET ROLE TO parkventory_owner;
@@ -1092,7 +1101,19 @@ def proof_sql() -> str:
             "'runtime_has_owner_membership', pg_has_role('parkventory_runtime','parkventory_owner','MEMBER')",
             "'migrator_settings', (SELECT COALESCE(array_agg(setting ORDER BY setting),'{}'::text[]) = ARRAY['role=parkventory_owner','search_path=public']::text[] FROM pg_db_role_setting s CROSS JOIN LATERAL unnest(s.setconfig) setting WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory'))",
             "'runtime_settings', (SELECT COALESCE(array_agg(setting ORDER BY setting),'{}'::text[]) = ARRAY['search_path=public']::text[] FROM pg_db_role_setting s CROSS JOIN LATERAL unnest(s.setconfig) setting WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory'))",
-            "'unexpected_role_settings', EXISTS (SELECT 1 FROM pg_db_role_setting s WHERE (s.setrole IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')) AND NOT ((s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory') AND ARRAY(SELECT setting FROM unnest(s.setconfig) setting ORDER BY setting)=ARRAY['role=parkventory_owner','search_path=public']::text[]) OR (s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory') AND ARRAY(SELECT setting FROM unnest(s.setconfig) setting ORDER BY setting)=ARRAY['search_path=public']::text[]))) OR (s.setrole=0 AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory')))",
+            (
+                "'unexpected_role_settings', EXISTS ("
+                "SELECT 1 FROM pg_db_role_setting s WHERE "
+                "(s.setrole=0 AND s.setdatabase IN "
+                "(0,(SELECT oid FROM pg_database WHERE datname='parkventory'))) OR "
+                "(s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') "
+                "AND s.setdatabase IN "
+                "(0,(SELECT oid FROM pg_database WHERE datname='parkventory'))) OR "
+                "(s.setrole IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator'),"
+                "(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')) "
+                "AND s.setdatabase=0)"
+                ")"
+            ),
             "'default_table_privileges', (" + privilege_array.format(object_type="'r'") + ")",
             "'default_sequence_privileges', (" + privilege_array.format(object_type="'S'") + ")",
             "'default_function_privileges', (" + privilege_array.format(object_type="'f'") + ")",
@@ -1105,7 +1126,7 @@ def proof_sql() -> str:
             "'all_relations_owned', NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') AND c.relowner<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'))",
             "'unexpected_relation_grantee', EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl,acldefault(CASE WHEN c.relkind='S' THEN 'S'::\"char\" ELSE 'r'::\"char\" END,c.relowner))) a WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') AND a.grantee NOT IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')))",
             "'column_acl_present', EXISTS (SELECT 1 FROM pg_attribute attribute JOIN pg_class relation ON relation.oid=attribute.attrelid JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace CROSS JOIN LATERAL aclexplode(attribute.attacl) acl WHERE namespace.nspname='public' AND relation.relkind IN ('r','p','v','m','f') AND attribute.attnum>0 AND NOT attribute.attisdropped)",
-            "'runtime_relation_privileges_bounded', NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f') AND c.relname NOT IN ('admin_claim','app_session','audit_event','availability_offer','idempotency_record','invitation','magic_link_request','membership','organization','organization_domain','outbox_dispatch','outbox_event','parking_site','parking_spot','reservation','spot_assignment','user_account','user_email') AND (has_table_privilege('parkventory_runtime',c.oid,'SELECT') OR has_table_privilege('parkventory_runtime',c.oid,'INSERT') OR has_table_privilege('parkventory_runtime',c.oid,'UPDATE') OR has_table_privilege('parkventory_runtime',c.oid,'DELETE') OR has_table_privilege('parkventory_runtime',c.oid,'TRUNCATE') OR has_table_privilege('parkventory_runtime',c.oid,'REFERENCES') OR has_table_privilege('parkventory_runtime',c.oid,'TRIGGER')))",
+            "'runtime_relation_privileges_bounded', NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f') AND c.relname NOT IN ('admin_claim','app_session','audit_event','availability_offer','idempotency_record','invitation','magic_link_request','membership','organization','organization_domain','outbox_dispatch','outbox_event','parking_site','parking_spot','reservation','spot_assignment','user_account','user_email') AND (has_table_privilege('parkventory_runtime',c.oid,'SELECT') OR has_table_privilege('parkventory_runtime',c.oid,'INSERT') OR has_table_privilege('parkventory_runtime',c.oid,'UPDATE') OR has_table_privilege('parkventory_runtime',c.oid,'DELETE') OR has_table_privilege('parkventory_runtime',c.oid,'TRUNCATE') OR has_table_privilege('parkventory_runtime',c.oid,'REFERENCES') OR has_table_privilege('parkventory_runtime',c.oid,'TRIGGER') OR has_table_privilege('parkventory_runtime',c.oid,'MAINTAIN')))",
             "'runtime_sequence_privileges_bounded', NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='S' AND (has_sequence_privilege('parkventory_runtime',c.oid,'USAGE') OR has_sequence_privilege('parkventory_runtime',c.oid,'SELECT') OR has_sequence_privilege('parkventory_runtime',c.oid,'UPDATE')))",
             "'routine_ownership_bounded', NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace LEFT JOIN pg_depend extension_dependency ON extension_dependency.classid='pg_proc'::regclass AND extension_dependency.objid=p.oid AND extension_dependency.objsubid=0 AND extension_dependency.refclassid='pg_extension'::regclass AND extension_dependency.deptype='e' LEFT JOIN pg_extension extension ON extension.oid=extension_dependency.refobjid LEFT JOIN pg_namespace extension_namespace ON extension_namespace.oid=extension.extnamespace WHERE n.nspname='public' AND ((extension.oid IS NULL AND p.proowner<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner')) OR (extension.oid IS NOT NULL AND (extension.extname<>'btree_gist' OR extension.extversion<>'1.7' OR extension_namespace.nspname<>'public' OR extension.extowner<>(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') OR p.proowner<>(SELECT oid FROM pg_roles WHERE rolname='platform_admin')))))",
             "'unexpected_routine_grantee', EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace LEFT JOIN pg_depend extension_dependency ON extension_dependency.classid='pg_proc'::regclass AND extension_dependency.objid=p.oid AND extension_dependency.objsubid=0 AND extension_dependency.refclassid='pg_extension'::regclass AND extension_dependency.deptype='e' CROSS JOIN LATERAL aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) a WHERE n.nspname='public' AND NOT (a.grantee=p.proowner OR (extension_dependency.objid IS NULL AND p.proowner=(SELECT oid FROM pg_roles WHERE rolname='parkventory_owner') AND p.proname IN ('app_current_identity_user_id','app_current_magic_link_hash','app_current_organization_id','app_current_requested_email','app_current_session_hash','app_current_verified_domain','app_current_verified_email') AND pg_get_function_identity_arguments(p.oid)='' AND a.grantee=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime'))))",
@@ -1163,6 +1184,33 @@ SELECT jsonb_build_object(
               AND type.typelem = 0
           ) member
         ),
+        'all_members', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'catalog', dependency.classid::regclass::text,
+              'type', identity.type,
+              'schema', identity.schema,
+              'name', identity.name,
+              'identity', identity.identity,
+              'subobject', dependency.objsubid
+            )
+            ORDER BY dependency.classid::regclass::text,
+              identity.type,
+              identity.schema,
+              identity.name,
+              identity.identity,
+              dependency.objsubid
+          )
+          FROM pg_depend dependency
+          CROSS JOIN LATERAL pg_identify_object(
+            dependency.classid,
+            dependency.objid,
+            dependency.objsubid
+          ) identity
+          WHERE dependency.refclassid = 'pg_extension'::regclass
+            AND dependency.refobjid = extension.oid
+            AND dependency.deptype = 'e'
+        ), '[]'::jsonb),
         'routine_members', COALESCE((
           SELECT jsonb_agg(
             jsonb_build_object(
@@ -1216,7 +1264,6 @@ SELECT jsonb_build_object(
     )
     FROM pg_extension extension
     JOIN pg_namespace namespace ON namespace.oid = extension.extnamespace
-    WHERE namespace.nspname = 'public'
   ), '[]'::jsonb),
   'tables', COALESCE((
     SELECT jsonb_agg(
@@ -1312,6 +1359,7 @@ SELECT jsonb_build_object(
           FROM (VALUES
             ('DELETE'), ('DELETE WITH GRANT OPTION'),
             ('INSERT'), ('INSERT WITH GRANT OPTION'),
+            ('MAINTAIN'), ('MAINTAIN WITH GRANT OPTION'),
             ('REFERENCES'), ('REFERENCES WITH GRANT OPTION'),
             ('SELECT'), ('SELECT WITH GRANT OPTION'),
             ('TRIGGER'), ('TRIGGER WITH GRANT OPTION'),
@@ -1543,7 +1591,7 @@ def fingerprint_extension_members(proof: object) -> object:
     for extension in proof["extensions"]:
         if not isinstance(extension, dict):
             return None
-        for key in ("routine_members", "type_members"):
+        for key in ("all_members", "routine_members", "type_members"):
             members = extension.get(key)
             if not isinstance(members, list):
                 return None

@@ -143,6 +143,12 @@ class ParkventoryPostgresTests(unittest.TestCase):
                     "schema": "public",
                     "owner": "parkventory_owner",
                     "member_owner": "platform_admin",
+                    "all_members": {
+                        "count": 264,
+                        "identity_sha256": (
+                            "sha256:52b11efe87483725ab571138cf124124deca29c45d114472055e358b2382aa17"
+                        ),
+                    },
                     "routine_members": {
                         "count": 188,
                         "identity_sha256": (
@@ -155,7 +161,32 @@ class ParkventoryPostgresTests(unittest.TestCase):
                             "sha256:8866390c21998f6e60995a60fd3edf5fc8ebc480b76b5701628ed4dbf5e86828"
                         ),
                     },
-                }
+                },
+                {
+                    "name": "plpgsql",
+                    "version": "1.0",
+                    "schema": "pg_catalog",
+                    "owner": "platform_admin",
+                    "member_owner": "platform_admin",
+                    "all_members": {
+                        "count": 4,
+                        "identity_sha256": (
+                            "sha256:9daaf0961466e69fdc380fd1c0066b4fa6b37cc60b25fae14ac54b1f26e4a9f8"
+                        ),
+                    },
+                    "routine_members": {
+                        "count": 3,
+                        "identity_sha256": (
+                            "sha256:2872282c187c13d718ea00e72335763abd665dc0f377e0efaa66bebc1362f885"
+                        ),
+                    },
+                    "type_members": {
+                        "count": 0,
+                        "identity_sha256": (
+                            "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+                        ),
+                    },
+                },
             ],
         )
         self.assertEqual(len(rls["tables"]), 18)
@@ -217,8 +248,10 @@ class ParkventoryPostgresTests(unittest.TestCase):
         self.assertIn("ALTER ROLE parkventory_migrator RESET ALL", sql)
         self.assertIn("ALTER ROLE parkventory_runtime RESET ALL", sql)
         self.assertIn("ALTER DATABASE parkventory RESET ALL", sql)
-        self.assertIn("pg_db_role_setting setting", sql)
-        self.assertIn("ALTER ROLE %I IN DATABASE %I RESET ALL", sql)
+        self.assertIn(
+            "ALTER ROLE parkventory_owner IN DATABASE parkventory RESET ALL",
+            sql,
+        )
         self.assertIn(
             "ALTER ROLE parkventory_migrator IN DATABASE parkventory RESET ALL",
             sql,
@@ -445,10 +478,13 @@ class ParkventoryPostgresTests(unittest.TestCase):
             "ARRAY['role=parkventory_owner','search_path=public']::text[]",
             "ARRAY['search_path=public']::text[]",
             "left(n.nspname,3)<>'pg_'",
-            "s.setrole=0 AND s.setdatabase=",
+            "has_table_privilege('parkventory_runtime',c.oid,'MAINTAIN')",
+            "s.setrole=0 AND s.setdatabase IN",
+            "s.setdatabase IN (0,",
         ):
             self.assertIn(fragment, base_sql)
         sql = PROVISIONER.rls_proof_sql()
+        self.assertIn("('MAINTAIN'), ('MAINTAIN WITH GRANT OPTION')", sql)
         for catalog_field in (
             "relrowsecurity",
             "relforcerowsecurity",
@@ -460,6 +496,7 @@ class ParkventoryPostgresTests(unittest.TestCase):
             "has_table_privilege",
             "pg_depend",
             "pg_extension",
+            "pg_identify_object",
         ):
             self.assertIn(catalog_field, sql)
 
