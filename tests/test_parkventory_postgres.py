@@ -211,6 +211,14 @@ class ParkventoryPostgresTests(unittest.TestCase):
         self.assertIn("WITH ADMIN FALSE, INHERIT FALSE, SET TRUE", sql)
         self.assertIn("REVOKE %I FROM %I", sql)
         self.assertIn("ALTER DATABASE parkventory OWNER TO parkventory_owner", sql)
+        self.assertIn(
+            "ALTER ROLE parkventory_migrator IN DATABASE parkventory RESET ALL",
+            sql,
+        )
+        self.assertIn(
+            "ALTER ROLE parkventory_runtime IN DATABASE parkventory RESET ALL",
+            sql,
+        )
         self.assertIn("REVOKE ALL PRIVILEGES ON DATABASE parkventory FROM PUBLIC", sql)
         self.assertIn("unexpected_role", sql)
         self.assertIn("GRANT USAGE ON SCHEMA public TO parkventory_runtime", sql)
@@ -235,6 +243,80 @@ class ParkventoryPostgresTests(unittest.TestCase):
         self.assertNotIn("GRANT EXECUTE ON ALL FUNCTIONS", sql)
         self.assertNotIn("GRANT USAGE ON TYPES", sql)
         self.assertNotIn("GRANT CREATE ON SCHEMA public TO parkventory_runtime", sql)
+
+    def test_credential_proof_uses_network_password_auth_without_argv_secret(
+        self,
+    ) -> None:
+        passwords = {
+            "parkventory_migrator": "A" * 64,
+            "parkventory_runtime": "B" * 64,
+        }
+        identities = {
+            "parkventory_migrator": (
+                "parkventory_migrator|parkventory_owner|parkventory\n"
+            ),
+            "parkventory_runtime": (
+                "parkventory_runtime|parkventory_runtime|parkventory\n"
+            ),
+        }
+        calls: list[tuple[list[str], dict[str, str] | None]] = []
+        original_command = PROVISIONER.command
+        try:
+
+            def authenticate(
+                arguments: list[str],
+                *,
+                input_text: str | None = None,
+                environment: dict[str, str] | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                del input_text
+                calls.append((arguments, environment))
+                role = arguments[arguments.index("--username") + 1]
+                assert environment is not None
+                accepted = environment.get("PGPASSWORD") == passwords[role]
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0 if accepted else 2,
+                    identities[role] if accepted else "",
+                    "" if accepted else "password authentication failed\n",
+                )
+
+            PROVISIONER.command = authenticate
+            PROVISIONER.verify_database_credentials(
+                "postgres-container",
+                passwords["parkventory_migrator"],
+                passwords["parkventory_runtime"],
+            )
+        finally:
+            PROVISIONER.command = original_command
+        self.assertEqual(len(calls), 4)
+        for arguments, environment in calls:
+            self.assertIn("postgresql", arguments)
+            self.assertIn("PGPASSWORD", arguments)
+            assert environment is not None
+            self.assertNotIn(environment["PGPASSWORD"], "\0".join(arguments))
+
+        original_probe = PROVISIONER.credential_probe
+        try:
+            PROVISIONER.credential_probe = (
+                lambda container, role, password: subprocess.CompletedProcess(
+                    [],
+                    0,
+                    identities[role],
+                    "",
+                )
+            )
+            with self.assertRaisesRegex(
+                PROVISIONER.ProvisionError,
+                "network authentication does not enforce",
+            ):
+                PROVISIONER.verify_database_credentials(
+                    "postgres-container",
+                    passwords["parkventory_migrator"],
+                    passwords["parkventory_runtime"],
+                )
+        finally:
+            PROVISIONER.credential_probe = original_probe
 
     def test_observation_is_exact_and_evidence_is_canonical(self) -> None:
         original = PROVISIONER.psql
@@ -350,6 +432,8 @@ class ParkventoryPostgresTests(unittest.TestCase):
             "extension.extversion<>'1.7'",
             "a.grantee=p.proowner",
             "a.grantee<>t.typowner",
+            "ARRAY['role=parkventory_owner','search_path=public']::text[]",
+            "ARRAY['search_path=public']::text[]",
         ):
             self.assertIn(fragment, base_sql)
         sql = PROVISIONER.rls_proof_sql()

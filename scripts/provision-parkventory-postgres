@@ -507,8 +507,14 @@ def load_contract(path: Path) -> tuple[dict[str, object], str]:
 
 
 def command(
-    arguments: list[str], *, input_text: str | None = None
+    arguments: list[str],
+    *,
+    input_text: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    command_environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"}
+    if environment is not None:
+        command_environment.update(environment)
     try:
         return subprocess.run(
             arguments,
@@ -516,7 +522,7 @@ def command(
             check=False,
             capture_output=True,
             text=True,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"},
+            env=command_environment,
             timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -655,6 +661,80 @@ def psql(container: str, database: str, sql: str) -> str:
     return result.stdout.strip()
 
 
+def credential_probe(
+    container: str,
+    role: str,
+    role_auth: str,
+) -> subprocess.CompletedProcess[str]:
+    if role not in {"parkventory_migrator", "parkventory_runtime"}:
+        raise ProvisionError("credential verification role is outside the allowlist")
+    if re.fullmatch(r"[A-Za-z0-9_-]{64}", role_auth) is None:
+        raise ProvisionError("credential verification password is invalid")
+    return command(
+        [
+            "/usr/bin/docker",
+            "exec",
+            "--env",
+            "PGPASSWORD",
+            "--env",
+            "PGCONNECT_TIMEOUT=5",
+            container,
+            "psql",
+            "--no-password",
+            "--host",
+            "postgresql",
+            "--username",
+            role,
+            "--dbname",
+            "parkventory",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--quiet",
+            "--command",
+            "SELECT concat_ws('|', session_user, current_user, current_database());",
+        ],
+        environment={"PGPASSWORD": role_auth},
+    )
+
+
+def verify_database_credentials(
+    container: str,
+    migrator_auth: str,
+    runtime_auth: str,
+) -> None:
+    expected_identities = (
+        (
+            "parkventory_migrator",
+            migrator_auth,
+            "parkventory_migrator|parkventory_owner|parkventory\n",
+        ),
+        (
+            "parkventory_runtime",
+            runtime_auth,
+            "parkventory_runtime|parkventory_runtime|parkventory\n",
+        ),
+    )
+    for role, role_auth, expected_identity in expected_identities:
+        accepted = credential_probe(container, role, role_auth)
+        if (
+            accepted.returncode != 0
+            or accepted.stdout != expected_identity
+            or accepted.stderr
+        ):
+            raise ProvisionError(
+                f"PostgreSQL rejected the protected {role} credential"
+            )
+        replacement = "A" if role_auth[0] != "A" else "B"
+        rejected = credential_probe(container, role, replacement + role_auth[1:])
+        if rejected.returncode == 0:
+            raise ProvisionError(
+                f"PostgreSQL network authentication does not enforce the {role} credential"
+            )
+
+
 def apply_database(container: str, migrator_password: str, runtime_password: str) -> None:
     cluster_sql = f"""
 BEGIN;
@@ -726,6 +806,8 @@ END
 $database_acl$;
 GRANT CONNECT ON DATABASE parkventory TO parkventory_migrator, parkventory_runtime;
 ALTER DATABASE parkventory OWNER TO parkventory_owner;
+ALTER ROLE parkventory_migrator IN DATABASE parkventory RESET ALL;
+ALTER ROLE parkventory_runtime IN DATABASE parkventory RESET ALL;
 ALTER ROLE parkventory_migrator IN DATABASE parkventory SET ROLE TO parkventory_owner;
 ALTER ROLE parkventory_migrator IN DATABASE parkventory SET search_path TO public;
 ALTER ROLE parkventory_runtime IN DATABASE parkventory SET search_path TO public;
@@ -980,8 +1062,8 @@ def proof_sql() -> str:
             "'unexpected_schema_grantee', EXISTS (SELECT 1 FROM pg_namespace n CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname='public' AND a.grantee NOT IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')))",
             "'migrator_is_owner_member', pg_has_role('parkventory_migrator','parkventory_owner','MEMBER')",
             "'runtime_has_owner_membership', pg_has_role('parkventory_runtime','parkventory_owner','MEMBER')",
-            "'migrator_settings', EXISTS (SELECT 1 FROM pg_db_role_setting s WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory') AND 'role=parkventory_owner'=ANY(s.setconfig) AND 'search_path=public'=ANY(s.setconfig))",
-            "'runtime_settings', EXISTS (SELECT 1 FROM pg_db_role_setting s WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory') AND 'search_path=public'=ANY(s.setconfig))",
+            "'migrator_settings', (SELECT COALESCE(array_agg(setting ORDER BY setting),'{}'::text[]) = ARRAY['role=parkventory_owner','search_path=public']::text[] FROM pg_db_role_setting s CROSS JOIN LATERAL unnest(s.setconfig) setting WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory'))",
+            "'runtime_settings', (SELECT COALESCE(array_agg(setting ORDER BY setting),'{}'::text[]) = ARRAY['search_path=public']::text[] FROM pg_db_role_setting s CROSS JOIN LATERAL unnest(s.setconfig) setting WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory'))",
             "'default_table_privileges', (" + privilege_array.format(object_type="'r'") + ")",
             "'default_sequence_privileges', (" + privilege_array.format(object_type="'S'") + ")",
             "'default_function_privileges', (" + privilege_array.format(object_type="'f'") + ")",
@@ -1876,6 +1958,7 @@ def main() -> int:
             require_safe_evidence_target()
             try:
                 proof = observe(container)
+                verify_database_credentials(container, migrator, runtime)
                 evidence = evidence_document(
                     contract_digest, image, proof, credential_digests
                 )
@@ -1887,6 +1970,7 @@ def main() -> int:
             if schema_present:
                 changed = reconcile_application_acl(container) or changed
             proof = observe(container, require_rls=schema_present)
+            verify_database_credentials(container, migrator, runtime)
             evidence = evidence_document(
                 contract_digest, image, proof, credential_digests
             )
@@ -1895,12 +1979,14 @@ def main() -> int:
             else:
                 require_evidence(evidence)
         elif arguments.mode == "reconcile-application-schema":
+            verify_database_credentials(container, migrator, runtime)
             if not application_schema_present(container):
                 raise ProvisionError(
                     "application schema is absent after migration"
                 )
             changed = reconcile_application_acl(container)
             proof = observe(container, require_rls=True)
+            verify_database_credentials(container, migrator, runtime)
             evidence = evidence_document(
                 contract_digest, image, proof, credential_digests
             )
@@ -1910,6 +1996,7 @@ def main() -> int:
                 container,
                 require_rls=arguments.require_rls,
             )
+            verify_database_credentials(container, migrator, runtime)
             evidence = evidence_document(
                 contract_digest, image, proof, credential_digests
             )

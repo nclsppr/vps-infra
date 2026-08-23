@@ -103,24 +103,32 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
         assert docker is not None
         image = str(PROVISIONER.EXPECTED_CONTRACT["postgres"]["image"])
         container = f"pv-postgres-contract-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        network = f"pv-postgres-contract-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         platform_auth = "PlatformContractPassword123456789"
         migrator_auth = "A" * 64
         runtime_auth = "B" * 64
         original_command = PROVISIONER.command
 
         try:
+            self.docker(docker, "network", "create", network)
             self.docker(
                 docker,
                 "run",
                 "--detach",
                 "--name",
                 container,
+                "--network",
+                network,
+                "--network-alias",
+                "postgresql",
                 "--env",
                 "POSTGRES_USER=platform_admin",
                 "--env",
                 f"POSTGRES_PASSWORD={platform_auth}",
                 "--env",
                 "POSTGRES_DB=postgres",
+                "--env",
+                "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=trust",
                 image,
             )
             for _ in range(120):
@@ -157,14 +165,26 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
                 self.fail(f"PostgreSQL did not become ready:\n{logs.stderr}")
 
             def local_command(
-                arguments: list[str], *, input_text: str | None = None
+                arguments: list[str],
+                *,
+                input_text: str | None = None,
+                environment: dict[str, str] | None = None,
             ) -> subprocess.CompletedProcess[str]:
                 if arguments and arguments[0] == "/usr/bin/docker":
                     arguments = [docker, *arguments[1:]]
-                return original_command(arguments, input_text=input_text)
+                return original_command(
+                    arguments,
+                    input_text=input_text,
+                    environment=environment,
+                )
 
             PROVISIONER.command = local_command
             PROVISIONER.apply_database(
+                container,
+                migrator_auth,
+                runtime_auth,
+            )
+            PROVISIONER.verify_database_credentials(
                 container,
                 migrator_auth,
                 runtime_auth,
@@ -349,6 +369,43 @@ SELECT jsonb_build_object(
                 PROVISIONER.EXPECTED_PROOF,
             )
             self.assertFalse(PROVISIONER.reconcile_application_acl(container))
+
+            stale_runtime_auth = "C" * 64
+            PROVISIONER.psql(
+                container,
+                "parkventory",
+                f"""
+ALTER ROLE parkventory_runtime PASSWORD '{stale_runtime_auth}';
+ALTER ROLE parkventory_runtime IN DATABASE parkventory
+  SET statement_timeout TO '5s';
+""",
+            )
+            with self.assertRaisesRegex(
+                PROVISIONER.ProvisionError,
+                "rejected the protected parkventory_runtime credential",
+            ):
+                PROVISIONER.verify_database_credentials(
+                    container,
+                    migrator_auth,
+                    runtime_auth,
+                )
+            with self.assertRaisesRegex(
+                PROVISIONER.ProvisionError,
+                "effective database roles or default privileges",
+            ):
+                PROVISIONER.observe(container, require_rls=True)
+            PROVISIONER.apply_database(
+                container,
+                migrator_auth,
+                runtime_auth,
+            )
+            self.assertTrue(PROVISIONER.reconcile_application_acl(container))
+            PROVISIONER.verify_database_credentials(
+                container,
+                migrator_auth,
+                runtime_auth,
+            )
+            PROVISIONER.observe(container, require_rls=True)
 
             final_extension_access = json.loads(
                 PROVISIONER.psql(
@@ -722,6 +779,13 @@ DROP ROLE extension_hijacker;
                 "rm",
                 "--force",
                 container,
+                check=False,
+            )
+            self.docker(
+                docker or "docker",
+                "network",
+                "rm",
+                network,
                 check=False,
             )
 
