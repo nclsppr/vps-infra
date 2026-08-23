@@ -67,7 +67,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
         docker: str,
         container: str,
         role: str,
-        password: str,
+        role_auth: str,
         sql: str,
         *,
         check: bool = True,
@@ -77,7 +77,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
             "exec",
             "--interactive",
             "--env",
-            f"PGPASSWORD={password}",
+            f"PGPASSWORD={role_auth}",
             container,
             "psql",
             "--no-password",
@@ -103,9 +103,9 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
         assert docker is not None
         image = str(PROVISIONER.EXPECTED_CONTRACT["postgres"]["image"])
         container = f"pv-postgres-contract-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        platform_password = "PlatformContractPassword123456789"
-        migrator_password = "A" * 64
-        runtime_password = "B" * 64
+        platform_auth = "PlatformContractPassword123456789"
+        migrator_auth = "A" * 64
+        runtime_auth = "B" * 64
         original_command = PROVISIONER.command
 
         try:
@@ -118,7 +118,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
                 "--env",
                 "POSTGRES_USER=platform_admin",
                 "--env",
-                f"POSTGRES_PASSWORD={platform_password}",
+                f"POSTGRES_PASSWORD={platform_auth}",
                 "--env",
                 "POSTGRES_DB=postgres",
                 image,
@@ -128,7 +128,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
                     docker,
                     "exec",
                     "--env",
-                    f"PGPASSWORD={platform_password}",
+                    f"PGPASSWORD={platform_auth}",
                     container,
                     "psql",
                     "--no-password",
@@ -166,8 +166,8 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
             PROVISIONER.command = local_command
             PROVISIONER.apply_database(
                 container,
-                migrator_password,
-                runtime_password,
+                migrator_auth,
+                runtime_auth,
             )
             self.assertFalse(PROVISIONER.application_schema_present(container))
             self.assertEqual(
@@ -184,7 +184,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
                 docker,
                 container,
                 "parkventory_migrator",
-                migrator_password,
+                migrator_auth,
                 "CREATE VIEW partial_schema_probe AS SELECT 1 AS id;",
             )
             self.assertTrue(PROVISIONER.application_schema_present(container))
@@ -197,7 +197,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
                 docker,
                 container,
                 "parkventory_migrator",
-                migrator_password,
+                migrator_auth,
                 "DROP VIEW partial_schema_probe;",
             )
             self.assertFalse(PROVISIONER.application_schema_present(container))
@@ -206,7 +206,7 @@ class ParkventoryPostgresIntegrationTests(unittest.TestCase):
                 docker,
                 container,
                 "parkventory_migrator",
-                migrator_password,
+                migrator_auth,
                 """
 CREATE TABLE flyway_schema_history (
   installed_rank INTEGER PRIMARY KEY,
@@ -233,7 +233,7 @@ CREATE TABLE flyway_schema_history (
                     docker,
                     container,
                     "parkventory_migrator",
-                    migrator_password,
+                    migrator_auth,
                     (
                         "BEGIN;\n"
                         + sql
@@ -455,7 +455,7 @@ SELECT jsonb_build_object(
                 docker,
                 container,
                 "parkventory_runtime",
-                runtime_password,
+                runtime_auth,
                 """
 SELECT concat_ws('|',
   has_table_privilege(
@@ -479,7 +479,7 @@ SELECT concat_ws('|',
                 docker,
                 container,
                 "parkventory_migrator",
-                migrator_password,
+                migrator_auth,
                 """
 GRANT SELECT (name) ON organization TO parkventory_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public
@@ -494,7 +494,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE parkventory_owner IN SCHEMA public
                 docker,
                 container,
                 "parkventory_runtime",
-                runtime_password,
+                runtime_auth,
                 """
 BEGIN;
 SET LOCAL app.organization_id = '00000000-0000-0000-0000-000000000001';
@@ -569,7 +569,7 @@ ROLLBACK;
                 docker,
                 container,
                 "parkventory_runtime",
-                runtime_password,
+                runtime_auth,
                 "SELECT 1::integer <-> 2::integer;",
                 check=False,
             )
@@ -580,7 +580,7 @@ ROLLBACK;
                 docker,
                 container,
                 "parkventory_migrator",
-                migrator_password,
+                migrator_auth,
                 """
 CREATE TABLE unexpected_runtime_object (id INTEGER PRIMARY KEY);
 GRANT SELECT ON unexpected_runtime_object TO parkventory_runtime;
@@ -601,7 +601,7 @@ GRANT SELECT ON unexpected_runtime_object TO parkventory_runtime;
                 docker,
                 container,
                 "platform_admin",
-                platform_password,
+                platform_auth,
                 """
 CREATE TYPE public.unexpected_base_type;
 CREATE FUNCTION public.unexpected_base_type_in(cstring)
