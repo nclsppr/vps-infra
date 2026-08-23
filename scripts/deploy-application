@@ -29,7 +29,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit
 
-
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 LIB_DIRECTORY = SCRIPT_DIRECTORY / "lib"
 sys.path.insert(0, str(LIB_DIRECTORY))
@@ -92,6 +91,10 @@ STATE_NAME_RE = re.compile(r"^[a-z0-9-]+(?:-[0-9a-f]{64})?\.json$")
 CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 CONFIG_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 CONFIG_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,511}$")
+STAGING_RELEASE_NAME_RE = re.compile(
+    r"^\.sha256-[0-9a-f]{64}-[0-9a-f]{16}$"
+)
+MAX_STAGING_RELEASES = 16
 
 APPLICATION_PRODUCTION_CONTRACT = Path(
     "/srv/vps/repository/releases/application-production.json"
@@ -100,6 +103,7 @@ STATIC_PRODUCTION_CONTRACT = Path(
     "/srv/vps/repository/releases/static-production.json"
 )
 APPLICATION_ROOT = Path("/srv/applications")
+MONFLORIAN_EDGE_RELEASE_ROOT = APPLICATION_ROOT / "monflorian" / "edge-releases"
 APPLICATION_STATE_ROOT = Path("/var/lib/vps-application")
 ACTIVE_STATE_ROOT = APPLICATION_STATE_ROOT / "active"
 INVENTORY_STATE_ROOT = APPLICATION_STATE_ROOT / "inventories"
@@ -124,12 +128,8 @@ SURPLASSE_PUBLIC_EDGE_SUBNET = "172.30.10.0/24"
 SURPLASSE_PUBLIC_EDGE_ADDRESS = "172.30.10.254"
 RUNTIME_DIRECTORY_ENV = "VPS_APPLICATION_RUNTIME_DIRECTORY"
 VALIDATE_COMPOSE_PATH = SCRIPT_DIRECTORY / "validate-compose"
-SURPLASSE_INPUT_VALIDATOR_PATH = (
-    SCRIPT_DIRECTORY / "materialize-surplasse-secrets"
-)
-SURPLASSE_ADAPTER_PATH = Path(
-    "/srv/vps/repository/applications/surplasse/adapter.json"
-)
+SURPLASSE_INPUT_VALIDATOR_PATH = SCRIPT_DIRECTORY / "materialize-surplasse-secrets"
+SURPLASSE_ADAPTER_PATH = Path("/srv/vps/repository/applications/surplasse/adapter.json")
 SURPLASSE_OPERATOR_MANIFEST_PATH = (
     CREDENTIAL_ROOT
     / "surplasse"
@@ -156,6 +156,7 @@ MAX_STATE_BYTES = 512 * 1024
 MAX_RENDERED_COMPOSE_BYTES = 2 * 1024 * 1024
 MAX_CONFIG_BYTES = 16 * 1024
 MAX_PROBE_BODY_BYTES = 1024 * 1024
+MAX_PROBE_HEADER_BYTES = 16 * 1024
 SOURCE_REF = "refs/heads/main"
 
 
@@ -531,6 +532,11 @@ def validate_runtime() -> None:
         releases = app_root / "releases"
         require_protected_directory(app_root, f"{application} release root", mode=0o755)
         require_protected_directory(releases, f"{application} releases", mode=0o755)
+    require_protected_directory(
+        MONFLORIAN_EDGE_RELEASE_ROOT,
+        "Mon Florian edge release root",
+        mode=0o755,
+    )
     for path, label in (
         (APPLICATION_PRODUCTION_CONTRACT, "application production contract"),
         (STATIC_PRODUCTION_CONTRACT, "static production contract"),
@@ -1449,9 +1455,8 @@ def surplasse_adapter_payment_profile() -> dict[str, object]:
     if not isinstance(value, dict):
         fail("Surplasse versioned adapter is not an object")
     payment = value.get("payment")
-    if (
-        not isinstance(payment, dict)
-        or canonical_json(payment) != canonical_json(SURPLASSE_PAYMENT_PROFILE)
+    if not isinstance(payment, dict) or canonical_json(payment) != canonical_json(
+        SURPLASSE_PAYMENT_PROFILE
     ):
         fail("Surplasse adapter payment profile differs from the tester policy")
     return dict(SURPLASSE_PAYMENT_PROFILE)
@@ -1515,10 +1520,9 @@ def validate_surplasse_payment_binding(
         return
     adapter_payment = surplasse_adapter_payment_profile()
     bundle_payment = bundle.contract.get("payment")
-    if (
-        not isinstance(bundle_payment, dict)
-        or canonical_json(bundle_payment) != canonical_json(adapter_payment)
-    ):
+    if not isinstance(bundle_payment, dict) or canonical_json(
+        bundle_payment
+    ) != canonical_json(adapter_payment):
         fail("Surplasse bundle payment profile differs from the versioned adapter")
     if not isinstance(rendered, dict):
         fail("rendered Surplasse Compose document is not an object")
@@ -1620,9 +1624,10 @@ def validate_application_compose_semantics(
         and environment.get("QUARKUS_FLYWAY_MIGRATE_AT_START") != "false"
     ):
         fail("rendered Compose backend can perform automatic migrations")
-    if profile.application == "parkventory" and environment.get(
-        "PARKVENTORY_MIGRATION_ONLY"
-    ) != "false":
+    if (
+        profile.application == "parkventory"
+        and environment.get("PARKVENTORY_MIGRATION_ONLY") != "false"
+    ):
         fail("rendered Parkventory backend can enter migration-only mode")
     if profile.application == "parkventory":
         expected_oidc_files = {
@@ -1944,6 +1949,51 @@ def expose_release_directory(path: Path) -> None:
         fail(f"cannot protect materialized application release: {exc}")
 
 
+def cleanup_staging_release_directories(
+    root: Path,
+    label: str,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        fail(f"cannot open {label} root safely during cleanup: {exc}")
+    try:
+        parent = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or stat.S_IMODE(parent.st_mode) != 0o755
+        ):
+            fail(f"{label} root is unsafe during cleanup")
+        names = sorted(
+            name
+            for name in os.listdir(root_fd)
+            if STAGING_RELEASE_NAME_RE.fullmatch(name) is not None
+        )
+        if len(names) > MAX_STAGING_RELEASES:
+            fail(f"{label} cleanup exceeded its staging limit")
+        for name in names:
+            metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != expected_uid
+                or metadata.st_gid != expected_gid
+                or metadata.st_dev != parent.st_dev
+                or stat.S_IMODE(metadata.st_mode) not in {0o700, 0o755}
+            ):
+                fail(f"{label} staging residue is not one protected directory")
+            shutil.rmtree(name, dir_fd=root_fd)
+        if names:
+            os.fsync(root_fd)
+    finally:
+        os.close(root_fd)
+
+
 def cleanup_application_filesystem_residue(
     application: str,
     *,
@@ -1956,39 +2006,19 @@ def cleanup_application_filesystem_residue(
         fail("application filesystem cleanup requires symlink-safe removal")
     app_root = APPLICATION_ROOT / application
     releases = app_root / "releases"
-    releases_fd = os.open(releases, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        parent = os.fstat(releases_fd)
-        if (
-            not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != expected_uid
-            or parent.st_gid != expected_gid
-            or stat.S_IMODE(parent.st_mode) != 0o755
-        ):
-            fail("application releases directory is unsafe during cleanup")
-        names = sorted(
-            name
-            for name in os.listdir(releases_fd)
-            if re.fullmatch(r"\.sha256-[0-9a-f]{64}-[0-9a-f]{16}", name)
+    cleanup_staging_release_directories(
+        releases,
+        "application release",
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if application == "monflorian":
+        cleanup_staging_release_directories(
+            MONFLORIAN_EDGE_RELEASE_ROOT,
+            "Mon Florian edge release",
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
         )
-        if len(names) > 16:
-            fail("application filesystem cleanup exceeded its staging limit")
-        for name in names:
-            metadata = os.stat(name, dir_fd=releases_fd, follow_symlinks=False)
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or stat.S_ISLNK(metadata.st_mode)
-                or metadata.st_uid != expected_uid
-                or metadata.st_gid != expected_gid
-                or metadata.st_dev != parent.st_dev
-                or stat.S_IMODE(metadata.st_mode) not in {0o700, 0o755}
-            ):
-                fail("application staging residue is not one protected directory")
-            shutil.rmtree(name, dir_fd=releases_fd)
-        if names:
-            os.fsync(releases_fd)
-    finally:
-        os.close(releases_fd)
 
     app_fd = os.open(app_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -2042,10 +2072,7 @@ def validate_materialized_release(release: Path, state: ApplicationState) -> Non
 
 
 def materialization_inventory_name(state: ApplicationState) -> str:
-    return (
-        f"{state.application}-"
-        f"{release_name(state).removeprefix('sha256-')}.json"
-    )
+    return f"{state.application}-" f"{release_name(state).removeprefix('sha256-')}.json"
 
 
 def ensure_external_inventory(release: Path, state: ApplicationState) -> None:
@@ -2133,6 +2160,96 @@ def materialize_candidate(
     validate_materialized_release(final, state)
     ensure_external_inventory(final, state)
     return final
+
+
+def validate_materialized_edge_route(
+    release: Path,
+    state: ApplicationState,
+    route: bytes,
+) -> Path:
+    if state.application != "monflorian":
+        fail("edge route materialization is reserved for Mon Florian")
+    require_protected_directory(
+        release,
+        "materialized Mon Florian edge release",
+        mode=0o755,
+    )
+    try:
+        entries = sorted(path.name for path in release.iterdir())
+    except OSError as exc:
+        fail(f"cannot inspect materialized Mon Florian edge release: {exc}")
+    if entries != ["monflorian.caddy", "state.json"]:
+        fail("materialized Mon Florian edge release has an unexpected entry set")
+    route_path = release / "monflorian.caddy"
+    require_protected_file(
+        route_path,
+        "materialized Mon Florian edge route",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_CONFIG_BYTES,
+    )
+    if route_path.read_bytes() != route:
+        fail("materialized Mon Florian edge route differs from its attested bytes")
+    state_path = release / "state.json"
+    require_protected_file(
+        state_path,
+        "materialized Mon Florian edge state",
+        allowed_modes=frozenset({0o444}),
+        maximum_size=MAX_STATE_BYTES,
+    )
+    if state_path.read_bytes() != canonical_state(state):
+        fail("materialized Mon Florian edge state differs from its attestation")
+    return route_path
+
+
+def materialize_edge_route(
+    state: ApplicationState,
+    bundle: ApplicationBundle,
+) -> Path:
+    if state.application != "monflorian":
+        fail("edge route materialization is reserved for Mon Florian")
+    route = bundle.files.get("caddy/monflorian.caddy")
+    if not isinstance(route, bytes) or not 1 <= len(route) <= MAX_CONFIG_BYTES:
+        fail("attested Mon Florian bundle has no bounded Caddy route")
+    require_protected_directory(
+        MONFLORIAN_EDGE_RELEASE_ROOT,
+        "Mon Florian edge release root",
+        mode=0o755,
+    )
+    final = MONFLORIAN_EDGE_RELEASE_ROOT / release_name(state)
+    if final.exists() or final.is_symlink():
+        return validate_materialized_edge_route(final, state, route)
+    staging = MONFLORIAN_EDGE_RELEASE_ROOT / (
+        f".{release_name(state)}-{secrets.token_hex(8)}"
+    )
+    if staging.exists() or staging.is_symlink():
+        fail("Mon Florian edge release staging name collided")
+    staging.mkdir(mode=0o700)
+    try:
+        write_release_file(
+            staging / "monflorian.caddy",
+            route,
+            "Mon Florian edge route",
+        )
+        write_release_file(
+            staging / "state.json",
+            canonical_state(state),
+            "Mon Florian edge state",
+        )
+        expose_release_directory(staging)
+        fsync_release_tree(staging)
+        os.replace(staging, final)
+        parent_fd = os.open(
+            MONFLORIAN_EDGE_RELEASE_ROOT,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return validate_materialized_edge_route(final, state, route)
 
 
 def source_worker_environment(home: Path) -> dict[str, str]:
@@ -2270,7 +2387,11 @@ def current_target(current: Path, releases: Path) -> str | None:
         return None
     except OSError as exc:
         fail(f"cannot inspect application current link: {exc}")
-    if not stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+    if (
+        not stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+    ):
         fail("application current path is not a protected symbolic link")
     target = os.readlink(current)
     if re.fullmatch(r"releases/sha256-[0-9a-f]{64}", target) is None:
@@ -2283,7 +2404,10 @@ def current_target(current: Path, releases: Path) -> str | None:
 
 
 def switch_current(current: Path, target: str | None, releases: Path) -> None:
-    if target is not None and re.fullmatch(r"releases/sha256-[0-9a-f]{64}", target) is None:
+    if (
+        target is not None
+        and re.fullmatch(r"releases/sha256-[0-9a-f]{64}", target) is None
+    ):
         fail("application switch target is invalid")
     app_root_fd = os.open(current.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     temporary = f".current-{secrets.token_hex(8)}"
@@ -2509,9 +2633,9 @@ def pull_and_verify_images(state: ApplicationState) -> None:
                 "--format",
                 (
                     "{{.Architecture}}\t{{.Os}}\t"
-                    "{{index .Config.Labels \"org.opencontainers.image.source\"}}\t"
-                    "{{index .Config.Labels \"org.opencontainers.image.revision\"}}\t"
-                    "{{index .Config.Labels \"org.opencontainers.image.version\"}}"
+                    '{{index .Config.Labels "org.opencontainers.image.source"}}\t'
+                    '{{index .Config.Labels "org.opencontainers.image.revision"}}\t'
+                    '{{index .Config.Labels "org.opencontainers.image.version"}}'
                 ),
                 reference,
             ],
@@ -2590,9 +2714,9 @@ def validate_migration_container_identity(
             "--format",
             (
                 "{{.Name}}\t{{.Id}}\t{{.Config.Image}}\t"
-                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
-                "{{index .Config.Labels \"com.docker.compose.service\"}}\t"
-                "{{index .Config.Labels \"com.docker.compose.oneoff\"}}"
+                '{{index .Config.Labels "com.docker.compose.project"}}\t'
+                '{{index .Config.Labels "com.docker.compose.service"}}\t'
+                '{{index .Config.Labels "com.docker.compose.oneoff"}}'
             ),
             container_id,
         ],
@@ -2726,8 +2850,13 @@ def _probe_http(
     expected_body: str | None,
     work: Path,
     resolve_host: str | None = None,
+    method: str = "GET",
+    require_basic_challenge: bool = False,
 ) -> None:
+    if method not in {"GET", "POST"}:
+        fail("application probe method is outside the exact allowlist")
     output = work / f"probe-{secrets.token_hex(8)}.body"
+    headers = work / f"probe-{secrets.token_hex(8)}.headers"
     try:
         resolution_arguments = (
             []
@@ -2751,6 +2880,9 @@ def _probe_http(
                 "--max-filesize",
                 str(MAX_PROBE_BODY_BYTES),
                 *resolution_arguments,
+                "--request",
+                method,
+                *(["--dump-header", str(headers)] if require_basic_challenge else []),
                 "--output",
                 str(output),
                 "--write-out",
@@ -2766,9 +2898,22 @@ def _probe_http(
         raw = STATIC.read_bounded_file(output, MAX_PROBE_BODY_BYTES, "application probe body")
         if expected_body is not None and expected_body.encode("utf-8") not in raw:
             fail(f"application probe body did not contain its marker for {url}")
+        if require_basic_challenge:
+            header_raw = STATIC.read_bounded_file(
+                headers,
+                MAX_PROBE_HEADER_BYTES,
+                "application probe headers",
+            )
+            challenges = re.findall(
+                rb"(?im)^www-authenticate:[ \t]*Basic(?:[ \t]+realm=\"[^\r\n\"]+\")?[ \t]*\r?$",
+                header_raw,
+            )
+            if len(challenges) != 1:
+                fail(f"application probe returned no exact Basic challenge for {url}")
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            output.unlink()
+        for path in (output, headers):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
 
 
 def runtime_container_id(state: ApplicationState, service: str) -> str:
@@ -2796,8 +2941,8 @@ def validate_runtime_container_identity(
             "--format",
             (
                 "{{.Id}}\t{{.Config.Image}}\t"
-                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
-                "{{index .Config.Labels \"com.docker.compose.service\"}}\t"
+                '{{index .Config.Labels "com.docker.compose.project"}}\t'
+                '{{index .Config.Labels "com.docker.compose.service"}}\t'
                 "{{.State.Status}}\t"
                 "{{if .State.Health}}{{.State.Health.Status}}{{end}}"
             ),
@@ -2863,7 +3008,7 @@ def _service_address(state: ApplicationState, service: str) -> str:
             "container",
             "inspect",
             "--format",
-            f"{{{{with index .NetworkSettings.Networks \"{network}\"}}}}{{{{.IPAddress}}}}{{{{end}}}}",
+            f'{{{{with index .NetworkSettings.Networks "{network}"}}}}{{{{.IPAddress}}}}{{{{end}}}}',
             identifier,
         ],
         environment=safe_environment(state_release(state)),
@@ -2932,7 +3077,7 @@ def validate_surplasse_public_edge_attachment(release: Path) -> None:
             (
                 "{{.Id}}\t{{.Name}}\t{{.Driver}}\t{{.Scope}}\t"
                 "{{.Internal}}\t{{.Attachable}}\t{{.Ingress}}\t"
-                "{{index .Labels \"com.nclsppr.vps-infra.managed\"}}\t"
+                '{{index .Labels "com.nclsppr.vps-infra.managed"}}\t'
                 "{{len .IPAM.Config}}\t"
                 "{{range .IPAM.Config}}{{.Subnet}}{{end}}"
             ),
@@ -2972,8 +3117,8 @@ def validate_surplasse_public_edge_attachment(release: Path) -> None:
             (
                 "{{.State.Status}}\t"
                 "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
-                "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
-                f"{{{{with index .NetworkSettings.Networks \"{SURPLASSE_PUBLIC_EDGE_NETWORK}\"}}}}"
+                '{{index .Config.Labels "com.docker.compose.project"}}\t'
+                f'{{{{with index .NetworkSettings.Networks "{SURPLASSE_PUBLIC_EDGE_NETWORK}"}}}}'
                 "{{.NetworkID}}\t{{.IPAddress}}\t{{.IPPrefixLen}}{{end}}"
             ),
             PUBLIC_EDGE_CONTAINER,
@@ -3024,8 +3169,8 @@ def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
                 (
                     "{{.State.Status}}\t"
                     "{{if .State.Health}}{{.State.Health.Status}}{{end}}\t"
-                    "{{index .Config.Labels \"com.docker.compose.project\"}}\t"
-                    f"{{{{if index .NetworkSettings.Networks \"{network}\"}}}}"
+                    '{{index .Config.Labels "com.docker.compose.project"}}\t'
+                    f'{{{{if index .NetworkSettings.Networks "{network}"}}}}'
                     "attached{{end}}"
                 ),
                 PUBLIC_EDGE_CONTAINER,
@@ -3067,6 +3212,17 @@ def validate_public_edge_cutover(state: ApplicationState, work: Path) -> None:
         work=work,
         resolve_host=host,
     )
+    if state.application == "monflorian":
+        for path in ("/api/itineraries", "/api/illustrations"):
+            _probe_http(
+                f"https://{host}{path}",
+                expected_status=401,
+                expected_body=None,
+                work=work,
+                resolve_host=host,
+                method="POST",
+                require_basic_challenge=True,
+            )
 
 
 def static_parkventory_owner_present() -> bool:
@@ -3085,7 +3241,9 @@ def static_parkventory_owner_present() -> bool:
     return False
 
 
-def prepare_transaction(state: ApplicationState) -> tuple[bool, ApplicationState | None]:
+def prepare_transaction(
+    state: ApplicationState,
+) -> tuple[bool, ApplicationState | None]:
     application = state.application
     app_root = APPLICATION_ROOT / application
     releases = app_root / "releases"
@@ -3481,6 +3639,7 @@ def deploy(
     release_reference: str,
     *,
     activate_live: bool,
+    materialize_edge_route_only: bool = False,
 ) -> None:
     profile = PROFILES.get(application)
     if profile is None:
@@ -3509,7 +3668,12 @@ def deploy(
         STATIC_PRODUCTION_CONTRACT,
     )
     policy = next(item for item in contract.applications if item.name == application)
-    if not policy.enabled:
+    if materialize_edge_route_only and (application != "monflorian" or activate_live):
+        fail(
+            "dormant edge route materialization is reserved for inactive "
+            "Mon Florian admission"
+        )
+    if not policy.enabled and not materialize_edge_route_only:
         fail("application is disabled by the protected production contract")
     validate_runtime()
     with deployment_lock():
@@ -3533,6 +3697,13 @@ def deploy(
                 release_reference,
                 temporary,
             )
+            if materialize_edge_route_only:
+                route = materialize_edge_route(state, bundle)
+                print(
+                    "attested Mon Florian edge route materialized without "
+                    f"application activation: {route}"
+                )
+                return
             release = materialize_candidate(state, profile, bundle, evidence)
             if activate_live:
                 activate_candidate(state, temporary)
@@ -3564,7 +3735,9 @@ def recover_live(application: str | None) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument("--activate-live", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--activate-live", action="store_true")
+    modes.add_argument("--materialize-edge-route", action="store_true")
     parser.add_argument("application", choices=sorted(PROFILES))
     parser.add_argument("source_revision")
     parser.add_argument("release_reference")
@@ -3595,6 +3768,7 @@ def main(argv: list[str] | None = None) -> int:
             parsed.source_revision,
             parsed.release_reference,
             activate_live=parsed.activate_live,
+            materialize_edge_route_only=parsed.materialize_edge_route,
         )
     except (
         OSError,

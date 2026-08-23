@@ -148,7 +148,8 @@ check-public-static-edge: ## Validate the isolated Caddy-only public edge.
 check-surplasse-public-edge-candidate: check-public-static-edge ## Validate the inactive exact Surplasse public edge extension.
 	@set -Eeuo pipefail; \
 	rendered="$$(mktemp)"; \
-	trap 'rm -f -- "$$rendered"' EXIT; \
+	composite="$$(mktemp)"; \
+	trap 'rm -f -- "$$rendered" "$$composite"' EXIT; \
 	$(COMPOSE) --file platform/public-static-edge/compose.yaml \
 		--file applications/surplasse/integration/public-edge.override.yaml \
 		config --format json >"$$rendered"; \
@@ -156,9 +157,23 @@ check-surplasse-public-edge-candidate: check-public-static-edge ## Validate the 
 		--approved-route platform/caddy/routes/surplasse.caddy.disabled \
 		--candidate-only \
 		"$$rendered"; \
+	MONFLORIAN_PRIVATE_ACCESS_SOURCE="/srv/vps/releases/public-static-edge-surplasse/$$(printf '0%.0s' {1..64})/private/monflorian-private-access.caddy" \
+		$(COMPOSE) --file platform/public-static-edge/compose.yaml \
+		--file applications/surplasse/integration/public-edge.override.yaml \
+		--file applications/monflorian/integration/public-edge.override.yaml \
+		config --format json >"$$composite"; \
+	./scripts/validate-surplasse-public-edge-candidate \
+		--approved-route platform/caddy/routes/surplasse.caddy.disabled \
+		--approved-monflorian-route \
+			platform/caddy/routes/monflorian.caddy.disabled \
+		--candidate-only \
+		"$$composite"; \
 	image="$$(jq -r .caddy platform/public-static-edge/expected-images.json)"; \
 	./scripts/verify-surplasse-public-edge-caddy \
-		"$$image" platform/caddy/routes/surplasse.caddy.disabled
+		"$$image" platform/caddy/routes/surplasse.caddy.disabled; \
+	./scripts/verify-surplasse-public-edge-caddy \
+		"$$image" platform/caddy/routes/surplasse.caddy.disabled \
+		platform/caddy/routes/monflorian.caddy.disabled
 
 check-surplasse-public-edge-controller: ## Test the crash-safe Surplasse edge transition controller.
 	PYTHONDONTWRITEBYTECODE=1 python3 \

@@ -4,7 +4,7 @@
     that:
       - >-
         vps_public_static_edge_state in
-        ['prepare', 'precutover', 'activate', 'stopped']
+        ['preserve', 'prepare', 'precutover', 'activate', 'stopped']
       - vps_public_static_edge_project == 'vps-public-static-edge'
       - vps_public_static_edge_release_root == '/srv/vps/releases/public-static-edge'
       - vps_public_static_edge_runtime_dir == '/srv/vps/runtime/public-static-edge'

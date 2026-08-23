@@ -14,7 +14,6 @@ from unittest import mock
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -49,8 +48,7 @@ class SurplassePublicEdgeCandidateTests(unittest.TestCase):
     def test_override_is_exact_and_uses_the_separate_dns_directory(self) -> None:
         override = yaml.safe_load(
             (
-                ROOT
-                / "applications/surplasse/integration/public-edge.override.yaml"
+                ROOT / "applications/surplasse/integration/public-edge.override.yaml"
             ).read_text(encoding="utf-8")
         )
         self.assertEqual(set(override["services"]), {"caddy"})
@@ -81,6 +79,71 @@ class SurplassePublicEdgeCandidateTests(unittest.TestCase):
                 override["secrets"][secret_name]["file"],
                 f"/etc/vps/secrets/dns/surplasse/{file_name}",
             )
+
+    def test_monflorian_override_is_additive_and_uses_a_versioned_private_source(
+        self,
+    ) -> None:
+        override = yaml.safe_load(
+            (
+                ROOT / "applications/monflorian/integration/public-edge.override.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(set(override), {"networks", "services"})
+        self.assertEqual(
+            override["networks"],
+            {
+                "app_monflorian": {
+                    "external": True,
+                    "name": "app_monflorian",
+                }
+            },
+        )
+        caddy = override["services"]["caddy"]
+        self.assertEqual(
+            caddy["networks"],
+            {"app_monflorian": {"ipv4_address": "172.30.40.254"}},
+        )
+        self.assertEqual(
+            caddy["volumes"],
+            [
+                {
+                    "bind": {"create_host_path": False},
+                    "read_only": True,
+                    "source": "${MONFLORIAN_PRIVATE_ACCESS_SOURCE:?required}",
+                    "target": "/etc/caddy/monflorian-private-access.caddy",
+                    "type": "bind",
+                }
+            ],
+        )
+
+    def test_monflorian_route_allows_only_the_attested_revision_substitution(
+        self,
+    ) -> None:
+        approved = ROOT / "platform/caddy/routes/monflorian.caddy.disabled"
+        revision = "0123456789abcdef0123456789abcdef01234567"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            attested = Path(temporary_directory) / "monflorian.caddy"
+            attested.write_bytes(
+                approved.read_bytes().replace(
+                    b"__SOURCE_REVISION__",
+                    revision.encode("ascii"),
+                )
+            )
+            self.assertEqual(
+                VALIDATOR.validate_monflorian_route_bytes(
+                    attested,
+                    None,
+                    approved,
+                ),
+                revision,
+            )
+            attested.write_bytes(attested.read_bytes() + b"respond 200\n")
+            with self.assertRaisesRegex(VALIDATOR.CandidateError, "approved route"):
+                VALIDATOR.validate_monflorian_route_bytes(
+                    attested,
+                    None,
+                    approved,
+                )
 
     def test_route_delegates_dns_01_to_the_exact_atlas_snippet(self) -> None:
         route = ROOT / "platform/caddy/routes/surplasse.caddy.disabled"
@@ -144,13 +207,14 @@ class SurplassePublicEdgeCandidateTests(unittest.TestCase):
                 "--installed-tls-snippet",
                 VALIDATOR.TLS_SNIPPET_SOURCE,
             ],
-            base_arguments[:-2]
-            + ["--installed-tls-snippet", "/tmp/copied-tls.caddy"],
+            base_arguments[:-2] + ["--installed-tls-snippet", "/tmp/copied-tls.caddy"],
         )
         for arguments in invalid_arguments:
-            with self.subTest(arguments=arguments), contextlib.redirect_stderr(
-                io.StringIO()
-            ), mock.patch.object(VALIDATOR.sys, "argv", arguments):
+            with (
+                self.subTest(arguments=arguments),
+                contextlib.redirect_stderr(io.StringIO()),
+                mock.patch.object(VALIDATOR.sys, "argv", arguments),
+            ):
                 with self.assertRaises(SystemExit) as raised:
                     VALIDATOR.main()
                 self.assertEqual(raised.exception.code, 2)

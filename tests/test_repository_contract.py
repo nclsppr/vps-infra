@@ -1086,6 +1086,11 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             defaults["vps_monflorian_openai_api_key_path"],
             "/etc/vps/secrets/monflorian/monflorian-openai-api-key",
         )
+        self.assertEqual(defaults["vps_monflorian_private_access_source"], "")
+        self.assertEqual(
+            defaults["vps_monflorian_private_access_path"],
+            "/etc/vps/secrets/monflorian/monflorian-private-access.caddy",
+        )
         self.assertIn("deploy-application", defaults["vps_deploy_executables"])
         self.assertIn(
             "deploy-application-live-gate",
@@ -1124,6 +1129,10 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 ],
                 "0755",
             )
+        self.assertEqual(
+            directories["{{ vps_application_root }}/monflorian/edge-releases"],
+            "0755",
+        )
         self.assertEqual(directories["/etc/vps/secrets/monflorian"], "0700")
 
         materialized_copy = by_name[
@@ -1160,6 +1169,41 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn(
             "vps_monflorian_openai_api_key_stat.stat.nlink == 1",
             metadata_assertions,
+        )
+        private_access_copy = by_name[
+            "Materialize the Mon Florian access snippet from private operator input"
+        ]["ansible.builtin.copy"]
+        self.assertEqual(
+            private_access_copy,
+            {
+                "src": "{{ vps_monflorian_private_access_source }}",
+                "dest": "{{ vps_monflorian_private_access_path }}",
+                "owner": "root",
+                "group": "root",
+                "mode": "0400",
+                "force": True,
+                "backup": False,
+            },
+        )
+        private_access_stat = by_name[
+            "Inspect the Mon Florian access snippet without reading its value"
+        ]["ansible.builtin.stat"]
+        self.assertEqual(private_access_stat["get_checksum"], False)
+        self.assertEqual(private_access_stat["get_mime"], False)
+        private_access_assertions = by_name[
+            "Prove the Mon Florian access snippet metadata when present"
+        ]["ansible.builtin.assert"]["that"]
+        self.assertIn(
+            "vps_monflorian_private_access_stat.stat.gid == 0",
+            private_access_assertions,
+        )
+        self.assertIn(
+            "vps_monflorian_private_access_stat.stat.mode == '0400'",
+            private_access_assertions,
+        )
+        self.assertIn(
+            "vps_monflorian_private_access_stat.stat.nlink == 1",
+            private_access_assertions,
         )
         recovery_install = by_name[
             "Install the application transaction recovery unit"
@@ -1782,6 +1826,26 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             [entry["role"] for entry in playbook[0]["roles"]],
             ["public_static_edge", "surplasse_dns_cutover"],
         )
+        precondition = playbook[0]["pre_tasks"][0]["ansible.builtin.assert"]["that"]
+        self.assertTrue(any("'preserve'" in item for item in precondition))
+        tasks = yaml.safe_load(
+            (ROOT / "ansible/roles/public_static_edge/tasks/main.yml").read_text()
+        )
+        self.assertIn("'preserve'", tasks[0]["ansible.builtin.assert"]["that"][0])
+        stopped = next(
+            task
+            for task in tasks
+            if task.get("name")
+            == "Stop and prove the isolated public static edge is absent"
+        )
+        convergence = next(
+            task
+            for task in tasks
+            if task.get("name")
+            == "Stage, switch, and verify the isolated public static edge"
+        )
+        self.assertEqual(stopped["when"], "vps_public_static_edge_state == 'stopped'")
+        self.assertNotIn("preserve", convergence["when"])
         role_text = (
             ROOT / "ansible/roles/public_static_edge/tasks/main.yml"
         ).read_text(encoding="utf-8")

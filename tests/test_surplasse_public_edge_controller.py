@@ -80,6 +80,9 @@ class ControllerFixture:
             deployment_lock=root / "run/lock/vps-static.lock",
             docker=root / "usr/bin/docker",
             systemctl=root / "usr/bin/systemctl",
+            private_access_snippet=(
+                root / "etc/vps/secrets/monflorian/monflorian-private-access.caddy"
+            ),
             expected_uid=os.getuid(),
             expected_gid=os.getgid(),
         )
@@ -95,6 +98,7 @@ class ControllerFixture:
             (self.paths.dns_bundle_root, 0o700),
             (self.paths.docker.parent, 0o755),
             (self.paths.systemctl.parent, 0o755),
+            (self.paths.private_access_snippet.parent, 0o700),
         ):
             directory.mkdir(parents=True, exist_ok=True)
             directory.chmod(mode)
@@ -111,9 +115,32 @@ class ControllerFixture:
         self.overlay = (
             ROOT / "applications/surplasse/integration/public-edge.override.yaml"
         ).read_bytes()
+        self.monflorian_approved_route = (
+            ROOT / "platform/caddy/routes/monflorian.caddy.disabled"
+        ).read_bytes()
+        self.monflorian_route = self.monflorian_approved_route.replace(
+            b"__SOURCE_REVISION__",
+            REVISION.encode("ascii"),
+        )
+        self.monflorian_overlay = (
+            ROOT / "applications/monflorian/integration/public-edge.override.yaml"
+        ).read_bytes()
+        self.private_access = (
+            b"basic_auth {\n\tvalidation $2a$14$" + b"A" * 53 + b"\n}\n"
+        )
         protected_file(self.paths.approved_route, self.route)
         protected_file(self.paths.tls_snippet, self.tls)
         protected_file(self.paths.overlay, self.overlay)
+        protected_file(
+            self.paths.approved_monflorian_route,
+            self.monflorian_approved_route,
+        )
+        protected_file(self.paths.monflorian_overlay, self.monflorian_overlay)
+        protected_file(
+            self.paths.private_access_snippet,
+            self.private_access,
+            0o400,
+        )
         protected_file(self.paths.candidate_validator, b"#!/bin/sh\nexit 0\n", 0o755)
         protected_file(self.paths.caddy_verifier, b"#!/bin/sh\nexit 0\n", 0o755)
         self.base = self.create_base()
@@ -125,6 +152,37 @@ class ControllerFixture:
             / "integration/caddy/surplasse.caddy"
         )
         protected_file(self.attested, self.route)
+        self.monflorian_attested = (
+            root
+            / "srv/applications/monflorian/edge-releases"
+            / ("sha256-" + "b" * 64)
+            / "monflorian.caddy"
+        )
+        protected_file(self.monflorian_attested, self.monflorian_route)
+        protected_file(
+            self.monflorian_attested.with_name("state.json"),
+            CONTROLLER.canonical_json(
+                {
+                    "application": "monflorian",
+                    "components": {
+                        "backend": (
+                            "ghcr.io/nclsppr/monflorian/backend@sha256:" + "c" * 64
+                        )
+                    },
+                    "integration_reference": (
+                        "ghcr.io/nclsppr/monflorian/vps-integration@sha256:" + "d" * 64
+                    ),
+                    "migration_inventory_digest": "sha256:" + "e" * 64,
+                    "probe_inventory_digest": "sha256:" + "f" * 64,
+                    "release_reference": (
+                        "ghcr.io/nclsppr/monflorian/application-release@sha256:"
+                        + "b" * 64
+                    ),
+                    "schema": 1,
+                    "source_revision": REVISION,
+                }
+            ),
+        )
 
     def create_base(self, phase: str = "prepare") -> Path:
         base = self.paths.base_release_root / f"{REVISION}-{phase}"
@@ -145,12 +203,12 @@ class ControllerFixture:
         base.chmod(0o555)
         return base
 
-    def stage(self):
+    def stage(self, *, composite: bool = False):
         compose = CONTROLLER.canonical_json(
             {"name": CONTROLLER.PROJECT, "services": {"caddy": {"image": IMAGE}}}
         )
 
-        def render(_base, staging, _paths):
+        def render(_base, staging, _paths, **_kwargs):
             protected_file(staging / "compose.yaml", compose)
             return compose, {
                 "name": CONTROLLER.PROJECT,
@@ -165,7 +223,11 @@ class ControllerFixture:
             mock.patch.object(CONTROLLER, "validate_local_image"),
             mock.patch.object(CONTROLLER, "validate_caddy_candidate"),
         ):
-            return CONTROLLER.stage_candidate(self.attested, self.paths)
+            return CONTROLLER.stage_candidate(
+                self.attested,
+                self.paths,
+                self.monflorian_attested if composite else None,
+            )
 
 
 class SurplassePublicEdgeControllerTests(unittest.TestCase):
@@ -183,12 +245,8 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
         with self.fixture.paths.docker.open("r+b") as stream:
             stream.truncate(incident_size)
         self.assertGreater(incident_size, 16 * 1024 * 1024)
-        self.assertEqual(
-            CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES, 128 * 1024 * 1024
-        )
-        self.assertEqual(
-            CONTROLLER.MAX_CONTROL_EXECUTABLE_BYTES, 16 * 1024 * 1024
-        )
+        self.assertEqual(CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES, 128 * 1024 * 1024)
+        self.assertEqual(CONTROLLER.MAX_CONTROL_EXECUTABLE_BYTES, 16 * 1024 * 1024)
         with mock.patch.object(
             CONTROLLER.os,
             "read",
@@ -215,9 +273,7 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
                 try:
                     if case == "oversize":
                         with docker.open("r+b") as stream:
-                            stream.truncate(
-                                CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES + 1
-                            )
+                            stream.truncate(CONTROLLER.MAX_DOCKER_EXECUTABLE_BYTES + 1)
                     elif case == "symlink":
                         linked.symlink_to(docker)
                         candidate = linked
@@ -259,12 +315,8 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
         self,
     ) -> None:
         metadata = self.fixture.paths.docker.lstat()
-        changed = changed_metadata(
-            metadata, st_mtime_ns=metadata.st_mtime_ns + 1
-        )
-        with mock.patch.object(
-            CONTROLLER.os, "fstat", side_effect=(metadata, changed)
-        ):
+        changed = changed_metadata(metadata, st_mtime_ns=metadata.st_mtime_ns + 1)
+        with mock.patch.object(CONTROLLER.os, "fstat", side_effect=(metadata, changed)):
             with self.assertRaisesRegex(
                 CONTROLLER.EdgeDeploymentError, "changed while it was validated"
             ):
@@ -311,9 +363,7 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
 
     def test_pre_cutover_is_a_valid_public_edge_base_phase(self) -> None:
         release = self.fixture.create_base("precutover")
-        revision, phase = CONTROLLER.validate_base_release(
-            release, self.fixture.paths
-        )
+        revision, phase = CONTROLLER.validate_base_release(release, self.fixture.paths)
         self.assertEqual(revision, REVISION)
         self.assertEqual(phase, "precutover")
 
@@ -342,6 +392,242 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
         )
         self.assertEqual(state.route_sha256, CONTROLLER.ROUTE_SHA256)
         CONTROLLER.validate_candidate_release(release, state, self.fixture.paths)
+
+    def test_composite_stage_versions_private_access_and_keeps_every_route(
+        self,
+    ) -> None:
+        state = self.fixture.stage(composite=True)
+        release = Path(state.release)
+        self.assertEqual(state.as_dict()["schema"], 2)
+        self.assertEqual(
+            sorted(path.name for path in (release / "routes").iterdir()),
+            [
+                "monflorian.caddy",
+                "papersempire.caddy",
+                "parkventory.caddy",
+                "personal.caddy",
+                "surplasse.caddy",
+            ],
+        )
+        private = release / "private" / CONTROLLER.PRIVATE_ACCESS_NAME
+        self.assertEqual(private.read_bytes(), self.fixture.private_access)
+        self.assertEqual(private.stat().st_mode & 0o777, 0o400)
+        for public_file in (release / "candidate.json", release / "compose.yaml"):
+            self.assertNotIn(self.fixture.private_access, public_file.read_bytes())
+        CONTROLLER.validate_candidate_release(release, state, self.fixture.paths)
+
+    def test_composite_recovery_needs_neither_current_input_nor_product_release(
+        self,
+    ) -> None:
+        state = self.fixture.stage(composite=True)
+        self.fixture.paths.private_access_snippet.unlink()
+        self.fixture.monflorian_attested.unlink()
+        self.fixture.monflorian_attested.with_name("state.json").unlink()
+        CONTROLLER.validate_candidate_release(
+            Path(state.release),
+            state,
+            self.fixture.paths,
+        )
+
+    def test_private_access_rotation_creates_a_new_immutable_candidate(self) -> None:
+        first = self.fixture.stage(composite=True)
+        first_bytes = (
+            Path(first.release) / "private" / CONTROLLER.PRIVATE_ACCESS_NAME
+        ).read_bytes()
+        rotated = b"basic_auth {\n\tvalidation $2a$14$" + b"B" * 53 + b"\n}\n"
+        self.fixture.paths.private_access_snippet.chmod(0o600)
+        self.fixture.paths.private_access_snippet.write_bytes(rotated)
+        self.fixture.paths.private_access_snippet.chmod(0o400)
+        second = self.fixture.stage(composite=True)
+        self.assertNotEqual(first.release, second.release)
+        self.assertEqual(
+            Path(second.release)
+            .joinpath("private", CONTROLLER.PRIVATE_ACCESS_NAME)
+            .read_bytes(),
+            rotated,
+        )
+        self.assertEqual(
+            Path(first.release)
+            .joinpath("private", CONTROLLER.PRIVATE_ACCESS_NAME)
+            .read_bytes(),
+            first_bytes,
+        )
+
+    def test_live_schema_two_requires_exact_network_address_and_private_mount(
+        self,
+    ) -> None:
+        state = self.fixture.stage(composite=True)
+        network_ids = {
+            CONTROLLER.APP_NETWORK: "a" * 64,
+            CONTROLLER.MONFLORIAN_APP_NETWORK: "b" * 64,
+        }
+
+        def network(name, subnet):
+            return (
+                network_ids[name],
+                {
+                    "Driver": "bridge",
+                    "IPAM": {"Config": [{"Subnet": subnet}]},
+                    "Internal": False,
+                    "Labels": {"com.nclsppr.vps-infra.managed": "true"},
+                    "Name": name,
+                    "Scope": "local",
+                },
+            )
+
+        base_container = {
+            "Config": {
+                "Image": IMAGE,
+                "Labels": {"com.docker.compose.project": CONTROLLER.PROJECT},
+            },
+            "Mounts": [
+                {
+                    "Destination": CONTROLLER.ROUTES_TARGET,
+                    "RW": False,
+                    "Source": str(self.fixture.paths.runtime_link / "routes"),
+                    "Type": "bind",
+                },
+                {
+                    "Destination": CONTROLLER.TLS_TARGET,
+                    "RW": False,
+                    "Source": str(
+                        self.fixture.paths.runtime_link / "surplasse-tls.caddy"
+                    ),
+                    "Type": "bind",
+                },
+                {
+                    "Destination": CONTROLLER.PRIVATE_ACCESS_TARGET,
+                    "RW": False,
+                    "Source": str(
+                        Path(state.release) / "private" / CONTROLLER.PRIVATE_ACCESS_NAME
+                    ),
+                    "Type": "bind",
+                },
+            ],
+            "NetworkSettings": {
+                "Networks": {
+                    CONTROLLER.EDGE_NETWORK: {},
+                    CONTROLLER.APP_NETWORK: {
+                        "IPAddress": CONTROLLER.APP_ADDRESS,
+                        "IPPrefixLen": 24,
+                        "NetworkID": network_ids[CONTROLLER.APP_NETWORK],
+                    },
+                    CONTROLLER.MONFLORIAN_APP_NETWORK: {
+                        "IPAddress": CONTROLLER.MONFLORIAN_APP_ADDRESS,
+                        "IPPrefixLen": 24,
+                        "NetworkID": network_ids[CONTROLLER.MONFLORIAN_APP_NETWORK],
+                    },
+                }
+            },
+            "State": {"Health": {"Status": "healthy"}, "Status": "running"},
+        }
+        cases = (
+            ("valid", base_container, None),
+            (
+                "address",
+                {
+                    **base_container,
+                    "NetworkSettings": {
+                        "Networks": {
+                            **base_container["NetworkSettings"]["Networks"],
+                            CONTROLLER.MONFLORIAN_APP_NETWORK: {
+                                **base_container["NetworkSettings"]["Networks"][
+                                    CONTROLLER.MONFLORIAN_APP_NETWORK
+                                ],
+                                "IPAddress": "172.30.40.253",
+                            },
+                        }
+                    },
+                },
+                "exact app_monflorian address",
+            ),
+            (
+                "mount",
+                {
+                    **base_container,
+                    "Mounts": [
+                        *base_container["Mounts"][:-1],
+                        {
+                            **base_container["Mounts"][-1],
+                            "Source": str(self.fixture.paths.private_access_snippet),
+                        },
+                    ],
+                },
+                "monflorian-private-access",
+            ),
+        )
+        for name, container, expected_error in cases:
+            with (
+                self.subTest(name=name),
+                (
+                    self.assertRaisesRegex(
+                        CONTROLLER.EdgeDeploymentError,
+                        expected_error,
+                    )
+                    if expected_error is not None
+                    else contextlib.nullcontext()
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "current_release",
+                    return_value=Path(state.release),
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "validate_candidate_release",
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "compose_document",
+                    return_value={
+                        "services": {"caddy": {"image": IMAGE}},
+                    },
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "run",
+                    side_effect=(
+                        mock.Mock(stdout=b"caddy\n", stderr=b"", returncode=0),
+                        mock.Mock(
+                            stdout=CONTROLLER.canonical_json([container]),
+                            stderr=b"",
+                            returncode=0,
+                        ),
+                    ),
+                ),
+                mock.patch.object(
+                    CONTROLLER,
+                    "network_identity",
+                    side_effect=(
+                        network(CONTROLLER.APP_NETWORK, CONTROLLER.APP_SUBNET),
+                        network(
+                            CONTROLLER.MONFLORIAN_APP_NETWORK,
+                            CONTROLLER.MONFLORIAN_APP_SUBNET,
+                        ),
+                    ),
+                ),
+            ):
+                CONTROLLER.verify_live_runtime(self.fixture.paths, state)
+
+    def test_composite_stage_refuses_missing_or_noncanonical_private_access(
+        self,
+    ) -> None:
+        self.fixture.paths.private_access_snippet.unlink()
+        with self.assertRaisesRegex(
+            CONTROLLER.EdgeDeploymentError,
+            "cannot open Mon Florian private access snippet",
+        ):
+            self.fixture.stage(composite=True)
+        protected_file(
+            self.fixture.paths.private_access_snippet,
+            b"basic_auth validation plaintext\n",
+            0o400,
+        )
+        with self.assertRaisesRegex(
+            CONTROLLER.EdgeDeploymentError,
+            "canonical bcrypt",
+        ):
+            self.fixture.stage(composite=True)
 
     def test_approved_route_reserves_the_complete_technical_name_set(self) -> None:
         route = self.fixture.route.decode("utf-8")
@@ -417,6 +703,30 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
                 0,
             )
 
+    def test_cli_uses_a_distinct_command_for_composite_removal(self) -> None:
+        release = self.fixture.paths.extension_release_root / ("b" * 64)
+        with (
+            mock.patch.object(CONTROLLER, "require_runtime"),
+            mock.patch.object(
+                CONTROLLER,
+                "deployment_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(CONTROLLER, "activate_candidate") as activate,
+        ):
+            self.assertEqual(
+                CONTROLLER.main(
+                    ["--remove-monflorian", str(release)],
+                    paths=self.fixture.paths,
+                ),
+                0,
+            )
+        activate.assert_called_once_with(
+            release,
+            self.fixture.paths,
+            remove_monflorian=True,
+        )
+
     def test_shared_lock_refuses_a_second_hard_link(self) -> None:
         self.fixture.paths.deployment_lock.touch(mode=0o600)
         os.link(
@@ -471,6 +781,147 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
         )
         CONTROLLER._write_transaction(transaction, self.fixture.paths)
         return state, transaction
+
+    def assert_failed_transition_rolls_back_from_every_phase(
+        self,
+        label,
+        build_transition,
+        *,
+        remove_monflorian=False,
+    ) -> None:
+        for phase in CONTROLLER.TRANSACTION_PHASES:
+            with (
+                self.subTest(transition=label, phase=phase),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                fixture = ControllerFixture(Path(temporary))
+                previous, candidate = build_transition(fixture)
+                CONTROLLER.switch_release(fixture.paths, Path(previous.release))
+                CONTROLLER.write_state(
+                    fixture.paths.active_path,
+                    previous.as_dict(),
+                    fixture.paths,
+                )
+                transaction = CONTROLLER.EdgeTransaction(
+                    candidate=candidate,
+                    previous=previous,
+                    previous_release=previous.release,
+                    phase=phase,
+                    remove_monflorian=remove_monflorian,
+                )
+                CONTROLLER._write_transaction(transaction, fixture.paths)
+                if phase != "prepared":
+                    CONTROLLER.switch_release(fixture.paths, Path(candidate.release))
+                verification = (
+                    [CONTROLLER.EdgeDeploymentError("candidate rejected"), None]
+                    if phase in {"reconciled", "verified"}
+                    else [None]
+                )
+                with (
+                    mock.patch.object(CONTROLLER, "restart_edge"),
+                    mock.patch.object(
+                        CONTROLLER,
+                        "verify_live_runtime",
+                        side_effect=verification,
+                    ),
+                ):
+                    CONTROLLER.recover_locked(fixture.paths)
+                self.assertEqual(
+                    CONTROLLER.current_release(fixture.paths),
+                    Path(previous.release),
+                )
+                self.assertEqual(CONTROLLER.read_active(fixture.paths), previous)
+                self.assertFalse(fixture.paths.transaction_path.exists())
+
+    def test_first_composition_rolls_back_from_every_transaction_phase(self) -> None:
+        self.assert_failed_transition_rolls_back_from_every_phase(
+            "schema 1 to schema 2",
+            lambda fixture: (fixture.stage(), fixture.stage(composite=True)),
+        )
+
+    def test_private_access_rotation_rolls_back_from_every_transaction_phase(
+        self,
+    ) -> None:
+        def build_transition(fixture):
+            previous = fixture.stage(composite=True)
+            rotated = b"basic_auth {\n\tvalidation $2a$14$" + b"B" * 53 + b"\n}\n"
+            fixture.paths.private_access_snippet.chmod(0o600)
+            fixture.paths.private_access_snippet.write_bytes(rotated)
+            fixture.paths.private_access_snippet.chmod(0o400)
+            return previous, fixture.stage(composite=True)
+
+        self.assert_failed_transition_rolls_back_from_every_phase(
+            "schema 2 rotation",
+            build_transition,
+        )
+
+    def test_composite_removal_rolls_back_from_every_transaction_phase(self) -> None:
+        self.assert_failed_transition_rolls_back_from_every_phase(
+            "schema 2 removal",
+            lambda fixture: (fixture.stage(composite=True), fixture.stage()),
+            remove_monflorian=True,
+        )
+
+    def test_composite_removal_requires_the_explicit_transaction_schema(self) -> None:
+        legacy = self.fixture.stage()
+        composite = self.fixture.stage(composite=True)
+        unauthorized = CONTROLLER.EdgeTransaction(
+            candidate=legacy,
+            previous=composite,
+            previous_release=composite.release,
+            phase="prepared",
+        )
+        with self.assertRaisesRegex(
+            CONTROLLER.EdgeDeploymentError,
+            "removal authorization",
+        ):
+            CONTROLLER.validate_transaction(
+                unauthorized.as_dict(),
+                self.fixture.paths,
+                "removal transaction",
+            )
+        authorized = CONTROLLER.dataclasses.replace(
+            unauthorized,
+            remove_monflorian=True,
+        )
+        restored = CONTROLLER.validate_transaction(
+            authorized.as_dict(),
+            self.fixture.paths,
+            "removal transaction",
+        )
+        self.assertTrue(restored.remove_monflorian)
+        self.assertEqual(restored.as_dict()["schema"], 2)
+
+    def test_normal_stage_cannot_drop_an_active_composite(self) -> None:
+        composite = self.fixture.stage(composite=True)
+        CONTROLLER.switch_release(self.fixture.paths, Path(composite.release))
+        CONTROLLER.write_state(
+            self.fixture.paths.active_path,
+            composite.as_dict(),
+            self.fixture.paths,
+        )
+        with self.assertRaisesRegex(
+            CONTROLLER.EdgeDeploymentError,
+            "cannot remove the active Mon Florian edge",
+        ):
+            self.fixture.stage()
+
+    def test_composite_stage_retains_the_active_base_across_controller_install(
+        self,
+    ) -> None:
+        legacy = self.fixture.stage()
+        CONTROLLER.switch_release(self.fixture.paths, Path(legacy.release))
+        CONTROLLER.write_state(
+            self.fixture.paths.active_path,
+            legacy.as_dict(),
+            self.fixture.paths,
+        )
+        self.fixture.paths.controller_revision.chmod(0o644)
+        self.fixture.paths.controller_revision.write_text(f"{'f' * 40}\n")
+        self.fixture.paths.controller_revision.chmod(0o444)
+        composite = self.fixture.stage(composite=True)
+        self.assertEqual(composite.base_release, legacy.base_release)
+        self.assertEqual(composite.source_revision, legacy.source_revision)
 
     def test_prepared_recovery_rolls_back_even_after_the_link_switched(self) -> None:
         state, _transaction = self.transaction("prepared")
@@ -724,7 +1175,9 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
             nested_names,
         )
 
-    def test_canonical_admission_is_enabled_but_legacy_adapter_remains_locked(self) -> None:
+    def test_canonical_admission_is_enabled_but_legacy_adapter_remains_locked(
+        self,
+    ) -> None:
         application = json.loads(
             (ROOT / "releases/application-production.json").read_text()
         )

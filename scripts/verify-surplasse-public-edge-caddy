@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 usage() {
-  printf 'usage: %s IMAGE APPROVED_ROUTE\n' "${0##*/}" >&2
-  exit 2
+	printf 'usage: %s IMAGE APPROVED_SURPLASSE_ROUTE [MONFLORIAN_ROUTE]\n' "${0##*/}" >&2
+	exit 2
 }
 
 fail() {
@@ -11,13 +11,18 @@ fail() {
   exit 1
 }
 
-[[ $# -eq 2 ]] || usage
+[[ $# -eq 2 || $# -eq 3 ]] || usage
 image=$1
 approved_route=$2
+monflorian_route=${3:-}
 [[ $image =~ ^ghcr\.io/nclsppr/vps-infra/caddy:[^@]+@sha256:[0-9a-f]{64}$ ]] \
   || fail "Caddy image is not the immutable platform image"
 [[ -f $approved_route && ! -L $approved_route ]] \
-  || fail "approved route must be a regular non-symbolic file"
+	|| fail "approved route must be a regular non-symbolic file"
+if [[ -n $monflorian_route ]]; then
+	[[ -f $monflorian_route && ! -L $monflorian_route ]] \
+		|| fail "Mon Florian route must be a regular non-symbolic file"
+fi
 
 script_directory=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repository_root=$(CDPATH='' cd -- "$script_directory/.." && pwd -P)
@@ -32,39 +37,48 @@ trap 'rm -rf -- "$routes" "$secrets"; rm -f -- "$adapted"' EXIT
 
 cp -- "$repository_root/platform/public-static-edge/routes-activate/"*.caddy "$routes/"
 cp -- "$approved_route" "$routes/surplasse.caddy"
+if [[ -n $monflorian_route ]]; then
+	cp -- "$monflorian_route" "$routes/monflorian.caddy"
+	validation_digest=$(docker run --rm "$image" \
+		caddy hash-password --algorithm bcrypt --plaintext validation-only)
+	[[ $validation_digest =~ ^\$2[aby]\$14\$[./A-Za-z0-9]{53}$ ]] \
+		|| fail "Caddy did not produce the required bcrypt cost"
+	printf 'basic_auth {\n\tvalidation %s\n}\n' "$validation_digest" \
+		>"$secrets/monflorian-private-access.caddy"
+fi
 for name in application-key application-secret consumer-key; do
   printf 'validation-placeholder\n' >"$secrets/$name"
 done
 
+common_docker_run=(
+	docker run --rm
+	--env OVH_APPLICATION_KEY_FILE=/run/secrets/surplasse_ovh_application_key
+	--env OVH_APPLICATION_SECRET_FILE=/run/secrets/surplasse_ovh_application_secret
+	--env OVH_CONSUMER_KEY_FILE=/run/secrets/surplasse_ovh_consumer_key
+	--volume "$secrets/application-key:/run/secrets/surplasse_ovh_application_key:ro"
+	--volume "$secrets/application-secret:/run/secrets/surplasse_ovh_application_secret:ro"
+	--volume "$repository_root/platform/public-static-edge/Caddyfile:/etc/caddy/Caddyfile:ro"
+	--volume "$repository_root/platform/public-static-edge/surplasse-tls.caddy:/etc/caddy/surplasse-tls.caddy:ro"
+	--volume "$routes:/etc/caddy/routes:ro"
+)
+if [[ -n $monflorian_route ]]; then
+	common_docker_run+=(
+		--volume "$secrets/monflorian-private-access.caddy:/etc/caddy/monflorian-private-access.caddy:ro"
+	)
+fi
 docker_run=(
-  docker run --rm
-  --env OVH_APPLICATION_KEY_FILE=/run/secrets/surplasse_ovh_application_key
-  --env OVH_APPLICATION_SECRET_FILE=/run/secrets/surplasse_ovh_application_secret
-  --env OVH_CONSUMER_KEY_FILE=/run/secrets/surplasse_ovh_consumer_key
-  --volume "$secrets/application-key:/run/secrets/surplasse_ovh_application_key:ro"
-  --volume "$secrets/application-secret:/run/secrets/surplasse_ovh_application_secret:ro"
-  --volume "$secrets/consumer-key:/run/secrets/surplasse_ovh_consumer_key:ro"
-  --volume "$repository_root/platform/public-static-edge/Caddyfile:/etc/caddy/Caddyfile:ro"
-  --volume "$repository_root/platform/public-static-edge/surplasse-tls.caddy:/etc/caddy/surplasse-tls.caddy:ro"
-  --volume "$routes:/etc/caddy/routes:ro"
+	"${common_docker_run[@]}"
+	--volume "$secrets/consumer-key:/run/secrets/surplasse_ovh_consumer_key:ro"
 )
 
 "${docker_run[@]}" "$image" \
   caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
   || fail "the exact image, entry point, approved route, and scoped TLS snippet are incompatible"
 
-if docker run --rm \
-  --env OVH_APPLICATION_KEY_FILE=/run/secrets/surplasse_ovh_application_key \
-  --env OVH_APPLICATION_SECRET_FILE=/run/secrets/surplasse_ovh_application_secret \
-  --env OVH_CONSUMER_KEY_FILE=/run/secrets/surplasse_ovh_consumer_key \
-  --volume "$secrets/application-key:/run/secrets/surplasse_ovh_application_key:ro" \
-  --volume "$secrets/application-secret:/run/secrets/surplasse_ovh_application_secret:ro" \
-  --volume "$repository_root/platform/public-static-edge/Caddyfile:/etc/caddy/Caddyfile:ro" \
-  --volume "$repository_root/platform/public-static-edge/surplasse-tls.caddy:/etc/caddy/surplasse-tls.caddy:ro" \
-  --volume "$routes:/etc/caddy/routes:ro" \
-  "$image" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
-  >/dev/null 2>&1; then
-  fail "the entry point accepted an incomplete DNS credential set"
+if "${common_docker_run[@]}" "$image" \
+	caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
+	>/dev/null 2>&1; then
+	fail "the entry point accepted an incomplete DNS credential set"
 fi
 
 "${docker_run[@]}" "$image" \
@@ -90,5 +104,41 @@ jq -e '
   )
 ' "$adapted" >/dev/null \
   || fail "DNS-01 automation is not scoped exactly to the Surplasse subjects"
+
+if [[ -n $monflorian_route ]]; then
+	jq -e '
+		[
+			.apps.http.servers[]?.routes[]?
+			| select(.match == [{"host": ["monflorian.com"]}])
+		] as $sites
+		| ($sites[0] // {}) as $site
+		| [
+			$site | .. | objects
+			| .handle? // empty
+			| select(type == "array")
+			| select(any(.[]; .handler? == "reverse_proxy"))
+		] as $proxy_handlers
+		| [
+			$site | .. | objects
+			| select(.handler? == "reverse_proxy")
+		] as $proxies
+		| [
+			$site | .. | objects
+			| select(.handler? == "authentication")
+			| .providers.http_basic.accounts[]?
+		] as $accounts
+		| ($sites | length) == 1
+		and ($proxy_handlers | length) == 1
+		and ([$proxy_handlers[0][] | .handler] == ["authentication", "reverse_proxy"])
+		and ($proxies == [{
+			"handler": "reverse_proxy",
+			"upstreams": [{"dial": "monflorian-backend:8080"}]
+		}])
+		and ($accounts | length) == 1
+		and $accounts[0].username == "validation"
+		and ($accounts[0].password | test("^\\$2[aby]\\$14\\$"))
+	' "$adapted" >/dev/null \
+		|| fail "Mon Florian Basic Auth is not ordered before its reverse proxy"
+fi
 
 printf 'Surplasse public edge Caddy candidate verified: %s\n' "$image"
