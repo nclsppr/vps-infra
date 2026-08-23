@@ -213,6 +213,12 @@ class ParkventoryPostgresTests(unittest.TestCase):
         self.assertIn("WITH ADMIN FALSE, INHERIT FALSE, SET TRUE", sql)
         self.assertIn("REVOKE %I FROM %I", sql)
         self.assertIn("ALTER DATABASE parkventory OWNER TO parkventory_owner", sql)
+        self.assertIn("ALTER ROLE parkventory_owner RESET ALL", sql)
+        self.assertIn("ALTER ROLE parkventory_migrator RESET ALL", sql)
+        self.assertIn("ALTER ROLE parkventory_runtime RESET ALL", sql)
+        self.assertIn("ALTER DATABASE parkventory RESET ALL", sql)
+        self.assertIn("pg_db_role_setting setting", sql)
+        self.assertIn("ALTER ROLE %I IN DATABASE %I RESET ALL", sql)
         self.assertIn(
             "ALTER ROLE parkventory_migrator IN DATABASE parkventory RESET ALL",
             sql,
@@ -380,6 +386,8 @@ class ParkventoryPostgresTests(unittest.TestCase):
         for key in (
             "unexpected_database_grantee",
             "unexpected_schema_grantee",
+            "unexpected_application_schema",
+            "unexpected_role_settings",
             "unexpected_default_grantee",
             "global_default_public_grantee",
             "global_default_runtime_grantee",
@@ -436,6 +444,8 @@ class ParkventoryPostgresTests(unittest.TestCase):
             "a.grantee<>t.typowner",
             "ARRAY['role=parkventory_owner','search_path=public']::text[]",
             "ARRAY['search_path=public']::text[]",
+            "left(n.nspname,3)<>'pg_'",
+            "s.setrole=0 AND s.setdatabase=",
         ):
             self.assertIn(fragment, base_sql)
         sql = PROVISIONER.rls_proof_sql()

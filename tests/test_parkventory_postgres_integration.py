@@ -407,6 +407,67 @@ ALTER ROLE parkventory_runtime IN DATABASE parkventory
             )
             PROVISIONER.observe(container, require_rls=True)
 
+            PROVISIONER.psql(
+                container,
+                "postgres",
+                """
+ALTER ROLE parkventory_runtime
+  SET default_transaction_read_only TO on;
+ALTER DATABASE parkventory
+  SET idle_in_transaction_session_timeout TO '5s';
+""",
+            )
+            with self.assertRaisesRegex(
+                PROVISIONER.ProvisionError,
+                "effective database roles or default privileges",
+            ):
+                PROVISIONER.observe(container, require_rls=True)
+            PROVISIONER.apply_database(
+                container,
+                migrator_auth,
+                runtime_auth,
+            )
+            self.assertTrue(PROVISIONER.reconcile_application_acl(container))
+            PROVISIONER.verify_database_credentials(
+                container,
+                migrator_auth,
+                runtime_auth,
+            )
+            PROVISIONER.observe(container, require_rls=True)
+
+            PROVISIONER.psql(
+                container,
+                "parkventory",
+                """
+SET ROLE parkventory_owner;
+CREATE SCHEMA runtime_bypass;
+CREATE TABLE runtime_bypass.unisolated_row (id INTEGER PRIMARY KEY);
+INSERT INTO runtime_bypass.unisolated_row VALUES (1);
+RESET ROLE;
+GRANT USAGE ON SCHEMA runtime_bypass TO parkventory_runtime;
+GRANT SELECT ON runtime_bypass.unisolated_row TO parkventory_runtime;
+""",
+            )
+            bypass = self.role_psql(
+                docker,
+                container,
+                "parkventory_runtime",
+                runtime_auth,
+                "SELECT id FROM runtime_bypass.unisolated_row;",
+            )
+            self.assertEqual(bypass.stdout.strip(), "1")
+            with self.assertRaisesRegex(
+                PROVISIONER.ProvisionError,
+                "effective database roles or default privileges",
+            ):
+                PROVISIONER.observe(container, require_rls=True)
+            PROVISIONER.psql(
+                container,
+                "parkventory",
+                "DROP SCHEMA runtime_bypass CASCADE;",
+            )
+            PROVISIONER.observe(container, require_rls=True)
+
             final_extension_access = json.loads(
                 PROVISIONER.psql(
                     container,

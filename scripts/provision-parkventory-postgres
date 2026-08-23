@@ -806,6 +806,33 @@ END
 $database_acl$;
 GRANT CONNECT ON DATABASE parkventory TO parkventory_migrator, parkventory_runtime;
 ALTER DATABASE parkventory OWNER TO parkventory_owner;
+ALTER ROLE parkventory_owner RESET ALL;
+ALTER ROLE parkventory_migrator RESET ALL;
+ALTER ROLE parkventory_runtime RESET ALL;
+ALTER DATABASE parkventory RESET ALL;
+DO $role_settings$
+DECLARE
+  candidate record;
+BEGIN
+  FOR candidate IN
+    SELECT role.rolname, database.datname
+    FROM pg_db_role_setting setting
+    JOIN pg_roles role ON role.oid = setting.setrole
+    JOIN pg_database database ON database.oid = setting.setdatabase
+    WHERE role.rolname IN (
+      'parkventory_owner',
+      'parkventory_migrator',
+      'parkventory_runtime'
+    )
+  LOOP
+    EXECUTE format(
+      'ALTER ROLE %I IN DATABASE %I RESET ALL',
+      candidate.rolname,
+      candidate.datname
+    );
+  END LOOP;
+END
+$role_settings$;
 ALTER ROLE parkventory_migrator IN DATABASE parkventory RESET ALL;
 ALTER ROLE parkventory_runtime IN DATABASE parkventory RESET ALL;
 ALTER ROLE parkventory_migrator IN DATABASE parkventory SET ROLE TO parkventory_owner;
@@ -1060,10 +1087,12 @@ def proof_sql() -> str:
             "'runtime_can_use_schema', has_schema_privilege('parkventory_runtime','public','USAGE')",
             "'runtime_can_create_schema', has_schema_privilege('parkventory_runtime','public','CREATE')",
             "'unexpected_schema_grantee', EXISTS (SELECT 1 FROM pg_namespace n CROSS JOIN LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname='public' AND a.grantee NOT IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')))",
+            "'unexpected_application_schema', EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname<>'public' AND n.nspname<>'information_schema' AND left(n.nspname,3)<>'pg_')",
             "'migrator_is_owner_member', pg_has_role('parkventory_migrator','parkventory_owner','MEMBER')",
             "'runtime_has_owner_membership', pg_has_role('parkventory_runtime','parkventory_owner','MEMBER')",
             "'migrator_settings', (SELECT COALESCE(array_agg(setting ORDER BY setting),'{}'::text[]) = ARRAY['role=parkventory_owner','search_path=public']::text[] FROM pg_db_role_setting s CROSS JOIN LATERAL unnest(s.setconfig) setting WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory'))",
             "'runtime_settings', (SELECT COALESCE(array_agg(setting ORDER BY setting),'{}'::text[]) = ARRAY['search_path=public']::text[] FROM pg_db_role_setting s CROSS JOIN LATERAL unnest(s.setconfig) setting WHERE s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory'))",
+            "'unexpected_role_settings', EXISTS (SELECT 1 FROM pg_db_role_setting s WHERE (s.setrole IN ((SELECT oid FROM pg_roles WHERE rolname='parkventory_owner'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator'),(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime')) AND NOT ((s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_migrator') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory') AND ARRAY(SELECT setting FROM unnest(s.setconfig) setting ORDER BY setting)=ARRAY['role=parkventory_owner','search_path=public']::text[]) OR (s.setrole=(SELECT oid FROM pg_roles WHERE rolname='parkventory_runtime') AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory') AND ARRAY(SELECT setting FROM unnest(s.setconfig) setting ORDER BY setting)=ARRAY['search_path=public']::text[]))) OR (s.setrole=0 AND s.setdatabase=(SELECT oid FROM pg_database WHERE datname='parkventory')))",
             "'default_table_privileges', (" + privilege_array.format(object_type="'r'") + ")",
             "'default_sequence_privileges', (" + privilege_array.format(object_type="'S'") + ")",
             "'default_function_privileges', (" + privilege_array.format(object_type="'f'") + ")",
@@ -1464,10 +1493,12 @@ EXPECTED_PROOF = {
     "runtime_can_use_schema": True,
     "runtime_can_create_schema": False,
     "unexpected_schema_grantee": False,
+    "unexpected_application_schema": False,
     "migrator_is_owner_member": True,
     "runtime_has_owner_membership": False,
     "migrator_settings": True,
     "runtime_settings": True,
+    "unexpected_role_settings": False,
     "default_table_privileges": [],
     "default_sequence_privileges": [],
     "default_function_privileges": [],
