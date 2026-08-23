@@ -368,6 +368,7 @@ class ParkventoryPostgresTests(unittest.TestCase):
         }
         calls: list[tuple[list[str], dict[str, str] | None]] = []
         original_command = PROVISIONER.command
+        original_docker_json = PROVISIONER.docker_json
         try:
 
             def authenticate(
@@ -389,6 +390,15 @@ class ParkventoryPostgresTests(unittest.TestCase):
                 )
 
             PROVISIONER.command = authenticate
+            PROVISIONER.docker_json = lambda arguments, label: [
+                {
+                    "NetworkSettings": {
+                        "Networks": {
+                            "db_parkventory": {"IPAddress": "172.30.21.2"}
+                        }
+                    }
+                }
+            ]
             PROVISIONER.verify_database_credentials(
                 "postgres-container",
                 passwords["parkventory_migrator"],
@@ -396,9 +406,11 @@ class ParkventoryPostgresTests(unittest.TestCase):
             )
         finally:
             PROVISIONER.command = original_command
+            PROVISIONER.docker_json = original_docker_json
         self.assertEqual(len(calls), 4)
         for arguments, environment in calls:
-            self.assertIn("postgresql", arguments)
+            self.assertIn("172.30.21.2", arguments)
+            self.assertNotIn("postgresql", arguments)
             self.assertIn("PGPASSWORD", arguments)
             assert environment is not None
             self.assertNotIn(environment["PGPASSWORD"], "\0".join(arguments))
@@ -424,6 +436,48 @@ class ParkventoryPostgresTests(unittest.TestCase):
                 )
         finally:
             PROVISIONER.credential_probe = original_probe
+
+    def test_credential_address_is_bounded_to_db_parkventory(self) -> None:
+        original_docker_json = PROVISIONER.docker_json
+        try:
+            for address in (
+                None,
+                2887652610,
+                "172.30.31.2",
+                "172.30.21.0",
+                "172.30.21.255",
+            ):
+                with self.subTest(address=address):
+                    PROVISIONER.docker_json = lambda arguments, label, value=address: [
+                        {
+                            "NetworkSettings": {
+                                "Networks": {
+                                    "db_parkventory": {"IPAddress": value}
+                                }
+                            }
+                        }
+                    ]
+                    with self.assertRaisesRegex(
+                        PROVISIONER.ProvisionError,
+                        "db_parkventory|outside",
+                    ):
+                        PROVISIONER.parkventory_database_address(
+                            "postgres-container"
+                        )
+            for invalid in ([None], [{"NetworkSettings": None}]):
+                with self.subTest(invalid=invalid):
+                    PROVISIONER.docker_json = (
+                        lambda arguments, label, value=invalid: value
+                    )
+                    with self.assertRaisesRegex(
+                        PROVISIONER.ProvisionError,
+                        "incomplete|db_parkventory",
+                    ):
+                        PROVISIONER.parkventory_database_address(
+                            "postgres-container"
+                        )
+        finally:
+            PROVISIONER.docker_json = original_docker_json
 
     def test_observation_is_exact_and_evidence_is_canonical(self) -> None:
         original = PROVISIONER.psql

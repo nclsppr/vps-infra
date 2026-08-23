@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -692,6 +693,52 @@ def psql(container: str, database: str, sql: str) -> str:
     return result.stdout.strip()
 
 
+def parkventory_database_address(container: str) -> str:
+    inspected = docker_json(
+        ["inspect", container],
+        "shared PostgreSQL credential address",
+    )
+    if (
+        not isinstance(inspected, list)
+        or len(inspected) != 1
+        or not isinstance(inspected[0], dict)
+    ):
+        raise ProvisionError("shared PostgreSQL credential address is incomplete")
+    network_settings = inspected[0].get("NetworkSettings", {})
+    networks = (
+        network_settings.get("Networks", {})
+        if isinstance(network_settings, dict)
+        else {}
+    )
+    parkventory_network = (
+        networks.get("db_parkventory", {}) if isinstance(networks, dict) else {}
+    )
+    raw_address = (
+        parkventory_network.get("IPAddress")
+        if isinstance(parkventory_network, dict)
+        else None
+    )
+    expected_network = EXPECTED_CONTRACT["network"]
+    assert isinstance(expected_network, dict)
+    if not isinstance(raw_address, str):
+        raise ProvisionError(
+            "shared PostgreSQL has no valid db_parkventory address"
+        )
+    try:
+        address = ipaddress.IPv4Address(raw_address)
+        subnet = ipaddress.IPv4Network(str(expected_network["subnet"]))
+    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError) as exc:
+        raise ProvisionError(
+            "shared PostgreSQL has no valid db_parkventory address"
+        ) from exc
+    if address not in subnet or address in {
+        subnet.network_address,
+        subnet.broadcast_address,
+    }:
+        raise ProvisionError("shared PostgreSQL address is outside db_parkventory")
+    return str(address)
+
+
 def credential_probe(
     container: str,
     role: str,
@@ -701,6 +748,7 @@ def credential_probe(
         raise ProvisionError("credential verification role is outside the allowlist")
     if re.fullmatch(r"[A-Za-z0-9_-]{64}", role_auth) is None:
         raise ProvisionError("credential verification password is invalid")
+    database_address = parkventory_database_address(container)
     return command(
         [
             "/usr/bin/docker",
@@ -713,7 +761,7 @@ def credential_probe(
             "psql",
             "--no-password",
             "--host",
-            "postgresql",
+            database_address,
             "--username",
             role,
             "--dbname",
