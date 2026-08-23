@@ -104,6 +104,31 @@
         "runtime_auto_migrate": false,
         "proven": false
       }
+    },
+    "monflorian": {
+      "enabled": false,
+      "type": "compose",
+      "source_repository": "nclsppr/monflorian",
+      "source_branch": "main",
+      "compose_project": "monflorian",
+      "published_ports": [],
+      "blocked_by": [
+        "application-release",
+        "domain-and-dns",
+        "edge-network-attachment",
+        "file-based-secrets",
+        "openai-api-access",
+        "private-edge-access",
+        "protected-main",
+        "public-smoke",
+        "recovery-policy",
+        "vps-integration-bundle"
+      ],
+      "migrations": {
+        "strategy": "none",
+        "runtime_auto_migrate": false,
+        "proven": true
+      }
     }
   }
 }

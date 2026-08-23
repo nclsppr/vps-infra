@@ -32,6 +32,7 @@ SAFE_ENVIRONMENT = {
 RELEASE_REPOSITORIES = {
     "surplasse": "ghcr.io/nclsppr/surplasse/application-release",
     "parkventory": "ghcr.io/nclsppr/parkventory/application-release",
+    "monflorian": "ghcr.io/nclsppr/monflorian/application-release",
 }
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.ASCII)

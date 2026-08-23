@@ -160,9 +160,9 @@ The generic controller can validate and plan. Static activation has its own
 reviewed gate. The 2026-08-18 rollout converged repository revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b` and proved that the root-owned
 `deploy-application` controller and its argument-free gate are installed.
-Canonical Surplasse tester admission is enabled. Parkventory remains disabled.
-No application deployment workflow invokes the gate, and admission does not
-prove live runtime state.
+Canonical Surplasse tester admission is enabled. Parkventory and Mon Florian
+remain disabled. No application deployment workflow invokes the gate, and
+admission does not prove live runtime state.
 
 The deploy role declares GitHub CLI 2.97.0 from its official release archive.
 On convergence, it selects `amd64` or `arm64`, verifies the archive SHA-256,
@@ -202,6 +202,10 @@ quarantine state lives under `/srv/applications` and
 `/var/lib/vps-application`; runtime configuration lives under the root-only
 `/etc/vps/applications` directory. Secret bytes remain in
 `/etc/vps/secrets/<application>` and are never copied into state.
+Mon Florian's OpenAI key is copied only when the operator supplies
+`vps_monflorian_openai_api_key_source` through a private variables file. The
+destination is a regular `root:10001` file in mode `0440`; metadata validation
+does not read or log the value.
 For Surplasse, the root-only input helper derives `surplasse.env` atomically
 from the validated JWT key identifier and SMTP host. The file contains exactly
 those two keys. The same helper commit marker binds the source inputs, runtime
@@ -349,7 +353,7 @@ before accepting production data.
 
 ## Prepared Docker networks
 
-Ansible creates seven external Docker networks with fixed properties. The
+Ansible creates eight external Docker networks with fixed properties. The
 isolated public static edge joins only `edge`. The locked complete platform
 definition uses `ops`, `db_monitoring`, and `db_surplasse`. PostgreSQL joins
 only `db_monitoring` and `db_surplasse`. Its Caddy and Prometheus services join

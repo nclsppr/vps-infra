@@ -1039,6 +1039,11 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             defaults["vps_application_recovery_unit"],
             "vps-application-recover.service",
         )
+        self.assertEqual(defaults["vps_monflorian_openai_api_key_source"], "")
+        self.assertEqual(
+            defaults["vps_monflorian_openai_api_key_path"],
+            "/etc/vps/secrets/monflorian/monflorian-openai-api-key",
+        )
         self.assertIn("deploy-application", defaults["vps_deploy_executables"])
         self.assertIn(
             "deploy-application-live-gate",
@@ -1066,7 +1071,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "{{ vps_application_state_dir }}/transactions",
         ):
             self.assertEqual(directories[path], "0700")
-        for application in ("surplasse", "parkventory"):
+        for application in ("surplasse", "parkventory", "monflorian"):
             self.assertEqual(
                 directories[f"{{{{ vps_application_root }}}}/{application}"],
                 "0755",
@@ -1077,7 +1082,43 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 ],
                 "0755",
             )
+        self.assertEqual(directories["/etc/vps/secrets/monflorian"], "0700")
 
+        materialized_copy = by_name[
+            "Materialize the Mon Florian OpenAI secret from private operator input"
+        ]["ansible.builtin.copy"]
+        self.assertEqual(
+            materialized_copy,
+            {
+                "src": "{{ vps_monflorian_openai_api_key_source }}",
+                "dest": "{{ vps_monflorian_openai_api_key_path }}",
+                "owner": "root",
+                "group": "10001",
+                "mode": "0440",
+                "force": True,
+                "backup": False,
+            },
+        )
+        metadata_stat = by_name[
+            "Inspect the Mon Florian OpenAI secret without reading its value"
+        ]["ansible.builtin.stat"]
+        self.assertEqual(metadata_stat["get_checksum"], False)
+        self.assertEqual(metadata_stat["get_mime"], False)
+        metadata_assertions = by_name[
+            "Prove the Mon Florian OpenAI secret metadata when present"
+        ]["ansible.builtin.assert"]["that"]
+        self.assertIn(
+            "vps_monflorian_openai_api_key_stat.stat.gid == 10001",
+            metadata_assertions,
+        )
+        self.assertIn(
+            "vps_monflorian_openai_api_key_stat.stat.mode == '0440'",
+            metadata_assertions,
+        )
+        self.assertIn(
+            "vps_monflorian_openai_api_key_stat.stat.nlink == 1",
+            metadata_assertions,
+        )
         recovery_install = by_name[
             "Install the application transaction recovery unit"
         ]["ansible.builtin.template"]
@@ -2303,7 +2344,15 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "subnet": "172.30.32.0/24",
             },
         )
-        self.assertEqual(len(networks), 7)
+        self.assertEqual(
+            networks["app_monflorian"],
+            {
+                "driver": "bridge",
+                "internal": False,
+                "subnet": "172.30.40.0/24",
+            },
+        )
+        self.assertEqual(len(networks), 8)
         self.assertEqual(
             len({network["subnet"] for network in networks.values()}),
             len(networks),

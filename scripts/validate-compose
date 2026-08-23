@@ -19,12 +19,24 @@ IMAGE_REF_RE = re.compile(
 )
 MAX_EXPECTED_IMAGES_BYTES = 64 * 1024
 PROJECTS = frozenset(
-    {"vps-platform", "vps-public-static-edge", "surplasse", "parkventory"}
+    {
+        "vps-platform",
+        "vps-public-static-edge",
+        "surplasse",
+        "parkventory",
+        "monflorian",
+    }
 )
 INFRASTRUCTURE_PROJECTS = frozenset({"vps-platform", "vps-public-static-edge"})
 APPLICATION_COMPONENTS = {
     "surplasse": frozenset({"backend", "onboarding", "commande", "dashboard", "docs"}),
     "parkventory": frozenset({"backend", "frontend"}),
+    "monflorian": frozenset({"backend"}),
+}
+APPLICATION_MIGRATION_STRATEGIES = {
+    "surplasse": "dedicated",
+    "parkventory": "dedicated",
+    "monflorian": "none",
 }
 SURPLASSE_PILOT_SERVICE = "pilot-bootstrap"
 SURPLASSE_PILOT_PROFILE = "pilot-bootstrap"
@@ -519,7 +531,9 @@ def service_networks(project: str, service_name: str, service: dict[str, Any]) -
     else:
         app_network = f"app_{project}"
         db_network = f"db_{project}"
-        if service_name == "migrator" or service_name.endswith("_migrator"):
+        if APPLICATION_MIGRATION_STRATEGIES[project] == "none":
+            expected = {app_network}
+        elif service_name == "migrator" or service_name.endswith("_migrator"):
             expected = {db_network}
         elif project == "surplasse" and service_name == SURPLASSE_PILOT_SERVICE:
             expected = {app_network, db_network}
@@ -794,12 +808,17 @@ def validate_secrets(project: str, service_name: str, service: dict[str, Any]) -
         target = secret.get("target")
         if not isinstance(source, str) or not isinstance(target, str):
             fail(f"services.{service_name}.secrets[{index}]: source and target strings are required")
-        if target != f"/run/secrets/{source}":
-            fail(f"services.{service_name}.secrets[{index}].target: must equal /run/secrets/{source}")
-        if source in sources or target in targets:
+        runtime_target = f"/run/secrets/{source}"
+        declared_target = source if project == "monflorian" else runtime_target
+        if target != declared_target:
+            fail(
+                f"services.{service_name}.secrets[{index}].target: "
+                f"must equal {declared_target}"
+            )
+        if source in sources or runtime_target in targets:
             fail(f"services.{service_name}.secrets[{index}]: duplicate source or target")
         sources.add(source)
-        targets.add(target)
+        targets.add(runtime_target)
     if project == "vps-platform":
         expected = PLATFORM_SECRETS.get(service_name)
         if expected is None or sources != expected:
@@ -975,6 +994,8 @@ def validate_top_level_resources(project: str, document: dict[str, Any]) -> None
         expected_networks = set(PLATFORM_NETWORKS)
     elif project == "vps-public-static-edge":
         expected_networks = set(PUBLIC_STATIC_EDGE_NETWORKS)
+    elif APPLICATION_MIGRATION_STRATEGIES[project] == "none":
+        expected_networks = {f"app_{project}"}
     else:
         expected_networks = {f"app_{project}", f"db_{project}"}
     networks = document.get("networks")
@@ -1102,7 +1123,9 @@ def validate_compose(
                         "release-manifest reference"
                     )
     if project not in INFRASTRUCTURE_PROJECTS:
-        expected_services = set(APPLICATION_COMPONENTS[project]) | {"migrator"}
+        expected_services = set(APPLICATION_COMPONENTS[project])
+        if APPLICATION_MIGRATION_STRATEGIES[project] == "dedicated":
+            expected_services.add("migrator")
         if (
             project == "surplasse"
             and expected_images is not None

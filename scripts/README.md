@@ -323,12 +323,14 @@ convergence of repository revision
 `da04a09bfa9788ae8127b63f9f3a6692bef2551b`. The root-owned
 `deploy-application` executable and argument-free gate are present. The
 repository now enables only the canonical Surplasse tester admission entry.
-Parkventory remains disabled, and no application workflow invokes either gate.
+Parkventory and Mon Florian remain disabled, and no application workflow
+invokes either gate.
 
 `deploy-application` consumes only the immutable
 `ghcr.io/nclsppr/<application>/application-release@sha256:<digest>` selected by
-the admission resolver. It supports the exact `surplasse` and `parkventory`
-profiles. `releases/application-production.json` enables only Surplasse. A
+the admission resolver. It supports the exact `surplasse`, `parkventory`, and
+`monflorian` profiles. `releases/application-production.json` enables only
+Surplasse. A
 disabled application still stops before runtime validation or network access.
 An enabled entry authorizes admission, but it does not invoke live activation.
 
@@ -353,7 +355,7 @@ Active, inventory, transaction, and quarantine records live under
 The live SSH record is exact and digest-only:
 
 ```text
-deploy-application-live <surplasse|parkventory> <source-sha40> \
+deploy-application-live <surplasse|parkventory|monflorian> <source-sha40> \
   <application-release@sha256>
 ```
 
@@ -366,7 +368,7 @@ the systemd-managed public edge, but does not close Docker's earlier
 `unless-stopped` restart path.
 
 Before a dedicated migration can run, Parkventory must no longer have static
-active state. For both applications, the installed public edge route must equal
+active state. For every application, the installed public edge route must equal
 the attested bundle route byte for byte and the healthy edge Caddy container
 must already be attached to the exact application network. The controller does
 not mutate the immutable edge release. For Surplasse, the preflight also
@@ -439,7 +441,7 @@ Application integration uses a contract from its verified bundle:
 
 ```text
 validate-compose --expected-images /path/to/expected-images.json \
-  <surplasse|parkventory> /path/to/rendered-compose.json
+  <surplasse|parkventory|monflorian> /path/to/rendered-compose.json
 ```
 
 The image contract is a strict JSON object. Each key is a Compose service name.

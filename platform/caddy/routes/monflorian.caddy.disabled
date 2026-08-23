@@ -1,0 +1,19 @@
+monflorian.com {
+	log
+	import security_headers
+
+	handle /.well-known/monflorian-release {
+		header Content-Type text/plain
+		respond "monflorian __SOURCE_REVISION__\n" 200
+	}
+
+	handle {
+		import /etc/caddy/monflorian-private-access.caddy
+		reverse_proxy monflorian-backend:8080
+	}
+}
+
+www.monflorian.com {
+	import security_headers
+	redir https://monflorian.com{uri} 308
+}

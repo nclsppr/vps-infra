@@ -17,13 +17,19 @@
   "properties": {
     "schema": { "const": 1 },
     "contract": { "const": "vps-infra.application-release.v1" },
-    "application": { "enum": ["surplasse", "parkventory"] },
+    "application": { "enum": ["surplasse", "parkventory", "monflorian"] },
     "source": {
       "type": "object",
       "additionalProperties": false,
       "required": ["repository", "branch", "revision"],
       "properties": {
-        "repository": { "enum": ["nclsppr/surplasse", "nclsppr/parkventory"] },
+        "repository": {
+          "enum": [
+            "nclsppr/surplasse",
+            "nclsppr/parkventory",
+            "nclsppr/monflorian"
+          ]
+        },
         "branch": { "const": "main" },
         "revision": { "$ref": "#/$defs/revision" }
       }
@@ -48,7 +54,7 @@
         "inventory_sha256"
       ],
       "properties": {
-        "strategy": { "const": "dedicated" },
+        "strategy": { "enum": ["dedicated", "none"] },
         "runtime_auto_migrate": { "const": false },
         "inventory_artifact": { "$ref": "#/$defs/digestReference" },
         "inventory_sha256": { "$ref": "#/$defs/digest" }
@@ -85,6 +91,7 @@
           },
           "migrations": {
             "properties": {
+              "strategy": { "const": "dedicated" },
               "inventory_artifact": {
                 "pattern": "^ghcr\\.io/nclsppr/surplasse/vps-integration@sha256:[0-9a-f]{64}$"
               }
@@ -98,8 +105,14 @@
             }
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": { "application": { "const": "parkventory" } },
+        "required": ["application"]
       },
-      "else": {
+      "then": {
         "properties": {
           "source": {
             "properties": { "repository": { "const": "nclsppr/parkventory" } }
@@ -114,6 +127,7 @@
           },
           "migrations": {
             "properties": {
+              "strategy": { "const": "dedicated" },
               "inventory_artifact": {
                 "pattern": "^ghcr\\.io/nclsppr/parkventory/vps-integration@sha256:[0-9a-f]{64}$"
               }
@@ -123,6 +137,42 @@
             "properties": {
               "inventory_artifact": {
                 "pattern": "^ghcr\\.io/nclsppr/parkventory/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "application": { "const": "monflorian" } },
+        "required": ["application"]
+      },
+      "then": {
+        "properties": {
+          "source": {
+            "properties": { "repository": { "const": "nclsppr/monflorian" } }
+          },
+          "components": { "$ref": "#/$defs/monflorianComponents" },
+          "integration": {
+            "properties": {
+              "artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/monflorian/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "migrations": {
+            "properties": {
+              "strategy": { "const": "none" },
+              "inventory_artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/monflorian/vps-integration@sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "probes": {
+            "properties": {
+              "inventory_artifact": {
+                "pattern": "^ghcr\\.io/nclsppr/monflorian/vps-integration@sha256:[0-9a-f]{64}$"
               }
             }
           }
@@ -243,6 +293,25 @@
               "properties": {
                 "image": {
                   "pattern": "^ghcr\\.io/nclsppr/parkventory/frontend@sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "monflorianComponents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend"],
+      "properties": {
+        "backend": {
+          "allOf": [
+            { "$ref": "#/$defs/component" },
+            {
+              "properties": {
+                "image": {
+                  "pattern": "^ghcr\\.io/nclsppr/monflorian/backend@sha256:[0-9a-f]{64}$"
                 }
               }
             }

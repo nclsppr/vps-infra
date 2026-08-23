@@ -53,6 +53,7 @@ EXPECTED_APPLICATIONS: Mapping[str, Mapping[str, object]] = {
             "docs": "ghcr.io/nclsppr/surplasse/docs",
         },
         "required_checks": ("Publish immutable application release",),
+        "migration_strategy": "dedicated",
     },
     "parkventory": {
         "mode": "compose",
@@ -65,6 +66,19 @@ EXPECTED_APPLICATIONS: Mapping[str, Mapping[str, object]] = {
             "frontend": "ghcr.io/nclsppr/parkventory/frontend",
         },
         "required_checks": ("Publish immutable application release", "verify"),
+        "migration_strategy": "dedicated",
+    },
+    "monflorian": {
+        "mode": "compose",
+        "source_repository": "nclsppr/monflorian",
+        "source_branch": "main",
+        "release_repository": "ghcr.io/nclsppr/monflorian/application-release",
+        "integration_repository": "ghcr.io/nclsppr/monflorian/vps-integration",
+        "component_repositories": {
+            "backend": "ghcr.io/nclsppr/monflorian/backend",
+        },
+        "required_checks": ("Publish immutable application release", "verify"),
+        "migration_strategy": "none",
     },
 }
 
@@ -84,6 +98,7 @@ class ApplicationPolicy:
     integration_repository: str
     component_repositories: Mapping[str, str]
     required_checks: tuple[str, ...]
+    migration_strategy: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -273,6 +288,7 @@ def load_production_contract(
                 integration_repository=str(expected["integration_repository"]),
                 component_repositories=dict(expected_components),
                 required_checks=tuple(str(item) for item in expected["required_checks"]),
+                migration_strategy=str(expected["migration_strategy"]),
             )
         )
 
@@ -436,7 +452,7 @@ def validate_release_descriptor(
     )
     _literal(
         migrations["strategy"],
-        "dedicated",
+        policy.migration_strategy,
         "application release descriptor.migrations.strategy",
     )
     _literal(

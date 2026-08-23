@@ -96,7 +96,14 @@ def create_plan(
         raise ReconcileError(f"desired artifacts are quarantined: {', '.join(blocked)}")
 
     actions: list[dict[str, Any]] = []
-    units = ["platform", "personal", "papersempire", "surplasse", "parkventory"]
+    units = [
+        "platform",
+        "personal",
+        "papersempire",
+        "surplasse",
+        "parkventory",
+        "monflorian",
+    ]
     for unit in units:
         desired_state = unit_state(desired, unit)
         active_state = unit_state(active, unit) if active is not None else None

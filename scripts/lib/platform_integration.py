@@ -41,6 +41,7 @@ REVISION_RE = re.compile(r"[0-9a-f]{40}")
 RUNTIME_PATHS = (
     "platform/.env.example",
     "platform/caddy/Caddyfile",
+    "platform/caddy/routes/monflorian.caddy.disabled",
     "platform/caddy/routes/papersempire.caddy.disabled",
     "platform/caddy/routes/parkventory.caddy.disabled",
     "platform/caddy/routes/personal.caddy.disabled",
