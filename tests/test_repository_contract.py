@@ -2259,6 +2259,70 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(".State.Health.Status == 'healthy'", runtime_verification)
 
+    def test_parkventory_guard_accepts_the_active_oneshot_platform_unit(
+        self,
+    ) -> None:
+        tasks = yaml.safe_load(
+            (
+                ROOT / "ansible/roles/parkventory_postgres/tasks/main.yml"
+            ).read_text(encoding="utf-8")
+        )
+        by_name = {task["name"]: task for task in tasks}
+        guard = by_name[
+            "Require the healthy internal platform before database inspection"
+        ]["ansible.builtin.assert"]["that"]
+        environment = Environment()
+
+        def guard_results(
+            *, activity_stdout: str, platform_status: str, docker_state: str
+        ) -> list[bool]:
+            variables = {
+                "ansible_facts": {
+                    "services": {
+                        "docker.service": {"state": docker_state},
+                        "vps-internal-platform.service": {
+                            "state": "stopped",
+                            "status": platform_status,
+                        },
+                    }
+                },
+                "vps_parkventory_internal_platform_active": {
+                    "stdout": activity_stdout
+                },
+            }
+            return [
+                bool(environment.compile_expression(assertion)(**variables))
+                for assertion in guard
+            ]
+
+        self.assertTrue(
+            all(
+                guard_results(
+                    activity_stdout="active",
+                    platform_status="enabled",
+                    docker_state="running",
+                )
+            )
+        )
+        for inactive_boundary in (
+            {
+                "activity_stdout": "inactive",
+                "platform_status": "enabled",
+                "docker_state": "running",
+            },
+            {
+                "activity_stdout": "active",
+                "platform_status": "disabled",
+                "docker_state": "running",
+            },
+            {
+                "activity_stdout": "active",
+                "platform_status": "enabled",
+                "docker_state": "stopped",
+            },
+        ):
+            self.assertFalse(all(guard_results(**inactive_boundary)))
+
     def test_internal_platform_secret_materialization_is_idempotent(self) -> None:
         helper = ROOT / "scripts/materialize-internal-platform-secrets"
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3326,6 +3390,14 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "network",
                 "inspect",
                 "db_parkventory",
+            ],
+            (
+                "parkventory_postgres",
+                "Read the effective internal platform activation state",
+            ): [
+                "/usr/bin/systemctl",
+                "is-active",
+                "vps-internal-platform.service",
             ],
             (
                 "parkventory_postgres",
