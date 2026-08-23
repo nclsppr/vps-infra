@@ -3408,7 +3408,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "{{ lookup('ansible.builtin.file', playbook_dir ~ "
                 "'/../../scripts/materialize-parkventory-secrets', "
                 "rstrip=false) }}",
-                "materialize-parkventory-secrets",
                 "--dry-run",
             ],
             (
@@ -3420,7 +3419,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 "{{ lookup('ansible.builtin.file', playbook_dir ~ "
                 "'/../../scripts/provision-parkventory-postgres', "
                 "rstrip=false) }}",
-                "provision-parkventory-postgres",
                 "--dry-run",
                 "--embedded-contract",
             ],
