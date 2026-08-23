@@ -3329,6 +3329,14 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             ],
             (
                 "parkventory_postgres",
+                "Read the effective internal platform activation state",
+            ): [
+                "/usr/bin/systemctl",
+                "is-active",
+                "vps-internal-platform.service",
+            ],
+            (
+                "parkventory_postgres",
                 "Run the reviewed-source Parkventory secret plan in check mode",
             ): [
                 "/usr/bin/python3",

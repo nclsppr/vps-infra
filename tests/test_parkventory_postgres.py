@@ -892,6 +892,30 @@ class ParkventoryPostgresTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         by_name = {task["name"]: task for task in tasks}
+        platform_state = by_name[
+            "Read the effective internal platform activation state"
+        ]
+        self.assertFalse(platform_state["check_mode"])
+        self.assertIs(platform_state["changed_when"], False)
+        self.assertEqual(
+            platform_state["ansible.builtin.command"]["argv"],
+            [
+                "/usr/bin/systemctl",
+                "is-active",
+                "vps-internal-platform.service",
+            ],
+        )
+        platform_proof = by_name[
+            "Require the healthy internal platform before database inspection"
+        ]["ansible.builtin.assert"]["that"]
+        self.assertIn(
+            "vps_parkventory_internal_platform_active.stdout == 'active'",
+            platform_proof,
+        )
+        self.assertNotIn(
+            "ansible_facts.services['vps-internal-platform.service'].state == 'running'",
+            platform_proof,
+        )
         copy_tasks = [task for task in tasks if "ansible.builtin.copy" in task]
         self.assertEqual(len(copy_tasks), 2)
         for task in copy_tasks:

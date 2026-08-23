@@ -191,11 +191,21 @@
 - name: Read the internal platform and Docker service state
   ansible.builtin.service_facts:
 
+- name: Read the effective internal platform activation state
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/systemctl
+      - is-active
+      - vps-internal-platform.service
+  register: vps_parkventory_internal_platform_active
+  changed_when: false
+  check_mode: false
+
 - name: Require the healthy internal platform before database inspection
   ansible.builtin.assert:
     that:
       - ansible_facts.services['docker.service'].state == 'running'
-      - ansible_facts.services['vps-internal-platform.service'].state == 'running'
+      - vps_parkventory_internal_platform_active.stdout == 'active'
       - ansible_facts.services['vps-internal-platform.service'].status == 'enabled'
     fail_msg: Start and verify the shared internal platform first.
 
