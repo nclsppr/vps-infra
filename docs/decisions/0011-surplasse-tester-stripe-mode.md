@@ -50,7 +50,7 @@ decision.
 
 The materializer requires two distinct `whsec_` values. One value signs Stripe
 account webhooks. The other value signs payment webhooks. A shared value is not
-accepted. Operator manifest version `3` records the fixed payment mode and the
+accepted. Operator manifest version `4` records the fixed payment mode and the
 digest of every supplied file without recording a secret value.
 
 At materialization, `deploy-application` binds four independent projections:
@@ -58,8 +58,8 @@ At materialization, `deploy-application` binds four independent projections:
 1. the versioned adapter payment object;
 2. the admitted immutable integration contract payment object;
 3. `STRIPE_LIVE_MODE=false` in rendered Compose;
-4. `payment_mode=test` in the protected operator manifest version `3`, whose
-   digest map must name exactly the nine operator inputs.
+4. `payment_mode=test` in the protected operator manifest version `4`, whose
+   digest map must name exactly the six operator inputs.
 
 The controller repeats this binding from the materialized release at the first
 step of activation, before it prepares a transaction or performs any image,

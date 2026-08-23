@@ -20,6 +20,7 @@ without group or other write permission:
 - `/usr/local/libexec/vps/deploy-static`
 - `/usr/local/libexec/vps/deploy-static-live-gate`
 - `/usr/local/libexec/vps/forced-command`
+- `/usr/local/libexec/vps/materialize-smtp-secrets`
 - `/usr/local/libexec/vps/materialize-surplasse-dns-secrets`
 - `/usr/local/libexec/vps/materialize-surplasse-pilot-manifest`
 - `/usr/local/libexec/vps/parse-forced-command`
@@ -51,6 +52,41 @@ production refuse de continuer sans ce validateur.
 Le miroir autorisé est `/srv/vps/repository`, avec l'origine exacte
 `https://github.com/nclsppr/vps-infra.git`. Le contrôleur ne récupère que
 `refs/heads/main` et n'accepte depuis SSH que `deploy <sha40>`.
+
+## SMTP credential materializer
+
+`materialize-smtp-secrets` owns the registered SMTP credential sets for
+`surplasse`, `parkventory`, and `monflorian`. It accepts one exact product per
+operation:
+
+```text
+materialize-smtp-secrets --product surplasse --registry-generation 1 --install-from /absolute/root-only/directory
+materialize-smtp-secrets --product surplasse --registry-generation 1 --check
+```
+
+Replace `surplasse` with `parkventory` or `monflorian` for the other exact
+profiles. The source directory must be `root:root 0700`. It must contain only
+`<product>-smtp-username` and `<product>-smtp-password` as regular,
+single-linked `root:root 0400` or `0600` files. The helper never accepts a value
+as a command argument and never prints a value.
+
+The helper installs each credential as `root:10001 0440`. It also installs the
+fixed `smtp.tem.scaleway.com` host as `root:root 0400` for Surplasse. It
+publishes `<product>-smtp-generation.json` last. The marker contains only the
+product, the exact registered identifiers and filenames, generation `1`, and
+the storage-only state. It contains no value or value-derived digest.
+
+If an install stops before the marker commit, rerun it with the identical
+source directory. The helper accepts only its own bounded staging files and
+canonical files that match that source. It refuses a different source, an
+unknown staging file, or an unrelated partial state. Read-only `--check`
+validates the password and username framing and the exact Surplasse relay host.
+
+The protected GitHub `application-production` environment stores the recovery
+inputs as `SURPLASSE_SMTP_USERNAME`, `SURPLASSE_SMTP_PASSWORD`,
+`PARKVENTORY_SMTP_USERNAME`, `PARKVENTORY_SMTP_PASSWORD`,
+`MONFLORIAN_SMTP_USERNAME`, and `MONFLORIAN_SMTP_PASSWORD`. Git stores only
+these names and the public file contract.
 
 ## Surplasse DNS credential materializer
 

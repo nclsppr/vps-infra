@@ -62,7 +62,7 @@ EXPECTED_TEM_CONTRACTS = {
             "monflorian.smtp-password",
             "monflorian.smtp-username",
         },
-        "materializer": "not-implemented",
+        "materializer": "materialize-smtp-secrets",
     },
     "parkventory": {
         "credential_set": "scaleway-tem:parkventory-prod-smtp",
@@ -71,7 +71,7 @@ EXPECTED_TEM_CONTRACTS = {
             "parkventory.smtp-password",
             "parkventory.smtp-username",
         },
-        "materializer": "materialize-parkventory-provider-secrets",
+        "materializer": "materialize-smtp-secrets",
     },
     "surplasse": {
         "credential_set": "scaleway-tem:surplasse-prod-smtp",
@@ -81,7 +81,7 @@ EXPECTED_TEM_CONTRACTS = {
             "surplasse.smtp-password",
             "surplasse.smtp-username",
         },
-        "materializer": "materialize-surplasse-secrets",
+        "materializer": "materialize-smtp-secrets",
     },
 }
 
@@ -147,10 +147,10 @@ class SecretRegistryTests(unittest.TestCase):
             "\n".join(error.message for error in errors),
         )
 
-    def test_value_recovery_is_explicit_and_not_configured(self) -> None:
+    def test_value_recovery_is_explicit_and_partial(self) -> None:
         self.assertEqual(
             self.registry["value_recovery_state"],
-            "not-configured",
+            "partial",
         )
         generated_entries = [
             entry
@@ -246,7 +246,7 @@ class SecretRegistryTests(unittest.TestCase):
                 if secret["declared_state"] == "planned":
                     self.assertEqual(secret["generation"], 0)
                     self.assertEqual(secret["target_generation"], 1)
-                    self.assertEqual(secret["host_state"], "absent")
+                    self.assertNotEqual(secret["host_state"], "runtime-loaded")
                 if secret["provider_state"] == "revoked":
                     self.assertEqual(secret["host_state"], "absent")
                     self.assertEqual(secret["rebuild"], "do-not-restore")
@@ -258,7 +258,20 @@ class SecretRegistryTests(unittest.TestCase):
             for secret in self.registry["secrets"]
             if secret["host_state"] == "materialized"
         ]
-        self.assertEqual(len(materialized_entries), 6)
+        self.assertEqual(
+            {entry["id"] for entry in materialized_entries},
+            {
+                "monflorian.openai-api-key",
+                "parkventory.postgres-migrator-password",
+                "parkventory.postgres-runtime-password",
+                "platform.grafana-admin-password",
+                "platform.grafana-secret-key",
+                "platform.postgres-exporter-password",
+                "platform.postgres-superuser-password",
+                "surplasse.postgres-migrator-password",
+                "surplasse.postgres-runtime-password",
+            },
+        )
         self.assertEqual(
             {secret["generation_binding"] for secret in self.registry["secrets"]},
             {"unlinked"},
@@ -353,7 +366,7 @@ class SecretRegistryTests(unittest.TestCase):
                         f"/etc/vps/secrets/{scope}/{scope}-smtp-"
                         f"{entry['id'].rsplit('-', maxsplit=1)[-1]}",
                     )
-                    self.assertEqual(entry["provider_state"], "planned")
+                    self.assertEqual(entry["provider_state"], "active")
 
                 if scope == "surplasse":
                     host = by_id["surplasse.smtp-host"]
@@ -367,7 +380,7 @@ class SecretRegistryTests(unittest.TestCase):
             any("access-key" in entry["id"] for entry in tem_entries)
         )
 
-    def test_monflorian_secret_targets_are_required_but_not_observed(self) -> None:
+    def test_monflorian_secret_targets_match_the_latest_observation(self) -> None:
         by_id = {entry["id"]: entry for entry in self.registry["secrets"]}
         expected = {
             "monflorian.openai-api-key": {
@@ -382,6 +395,7 @@ class SecretRegistryTests(unittest.TestCase):
                 "provider": "openai",
                 "provider_state": "active",
                 "source": "provider-secret",
+                "host_state": "materialized",
             },
             "monflorian.private-access": {
                 "classification": "secret",
@@ -395,6 +409,7 @@ class SecretRegistryTests(unittest.TestCase):
                 "provider": "local",
                 "provider_state": "not-applicable",
                 "source": "operator-file",
+                "host_state": "absent",
             },
         }
         for identifier, fields in expected.items():
@@ -413,7 +428,6 @@ class SecretRegistryTests(unittest.TestCase):
                 self.assertEqual(entry["generation"], 0)
                 self.assertEqual(entry["target_generation"], 1)
                 self.assertEqual(entry["generation_binding"], "unlinked")
-                self.assertEqual(entry["host_state"], "absent")
 
     def test_registry_paths_match_existing_executable_contracts(self) -> None:
         bundle = load_script_module(
@@ -431,6 +445,10 @@ class SecretRegistryTests(unittest.TestCase):
         parkventory_provider_materializer = load_script_module(
             "secret_registry_parkventory_provider_materializer",
             ROOT / "scripts/materialize-parkventory-provider-secrets",
+        )
+        smtp_materializer = load_script_module(
+            "secret_registry_smtp_materializer",
+            ROOT / "scripts/materialize-smtp-secrets",
         )
         dns_materializer = load_script_module(
             "secret_registry_dns_materializer",
@@ -459,6 +477,7 @@ class SecretRegistryTests(unittest.TestCase):
                 "materialize-monflorian-secret",
                 "materialize-parkventory-provider-secrets",
                 "materialize-parkventory-secrets",
+                "materialize-smtp-secrets",
                 "materialize-surplasse-dns-secrets",
                 "materialize-surplasse-secrets",
             )
@@ -493,6 +512,18 @@ class SecretRegistryTests(unittest.TestCase):
             {
                 str(surplasse_materializer.PRODUCTION_ROOT / spec.name)
                 for spec in surplasse_materializer.SPECS
+            },
+        )
+        self.assertEqual(
+            paths_by_materializer["materialize-smtp-secrets"],
+            {
+                str(
+                    smtp_materializer.PRODUCTION_ROOT
+                    / profile.product
+                    / name
+                )
+                for profile in smtp_materializer.PROFILES.values()
+                for name in profile.installed_names
             },
         )
         self.assertEqual(

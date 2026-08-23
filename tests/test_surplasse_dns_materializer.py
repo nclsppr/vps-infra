@@ -160,6 +160,7 @@ class SurplasseDnsMaterializerTests(unittest.TestCase):
             defaults["vps_deploy_root_helpers"],
             [
                 "materialize-monflorian-secret",
+                "materialize-smtp-secrets",
                 "materialize-surplasse-dns-secrets",
                 "materialize-surplasse-pilot-manifest",
                 "surplasse-pilot-bootstrap",

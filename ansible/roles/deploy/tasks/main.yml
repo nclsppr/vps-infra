@@ -29,6 +29,9 @@
       - >-
         vps_monflorian_secret_materializer_path ==
         '/usr/local/libexec/vps/materialize-monflorian-secret'
+      - >-
+        vps_smtp_materializer_path ==
+        '/usr/local/libexec/vps/materialize-smtp-secrets'
       - vps_deploy_schema_root == '/usr/local/share/vps-infra/schemas'
       - vps_deploy_repository_dir == '/srv/vps/repository'
       - vps_deploy_repository_url == 'https://github.com/nclsppr/vps-infra.git'
@@ -71,6 +74,7 @@
       - >-
         vps_deploy_root_helpers ==
         ['materialize-monflorian-secret',
+         'materialize-smtp-secrets',
          'materialize-surplasse-dns-secrets',
          'materialize-surplasse-pilot-manifest',
          'surplasse-pilot-bootstrap']

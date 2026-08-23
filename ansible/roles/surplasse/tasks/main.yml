@@ -32,8 +32,7 @@
       - >-
         vps_surplasse_application_operator_inputs | sort ==
         ['surplasse-jwt-jwks', 'surplasse-jwt-key-id',
-         'surplasse-jwt-private-key', 'surplasse-smtp-host',
-         'surplasse-smtp-password', 'surplasse-smtp-username',
+         'surplasse-jwt-private-key',
          'surplasse-stripe-account-webhook-secret',
          'surplasse-stripe-payment-webhook-secret',
          'surplasse-stripe-secret-key']

@@ -90,7 +90,7 @@ release, or prove a connected account capability. A public URL is discoverable
 even when only invited testers know it. Do not treat a low visitor count as
 access control.
 
-The materializer records payment mode `test` in operator manifest version `3`.
+The materializer records payment mode `test` in operator manifest version `4`.
 It accepts only a dedicated restricted test key with the `rk_test_` prefix. It
 rejects live keys, unrestricted keys, and placeholder-like values. Offline
 format validation cannot prove that Stripe issued the key, that it belongs to
@@ -102,8 +102,8 @@ The immutable integration `contract.json` repeats the exact tester payment
 profile. During materialization, the canonical `deploy-application` controller
 requires that contract to equal the versioned adapter, requires the rendered
 Backend environment to contain `STRIPE_LIVE_MODE=false`, and explicitly parses
-the protected operator manifest as version `3` with `payment_mode=test` and the
-exact nine input digests. It repeats the complete binding from the materialized
+the protected operator manifest as version `4` with `payment_mode=test` and the
+exact six input digests. It repeats the complete binding from the materialized
 release before `prepare_transaction`. A divergence therefore stops before an
 image pull, public-edge preflight, migration, container start, or transaction
 journal write. `validate-surplasse-adapter` is still useful locally, but it is
@@ -133,7 +133,7 @@ development seed.
 The preparation controller installs a root-only helper at
 `/usr/local/libexec/vps/materialize-surplasse-secrets`. It creates the two
 database passwords, but it never creates an operator value. The application
-operator must stage exactly the following nine files in a separate
+operator must stage exactly the following six files in a separate
 `root:root 0700` directory. Each source file must be root-owned, regular,
 single-linked, and inaccessible to group and other users:
 
@@ -141,9 +141,6 @@ single-linked, and inaccessible to group and other users:
 surplasse-jwt-jwks
 surplasse-jwt-private-key
 surplasse-jwt-key-id
-surplasse-smtp-host
-surplasse-smtp-password
-surplasse-smtp-username
 surplasse-stripe-account-webhook-secret
 surplasse-stripe-payment-webhook-secret
 surplasse-stripe-secret-key
@@ -158,9 +155,8 @@ connected-account Refunds write. Add another permission only when a reviewed
 request receives an explicit permission error. Restrict the test key to the
 Atlas IPv4 address when Stripe supports the policy. Both webhook values must
 have the Stripe signing-secret prefix, and the two values must be distinct.
-The secret materializer accepts a bounded DNS name as operator input. Prefix
-validation does not prove the key, its permissions, its account, or its network
-policy. It is not Stripe or SMTP readiness evidence.
+Prefix validation does not prove a Stripe key, its permissions, its account,
+or its network policy. It is not Stripe readiness evidence.
 
 The rendered adapter requires a lowercase DNS name and the constant port `587`,
 `SMTP_START_TLS=REQUIRED`, `SMTP_TLS=false`,
@@ -194,16 +190,17 @@ sudo /usr/local/libexec/vps/materialize-surplasse-secrets \
 sudo /usr/local/libexec/vps/materialize-surplasse-secrets --operator-only
 ```
 
-The secret destination is `/etc/vps/secrets/surplasse`. The seven supplied
+The secret destination is `/etc/vps/secrets/surplasse`. The five supplied
 values mounted in the Backend are `root:10001 0440`.
-`surplasse-jwt-key-id` and `surplasse-smtp-host` are controller-only files with
-mode `root:root 0400`. Under the same bundle lock, the helper derives
+`surplasse-jwt-key-id` is a controller-only file with mode `root:root 0400`.
+The separate SMTP materializer owns the host, username, password, and SMTP
+generation marker. Under the same bundle lock, the application helper derives
 `/etc/vps/applications/surplasse.env`. This file is regular, single-linked,
 `root:root 0600`, and contains exactly these canonical records:
 
 ```text
 SURPLASSE_AUTH_JWT_KEY_ID=<validated kid>
-SURPLASSE_SMTP_HOST=<validated DNS name>
+SURPLASSE_SMTP_HOST=smtp.tem.scaleway.com
 ```
 
 Each record has one LF terminator. The file has no additional key. Port `587`
@@ -215,8 +212,8 @@ lock. This order excludes a secret or runtime change while the application
 controller owns the deployment lock. `--operator-only` takes only the bundle
 lock, so the controller can call it while it owns the deployment lock. The
 helper replaces the supplied application files, then the runtime file, and
-publishes manifest version 3 as the final commit marker. The manifest binds the
-contract version, payment mode `test`, and SHA-256 value of all nine supplied
+publishes manifest version 4 as the final commit marker. The manifest binds the
+contract version, payment mode `test`, and SHA-256 value of all six supplied
 application files. It contains no secret value. A crash before the final
 manifest rename leaves an absent or stale marker. Validation then fails even
 if both the supplied files
@@ -239,8 +236,9 @@ surplasse-postgres-migrator-password
 surplasse-postgres-runtime-password
 ```
 
-These two files and the seven supplied mounted values form the exact set of nine
-application secrets. Each one is `root:10001 0440`, regular, and single-linked.
+These two files, the five application-readable operator values, and the two
+SMTP credentials form the exact set of nine application secrets. Each one is
+`root:10001 0440`, regular, and single-linked.
 GID `10001` is the dedicated group of the Backend and migrator containers.
 Docker Compose file secrets preserve the host file ownership; they do not remap
 it. The repository contains only file names and validation rules. It contains

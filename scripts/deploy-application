@@ -124,6 +124,9 @@ SURPLASSE_PUBLIC_EDGE_SUBNET = "172.30.10.0/24"
 SURPLASSE_PUBLIC_EDGE_ADDRESS = "172.30.10.254"
 RUNTIME_DIRECTORY_ENV = "VPS_APPLICATION_RUNTIME_DIRECTORY"
 VALIDATE_COMPOSE_PATH = SCRIPT_DIRECTORY / "validate-compose"
+SMTP_INPUT_VALIDATOR_PATH = SCRIPT_DIRECTORY / "materialize-smtp-secrets"
+SMTP_REGISTRY_GENERATION = 1
+SMTP_APPLICATIONS = frozenset({"parkventory", "surplasse"})
 SURPLASSE_INPUT_VALIDATOR_PATH = (
     SCRIPT_DIRECTORY / "materialize-surplasse-secrets"
 )
@@ -140,9 +143,6 @@ SURPLASSE_OPERATOR_INPUT_NAMES = frozenset(
         "surplasse-jwt-jwks",
         "surplasse-jwt-private-key",
         "surplasse-jwt-key-id",
-        "surplasse-smtp-host",
-        "surplasse-smtp-password",
-        "surplasse-smtp-username",
         "surplasse-stripe-account-webhook-secret",
         "surplasse-stripe-payment-webhook-secret",
         "surplasse-stripe-secret-key",
@@ -1487,7 +1487,7 @@ def validate_surplasse_input_commit() -> str:
         fail("Surplasse operator bundle manifest has an invalid shape")
     if (
         value["contract"] != "surplasse-operator-bundle"
-        or value["version"] != 3
+        or value["version"] != 4
         or isinstance(value["version"], bool)
         or value["payment_mode"] != "test"
     ):
@@ -1504,6 +1504,36 @@ def validate_surplasse_input_commit() -> str:
     ):
         fail("Surplasse operator bundle manifest digests are invalid")
     return value["payment_mode"]
+
+
+def validate_smtp_input_commit(application: str) -> None:
+    if application not in SMTP_APPLICATIONS:
+        return
+    require_protected_file(
+        SMTP_INPUT_VALIDATOR_PATH,
+        "SMTP input validator",
+        allowed_modes=frozenset({0o500}),
+        maximum_size=2 * 1024 * 1024,
+    )
+    result = _run_bounded(
+        [
+            str(SMTP_INPUT_VALIDATOR_PATH),
+            "--product",
+            application,
+            "--registry-generation",
+            str(SMTP_REGISTRY_GENERATION),
+            "--check",
+        ],
+        environment=safe_environment(RUNTIME_CONFIG_ROOT),
+        timeout=45,
+        maximum_stdout=1024,
+    )
+    expected = (
+        f"{application} SMTP credential generation "
+        f"{SMTP_REGISTRY_GENERATION} is valid\n"
+    )
+    if result.stdout != expected or result.stderr:
+        fail("SMTP input validation returned unexpected output")
 
 
 def validate_surplasse_payment_binding(
@@ -3513,6 +3543,7 @@ def deploy(
         fail("application is disabled by the protected production contract")
     validate_runtime()
     with deployment_lock():
+        validate_smtp_input_commit(application)
         cleanup_application_filesystem_residue(application)
         STATIC.refuse_isolated_worker_residue_locked()
         if application == "parkventory":

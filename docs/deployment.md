@@ -643,7 +643,7 @@ requires the explicit forced command and every runtime gate above.
 For Surplasse, the immutable integration contract contains the exact tester
 payment profile. Materialization and the first activation preflight both bind
 that object to the versioned Atlas adapter, rendered
-`STRIPE_LIVE_MODE=false`, and protected operator manifest version `3` with
+`STRIPE_LIVE_MODE=false`, and protected operator manifest version `4` with
 `payment_mode=test` and the exact input digest set. A mismatch stops before
 `prepare_transaction`, image pulls, migration, or container start. The legacy
 adapter validator alone is not canonical activation evidence. A later live

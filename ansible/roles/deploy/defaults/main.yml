@@ -9,6 +9,7 @@ vps_deploy_application_gate_path: /usr/local/libexec/vps/deploy-application-live
 vps_surplasse_dns_materializer_path: /usr/local/libexec/vps/materialize-surplasse-dns-secrets
 vps_surplasse_pilot_materializer_path: /usr/local/libexec/vps/materialize-surplasse-pilot-manifest
 vps_surplasse_pilot_controller_path: /usr/local/libexec/vps/surplasse-pilot-bootstrap
+vps_smtp_materializer_path: /usr/local/libexec/vps/materialize-smtp-secrets
 vps_deploy_git_sha_length: 40
 vps_deploy_schema_root: /usr/local/share/vps-infra/schemas
 vps_deploy_repository_dir: /srv/vps/repository
@@ -60,6 +61,7 @@ vps_deploy_executables:
   - verify-state
 vps_deploy_root_helpers:
   - materialize-monflorian-secret
+  - materialize-smtp-secrets
   - materialize-surplasse-dns-secrets
   - materialize-surplasse-pilot-manifest
   - surplasse-pilot-bootstrap
