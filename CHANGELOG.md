@@ -9,6 +9,11 @@
   migrator, and runtime roles without `BYPASSRLS`.
 - Admit the immutable candidate's exact OIDC public variables and root-owned
   secret files without storing secret bytes in Git.
+- Generate the two local OIDC secrets with the Parkventory database passwords.
+  Publish a non-secret generation marker last for the exact four-file set.
+- Add a locked Parkventory provider-bundle importer for the Auth0 client
+  secret, SMTP pair, and fixed public runtime configuration. Publish its
+  separate three-file generation marker last.
 - Add a manual Parkventory-only deployment workflow that remains inert while
   application admission is disabled and requires a separate protected
   environment activation switch for any future dispatch.
@@ -30,6 +35,8 @@
   runtime against that untrusted database state.
 - Revalidate the encrypted off-site backup proof after migration before the
   first runtime start and again immediately before the durable runtime commit.
+- Keep the Auth0 client secret and both SMTP inputs outside the local
+  Parkventory generator. Import them only from an exact root-only source.
 
 No Atlas convergence, GitHub environment change, provider provisioning, DNS
 cutover, or public application activation is part of this change.

@@ -48,9 +48,10 @@ after it installs and synchronizes the exact file set. The marker must contain
 only public contract identifiers, the exact registered secret identifiers, and
 the target generation. A read-only audit must verify that marker before Git can
 set `generation_binding` to `materializer-marker` and advance `generation`.
-No current materializer writes this marker. Existing root-only manifests bind
-files through private content digests, but they do not contain a registry
-generation. They do not satisfy this requirement.
+The two Parkventory materializers write separate markers for the four generated
+files and the three provider files. Other root-only manifests bind files
+through private content digests, but they do not contain a registry generation.
+They do not satisfy this requirement.
 
 `observed_at` and `controller_revision` bind the registry to one audit. A Git
 commit preserves that reviewed observation. It is not permanent proof of the
@@ -181,12 +182,19 @@ implemented.
 
 ## Parkventory
 
-The Parkventory PostgreSQL helper creates the migrator and runtime passwords
-once and publishes a root-only local manifest. The application remains
-disabled, and the baseline audit found neither file. The three admitted OIDC
-files and two SMTP files also remain absent. They have no operator materializer
-yet. Do not confuse the PostgreSQL helper with a complete application secret
-restore path.
+The Parkventory helper creates the migrator and runtime passwords and the two
+local OIDC secrets once. It publishes the database manifest first and the
+non-secret generation marker last. The marker binds target generation 1 to the
+exact four registered files. The helper does not read or write the Auth0 client
+secret or the two SMTP inputs.
+
+`materialize-parkventory-provider-secrets` validates one exact root-only source
+directory. It installs those three provider files and the fixed public runtime
+configuration under the shared deployment lock. It publishes a separate
+generation-1 marker last for the exact three registered provider identifiers.
+It does not print or record a value, content digest, or source path. The
+provider state stays `planned` until a separate provider audit verifies the
+Auth0 and Scaleway TEM credentials.
 
 ## Mon Florian
 

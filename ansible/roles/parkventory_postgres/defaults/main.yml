@@ -6,5 +6,6 @@ vps_parkventory_postgres_network:
   subnet: 172.30.21.0/24
   internal: true
 vps_parkventory_postgres_helpers:
+  - materialize-parkventory-provider-secrets
   - materialize-parkventory-secrets
   - provision-parkventory-postgres

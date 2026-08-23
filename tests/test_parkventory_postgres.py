@@ -41,6 +41,27 @@ PROVISIONER = load_script(
     "parkventory_postgres_provisioner",
     SCRIPTS / "provision-parkventory-postgres",
 )
+MATERIALIZER = load_script(
+    "parkventory_secret_materializer",
+    SCRIPTS / "materialize-parkventory-secrets",
+)
+
+DATABASE_CREDENTIAL_FILES = (
+    "parkventory-postgres-migrator-password",
+    "parkventory-postgres-runtime-password",
+)
+LOCAL_APPLICATION_CREDENTIAL_FILES = (
+    "parkventory-oidc-state-secret",
+    "parkventory-oidc-token-encryption-secret",
+)
+GENERATED_CREDENTIAL_FILES = (
+    DATABASE_CREDENTIAL_FILES + LOCAL_APPLICATION_CREDENTIAL_FILES
+)
+PROVIDER_INPUT_FILES = (
+    "parkventory-oidc-client-secret",
+    "parkventory-smtp-username",
+    "parkventory-smtp-password",
+)
 
 
 class ParkventoryPostgresTests(unittest.TestCase):
@@ -92,7 +113,7 @@ class ParkventoryPostgresTests(unittest.TestCase):
             self.assertTrue(json.loads(result.stdout)["changed"])
             self.assertEqual(set(root.iterdir()), set())
 
-    def test_database_passwords_are_private_distinct_and_idempotent(self) -> None:
+    def test_generated_secrets_are_private_distinct_and_idempotent(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("the helper intentionally rejects root test mode")
         with tempfile.TemporaryDirectory() as directory:
@@ -106,26 +127,76 @@ class ParkventoryPostgresTests(unittest.TestCase):
             first = self.run_materializer(root, "--apply")
             self.assertEqual(first.returncode, 0, first.stderr)
             values: dict[str, bytes] = {}
-            for name in (
-                "parkventory-postgres-migrator-password",
-                "parkventory-postgres-runtime-password",
-            ):
+            for name in GENERATED_CREDENTIAL_FILES:
                 path = root / name
                 values[name] = path.read_bytes()
                 self.assertRegex(values[name], rb"^[A-Za-z0-9_-]{64}\n$")
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o440)
                 self.assertNotIn(values[name][:-1], first.stdout.encode("utf-8"))
-            self.assertNotEqual(*values.values())
+                self.assertNotIn(
+                    hashlib.sha256(values[name]).hexdigest(), first.stdout
+                )
+            self.assertNotEqual(
+                values[DATABASE_CREDENTIAL_FILES[0]],
+                values[DATABASE_CREDENTIAL_FILES[1]],
+            )
+            self.assertNotEqual(
+                values[LOCAL_APPLICATION_CREDENTIAL_FILES[0]],
+                values[LOCAL_APPLICATION_CREDENTIAL_FILES[1]],
+            )
+            for name in PROVIDER_INPUT_FILES:
+                self.assertFalse((root / name).exists())
+
             manifest = root / "parkventory-database-secret-manifest.json"
             self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o400)
             document = json.loads(manifest.read_text(encoding="ascii"))
             self.assertEqual(
+                document["contract"], "vps-infra.parkventory-database-secrets.v1"
+            )
+            self.assertEqual(
                 document["sha256"],
                 {
-                    name: hashlib.sha256(value).hexdigest()
-                    for name, value in values.items()
+                    name: hashlib.sha256(values[name]).hexdigest()
+                    for name in DATABASE_CREDENTIAL_FILES
                 },
             )
+
+            marker = root / "parkventory-secret-generation.json"
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o400)
+            marker_document = json.loads(marker.read_text(encoding="ascii"))
+            self.assertEqual(
+                marker_document,
+                {
+                    "contract": "vps-infra.parkventory-secret-generation.v1",
+                    "materializer": "materialize-parkventory-secrets",
+                    "secrets": [
+                        {
+                            "file": "parkventory-oidc-state-secret",
+                            "id": "parkventory.oidc-state-secret",
+                        },
+                        {
+                            "file": "parkventory-oidc-token-encryption-secret",
+                            "id": "parkventory.oidc-token-encryption-secret",
+                        },
+                        {
+                            "file": "parkventory-postgres-migrator-password",
+                            "id": "parkventory.postgres-migrator-password",
+                        },
+                        {
+                            "file": "parkventory-postgres-runtime-password",
+                            "id": "parkventory.postgres-runtime-password",
+                        },
+                    ],
+                    "target_generation": 1,
+                },
+            )
+            self.assertNotIn("sha256", marker_document)
+            for value in values.values():
+                self.assertNotIn(value[:-1], marker.read_bytes())
+                self.assertNotIn(
+                    hashlib.sha256(value).hexdigest().encode("ascii"),
+                    marker.read_bytes(),
+                )
 
             second = self.run_materializer(root, "--apply")
             self.assertEqual(second.returncode, 0, second.stderr)
@@ -137,6 +208,187 @@ class ParkventoryPostgresTests(unittest.TestCase):
             checked = self.run_materializer(root, "--check")
             self.assertEqual(checked.returncode, 0, checked.stderr)
             self.assertTrue(json.loads(checked.stdout)["ready"])
+
+    def test_generation_marker_is_published_after_the_exact_generated_set(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally rejects root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "secrets"
+            root.mkdir(mode=0o700)
+            published: list[str] = []
+            original_publish = MATERIALIZER.publish_exclusive
+
+            def record_publish(*args, **kwargs):
+                created = original_publish(*args, **kwargs)
+                if created:
+                    published.append(args[1])
+                return created
+
+            try:
+                MATERIALIZER.publish_exclusive = record_publish
+                result = MATERIALIZER.materialize(root, "apply", production=False)
+            finally:
+                MATERIALIZER.publish_exclusive = original_publish
+
+            self.assertTrue(result["ready"])
+            self.assertEqual(
+                published[-1], "parkventory-secret-generation.json"
+            )
+            self.assertEqual(
+                set(published[:-1]),
+                set(GENERATED_CREDENTIAL_FILES)
+                | {"parkventory-database-secret-manifest.json"},
+            )
+
+    def test_killed_link_publication_is_recovered_before_retry(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally rejects root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "secrets"
+            root.mkdir(mode=0o700)
+            crash_program = """
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+helper, target = sys.argv[1:]
+loader = importlib.machinery.SourceFileLoader("crashing_materializer", helper)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = module
+spec.loader.exec_module(module)
+original_link = module.os.link
+
+def link_then_die(*args, **kwargs):
+    original_link(*args, **kwargs)
+    os._exit(92)
+
+module.os.link = link_then_die
+sys.argv = [helper, "--apply", "--test-root", target]
+module.main()
+"""
+            environment = os.environ.copy()
+            environment["VPS_PARKVENTORY_SECRET_TESTING"] = "1"
+            crashed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    crash_program,
+                    str(SCRIPTS / "materialize-parkventory-secrets"),
+                    str(root),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+                timeout=20,
+            )
+
+            self.assertEqual(crashed.returncode, 92, crashed.stderr)
+            canonical = root / DATABASE_CREDENTIAL_FILES[0]
+            pending = list(
+                root.glob(f".{DATABASE_CREDENTIAL_FILES[0]}.*.pending")
+            )
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(canonical.stat().st_ino, pending[0].stat().st_ino)
+            self.assertEqual(canonical.stat().st_nlink, 2)
+
+            retried = self.run_materializer(root, "--apply")
+
+            self.assertEqual(retried.returncode, 0, retried.stderr)
+            self.assertTrue(json.loads(retried.stdout)["changed"])
+            self.assertEqual(canonical.stat().st_nlink, 1)
+            self.assertFalse(list(root.glob(".*.pending")))
+            checked = self.run_materializer(root, "--check")
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertTrue(json.loads(checked.stdout)["ready"])
+
+    def test_unsafe_generated_staging_residue_is_refused_and_preserved(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally rejects root test mode")
+        cases = ("malformed-name", "symlink", "wrong-mode", "hardlink")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                root = parent / "secrets"
+                root.mkdir(mode=0o700)
+                if case == "malformed-name":
+                    residue = (
+                        root
+                        / ".parkventory-postgres-runtime-password.deadbeef.pending"
+                    )
+                    residue.write_bytes(b"staging residue\n")
+                    residue.chmod(0o440)
+                else:
+                    residue = (
+                        root
+                        / ".parkventory-postgres-runtime-password."
+                        "0123456789abcdef0123456789abcdef.pending"
+                    )
+                    external = parent / "external"
+                    external.write_bytes(b"staging residue\n")
+                    external.chmod(0o440)
+                    if case == "symlink":
+                        residue.symlink_to(external)
+                    elif case == "hardlink":
+                        os.link(external, residue)
+                    else:
+                        residue.write_bytes(b"staging residue\n")
+                        residue.chmod(0o644)
+
+                refused = self.run_materializer(root, "--apply")
+
+                self.assertEqual(refused.returncode, 78)
+                self.assertIn("staging residue is unsafe", refused.stderr)
+                self.assertTrue(os.path.lexists(residue))
+                self.assertFalse((root / DATABASE_CREDENTIAL_FILES[0]).exists())
+
+    def test_existing_generation_marker_blocks_partial_repair(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally rejects root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "secrets"
+            root.mkdir(mode=0o700)
+            applied = self.run_materializer(root, "--apply")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            missing = root / "parkventory-oidc-state-secret"
+            missing.unlink()
+
+            refused = self.run_materializer(root, "--apply")
+
+            self.assertEqual(refused.returncode, 78)
+            self.assertIn("is missing", refused.stderr)
+            self.assertFalse(missing.exists())
+
+    def test_provider_secrets_are_not_read_or_modified(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("the helper intentionally rejects root test mode")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "secrets"
+            root.mkdir(mode=0o700)
+            before: dict[str, tuple[bytes, int, int]] = {}
+            for name in PROVIDER_INPUT_FILES:
+                path = root / name
+                path.write_bytes(b"provider-owned-test-input\n")
+                path.chmod(0o440)
+                metadata = path.stat()
+                before[name] = (
+                    path.read_bytes(),
+                    metadata.st_ino,
+                    metadata.st_mtime_ns,
+                )
+
+            applied = self.run_materializer(root, "--apply")
+
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            for name, expected in before.items():
+                path = root / name
+                metadata = path.stat()
+                self.assertEqual(
+                    (path.read_bytes(), metadata.st_ino, metadata.st_mtime_ns),
+                    expected,
+                )
 
     def test_source_plan_uses_only_the_embedded_contract(self) -> None:
         original_parse_args = PROVISIONER.parse_args

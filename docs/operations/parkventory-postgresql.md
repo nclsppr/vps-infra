@@ -42,9 +42,15 @@ make prepare-parkventory-postgres \
   ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
 ```
 
-The operation creates only missing database passwords. It never rotates an
-existing password. The current platform contract attaches PostgreSQL durably
-to `db_parkventory`. Against an older live platform revision only, this command
+The operation creates only missing database passwords and the two local OIDC
+state and token-encryption secrets. It never rotates an existing value. It
+publishes `/etc/vps/secrets/parkventory/parkventory-secret-generation.json`
+last. This root-only marker binds target generation 1 to the exact four-file
+generated set. It contains file identifiers and no value or content-derived
+digest.
+
+The current platform contract attaches PostgreSQL durably to
+`db_parkventory`. Against an older live platform revision only, this command
 uses a temporary attachment and restores the previous membership. It applies
 an idempotent SQL contract, proves the effective state, writes
 `/var/lib/vps-readiness/parkventory/postgres.json`, and restores the previous
@@ -117,6 +123,41 @@ the following credentials outside Git as `root:10001 0440` files:
 /etc/vps/secrets/parkventory/parkventory-oidc-state-secret
 /etc/vps/secrets/parkventory/parkventory-oidc-token-encryption-secret
 ```
+
+`prepare-parkventory-postgres` generates the state and token-encryption files
+on Atlas. A separate helper installs the Auth0 client secret, SMTP username,
+SMTP password, and public runtime configuration from one private source
+directory. The directory must be `root:root 0700` and contain exactly:
+
+```text
+parkventory-oidc-client-secret
+parkventory-smtp-password
+parkventory-smtp-username
+parkventory.env
+```
+
+Validate the source before installation:
+
+```bash
+sudo /usr/local/libexec/vps/materialize-parkventory-provider-secrets \
+  --validate-source /absolute/root-only/source
+sudo /usr/local/libexec/vps/materialize-parkventory-provider-secrets \
+  --install-from /absolute/root-only/source
+sudo /usr/local/libexec/vps/materialize-parkventory-provider-secrets --check
+```
+
+The install takes the shared deployment lock. It installs the three provider
+files as `root:10001 0440` and `parkventory.env` as `root:root 0600`. It
+publishes the root-only generation marker last. The marker names the exact
+three registered provider inputs and target generation 1. It contains no
+value, digest, or source path. A committed marker blocks rotation until a
+reviewed registry change authorizes a new target generation.
+
+The runtime configuration fixes both database users, the private JDBC URL,
+Scaleway TEM at port 587, sender `no-reply@parkventory.com`, and public URL
+`https://parkventory.com`. It requires one Auth0 EU HTTPS issuer, the same auth
+server URL and issuer, and a bounded client identifier. This operation does
+not change SPF, DKIM, DMARC, MX, or any other DNS record.
 
 Only the Backend receives these files. The database migrator does not receive
 them. Do not put a value in a workflow variable, Ansible variable, command, or

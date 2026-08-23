@@ -639,8 +639,9 @@ expected path, permissions, consumer, target generation, generation binding,
 and last observed host state. It separates planned, materialized, and
 runtime-loaded states. A metadata audit can mark a file materialized, but only
 a non-secret marker written by the bounded materializer can bind that file set
-to a generation. No current materializer writes such a marker. A materialized
-file is not runtime proof.
+to a generation. The Parkventory materializers write markers for their two
+exact sets. Other materializers do not. A materialized file is not runtime
+proof.
 
 The repository has no SOPS payload, no `.sops.yaml` policy, and no proved age
 recovery identity. SOPS recovery remains blocked. Until a later reviewed change
