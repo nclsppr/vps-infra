@@ -275,7 +275,9 @@
     label: "{{ item.source }}"
   become: false
   delegate_to: localhost
-  when: vps_public_static_edge_state == 'activate'
+  when:
+    - vps_public_static_edge_state == 'activate'
+    - vps_public_static_edge_operation == 'standard'
 
 - name: Probe one-hop HTTPS redirects after DNS activation
   ansible.builtin.uri:
@@ -305,4 +307,6 @@
     label: "{{ item.source }}"
   become: false
   delegate_to: localhost
-  when: vps_public_static_edge_state == 'activate'
+  when:
+    - vps_public_static_edge_state == 'activate'
+    - vps_public_static_edge_operation == 'standard'

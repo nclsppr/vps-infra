@@ -2180,6 +2180,12 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "vps_public_static_edge_retained_origin_probe.server",
             runtime_verification,
         )
+        self.assertEqual(
+            runtime_verification.count(
+                "vps_public_static_edge_operation == 'standard'"
+            ),
+            2,
+        )
 
         authoritative_dns = (
             ROOT
