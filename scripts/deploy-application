@@ -583,7 +583,8 @@ def public_edge_base_release_from_value(value: object, label: str) -> Path:
         not release.is_absolute()
         or release.parent != PUBLIC_EDGE_RELEASE_ROOT
         or re.fullmatch(
-            r"[0-9a-f]{40}-(?:prepare|precutover|activate)", release.name
+            r"[0-9a-f]{40}-(?:prepare|precutover|activate|surplasse-static-v2)",
+            release.name,
         )
         is None
     ):

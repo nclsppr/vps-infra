@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Allow the public edge transaction controller to adopt the exact immutable
+  `surplasse-static-v2` release name already active on Atlas.
+
 ### Added
 
 - Prepare an inactive, fail-closed Parkventory public-launch application path.
