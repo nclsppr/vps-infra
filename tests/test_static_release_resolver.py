@@ -116,7 +116,7 @@ class ContractTests(unittest.TestCase):
             [(application.enabled, application.mode) for application in contract.applications],
             [
                 (True, "static-site"),
-                (True, "static-site"),
+                (False, "static-site"),
                 (True, "temporary-static-demo"),
             ],
         )
@@ -213,7 +213,10 @@ class ContractTests(unittest.TestCase):
             ROOT / "releases/static-production.json",
             ROOT / "releases/production.yaml",
         )
-        self.assertTrue(all(application.enabled for application in contract.applications))
+        self.assertEqual(
+            {application.name: application.enabled for application in contract.applications},
+            {"personal": True, "papersempire": False, "parkventory": True},
+        )
 
 
 class CheckRunTests(unittest.TestCase):
@@ -375,9 +378,6 @@ class CheckRunTests(unittest.TestCase):
                     ]
                 ),
                 api_response(
-                    [check_run("Publish immutable VPS artifacts"), check_run("build")]
-                ),
-                api_response(
                     [
                         check_run("Publish immutable VPS artifacts"),
                         check_run("build"),
@@ -398,7 +398,7 @@ class CheckRunTests(unittest.TestCase):
         )
         self.assertEqual(
             [(result.application, result.status) for result in results],
-            [("personal", "blocked"), (paper.name, "ready"), ("parkventory", "ready")],
+            [("personal", "blocked"), (paper.name, "disabled"), ("parkventory", "ready")],
         )
 
     def test_head_change_during_resolution_never_yields_an_old_candidate(self):

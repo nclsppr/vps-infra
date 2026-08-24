@@ -2,13 +2,13 @@
 
 ## Scope
 
-This runbook operates the automatic releases for these three static profiles:
+This runbook operates the automatic releases for these static profiles:
 
-| Profile | Canonical branch | Mode |
-|---|---|---|
-| `personal` | `main` | `static-site` |
-| `papersempire` | `main` | `static-site` |
-| `parkventory` | `main` | `temporary-static-demo` |
+| Profile | Canonical branch | Mode | Promotion |
+|---|---|---|---|
+| `personal` | `main` | `static-site` | enabled |
+| `papersempire` | `main` | `static-site` | disabled; production moved to Cloudflare Workers |
+| `parkventory` | `main` | `temporary-static-demo` | enabled |
 
 The workflow is `.github/workflows/deploy-static-releases.yml`. It is scheduled
 every ten minutes and also accepts a manual dispatch. GitHub schedules are
@@ -29,8 +29,11 @@ A normal content release starts in the producer repository:
 | Profile | Producer procedure | Merge branch |
 |---|---|---|
 | `personal` | [Comment déployer sur Atlas](https://github.com/nclsppr/personal#comment-déployer-sur-atlas) | `main` |
-| `papersempire` | [Deploy to Atlas](https://github.com/nclsppr/papersempire#deploy-to-atlas) | `main` |
 | `parkventory` | [Parkventory runbook](https://github.com/nclsppr/parkventory/blob/main/RUNBOOK.md) | `main` |
+
+Papers Empire releases no longer use this workflow. Its disabled entry remains
+visible in resolver evidence and must not be re-enabled while Cloudflare owns
+`papersempire.com` and `www.papersempire.com`.
 
 Open a producer PR, wait for `Validate VPS release`, merge it, then require the
 merged revision's producer workflow `VPS release` to succeed. That workflow
@@ -211,16 +214,17 @@ profile:
 The workflow resolves each profile independently. The resolver can complete
 successfully while one profile is `pending`, `blocked`, or `disabled`; ready
 profiles can still deploy. The overall run can therefore be green without
-covering all three sites. A deploy step can also return success after it skips
-SSH because the canonical HEAD changed immediately before the request.
+covering every enabled site. A deploy step can also return success after it
+skips SSH because the canonical HEAD changed immediately before the request.
 
-For a complete three-site reconciliation, require all of these facts:
+For a complete reconciliation, require all of these facts:
 
-1. the resolver summary reports `ready` for all three profiles;
-2. the run contains `Deploy personal`, `Deploy papersempire`, and
-   `Deploy parkventory`;
-3. `Request the exact static deployment` completed successfully in each job;
-4. `Report disabled static deployment` was skipped in each job;
+1. the resolver summary reports `ready` for Personal and Parkventory and
+   `disabled` for Papers Empire;
+2. the run contains `Deploy personal` and `Deploy parkventory`, with no
+   `Deploy papersempire` job;
+3. `Request the exact static deployment` completed successfully in both jobs;
+4. `Report disabled static deployment` was skipped in both jobs;
 5. the logs contain no canonical-HEAD skip, disabled warning, refusal, or
    activation failure;
 6. Atlas state and public probes match the selected immutable tuples.
@@ -302,7 +306,7 @@ This daemon-level bypass is a documented remaining hardening boundary.
 Inspect each complete active tuple and its matching symlink:
 
 ```bash
-for application in personal papersempire parkventory; do
+for application in personal parkventory; do
   sudo python3 -m json.tool \
     "/var/lib/vps-static/active/${application}.json"
   sudo readlink "/srv/www/${application}/current"
@@ -343,6 +347,11 @@ complete immutable tuple`. A new activation reports `static release activated
 after strict live HTTPS probe`.
 
 ## Public probes
+
+These probes cover only the enabled Atlas profiles. Do not pass either Papers
+Empire domain to this helper: its retirement proof is the `disabled` resolver
+status and absent deploy job above, while its public checks belong to its
+Cloudflare delivery procedure.
 
 Run strict IPv4 HTTPS probes from outside Atlas. Obtain `atlas_ipv4` from the
 independently verified Atlas inventory or provider console, not from the DNS
@@ -410,8 +419,6 @@ check_static_host www.nicolaspieper.com nicolaspieper.com 1 || failures=$((failu
 check_static_host pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
 check_static_host www.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
 check_static_host nicolas.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
-check_static_host papersempire.com papersempire.com 0 || failures=$((failures + 1))
-check_static_host www.papersempire.com papersempire.com 1 || failures=$((failures + 1))
 check_static_host parkventory.com parkventory.com 0 || failures=$((failures + 1))
 check_static_host www.parkventory.com parkventory.com 1 || failures=$((failures + 1))
 test "$failures" -eq 0
@@ -424,8 +431,8 @@ Ansible runtime probe also requires a direct `308` from HTTP and HTTPS for a pat
 with a query. Both the DNS-routed and direct-Atlas probes must report the
 independently verified Atlas IPv4 as `remote_ip`.
 
-Canonical responses and the Papers Empire and Parkventory redirects require
-HSTS. The four Personal redirects require HSTS to be absent while retaining
+Canonical responses and the Parkventory redirect require HSTS. The four
+Personal redirects require HSTS to be absent while retaining
 `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and
 `Permissions-Policy`, and they must not expose a `Server` header.
 
@@ -497,7 +504,8 @@ Use an overlap rotation. Never print the private key or put it in Git.
 4. run reviewed convergence and verify that both public keys have the forced
    `restrict` entry on Atlas;
 5. replace only the `VPS_STATIC_SSH_PRIVATE_KEY` environment secret;
-6. enable reconciliation, dispatch one run, and prove all three no-ops;
+6. enable reconciliation, dispatch one run, and prove both enabled-profile
+   no-ops plus the disabled Papers Empire resolver status;
 7. suspend reconciliation again, remove the old public key from the Ansible
    value, keep `vps_deploy_key_recovery_nonce` empty, converge, and prove that
    the retired key is rejected;
@@ -578,7 +586,8 @@ Exit `64` with that exact parser line means authentication succeeded and the
 deliberately malformed SHA was rejected before dispatch. Exit `255` means SSH
 transport or authentication failed; do not treat it as a successful boundary
 probe. Only after this proof, replace the GitHub environment private-key secret,
-re-enable reconciliation, dispatch a run, and prove all three no-ops. Do not
+re-enable reconciliation, dispatch a run, and prove both enabled-profile no-ops
+plus the disabled Papers Empire resolver status. Do not
 append a key manually without recording the same desired value in the ignored
 Ansible variables; the next convergence would otherwise recreate the outage.
 

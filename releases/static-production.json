@@ -19,7 +19,7 @@
       ]
     },
     "papersempire": {
-      "enabled": true,
+      "enabled": false,
       "mode": "static-site",
       "source_repository": "nclsppr/papersempire",
       "source_branch": "main",
