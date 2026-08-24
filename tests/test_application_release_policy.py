@@ -107,7 +107,7 @@ class ProductionContractTests(unittest.TestCase):
         self.contract_path = ROOT / "releases/application-production.json"
         self.static_path = ROOT / "releases/static-production.json"
 
-    def test_repository_contract_enables_only_surplasse(self):
+    def test_repository_contract_enables_surplasse_and_monflorian(self):
         contract = POLICY.load_production_contract(
             self.contract_path, self.static_path
         )
@@ -116,7 +116,7 @@ class ProductionContractTests(unittest.TestCase):
             [
                 ("surplasse", True),
                 ("parkventory", False),
-                ("monflorian", False),
+                ("monflorian", True),
             ],
         )
         self.assertEqual(

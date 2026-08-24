@@ -48,6 +48,9 @@ APP_ADDRESS = "172.30.10.254"
 PARKVENTORY_NETWORK = "app_parkventory"
 PARKVENTORY_SUBNET = "172.30.20.0/24"
 PARKVENTORY_ADDRESS = "172.30.20.254"
+MONFLORIAN_NETWORK = "app_monflorian"
+MONFLORIAN_SUBNET = "172.30.40.0/24"
+MONFLORIAN_ADDRESS = "172.30.40.254"
 EDGE_NETWORK = "edge"
 ROUTE_SHA256 = "645931a03bd1c80ab5b3982d6a285e673906d68fb010adbd1756d43d8a0cd306"
 ROUTE_NAMES = ("papersempire.caddy", "parkventory.caddy", "personal.caddy")
@@ -1402,7 +1405,7 @@ def verify_live_runtime(paths: RuntimePaths, state: EdgeState | None = None) -> 
         or not isinstance(networks, dict)
     ):
         fail("public edge Caddy container identity or health differs")
-    expected_networks = {EDGE_NETWORK, PARKVENTORY_NETWORK}
+    expected_networks = {EDGE_NETWORK, MONFLORIAN_NETWORK, PARKVENTORY_NETWORK}
     if state is not None:
         expected_networks.add(APP_NETWORK)
     if set(networks) != expected_networks:
@@ -1433,6 +1436,32 @@ def verify_live_runtime(paths: RuntimePaths, state: EdgeState | None = None) -> 
         or parkventory_attachment.get("IPPrefixLen") != 24
     ):
         fail("public edge Caddy does not own the exact app_parkventory address")
+    monflorian_network_id, monflorian_network = network_identity(
+        MONFLORIAN_NETWORK,
+        paths,
+    )
+    monflorian_ipam = monflorian_network.get("IPAM", {}).get("Config", [])
+    if (
+        monflorian_network.get("Name") != MONFLORIAN_NETWORK
+        or monflorian_network.get("Driver") != "bridge"
+        or monflorian_network.get("Scope") != "local"
+        or monflorian_network.get("Internal") is not False
+        or monflorian_network.get("Labels", {}).get(
+            "com.nclsppr.vps-infra.managed"
+        )
+        != "true"
+        or not isinstance(monflorian_ipam, list)
+        or len(monflorian_ipam) != 1
+        or monflorian_ipam[0].get("Subnet") != MONFLORIAN_SUBNET
+    ):
+        fail("app_monflorian network differs from the managed host contract")
+    monflorian_attachment = networks.get(MONFLORIAN_NETWORK, {})
+    if (
+        monflorian_attachment.get("NetworkID") != monflorian_network_id
+        or monflorian_attachment.get("IPAddress") != MONFLORIAN_ADDRESS
+        or monflorian_attachment.get("IPPrefixLen") != 24
+    ):
+        fail("public edge Caddy does not own the exact app_monflorian address")
     if state is not None:
         network_id, network = network_identity(APP_NETWORK, paths)
         ipam = network.get("IPAM", {}).get("Config", [])

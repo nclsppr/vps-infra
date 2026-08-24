@@ -1730,11 +1730,15 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertNotIn("secrets", caddy)
         self.assertEqual(
             set(compose["networks"]),
-            {"app_parkventory", "edge"},
+            {"app_monflorian", "app_parkventory", "edge"},
         )
         self.assertEqual(
             set(caddy["networks"]),
-            {"app_parkventory", "edge"},
+            {"app_monflorian", "app_parkventory", "edge"},
+        )
+        self.assertEqual(
+            caddy["networks"]["app_monflorian"],
+            {"ipv4_address": "172.30.40.254"},
         )
         self.assertEqual(
             caddy["networks"]["app_parkventory"],
@@ -1789,7 +1793,12 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         for route_directory in route_directories:
             self.assertEqual(
                 {path.name for path in (edge_root / route_directory).iterdir()},
-                {"personal.caddy", "papersempire.caddy", "parkventory.caddy"},
+                {
+                    "monflorian.caddy",
+                    "personal.caddy",
+                    "papersempire.caddy",
+                    "parkventory.caddy",
+                },
             )
         route_text = "\n".join(
             path.read_text(encoding="utf-8")
@@ -1799,6 +1808,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("nicolaspieper.com", route_text)
         self.assertIn("papersempire.com", route_text)
         self.assertIn("parkventory.com", route_text)
+        self.assertIn("monflorian.com", route_text)
         self.assertNotIn("surplasse", route_text.lower())
         self.assertNotIn("grafana", route_text.lower())
         self.assertIn("nicolas.pieper.fr", route_text)

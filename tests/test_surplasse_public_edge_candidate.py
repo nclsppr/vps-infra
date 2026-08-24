@@ -41,10 +41,20 @@ class SurplassePublicEdgeCandidateTests(unittest.TestCase):
         )
         caddy = base["services"]["caddy"]
         self.assertEqual(base["name"], "vps-public-static-edge")
-        self.assertEqual(set(base["networks"]), {"app_parkventory", "edge"})
+        self.assertEqual(
+            set(base["networks"]),
+            {"app_monflorian", "app_parkventory", "edge"},
+        )
         self.assertNotIn("environment", caddy)
         self.assertNotIn("secrets", caddy)
-        self.assertEqual(set(caddy["networks"]), {"app_parkventory", "edge"})
+        self.assertEqual(
+            set(caddy["networks"]),
+            {"app_monflorian", "app_parkventory", "edge"},
+        )
+        self.assertEqual(
+            caddy["networks"]["app_monflorian"],
+            {"ipv4_address": "172.30.40.254"},
+        )
         self.assertEqual(
             caddy["networks"]["app_parkventory"],
             {"ipv4_address": "172.30.20.254"},

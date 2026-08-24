@@ -1,0 +1,18 @@
+monflorian.com {
+	log
+	import security_headers
+
+	handle /.well-known/monflorian-release {
+		header Content-Type text/plain
+		respond "monflorian 4ac2c42339941e34c128f779399688032c8ef304\n" 200
+	}
+
+	handle {
+		reverse_proxy monflorian-backend:8080
+	}
+}
+
+www.monflorian.com {
+	import security_headers
+	redir https://monflorian.com{uri} 308
+}

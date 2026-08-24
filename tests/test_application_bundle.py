@@ -100,6 +100,15 @@ def fixture_files(profile):
             "          create_host_path: false\n"
             "\nnetworks:\n"
         ).encode()
+    elif profile.application == "monflorian":
+        raw["compose.yaml"] = (
+            "---\nname: monflorian\nservices:\n  backend:\n"
+            "    image: ${MONFLORIAN_BACKEND_IMAGE}\n"
+            "    environment:\n"
+            "      MONFLORIAN_ACCESS_MODE: public\n"
+            '      MONFLORIAN_GENERATION_ENABLED: "false"\n'
+            '      MONFLORIAN_ILLUSTRATION_ENABLED: "false"\n'
+        ).encode()
     else:
         raw["compose.yaml"] = (
             f"---\nname: {profile.application}\nservices:\n  backend:\n"
@@ -276,6 +285,32 @@ class ApplicationBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(
             BUNDLE.ApplicationBundleError,
             "exact no-migration policy",
+        ):
+            BUNDLE.validate_bundle(
+                build_archive(profile, files),
+                build_inventory(profile, files),
+                profile=profile,
+                revision=REVISION,
+                created=CREATED,
+                component_references=component_references,
+                migration_inventory_digest=BUNDLE.content_digest(
+                    files["migrations.json"]
+                ),
+                probe_inventory_digest=BUNDLE.content_digest(
+                    files["probes.json"]
+                ),
+            )
+
+    def test_monflorian_profile_rejects_an_enabled_generation_gate(self):
+        profile = BUNDLE.PROFILES["monflorian"]
+        files, component_references = fixture_files(profile)
+        files["compose.yaml"] = files["compose.yaml"].replace(
+            b'MONFLORIAN_GENERATION_ENABLED: "false"',
+            b'MONFLORIAN_GENERATION_ENABLED: "true"',
+        )
+        with self.assertRaisesRegex(
+            BUNDLE.ApplicationBundleError,
+            "public preview feature gates",
         ):
             BUNDLE.validate_bundle(
                 build_archive(profile, files),

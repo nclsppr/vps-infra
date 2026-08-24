@@ -1,0 +1,6 @@
+http://monflorian.com, http://www.monflorian.com {
+	log
+	import security_headers
+	header Content-Type text/plain
+	respond "Mon Florian arrive.\n" 200
+}

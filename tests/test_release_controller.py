@@ -990,6 +990,7 @@ def platform_document(*, include_grafana: bool = True) -> dict:
 def public_static_edge_document() -> dict:
     caddy = platform_caddy()
     caddy["networks"] = {
+        "app_monflorian": {"ipv4_address": "172.30.40.254"},
         "app_parkventory": {"ipv4_address": "172.30.20.254"},
         "edge": {},
     }
@@ -1024,6 +1025,10 @@ def public_static_edge_document() -> dict:
         "name": "vps-public-static-edge",
         "services": {"caddy": caddy},
         "networks": {
+            "app_monflorian": {
+                "external": True,
+                "name": "app_monflorian",
+            },
             "app_parkventory": {
                 "external": True,
                 "name": "app_parkventory",
@@ -1497,7 +1502,7 @@ class ComposePolicyTests(unittest.TestCase):
                 lambda document: document["services"]["caddy"].update(
                     networks={"ops": {}}
                 ),
-                "networks: expected app_parkventory, edge",
+                "networks: expected app_monflorian, app_parkventory, edge",
             ),
         )
         for mutation, message in cases:

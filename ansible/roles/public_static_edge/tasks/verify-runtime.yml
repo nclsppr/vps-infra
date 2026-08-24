@@ -53,8 +53,23 @@
       - >-
         (((vps_public_static_edge_inspect.stdout | from_json) |
           first).NetworkSettings.Networks.keys() | list | sort) ==
-        [vps_public_static_edge_parkventory_network,
+        [vps_public_static_edge_monflorian_network,
+         vps_public_static_edge_parkventory_network,
          vps_public_static_edge_network] | sort
+      - >-
+        (((vps_public_static_edge_inspect.stdout | from_json) |
+          first).NetworkSettings.Networks[
+            vps_public_static_edge_monflorian_network].NetworkID) ==
+        vps_public_static_edge_monflorian_network_state.Id
+      - >-
+        (((vps_public_static_edge_inspect.stdout | from_json) |
+          first).NetworkSettings.Networks[
+            vps_public_static_edge_monflorian_network].IPAddress) ==
+        vps_public_static_edge_monflorian_address
+      - >-
+        (((vps_public_static_edge_inspect.stdout | from_json) |
+          first).NetworkSettings.Networks[
+            vps_public_static_edge_monflorian_network].IPPrefixLen | int) == 24
       - >-
         (((vps_public_static_edge_inspect.stdout | from_json) |
           first).NetworkSettings.Networks[

@@ -25,6 +25,9 @@ vps_public_static_edge_parkventory_route: >-
 vps_public_static_edge_parkventory_network: app_parkventory
 vps_public_static_edge_parkventory_network_subnet: 172.30.20.0/24
 vps_public_static_edge_parkventory_address: 172.30.20.254
+vps_public_static_edge_monflorian_network: app_monflorian
+vps_public_static_edge_monflorian_network_subnet: 172.30.40.0/24
+vps_public_static_edge_monflorian_address: 172.30.40.254
 vps_public_static_edge_image: >-
   ghcr.io/nclsppr/vps-infra/caddy:sha-755565642f71918134151921f8eae63935951ad6@sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f
 vps_public_static_edge_files:
@@ -33,6 +36,7 @@ vps_public_static_edge_files:
   - expected-images.json
   - validate-compose
 vps_public_static_edge_routes:
+  - monflorian.caddy
   - papersempire.caddy
   - parkventory.caddy
   - personal.caddy
@@ -50,6 +54,8 @@ vps_public_static_edge_domains:
   - www.papersempire.com
   - parkventory.com
   - www.parkventory.com
+  - monflorian.com
+  - www.monflorian.com
 vps_public_static_edge_redirects:
   - source: www.nicolaspieper.com
     target: nicolaspieper.com
@@ -63,6 +69,8 @@ vps_public_static_edge_redirects:
     target: papersempire.com
   - source: www.parkventory.com
     target: parkventory.com
+  - source: www.monflorian.com
+    target: monflorian.com
 vps_public_static_edge_direct_http_redirects:
   - source: www.nicolaspieper.com
     target: nicolaspieper.com
@@ -79,6 +87,8 @@ vps_public_static_edge_pre_cutover_https_redirects:
     target: papersempire.com
   - source: www.parkventory.com
     target: parkventory.com
+  - source: www.monflorian.com
+    target: monflorian.com
 vps_public_static_edge_dns_zones:
   - zone: nicolaspieper.com
     names:
@@ -97,3 +107,7 @@ vps_public_static_edge_dns_zones:
     names:
       - parkventory.com
       - www.parkventory.com
+  - zone: monflorian.com
+    names:
+      - monflorian.com
+      - www.monflorian.com

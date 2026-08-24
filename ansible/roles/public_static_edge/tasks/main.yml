@@ -40,6 +40,10 @@
       - >-
         vps_public_static_edge_parkventory_network_subnet == '172.30.20.0/24'
       - vps_public_static_edge_parkventory_address == '172.30.20.254'
+      - vps_public_static_edge_monflorian_network == 'app_monflorian'
+      - >-
+        vps_public_static_edge_monflorian_network_subnet == '172.30.40.0/24'
+      - vps_public_static_edge_monflorian_address == '172.30.40.254'
       - >-
         vps_public_static_edge_image ==
         'ghcr.io/nclsppr/vps-infra/caddy:sha-755565642f71918134151921f8eae63935951ad6@sha256:1879be5d28d98d49522d74f4fc1bd8c176fd4e35112f757b6639151f3170f11f'
@@ -48,7 +52,8 @@
         ['Caddyfile', 'compose.yaml', 'expected-images.json', 'validate-compose']
       - >-
         vps_public_static_edge_routes | sort ==
-        ['papersempire.caddy', 'parkventory.caddy', 'personal.caddy']
+        ['monflorian.caddy', 'papersempire.caddy', 'parkventory.caddy',
+         'personal.caddy']
       - >-
         vps_public_static_edge_route_sources ==
         {'prepare': 'routes-prepare',
@@ -56,8 +61,9 @@
          'activate': 'routes-activate'}
       - >-
         vps_public_static_edge_domains | sort ==
-        ['nicolas.pieper.fr', 'nicolaspieper.com', 'papersempire.com',
-         'parkventory.com', 'pieper.fr', 'www.nicolaspieper.com',
+        ['monflorian.com', 'nicolas.pieper.fr', 'nicolaspieper.com',
+         'papersempire.com', 'parkventory.com', 'pieper.fr',
+         'www.monflorian.com', 'www.nicolaspieper.com',
          'www.papersempire.com', 'www.parkventory.com', 'www.pieper.fr']
       - >-
         vps_public_static_edge_redirects ==
@@ -66,7 +72,8 @@
          {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'www.papersempire.com', 'target': 'papersempire.com'},
-         {'source': 'www.parkventory.com', 'target': 'parkventory.com'}]
+         {'source': 'www.parkventory.com', 'target': 'parkventory.com'},
+         {'source': 'www.monflorian.com', 'target': 'monflorian.com'}]
       - >-
         vps_public_static_edge_direct_http_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
@@ -77,12 +84,14 @@
         vps_public_static_edge_pre_cutover_https_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
          {'source': 'www.papersempire.com', 'target': 'papersempire.com'},
-         {'source': 'www.parkventory.com', 'target': 'parkventory.com'}]
-      - vps_public_static_edge_dns_zones | length == 4
+         {'source': 'www.parkventory.com', 'target': 'parkventory.com'},
+         {'source': 'www.monflorian.com', 'target': 'monflorian.com'}]
+      - vps_public_static_edge_dns_zones | length == 5
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='zone') | list | sort ==
-        ['nicolaspieper.com', 'papersempire.com', 'parkventory.com', 'pieper.fr']
+        ['monflorian.com', 'nicolaspieper.com', 'papersempire.com',
+         'parkventory.com', 'pieper.fr']
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='names') | flatten | list | sort ==
@@ -305,6 +314,49 @@
             vps_public_static_edge_parkventory_network_state.Labels[
               'com.nclsppr.vps-infra.managed'] | default('') == 'true'
         fail_msg: app_parkventory differs from the managed host contract.
+
+    - name: Inspect the managed Mon Florian application network
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/docker
+          - network
+          - inspect
+          - "{{ vps_public_static_edge_monflorian_network }}"
+      register: vps_public_static_edge_monflorian_network_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Require the managed Mon Florian application network
+      ansible.builtin.assert:
+        that:
+          - vps_public_static_edge_monflorian_network_inspect.rc == 0
+        fail_msg: Run host convergence to create app_monflorian.
+
+    - name: Parse the managed Mon Florian application network
+      ansible.builtin.set_fact:
+        vps_public_static_edge_monflorian_network_state: >-
+          {{ vps_public_static_edge_monflorian_network_inspect.stdout |
+             from_json | first }}
+
+    - name: Prove the managed Mon Florian application network contract
+      ansible.builtin.assert:
+        that:
+          - >-
+            vps_public_static_edge_monflorian_network_state.Name ==
+            vps_public_static_edge_monflorian_network
+          - vps_public_static_edge_monflorian_network_state.Driver == 'bridge'
+          - vps_public_static_edge_monflorian_network_state.Scope == 'local'
+          - >-
+            not (vps_public_static_edge_monflorian_network_state.Internal |
+                 bool)
+          - >-
+            vps_public_static_edge_monflorian_network_state.IPAM.Config |
+            map(attribute='Subnet') | list ==
+            [vps_public_static_edge_monflorian_network_subnet]
+          - >-
+            vps_public_static_edge_monflorian_network_state.Labels[
+              'com.nclsppr.vps-infra.managed'] | default('') == 'true'
+        fail_msg: app_monflorian differs from the managed host contract.
 
     - name: Inspect active static release links
       ansible.builtin.stat:
@@ -625,10 +677,11 @@
           - >-
             vps_public_static_edge_route_entries.files |
             map(attribute='path') | map('basename') | list | sort ==
-            ['papersempire.caddy', 'parkventory.caddy', 'personal.caddy']
+            ['monflorian.caddy', 'papersempire.caddy', 'parkventory.caddy',
+             'personal.caddy']
           - >-
             vps_public_static_edge_route_entries.files |
-            selectattr('isreg', 'equalto', true) | list | length == 3
+            selectattr('isreg', 'equalto', true) | list | length == 4
           - >-
             (vps_public_static_edge_provenance.results[0].content |
              b64decode | trim) == vps_infra_revision
