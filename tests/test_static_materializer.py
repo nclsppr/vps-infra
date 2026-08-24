@@ -4698,15 +4698,7 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
             ),
         )
         self.assertEqual(MATERIALIZER.PROFILES["papersempire"].redirect_domains, ())
-        self.assertEqual(
-            MATERIALIZER.PROFILES["papersempire"].live_redirects,
-            (
-                MATERIALIZER.RedirectContract(
-                    "www.papersempire.com",
-                    expected_hsts=True,
-                ),
-            ),
-        )
+        self.assertEqual(MATERIALIZER.PROFILES["papersempire"].live_redirects, ())
         self.assertEqual(
             MATERIALIZER.PROFILES["parkventory"].live_redirects,
             (
@@ -4722,7 +4714,19 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         edge_redirects = edge_defaults["vps_public_static_edge_redirects"]
+        *_, enabled_applications = MATERIALIZER.read_static_production_pins(
+            ROOT / "releases/static-production.json",
+            require_root_owner=False,
+        )
         for application, profile in MATERIALIZER.PROFILES.items():
+            route = (
+                ROOT
+                / "platform/public-static-edge/routes-activate"
+                / f"{application}.caddy"
+            )
+            if application not in enabled_applications:
+                self.assertFalse(route.exists())
+                continue
             expected_live_domains = tuple(
                 redirect["source"]
                 for redirect in edge_redirects
@@ -4732,14 +4736,10 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
                 tuple(redirect.domain for redirect in profile.live_redirects),
                 expected_live_domains,
             )
-            route = (
-                ROOT
-                / "platform/public-static-edge/routes-activate"
-                / f"{application}.caddy"
-            ).read_text(encoding="utf-8")
-            self.assertIn(profile.canonical_domain, route)
+            route_text = route.read_text(encoding="utf-8")
+            self.assertIn(profile.canonical_domain, route_text)
             for redirect in profile.live_redirects:
-                self.assertIn(redirect.domain, route)
+                self.assertIn(redirect.domain, route_text)
         integration_route = (
             ROOT / "platform/caddy/routes/personal.caddy.disabled"
         ).read_text(encoding="utf-8")

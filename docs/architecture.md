@@ -11,7 +11,7 @@ The project states consolidated on 2026-08-18 are:
 | Project | Proved state | VPS consequence |
 |---|---|---|
 | `personal` | Immutable site and route artifacts from `163b9c9643dd9c54e9b1bb5d558d34a670e28e52` are active on Atlas. | Keep the allowlisted static producer and automatic reconciliation. |
-| `papersempire` | The assembled `site/` and route inventory from `b95f9bdde468aac9d03bd0548c7aa42969e52df7` are active on Atlas. | Publish the CI result, never the checkout. |
+| `papersempire` | Production moved to Cloudflare Workers on 2026-08-24. | Keep static promotion disabled and keep its domains out of the public edge route set. |
 | `parkventory` | The static demo from `db9571cc59d0fcc31c6554af259eda4c29988a6a` is active. Backend, frontend, integration, and application-release artifacts exist but are not active. | Keep the Compose application disabled until the explicit ownership handoff and all ADR-0010 blockers pass. |
 | `surplasse` | An immutable tester release and integration bundle exist. Canonical admission is enabled, but no Atlas application activation is proved. | Keep the legacy adapter locked and require every canonical secret, edge, migration, recovery, and public-probe check before activation. |
 
@@ -54,7 +54,6 @@ flowchart LR
     Internet --> Caddy["Caddy plateforme<br/>80 / 443"]
 
     Caddy --> Personal["release personal<br/>fichiers statiques"]
-    Caddy --> Papers["release papersempire<br/>fichiers statiques"]
     Caddy --> ParkStatic["Parkventory demo<br/>static release"]
     Caddy -. disabled .-> Surplasse["modules Surplasse<br/>Backend + frontends"]
     Caddy -. disabled .-> Parkventory["Parkventory React + Java<br/>Compose application"]
@@ -151,9 +150,8 @@ platform/caddy/
 ```
 
 The first live unit is `vps-public-static-edge`. It is a separate Compose
-project with exactly one Caddy service and exactly three static route files. It
-mounts the verified `current` roots for Personal, Papers Empire, and the
-Parkventory demo read-only.
+project with exactly one Caddy service and three base route files. It mounts the
+verified `current` roots for Personal and the Parkventory demo read-only.
 It keeps separate ACME volumes and does not receive a DNS provider credential.
 It joins only the dedicated external `edge` bridge. It does not join the
 internal observability network `ops`.
@@ -218,14 +216,15 @@ Avant tout rechargement :
 
 ## Sites statiques sans runtime dupliqué
 
-Personal, Papers Empire, and the Parkventory demo are served directly by Caddy:
+Personal and the Parkventory demo are served directly by Caddy. The retained
+Papers Empire directory is inactive retirement residue, not a route:
 
 ```text
 /srv/www/
   personal/
     releases/sha256-<site-manifest-digest>/
     current -> releases/sha256-<site-manifest-digest>
-  papersempire/
+  papersempire/  # inactive; no public edge route
     releases/sha256-<site-manifest-digest>/
     current -> releases/sha256-<site-manifest-digest>
   parkventory/
@@ -369,13 +368,10 @@ redirects are not file routes. The live activation and external public probes
 test them separately. This inventory prevents a new file route from being omitted from a
 handwritten smoke test.
 
-Pour `papersempire`, l’artefact est le répertoire `site/` déjà assemblé par le
-workflow : jeu, Dashboard, documentation Retype et pages de langue. Servir le
-checkout omettrait la documentation construite et les pages générées.
-
-Le domaine et le schéma de Papers Empire restent
-`https://papersempire.com`. Sa sauvegarde navigateur vit dans `localStorage` et
-est liée à cette origine.
+Papers Empire retained this immutable artifact history, but its production
+delivery and canonical `https://papersempire.com` origin moved to Cloudflare
+Workers on 2026-08-24. The static promotion profile is disabled and the public
+edge base contains no Papers Empire route.
 
 ## Applications conteneurisées
 

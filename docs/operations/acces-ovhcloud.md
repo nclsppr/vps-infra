@@ -141,6 +141,11 @@ apex and `www` names of `nicolaspieper.com`, `papersempire.com`, and
 `parkventory.com`. These names have no AAAA answer. The existing mail records
 remain unchanged. `surplasse.com` still points to its previous host.
 
+This is historical evidence. On 2026-08-24, Papers Empire moved its
+authoritative zone and web delivery to Cloudflare; it is no longer part of the
+Atlas DNS or public-edge mutation set. Its OVH mail records were preserved in
+the Cloudflare zone.
+
 The captured tables support rollback, but they do not replace a reusable API
 export of A, AAAA, CNAME, MX, SPF, DKIM, DMARC, CAA, wildcard, redirect, and TTL
 state.

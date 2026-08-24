@@ -326,7 +326,6 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
         self.assertEqual(
             sorted(path.name for path in (release / "routes").iterdir()),
             [
-                "papersempire.caddy",
                 "parkventory.caddy",
                 "personal.caddy",
                 "surplasse.caddy",

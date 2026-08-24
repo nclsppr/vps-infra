@@ -1796,7 +1796,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 {
                     "monflorian.caddy",
                     "personal.caddy",
-                    "papersempire.caddy",
                     "parkventory.caddy",
                 },
             )
@@ -1806,9 +1805,16 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             for path in sorted((edge_root / route_directory).iterdir())
         )
         self.assertIn("nicolaspieper.com", route_text)
-        self.assertIn("papersempire.com", route_text)
         self.assertIn("parkventory.com", route_text)
         self.assertIn("monflorian.com", route_text)
+        verify_runtime = (
+            ROOT / "ansible/roles/public_static_edge/tasks/verify-runtime.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Refuse the retired Papers Empire hosts", verify_runtime)
+        self.assertIn("Host: \"{{ item }}\"", verify_runtime)
+        self.assertIn("status_code: 404", verify_runtime)
+        self.assertIn("- papersempire.com", verify_runtime)
+        self.assertIn("- www.papersempire.com", verify_runtime)
         self.assertNotIn("surplasse", route_text.lower())
         self.assertNotIn("grafana", route_text.lower())
         self.assertIn("nicolas.pieper.fr", route_text)
@@ -1831,22 +1837,15 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "pieper.fr",
             "www.pieper.fr",
             "nicolas.pieper.fr",
-            "papersempire.com",
-            "www.papersempire.com",
             "parkventory.com",
             "www.parkventory.com",
         ):
             self.assertIn(f"http://{domain}", prepare_routes)
         self.assertNotIn("http://nicolaspieper.com", activate_routes)
-        self.assertNotIn("http://papersempire.com", activate_routes)
         self.assertNotIn("http://parkventory.com", activate_routes)
         self.assertNotIn("http://nicolaspieper.com", precutover_routes)
-        self.assertNotIn("http://papersempire.com", precutover_routes)
         self.assertNotIn("http://parkventory.com", precutover_routes)
-        self.assertEqual(
-            (edge_root / "routes-precutover/papersempire.caddy").read_bytes(),
-            (edge_root / "routes-activate/papersempire.caddy").read_bytes(),
-        )
+        self.assertNotIn("papersempire.com", route_text)
         self.assertEqual(
             (edge_root / "routes-precutover/parkventory.caddy").read_bytes(),
             (edge_root / "routes-activate/parkventory.caddy").read_bytes(),

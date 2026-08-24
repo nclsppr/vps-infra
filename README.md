@@ -138,10 +138,10 @@ The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
 controlled operator rollout recorded this live state:
 
-- the public static edge serves `nicolaspieper.com`, `papersempire.com`, and the
-  static Parkventory demo over HTTPS;
-- the apex and `www` DNS records for these three sites point to Atlas by IPv4,
-  with no public AAAA record;
+- the public static edge serves `nicolaspieper.com` and the static Parkventory
+  demo over HTTPS; Papers Empire moved to Cloudflare Workers on 24 August 2026;
+- the apex and `www` DNS records for the two enabled static profiles point to
+  Atlas by IPv4, with no public AAAA record;
 - PostgreSQL, Prometheus, Grafana, Node Exporter, and PostgreSQL Exporter run as
   the private internal platform;
 - only SSH, HTTP, and HTTPS use public host ports. Grafana binds to loopback.
