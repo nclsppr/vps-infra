@@ -37,7 +37,6 @@ vps_public_static_edge_files:
   - validate-compose
 vps_public_static_edge_routes:
   - monflorian.caddy
-  - papersempire.caddy
   - parkventory.caddy
   - personal.caddy
 vps_public_static_edge_route_sources:
@@ -50,8 +49,6 @@ vps_public_static_edge_domains:
   - pieper.fr
   - www.pieper.fr
   - nicolas.pieper.fr
-  - papersempire.com
-  - www.papersempire.com
   - parkventory.com
   - www.parkventory.com
   - monflorian.com
@@ -65,8 +62,6 @@ vps_public_static_edge_redirects:
     target: nicolaspieper.com
   - source: nicolas.pieper.fr
     target: nicolaspieper.com
-  - source: www.papersempire.com
-    target: papersempire.com
   - source: www.parkventory.com
     target: parkventory.com
   - source: www.monflorian.com
@@ -83,8 +78,6 @@ vps_public_static_edge_direct_http_redirects:
 vps_public_static_edge_pre_cutover_https_redirects:
   - source: www.nicolaspieper.com
     target: nicolaspieper.com
-  - source: www.papersempire.com
-    target: papersempire.com
   - source: www.parkventory.com
     target: parkventory.com
   - source: www.monflorian.com
@@ -99,10 +92,6 @@ vps_public_static_edge_dns_zones:
       - pieper.fr
       - www.pieper.fr
       - nicolas.pieper.fr
-  - zone: papersempire.com
-    names:
-      - papersempire.com
-      - www.papersempire.com
   - zone: parkventory.com
     names:
       - parkventory.com

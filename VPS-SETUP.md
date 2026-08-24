@@ -250,6 +250,8 @@ platform/
 
 ### Papers Empire
 
+- [x] move production delivery and both web domains to Cloudflare Workers;
+- [x] disable static reconciliation and remove the public edge route;
 - [x] corriger la documentation de tests contradictoire ;
 - [x] épingler les Actions par SHA ;
 - [x] conserver le build Retype et `build-lang-pages.mjs` ;
@@ -422,7 +424,8 @@ remaining full-stack rehearsal on a disposable VPS or VM.
 - [ ] activate and probe the `precutover` edge state: keep every established
       HTTPS site valid and expose the three pending `.fr` aliases only as direct
       Atlas HTTP `308` redirects;
-- [x] deploy and probe the three static releases before the DNS change;
+- [x] deploy and probe the original three static releases before the DNS change;
+- [x] retire the Papers Empire route after its Cloudflare Workers cutover;
 - [x] probe the new host with forced IPv4 resolution;
 - [x] create a verified PostgreSQL backup and complete an isolated restore
       rehearsal;

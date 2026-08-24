@@ -52,8 +52,7 @@
         ['Caddyfile', 'compose.yaml', 'expected-images.json', 'validate-compose']
       - >-
         vps_public_static_edge_routes | sort ==
-        ['monflorian.caddy', 'papersempire.caddy', 'parkventory.caddy',
-         'personal.caddy']
+        ['monflorian.caddy', 'parkventory.caddy', 'personal.caddy']
       - >-
         vps_public_static_edge_route_sources ==
         {'prepare': 'routes-prepare',
@@ -62,16 +61,15 @@
       - >-
         vps_public_static_edge_domains | sort ==
         ['monflorian.com', 'nicolas.pieper.fr', 'nicolaspieper.com',
-         'papersempire.com', 'parkventory.com', 'pieper.fr',
+         'parkventory.com', 'pieper.fr',
          'www.monflorian.com', 'www.nicolaspieper.com',
-         'www.papersempire.com', 'www.parkventory.com', 'www.pieper.fr']
+         'www.parkventory.com', 'www.pieper.fr']
       - >-
         vps_public_static_edge_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
          {'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'www.papersempire.com', 'target': 'papersempire.com'},
          {'source': 'www.parkventory.com', 'target': 'parkventory.com'},
          {'source': 'www.monflorian.com', 'target': 'monflorian.com'}]
       - >-
@@ -83,15 +81,13 @@
       - >-
         vps_public_static_edge_pre_cutover_https_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
-         {'source': 'www.papersempire.com', 'target': 'papersempire.com'},
          {'source': 'www.parkventory.com', 'target': 'parkventory.com'},
          {'source': 'www.monflorian.com', 'target': 'monflorian.com'}]
-      - vps_public_static_edge_dns_zones | length == 5
+      - vps_public_static_edge_dns_zones | length == 4
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='zone') | list | sort ==
-        ['monflorian.com', 'nicolaspieper.com', 'papersempire.com',
-         'parkventory.com', 'pieper.fr']
+        ['monflorian.com', 'nicolaspieper.com', 'parkventory.com', 'pieper.fr']
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='names') | flatten | list | sort ==
@@ -365,7 +361,6 @@
       register: vps_public_static_edge_links
       loop:
         - personal
-        - papersempire
 
     - name: Require protected relative static release links
       ansible.builtin.assert:
@@ -389,7 +384,6 @@
       register: vps_public_static_edge_roots
       loop:
         - personal
-        - papersempire
 
     - name: Require protected static release directories
       ansible.builtin.assert:
@@ -677,11 +671,10 @@
           - >-
             vps_public_static_edge_route_entries.files |
             map(attribute='path') | map('basename') | list | sort ==
-            ['monflorian.caddy', 'papersempire.caddy', 'parkventory.caddy',
-             'personal.caddy']
+            ['monflorian.caddy', 'parkventory.caddy', 'personal.caddy']
           - >-
             vps_public_static_edge_route_entries.files |
-            selectattr('isreg', 'equalto', true) | list | length == 4
+            selectattr('isreg', 'equalto', true) | list | length == 3
           - >-
             (vps_public_static_edge_provenance.results[0].content |
              b64decode | trim) == vps_infra_revision

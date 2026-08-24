@@ -130,6 +130,26 @@
   become: false
   delegate_to: localhost
 
+- name: Refuse the retired Papers Empire hosts from the operator network
+  ansible.builtin.uri:
+    url: "http://{{ ansible_default_ipv4.address }}/"
+    headers:
+      Host: "{{ item }}"
+    follow_redirects: none
+    status_code: 404
+    return_content: false
+  register: vps_public_static_edge_retired_papersempire_probe
+  until:
+    - vps_public_static_edge_retired_papersempire_probe.status == 404
+    - vps_public_static_edge_retired_papersempire_probe.server is not defined
+  retries: 6
+  delay: 5
+  loop:
+    - papersempire.com
+    - www.papersempire.com
+  become: false
+  delegate_to: localhost
+
 - name: Probe pending one-hop HTTP redirects directly on Atlas before DNS cutover
   ansible.builtin.uri:
     url: >-
@@ -176,7 +196,6 @@
   delay: 5
   loop:
     - nicolaspieper.com
-    - papersempire.com
     - parkventory.com
   become: false
   delegate_to: localhost

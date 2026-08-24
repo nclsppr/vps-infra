@@ -384,9 +384,7 @@ PROFILES = {
         signer_workflow="nclsppr/papersempire/.github/workflows/vps-release.yml",
         canonical_domain="papersempire.com",
         redirect_domains=(),
-        live_redirects=(
-            RedirectContract("www.papersempire.com", expected_hsts=True),
-        ),
+        live_redirects=(),
         site_repository="ghcr.io/nclsppr/papersempire/site",
         routes_repository="ghcr.io/nclsppr/papersempire/routes",
         max_archive_bytes=75 * MIB,

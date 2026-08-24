@@ -58,7 +58,7 @@ applications:
     readiness_evidence: <preuves-structurees>
 
   papersempire:
-    enabled: true
+    enabled: false
     type: static
     source_repository: nclsppr/papersempire
     source_branch: main
@@ -545,21 +545,11 @@ still require HSTS.
 
 ### Papers Empire
 
-Le workflow conserve sa vraie construction :
-
-1. installation verrouillée des dépendances ;
-2. build Retype vers `docs-site/` ;
-3. assemblage de `site/` ;
-4. génération des pages `/en/`, `/de/` et `/lb/` ;
-5. cache-busting par SHA ;
-6. route inventory generation for the complete assembled tree.
-
-The producer workflow does not perform an HTTP smoke. The VPS materializer
-provides the first Caddy HTTPS proof for every inventory route.
-
-L’archive contient exactement le même `site/` que l’artefact Pages, pas la
-racine du dépôt. `papersempire.com` reste l’apex canonique ; aucune redirection
-vers `www` ne doit changer l’origine de son `localStorage`.
+Papers Empire moved to Cloudflare Workers on 2026-08-24. Its disabled static
+profile retains the immutable artifact contract as retirement evidence, but it
+cannot enter the resolver matrix and its domains are absent from the public
+edge base. Builds and public probes now belong to the producer repository's
+Cloudflare delivery procedure.
 
 ### Parkventory demo
 
@@ -1064,9 +1054,9 @@ canonical-push job names consumed by the central resolver aligned with
 
 ### `papersempire`
 
-The assembled `site/`, route inventory, immutable OCI publication, attestation,
-and Atlas deployment are complete. Keep `main` protected and preserve the
-canonical `papersempire.com` origin for browser state.
+Production delivery moved to Cloudflare Workers on 2026-08-24. Keep the static
+promotion disabled, the public edge route absent, and the canonical
+`papersempire.com` origin under the producer repository's Cloudflare contract.
 
 ### `parkventory`
 
