@@ -2176,6 +2176,10 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "vps_public_static_edge_operation == 'retire-papersempire'",
             runtime_verification,
         )
+        self.assertNotIn(
+            "vps_public_static_edge_retained_origin_probe.server",
+            runtime_verification,
+        )
 
         authoritative_dns = (
             ROOT
