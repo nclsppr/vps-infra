@@ -5498,6 +5498,25 @@ class ApplicationControllerTests(unittest.TestCase):
         self.assertTrue(transactions[0].previous_unit_active)
         self.assertTrue(transactions[0].previous_unit_enabled)
 
+    def test_public_edge_base_accepts_the_deployed_legacy_release_name(self):
+        legacy = (
+            "/srv/vps/releases/public-static-edge/"
+            + PREVIOUS_REVISION
+            + "-surplasse-static-v2"
+        )
+        self.assertEqual(
+            CONTROLLER.public_edge_base_release_from_value(legacy, "release"),
+            Path(legacy),
+        )
+        with self.assertRaisesRegex(
+            CONTROLLER.ApplicationDeploymentError,
+            "outside the immutable public edge release root",
+        ):
+            CONTROLLER.public_edge_base_release_from_value(
+                legacy.removesuffix("v2") + "v3",
+                "release",
+            )
+
     def test_locked_public_edge_restart_does_not_schedule_recovery_dependencies(self):
         release = Path(
             "/srv/vps/releases/public-static-edge/"
