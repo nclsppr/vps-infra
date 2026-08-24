@@ -146,7 +146,6 @@
     - >-
       vps_public_static_edge_retained_origin_probe.location ==
       'https://' ~ item ~ '/__vps_retirement_probe__?source=papersempire'
-    - vps_public_static_edge_retained_origin_probe.server is not defined
   retries: 6
   delay: 5
   loop:
