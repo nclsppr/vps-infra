@@ -21,6 +21,12 @@
           - >-
             vps_public_static_edge_state in
             ['prepare', 'precutover', 'activate', 'stopped']
+          - >-
+            vps_public_static_edge_operation in
+            ['standard', 'retire-papersempire']
+          - >-
+            vps_public_static_edge_operation == 'standard' or
+            vps_public_static_edge_state == 'activate'
         fail_msg: >-
           The public static edge requires the converged Atlas administrator
           boundary and one exact infrastructure revision.
@@ -38,5 +44,6 @@
       ansible.builtin.debug:
         msg: >-
           Public static edge state is {{ vps_public_static_edge_state }}.
+          Operation is {{ vps_public_static_edge_operation }}.
           PostgreSQL, Prometheus, Grafana, Surplasse, Parkventory, the locked
           release applicator, and DNS were not started or changed.

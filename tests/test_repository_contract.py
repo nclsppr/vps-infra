@@ -2168,6 +2168,14 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("Refuse an unconfigured HTTP host", runtime_verification)
         self.assertIn("Host: unconfigured.invalid", runtime_verification)
         self.assertIn("status_code: 404", runtime_verification)
+        self.assertIn(
+            "Prove retained static origins directly during Papers Empire retirement",
+            runtime_verification,
+        )
+        self.assertIn(
+            "vps_public_static_edge_operation == 'retire-papersempire'",
+            runtime_verification,
+        )
 
         authoritative_dns = (
             ROOT
@@ -4347,6 +4355,31 @@ fi
                     rf"--extra-vars vps_public_static_edge_state={state} "
                     r"playbooks/public-static-edge\.yml$",
                 )
+
+            log.unlink()
+            retirement_result = subprocess.run(
+                [converge, "--retire-papersempire-public-edge"],
+                cwd=root,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                retirement_result.returncode,
+                0,
+                retirement_result.stderr,
+            )
+            retirement_execution = log.read_text(encoding="utf-8")
+            self.assertRegex(
+                retirement_execution,
+                rf"(?m)^arguments=.*vps_infra_revision={remote_sha} "
+                r"--extra-vars vps_public_static_edge_state=activate "
+                r"--extra-vars "
+                r"vps_public_static_edge_operation=retire-papersempire "
+                r"playbooks/public-static-edge\.yml$",
+            )
 
             for mode, state in (
                 ("--start-internal-platform", "started"),

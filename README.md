@@ -10,7 +10,10 @@ hébergeant :
 
 Papers Empire moved to Cloudflare Workers on 24 August 2026. Its static
 promotion entry stays disabled as retirement evidence and is no longer part of
-the active delivery set.
+the active delivery set. The bounded
+`make retire-papersempire-public-edge` operation removes its residual Caddy
+hosts without changing DNS and refuses to commit unless direct origin probes
+prove the retained and retired host sets.
 
 ## Déployer un site statique
 

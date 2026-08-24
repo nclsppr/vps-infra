@@ -5,6 +5,12 @@
       - >-
         vps_public_static_edge_state in
         ['prepare', 'precutover', 'activate', 'stopped']
+      - >-
+        vps_public_static_edge_operation in
+        ['standard', 'retire-papersempire']
+      - >-
+        vps_public_static_edge_operation == 'standard' or
+        vps_public_static_edge_state == 'activate'
       - vps_public_static_edge_project == 'vps-public-static-edge'
       - vps_public_static_edge_release_root == '/srv/vps/releases/public-static-edge'
       - vps_public_static_edge_runtime_dir == '/srv/vps/runtime/public-static-edge'
@@ -403,7 +409,9 @@
       ansible.builtin.set_fact:
         vps_public_static_edge_atlas_ipv4:
           - "{{ ansible_default_ipv4.address }}"
-      when: vps_public_static_edge_state == 'activate'
+      when:
+        - vps_public_static_edge_state == 'activate'
+        - vps_public_static_edge_operation == 'standard'
 
     - name: Discover every authoritative DNS server before HTTPS activation
       ansible.builtin.command:
@@ -419,7 +427,9 @@
       loop: "{{ vps_public_static_edge_dns_zones }}"
       loop_control:
         label: "{{ item.zone }}"
-      when: vps_public_static_edge_state == 'activate'
+      when:
+        - vps_public_static_edge_state == 'activate'
+        - vps_public_static_edge_operation == 'standard'
 
     - name: Require at least one authority for every public DNS zone
       ansible.builtin.assert:
@@ -433,21 +443,26 @@
       loop: "{{ vps_public_static_edge_dns_authorities.results }}"
       loop_control:
         label: "{{ item.item.zone }}"
-      when: vps_public_static_edge_state == 'activate'
+      when:
+        - vps_public_static_edge_state == 'activate'
+        - vps_public_static_edge_operation == 'standard'
 
     - name: Verify the cutover at every authoritative DNS server
       ansible.builtin.include_tasks: verify-authoritative-dns.yml
       loop: >-
         {{ query('subelements',
                  (vps_public_static_edge_dns_authorities.results
-                  if vps_public_static_edge_state == 'activate' else []),
+                  if vps_public_static_edge_state == 'activate' and
+                     vps_public_static_edge_operation == 'standard' else []),
                  'stdout_lines') }}
       loop_control:
         loop_var: vps_public_static_edge_authority
         label: >-
           {{ vps_public_static_edge_authority.0.item.zone }} at
           {{ vps_public_static_edge_authority.1 }}
-      when: vps_public_static_edge_state == 'activate'
+      when:
+        - vps_public_static_edge_state == 'activate'
+        - vps_public_static_edge_operation == 'standard'
 
     - name: Wait for exact recursive A answers before HTTPS activation
       ansible.builtin.command:
@@ -466,7 +481,9 @@
       retries: 30
       delay: 10
       loop: "{{ vps_public_static_edge_domains }}"
-      when: vps_public_static_edge_state == 'activate'
+      when:
+        - vps_public_static_edge_state == 'activate'
+        - vps_public_static_edge_operation == 'standard'
 
     - name: Wait for empty recursive AAAA answers before HTTPS activation
       ansible.builtin.command:
@@ -489,7 +506,9 @@
       retries: 30
       delay: 10
       loop: "{{ vps_public_static_edge_domains }}"
-      when: vps_public_static_edge_state == 'activate'
+      when:
+        - vps_public_static_edge_state == 'activate'
+        - vps_public_static_edge_operation == 'standard'
 
     - name: Create root-owned public edge release parents
       ansible.builtin.file:

@@ -35,6 +35,13 @@ Papers Empire releases no longer use this workflow. Its disabled entry remains
 visible in resolver evidence and must not be re-enabled while Cloudflare owns
 `papersempire.com` and `www.papersempire.com`.
 
+The one-time public-edge retirement uses
+`make retire-papersempire-public-edge`. It stages the active HTTPS route set
+without either Papers Empire host, skips the unrelated legacy direct-DNS
+cutover gate, and changes no DNS record. Before commit, the transaction forces
+origin probes that retain Personal and Parkventory and requires an exact `404`
+without a `Server` header for both retired Papers Empire hosts.
+
 Open a producer PR, wait for `Validate VPS release`, merge it, then require the
 merged revision's producer workflow `VPS release` to succeed. That workflow
 publishes immutable OCI artifacts and attestations; it has no VPS credential
