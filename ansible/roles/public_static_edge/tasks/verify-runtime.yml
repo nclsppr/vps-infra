@@ -130,6 +130,32 @@
   become: false
   delegate_to: localhost
 
+- name: Prove retained static origins directly during Papers Empire retirement
+  ansible.builtin.uri:
+    url: >-
+      http://{{ ansible_default_ipv4.address
+      }}/__vps_retirement_probe__?source=papersempire
+    headers:
+      Host: "{{ item }}"
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+  register: vps_public_static_edge_retained_origin_probe
+  until:
+    - vps_public_static_edge_retained_origin_probe.status == 308
+    - >-
+      vps_public_static_edge_retained_origin_probe.location ==
+      'https://' ~ item ~ '/__vps_retirement_probe__?source=papersempire'
+    - vps_public_static_edge_retained_origin_probe.server is not defined
+  retries: 6
+  delay: 5
+  loop:
+    - nicolaspieper.com
+    - parkventory.com
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_operation == 'retire-papersempire'
+
 - name: Refuse the retired Papers Empire hosts from the operator network
   ansible.builtin.uri:
     url: "http://{{ ansible_default_ipv4.address }}/"
