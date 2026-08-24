@@ -4395,7 +4395,7 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
         self.assertEqual(revision, value["integration"]["source_revision"])
         self.assertEqual(integration, value["integration"]["artifact"])
         self.assertEqual(caddy, value["caddy_image"])
-        self.assertEqual(enabled_applications, frozenset(MATERIALIZER.PROFILES))
+        self.assertEqual(enabled_applications, frozenset({"personal", "parkventory"}))
         self.assertEqual(
             caddy,
             MATERIALIZER.read_promoted_caddy_image(

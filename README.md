@@ -4,10 +4,13 @@ Source de vérité publique pour reconstruire et exploiter un VPS OVHcloud
 hébergeant :
 
 - `personal` (`nicolaspieper.com`) ;
-- `papersempire` (`papersempire.com`) ;
 - `surplasse` et ses frontends ;
 - the static Parkventory demo (`parkventory.com`), separate from its disabled
   backend application.
+
+Papers Empire moved to Cloudflare Workers on 24 August 2026. Its static
+promotion entry stays disabled as retirement evidence and is no longer part of
+the active delivery set.
 
 ## Déployer un site statique
 
@@ -16,8 +19,7 @@ Pour livrer un changement de contenu sur Atlas, modifier le dépôt du site, pas
 
 1. ouvrir une PR vers `main` pour
    [Personal](https://github.com/nclsppr/personal#comment-déployer-sur-atlas),
-   [Parkventory](https://github.com/nclsppr/parkventory) ou
-   [Papers Empire](https://github.com/nclsppr/papersempire#deploy-to-atlas) ;
+   ou [Parkventory](https://github.com/nclsppr/parkventory) ;
 2. attendre le check PR `Validate VPS release`, puis fusionner ;
 3. vérifier que le workflow producteur `VPS release` du SHA fusionné publie les
    artefacts immuables avec succès ;
@@ -52,9 +54,10 @@ Le socle reste volontairement simple :
 6. le VPS tire uniquement un commit `vps-infra` autorisé et des digests déjà
    validés. Il ne compile jamais les dépôts applicatifs.
 
-Personal, Papers Empire, and the Parkventory demo are static releases served by
-the common Caddy service. The Parkventory backend stays disabled. Surplasse
-keeps its application images, but not its copy of Caddy, PostgreSQL,
+Personal and the Parkventory demo are static releases served by the common
+Caddy service. Papers Empire is delivered separately by Cloudflare Workers.
+The Parkventory backend stays disabled. Surplasse keeps its application images,
+but not its copy of Caddy, PostgreSQL,
 Prometheus, or Grafana. One physical PostgreSQL cluster is shared. Each project
 keeps separate databases, roles, secrets, networks, and migrations.
 
@@ -72,8 +75,7 @@ Le premier socle exécutable est livré :
 - Compose plateforme durci et images amont épinglées par digest ;
 - Caddy with a generated, checksum-locked Go graph and the OVH DNS provider;
 - GitHub CLI 2.97.0 with archive and executable checksums, plus a fail-closed
-  static OCI materializer for Personal, Papers Empire, and the Parkventory
-  demo;
+  static OCI materializer for Personal and the Parkventory demo;
 - Codex CLI 0.147.0 from the standalone OpenAI package, with an isolated
   runtime account, managed permissions, and a private persistent App Server
   Unix socket for an optional bounded SSH gateway or outbound mobile control;
@@ -89,14 +91,14 @@ Le premier socle exécutable est livré :
 - deterministic platform integration publication from an exact runtime
   allowlist. The workflow verifies the manifest and both GHCR layer payloads
   before it creates and verifies GitHub provenance.
-- a fail-closed static release reconciler for Personal, Papers Empire, and
-  Parkventory. It selects only the canonical branch HEAD after every observed
+- a fail-closed static release reconciler for Personal and Parkventory. It
+  keeps the retired Papers Empire profile disabled, selects only the canonical branch HEAD after every observed
   check is complete and non-failing and every configured required check is a
   success, resolves the coherent site and route tags to
   digests, and uses one bounded Atlas command. The dedicated
   `static-production` environment is configured with
-  `VPS_STATIC_DEPLOY_ENABLED=true`; scheduled operation is proved for all three
-  profiles.
+  `VPS_STATIC_DEPLOY_ENABLED=true`; scheduled operation is proved for the
+  remaining enabled profiles.
 - immutable application-release admission plus repository-delivered Ansible
   wiring for a root-owned transactional Compose controller for Surplasse,
   Parkventory, and Mon Florian. The controller source verifies every component and integration

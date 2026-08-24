@@ -10,6 +10,11 @@ profiles and Atlas proved the repeated immutable tuples as healthy no-ops. See
 the [rollout evidence](../evidence/2026-08-18-static-reconciliation-rollout.md).
 This decision does not unlock the dynamic application controller.
 
+Papers Empire left this delivery path on 24 August 2026. Its static promotion
+switch is now disabled because Cloudflare Workers owns its production domains
+and continuous delivery. The profile remains in the contract only as explicit
+retirement evidence and cannot enter the deployment matrix.
+
 ## Context
 
 Personal, Papers Empire, and the Parkventory demo publish separate site and
