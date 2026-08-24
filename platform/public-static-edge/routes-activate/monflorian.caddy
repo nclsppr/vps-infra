@@ -4,7 +4,7 @@ monflorian.com {
 
 	handle /.well-known/monflorian-release {
 		header Content-Type text/plain
-		respond "monflorian 4ac2c42339941e34c128f779399688032c8ef304\n" 200
+		respond "monflorian 4c5619f807c98c929becf7589886577c2bdf9a5b\n" 200
 	}
 
 	handle {

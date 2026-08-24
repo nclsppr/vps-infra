@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Stage the Mon Florian public route for source revision
+  `4c5619f807c98c929becf7589886577c2bdf9a5b`.
+
 ### Fixed
 
 - Allow the public edge transaction controller to adopt the exact immutable
