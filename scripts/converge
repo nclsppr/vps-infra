@@ -42,6 +42,13 @@ case $# in
           --extra-vars vps_public_static_edge_operation=retire-papersempire
         )
         ;;
+      --retire-pieper-redirects-public-edge)
+        playbook=playbooks/public-static-edge.yml
+        ansible_extra_options=(
+          --extra-vars vps_public_static_edge_state=activate
+          --extra-vars vps_public_static_edge_operation=retire-pieper-redirects
+        )
+        ;;
       --prepare-parkventory-public-edge)
         playbook=playbooks/public-static-edge.yml
         ansible_extra_options=(--extra-vars vps_public_static_edge_state=activate)

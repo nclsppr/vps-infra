@@ -7,7 +7,7 @@
         ['prepare', 'precutover', 'activate', 'stopped']
       - >-
         vps_public_static_edge_operation in
-        ['standard', 'retire-papersempire']
+        ['standard', 'retire-papersempire', 'retire-pieper-redirects']
       - >-
         vps_public_static_edge_operation == 'standard' or
         vps_public_static_edge_state == 'activate'
@@ -77,6 +77,20 @@
       - >-
         vps_public_static_edge_direct_http_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'}]
+      - >-
+        vps_public_static_edge_cloudflare_redirects ==
+        [{'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
+         {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'}]
+      - >-
+        vps_public_static_edge_cloudflare_redirects |
+        map(attribute='source') | list |
+        intersect(vps_public_static_edge_domains) | length == 0
+      - >-
+        vps_public_static_edge_cloudflare_redirects |
+        map(attribute='source') | list |
+        intersect(vps_public_static_edge_redirects |
+                  map(attribute='source') | list) | length == 0
       - >-
         vps_public_static_edge_pre_cutover_https_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},

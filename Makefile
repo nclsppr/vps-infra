@@ -21,7 +21,7 @@ COMPOSE := $(MISE_EXEC) docker-compose
 	check-json bootstrap \
 	converge converge-check prepare-public-static-edge \
 	precutover-public-static-edge activate-public-static-edge \
-	retire-papersempire-public-edge \
+	retire-papersempire-public-edge retire-pieper-redirects-public-edge \
 	stop-public-static-edge prepare-parkventory-public-edge \
 	start-internal-platform stop-internal-platform \
 	install-postgres-backup stop-postgres-backup-schedule \
@@ -336,6 +336,11 @@ retire-papersempire-public-edge: ## Remove only the retired Papers Empire routes
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
 	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
 		./scripts/converge --retire-papersempire-public-edge
+
+retire-pieper-redirects-public-edge: ## Remove only the Cloudflare-owned Personal aliases from Atlas.
+	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \
+	ANSIBLE_EXTRA_VARS="$(abspath $(ANSIBLE_EXTRA_VARS))" \
+		./scripts/converge --retire-pieper-redirects-public-edge
 
 stop-public-static-edge: ## Stop only the static Caddy edge and preserve its data.
 	ANSIBLE_INVENTORY="$(abspath $(ANSIBLE_INVENTORY))" \

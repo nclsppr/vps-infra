@@ -42,6 +42,16 @@ cutover gate, and changes no DNS record. Before commit, the transaction forces
 origin probes that retain Personal and Parkventory and requires an exact `404`
 without a `Server` header for both retired Papers Empire hosts.
 
+The one-time Personal alias retirement uses
+`make retire-pieper-redirects-public-edge`. It stages the active HTTPS route
+set without `pieper.fr`, `www.pieper.fr`, or `nicolas.pieper.fr`. It skips only
+the standard Atlas DNS gate and changes no DNS record. Before commit, the
+transaction requires one public Cloudflare `308` over HTTP and one over HTTPS,
+with the exact path and query, for each alias. It then requires an exact `404`
+without a `Server` header for each alias sent directly to Atlas. The normal
+`.com` apex and redirect probes remain mandatory. Any failure restores the
+previous public-edge release.
+
 Open a producer PR, wait for `Validate VPS release`, merge it, then require the
 merged revision's producer workflow `VPS release` to succeed. That workflow
 publishes immutable OCI artifacts and attestations; it has no VPS credential
@@ -445,10 +455,12 @@ Canonical responses and the Parkventory redirect require HSTS. The
 The `.fr` Personal aliases use a separate Cloudflare contract:
 
 ```bash
-for host in pieper.fr www.pieper.fr nicolas.pieper.fr; do
-  curl --disable --silent --show-error --output /dev/null \
-    --dump-header - \
-    "https://${host}/__vps_redirect_probe__?source=cloudflare"
+for scheme in http https; do
+  for host in pieper.fr www.pieper.fr nicolas.pieper.fr; do
+    curl --disable --silent --show-error --output /dev/null \
+      --dump-header - \
+      "${scheme}://${host}/__vps_redirect_probe__?source=cloudflare"
+  done
 done
 ```
 
@@ -456,6 +468,22 @@ Each response must be `308` with an exact `Location` of
 `https://nicolaspieper.com/__vps_redirect_probe__?source=cloudflare`. Do not use
 `--resolve` with the Atlas address. Do not count this Cloudflare check as Atlas
 release evidence.
+
+After the Cloudflare checks pass and the reviewed controller revision is on
+`origin/main`, deploy the route retirement through the bounded operation:
+
+```bash
+make retire-pieper-redirects-public-edge \
+  ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
+```
+
+This command uses the `activate` route set but does not run the standard Atlas
+DNS cutover gate. Before the transaction commits, it repeats the HTTP and HTTPS
+Cloudflare checks with `source=cloudflare-retirement`, probes the retained
+`.com` hosts, and sends each retired `.fr` Host directly to the Atlas IPv4
+address. Every direct `.fr` request must return `404` without a `Server` header.
+Do not use the standard activation command for this one-time ownership
+transfer.
 
 ## Safe content rollback
 

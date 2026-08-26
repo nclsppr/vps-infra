@@ -23,7 +23,7 @@
             ['prepare', 'precutover', 'activate', 'stopped']
           - >-
             vps_public_static_edge_operation in
-            ['standard', 'retire-papersempire']
+            ['standard', 'retire-papersempire', 'retire-pieper-redirects']
           - >-
             vps_public_static_edge_operation == 'standard' or
             vps_public_static_edge_state == 'activate'

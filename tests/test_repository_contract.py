@@ -1718,6 +1718,12 @@ class SecurityBoundaryContractTests(unittest.TestCase):
 
     def test_public_static_edge_is_caddy_only_and_reversible(self) -> None:
         edge_root = ROOT / "platform/public-static-edge"
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("retire-pieper-redirects-public-edge:", makefile)
+        self.assertIn(
+            "./scripts/converge --retire-pieper-redirects-public-edge",
+            makefile,
+        )
         compose = yaml.safe_load((edge_root / "compose.yaml").read_text(encoding="utf-8"))
         self.assertEqual(compose["name"], "vps-public-static-edge")
         self.assertEqual(set(compose["services"]), {"caddy"})
@@ -1914,6 +1920,44 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 },
             ],
         )
+        cloudflare_redirects = edge_defaults[
+            "vps_public_static_edge_cloudflare_redirects"
+        ]
+        self.assertEqual(
+            cloudflare_redirects,
+            [
+                {"source": "pieper.fr", "target": "nicolaspieper.com"},
+                {"source": "www.pieper.fr", "target": "nicolaspieper.com"},
+                {
+                    "source": "nicolas.pieper.fr",
+                    "target": "nicolaspieper.com",
+                },
+            ],
+        )
+        self.assertTrue(
+            {redirect["source"] for redirect in cloudflare_redirects}.isdisjoint(
+                edge_defaults["vps_public_static_edge_domains"]
+            )
+        )
+        self.assertTrue(
+            {redirect["source"] for redirect in cloudflare_redirects}.isdisjoint(
+                {
+                    redirect["source"]
+                    for redirect in edge_defaults[
+                        "vps_public_static_edge_redirects"
+                    ]
+                }
+            )
+        )
+        self.assertTrue(
+            {redirect["source"] for redirect in cloudflare_redirects}.isdisjoint(
+                {
+                    name
+                    for zone in edge_defaults["vps_public_static_edge_dns_zones"]
+                    for name in zone["names"]
+                }
+            )
+        )
 
         playbook = yaml.safe_load(
             (ROOT / "ansible/playbooks/public-static-edge.yml").read_text(
@@ -1924,9 +1968,22 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             [entry["role"] for entry in playbook[0]["roles"]],
             ["public_static_edge", "surplasse_dns_cutover"],
         )
+        allowed_operations = (
+            "vps_public_static_edge_operation in "
+            "['standard', 'retire-papersempire', 'retire-pieper-redirects']"
+        )
+        self.assertIn(
+            allowed_operations,
+            playbook[0]["pre_tasks"][0]["ansible.builtin.assert"]["that"],
+        )
         role_text = (
             ROOT / "ansible/roles/public_static_edge/tasks/main.yml"
         ).read_text(encoding="utf-8")
+        role_tasks = yaml.safe_load(role_text)
+        self.assertIn(
+            allowed_operations,
+            role_tasks[0]["ansible.builtin.assert"]["that"],
+        )
         self.assertNotIn("/usr/local/libexec/vps/validate-compose", role_text)
         self.assertIn(
             '"{{ vps_public_static_edge_release_dir }}/validate-compose"',
@@ -2091,6 +2148,8 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         runtime_verification = (
             ROOT / "ansible/roles/public_static_edge/tasks/verify-runtime.yml"
         ).read_text(encoding="utf-8")
+        runtime_tasks = yaml.safe_load(runtime_verification)
+        runtime_tasks_by_name = {task["name"]: task for task in runtime_tasks}
         self.assertIn("NetworkSettings.Networks.keys()", runtime_verification)
         self.assertIn("vps_public_static_edge_network", runtime_verification)
         self.assertIn("inspect-bind-identities.yml", runtime_verification)
@@ -2161,15 +2220,137 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "vps_public_static_edge_operation == 'retire-papersempire'",
             runtime_verification,
         )
+        for scheme, task_name, register in (
+            (
+                "http",
+                "Validate originless Cloudflare HTTP redirects during "
+                "Personal alias retirement",
+                "vps_public_static_edge_cloudflare_http_redirect_probe",
+            ),
+            (
+                "https",
+                "Validate originless Cloudflare HTTPS redirects during "
+                "Personal alias retirement",
+                "vps_public_static_edge_cloudflare_https_redirect_probe",
+            ),
+        ):
+            cloudflare_probe = runtime_tasks_by_name[task_name]
+            cloudflare_request = cloudflare_probe["ansible.builtin.uri"]
+            self.assertEqual(
+                cloudflare_request["url"],
+                f"{scheme}://{{{{ item.source }}}}/__vps_redirect_probe__"
+                "?source=cloudflare-retirement",
+            )
+            self.assertEqual(cloudflare_request["follow_redirects"], "none")
+            self.assertEqual(cloudflare_request["status_code"], 308)
+            self.assertEqual(
+                cloudflare_request.get("validate_certs"),
+                True if scheme == "https" else None,
+            )
+            self.assertEqual(cloudflare_probe["register"], register)
+            self.assertEqual(
+                cloudflare_probe["loop"],
+                "{{ vps_public_static_edge_cloudflare_redirects }}",
+            )
+            self.assertEqual(
+                cloudflare_probe["when"],
+                "vps_public_static_edge_operation == 'retire-pieper-redirects'",
+            )
+            self.assertEqual(
+                cloudflare_probe["until"],
+                [
+                    f"{register}.status == 308",
+                    f"{register}.location == 'https://' ~ item.target ~ "
+                    "'/__vps_redirect_probe__?source=cloudflare-retirement'",
+                ],
+            )
+
+        retired_alias_probe = runtime_tasks_by_name[
+            "Refuse retired Personal aliases directly on Atlas"
+        ]
+        self.assertEqual(
+            retired_alias_probe["ansible.builtin.uri"],
+            {
+                "url": "http://{{ ansible_default_ipv4.address }}"
+                "/__vps_redirect_probe__?source=atlas-retirement",
+                "headers": {"Host": "{{ item.source }}"},
+                "follow_redirects": "none",
+                "status_code": 404,
+                "return_content": False,
+            },
+        )
+        self.assertEqual(
+            retired_alias_probe["loop"],
+            "{{ vps_public_static_edge_cloudflare_redirects }}",
+        )
+        self.assertEqual(
+            retired_alias_probe["when"],
+            "vps_public_static_edge_operation == 'retire-pieper-redirects'",
+        )
+        self.assertEqual(
+            retired_alias_probe["until"],
+            [
+                "vps_public_static_edge_retired_personal_alias_probe.status "
+                "== 404",
+                "vps_public_static_edge_retired_personal_alias_probe.server "
+                "is not defined",
+            ],
+        )
         self.assertNotIn(
             "vps_public_static_edge_retained_origin_probe.server",
             runtime_verification,
         )
-        self.assertEqual(
-            runtime_verification.count(
-                "vps_public_static_edge_operation == 'standard'"
+        retained_operation_condition = (
+            "vps_public_static_edge_operation in "
+            "['standard', 'retire-pieper-redirects']"
+        )
+        for task_name, expected_loop in (
+            (
+                "Probe one-hop HTTP redirects for active Atlas hosts",
+                "{{ vps_public_static_edge_direct_http_redirects }}",
             ),
-            2,
+            (
+                "Probe one-hop HTTPS redirects for active Atlas hosts",
+                "{{ vps_public_static_edge_redirects }}",
+            ),
+        ):
+            retained_probe = runtime_tasks_by_name[task_name]
+            self.assertEqual(retained_probe["loop"], expected_loop)
+            self.assertEqual(
+                retained_probe["when"],
+                [
+                    "vps_public_static_edge_state == 'activate'",
+                    retained_operation_condition,
+                ],
+            )
+
+        edge_transition = next(
+            task
+            for task in role_tasks
+            if task["name"]
+            == "Stage, switch, and verify the isolated public static edge"
+        )
+        transition_tasks = {
+            task["name"]: task for task in edge_transition["block"]
+        }
+        standard_dns_gate = [
+            "vps_public_static_edge_state == 'activate'",
+            "vps_public_static_edge_operation == 'standard'",
+        ]
+        for task_name in (
+            "Derive the exact Atlas IPv4 allowlist",
+            "Discover every authoritative DNS server before HTTPS activation",
+            "Require at least one authority for every public DNS zone",
+            "Verify the cutover at every authoritative DNS server",
+            "Wait for exact recursive A answers before HTTPS activation",
+            "Wait for empty recursive AAAA answers before HTTPS activation",
+        ):
+            self.assertEqual(transition_tasks[task_name]["when"], standard_dns_gate)
+        self.assertIn(
+            "vps_public_static_edge_operation == 'standard' else []",
+            transition_tasks[
+                "Verify the cutover at every authoritative DNS server"
+            ]["loop"],
         )
 
         authoritative_dns = (
@@ -4351,30 +4532,39 @@ fi
                     r"playbooks/public-static-edge\.yml$",
                 )
 
-            log.unlink()
-            retirement_result = subprocess.run(
-                [converge, "--retire-papersempire-public-edge"],
-                cwd=root,
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            self.assertEqual(
-                retirement_result.returncode,
-                0,
-                retirement_result.stderr,
-            )
-            retirement_execution = log.read_text(encoding="utf-8")
-            self.assertRegex(
-                retirement_execution,
-                rf"(?m)^arguments=.*vps_infra_revision={remote_sha} "
-                r"--extra-vars vps_public_static_edge_state=activate "
-                r"--extra-vars "
-                r"vps_public_static_edge_operation=retire-papersempire "
-                r"playbooks/public-static-edge\.yml$",
-            )
+            for mode, operation in (
+                (
+                    "--retire-papersempire-public-edge",
+                    "retire-papersempire",
+                ),
+                (
+                    "--retire-pieper-redirects-public-edge",
+                    "retire-pieper-redirects",
+                ),
+            ):
+                log.unlink()
+                retirement_result = subprocess.run(
+                    [converge, mode],
+                    cwd=root,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(
+                    retirement_result.returncode,
+                    0,
+                    retirement_result.stderr,
+                )
+                retirement_execution = log.read_text(encoding="utf-8")
+                self.assertRegex(
+                    retirement_execution,
+                    rf"(?m)^arguments=.*vps_infra_revision={remote_sha} "
+                    r"--extra-vars vps_public_static_edge_state=activate "
+                    rf"--extra-vars vps_public_static_edge_operation={operation} "
+                    r"playbooks/public-static-edge\.yml$",
+                )
 
             for mode, state in (
                 ("--start-internal-platform", "started"),

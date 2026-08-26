@@ -15,6 +15,12 @@ the active delivery set. The bounded
 hosts without changing DNS and refuses to commit unless direct origin probes
 prove the retained and retired host sets.
 
+The bounded `make retire-pieper-redirects-public-edge` operation removes the
+three Cloudflare-owned Personal `.fr` aliases from the active Atlas release. It
+changes no DNS record. It commits only after it validates the public HTTP and
+HTTPS one-hop Cloudflare redirects, refuses the three hosts directly on Atlas,
+and completes the retained `.com` probes.
+
 ## Déployer un site statique
 
 Pour livrer un changement de contenu sur Atlas, modifier le dépôt du site, pas
