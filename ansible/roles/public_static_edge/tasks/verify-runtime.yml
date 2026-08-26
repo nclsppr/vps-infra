@@ -224,6 +224,97 @@
   delegate_to: localhost
   when: vps_public_static_edge_operation == 'retire-pieper-redirects'
 
+- name: Validate public Personal HTTP redirect during alias retirement
+  ansible.builtin.uri:
+    url: >-
+      http://{{ item.source
+      }}/__vps_redirect_probe__?source=personal-retirement-public
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+  register: vps_public_static_edge_personal_public_http_redirect_probe
+  until:
+    - vps_public_static_edge_personal_public_http_redirect_probe.status == 308
+    - >-
+      vps_public_static_edge_personal_public_http_redirect_probe.location ==
+      'https://' ~ item.target ~
+      '/__vps_redirect_probe__?source=personal-retirement-public'
+    - >-
+      vps_public_static_edge_personal_public_http_redirect_probe.strict_transport_security
+      is not defined
+    - >-
+      vps_public_static_edge_personal_public_http_redirect_probe.x_content_type_options |
+      default('') == 'nosniff'
+  retries: 36
+  delay: 5
+  loop: "{{ vps_public_static_edge_direct_http_redirects }}"
+  loop_control:
+    label: "{{ item.source }}"
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_operation == 'retire-pieper-redirects'
+
+- name: Validate public Personal HTTPS redirect during alias retirement
+  ansible.builtin.uri:
+    url: >-
+      https://{{ item.source
+      }}/__vps_redirect_probe__?source=personal-retirement-public
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+    validate_certs: true
+  register: vps_public_static_edge_personal_public_https_redirect_probe
+  until:
+    - vps_public_static_edge_personal_public_https_redirect_probe.status == 308
+    - >-
+      vps_public_static_edge_personal_public_https_redirect_probe.location ==
+      'https://' ~ item.target ~
+      '/__vps_redirect_probe__?source=personal-retirement-public'
+    - >-
+      vps_public_static_edge_personal_public_https_redirect_probe.strict_transport_security
+      is not defined
+    - >-
+      vps_public_static_edge_personal_public_https_redirect_probe.x_content_type_options |
+      default('') == 'nosniff'
+  retries: 36
+  delay: 5
+  loop: "{{ vps_public_static_edge_direct_http_redirects }}"
+  loop_control:
+    label: "{{ item.source }}"
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_operation == 'retire-pieper-redirects'
+
+- name: Prove retained Personal hosts directly on Atlas during alias retirement
+  ansible.builtin.uri:
+    url: >-
+      http://{{ ansible_default_ipv4.address
+      }}/__vps_redirect_probe__?source=personal-retirement-atlas
+    headers:
+      Host: "{{ item.source }}"
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+  register: vps_public_static_edge_retained_personal_probe
+  until:
+    - vps_public_static_edge_retained_personal_probe.status == 308
+    - >-
+      vps_public_static_edge_retained_personal_probe.location ==
+      'https://' ~ item.target ~
+      '/__vps_redirect_probe__?source=personal-retirement-atlas'
+  retries: 6
+  delay: 5
+  loop:
+    - source: nicolaspieper.com
+      target: nicolaspieper.com
+    - source: www.nicolaspieper.com
+      target: nicolaspieper.com
+  loop_control:
+    label: "{{ item.source }}"
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_operation == 'retire-pieper-redirects'
+
 - name: Refuse retired Personal aliases directly on Atlas
   ansible.builtin.uri:
     url: >-
@@ -350,9 +441,7 @@
   delegate_to: localhost
   when:
     - vps_public_static_edge_state == 'activate'
-    - >-
-      vps_public_static_edge_operation in
-      ['standard', 'retire-pieper-redirects']
+    - vps_public_static_edge_operation == 'standard'
 
 - name: Probe one-hop HTTPS redirects for active Atlas hosts
   ansible.builtin.uri:
@@ -384,6 +473,4 @@
   delegate_to: localhost
   when:
     - vps_public_static_edge_state == 'activate'
-    - >-
-      vps_public_static_edge_operation in
-      ['standard', 'retire-pieper-redirects']
+    - vps_public_static_edge_operation == 'standard'

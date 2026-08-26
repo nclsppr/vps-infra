@@ -813,8 +813,12 @@ Use `make retire-pieper-redirects-public-edge` once the reviewed route removal
 is on `origin/main` and all three Cloudflare redirects pass. This bounded
 operation skips only the standard Atlas DNS gate. It changes no DNS record. It
 commits the new Caddy release only after the HTTP and HTTPS Cloudflare checks,
-retained `.com` probes, and direct Atlas `404` checks for all three retired
-hosts pass.
+the public HTTPS `nicolaspieper.com` apex check, dedicated public HTTP and HTTPS
+`www.nicolaspieper.com` redirects, direct Atlas checks for both retained
+Personal `.com` hosts, and direct Atlas `404` checks for all three retired
+hosts pass. Cloudflare may expose its own `Server` header on the dedicated
+public `.com` redirect checks; the exact `308`, path, query, and `Location`
+remain mandatory.
 
 This deployment does not waive or cancel the internal platform. PostgreSQL and
 Grafana are still required for Surplasse and Parkventory. They are admitted and

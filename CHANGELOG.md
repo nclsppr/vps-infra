@@ -12,6 +12,10 @@
 
 ### Fixed
 
+- Separate the Personal alias retirement probes from the standard public Atlas
+  redirect contract. The bounded operation now accepts Cloudflare's public
+  `Server` header while proving both retained Personal `.com` hosts directly
+  on Atlas with exact redirects.
 - Allow the public edge transaction controller to adopt the exact immutable
   `surplasse-static-v2` release name already active on Atlas.
 
@@ -20,7 +24,7 @@
 - Add a bounded `retire-pieper-redirects` public-edge operation. It skips only
   the standard Atlas DNS gate, requires the three public Cloudflare redirects
   over HTTP and HTTPS, refuses the retired hosts directly on Atlas, and retains
-  the `.com` probes.
+  the public and direct Atlas `.com` probes.
 - Prepare an inactive, fail-closed Parkventory public-launch application path.
 - Define the private PostgreSQL network, database, and separate owner,
   migrator, and runtime roles without `BYPASSRLS`.

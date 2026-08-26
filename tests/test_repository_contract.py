@@ -2265,6 +2265,96 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 ],
             )
 
+        for scheme, task_name, register in (
+            (
+                "http",
+                "Validate public Personal HTTP redirect during alias retirement",
+                "vps_public_static_edge_personal_public_http_redirect_probe",
+            ),
+            (
+                "https",
+                "Validate public Personal HTTPS redirect during alias retirement",
+                "vps_public_static_edge_personal_public_https_redirect_probe",
+            ),
+        ):
+            public_personal_probe = runtime_tasks_by_name[task_name]
+            public_personal_request = public_personal_probe["ansible.builtin.uri"]
+            self.assertEqual(
+                public_personal_request["url"],
+                f"{scheme}://{{{{ item.source }}}}/__vps_redirect_probe__"
+                "?source=personal-retirement-public",
+            )
+            self.assertEqual(public_personal_request["follow_redirects"], "none")
+            self.assertEqual(public_personal_request["status_code"], 308)
+            self.assertEqual(
+                public_personal_request.get("validate_certs"),
+                True if scheme == "https" else None,
+            )
+            self.assertEqual(public_personal_probe["register"], register)
+            self.assertEqual(
+                public_personal_probe["loop"],
+                "{{ vps_public_static_edge_direct_http_redirects }}",
+            )
+            self.assertEqual(
+                public_personal_probe["when"],
+                "vps_public_static_edge_operation == 'retire-pieper-redirects'",
+            )
+            self.assertEqual(
+                public_personal_probe["until"],
+                [
+                    f"{register}.status == 308",
+                    f"{register}.location == 'https://' ~ item.target ~ "
+                    "'/__vps_redirect_probe__?source=personal-retirement-public'",
+                    f"{register}.strict_transport_security is not defined",
+                    f"{register}.x_content_type_options | default('') == 'nosniff'",
+                ],
+            )
+            self.assertNotIn(
+                ".server",
+                " ".join(public_personal_probe["until"]),
+            )
+
+        retained_personal_probe = runtime_tasks_by_name[
+            "Prove retained Personal hosts directly on Atlas during alias retirement"
+        ]
+        self.assertEqual(
+            retained_personal_probe["ansible.builtin.uri"],
+            {
+                "url": "http://{{ ansible_default_ipv4.address }}"
+                "/__vps_redirect_probe__?source=personal-retirement-atlas",
+                "headers": {"Host": "{{ item.source }}"},
+                "follow_redirects": "none",
+                "status_code": 308,
+                "return_content": False,
+            },
+        )
+        self.assertEqual(
+            retained_personal_probe["loop"],
+            [
+                {
+                    "source": "nicolaspieper.com",
+                    "target": "nicolaspieper.com",
+                },
+                {
+                    "source": "www.nicolaspieper.com",
+                    "target": "nicolaspieper.com",
+                },
+            ],
+        )
+        self.assertEqual(
+            retained_personal_probe["when"],
+            "vps_public_static_edge_operation == 'retire-pieper-redirects'",
+        )
+        self.assertEqual(
+            retained_personal_probe["until"],
+            [
+                "vps_public_static_edge_retained_personal_probe.status == 308",
+                "vps_public_static_edge_retained_personal_probe.location == "
+                "'https://' ~ item.target ~ "
+                "'/__vps_redirect_probe__?source=personal-retirement-atlas'",
+            ],
+        )
+
         retired_alias_probe = runtime_tasks_by_name[
             "Refuse retired Personal aliases directly on Atlas"
         ]
@@ -2300,10 +2390,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "vps_public_static_edge_retained_origin_probe.server",
             runtime_verification,
         )
-        retained_operation_condition = (
-            "vps_public_static_edge_operation in "
-            "['standard', 'retire-pieper-redirects']"
-        )
         for task_name, expected_loop in (
             (
                 "Probe one-hop HTTP redirects for active Atlas hosts",
@@ -2320,7 +2406,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 retained_probe["when"],
                 [
                     "vps_public_static_edge_state == 'activate'",
-                    retained_operation_condition,
+                    "vps_public_static_edge_operation == 'standard'",
                 ],
             )
 

@@ -48,9 +48,12 @@ set without `pieper.fr`, `www.pieper.fr`, or `nicolas.pieper.fr`. It skips only
 the standard Atlas DNS gate and changes no DNS record. Before commit, the
 transaction requires one public Cloudflare `308` over HTTP and one over HTTPS,
 with the exact path and query, for each alias. It then requires an exact `404`
-without a `Server` header for each alias sent directly to Atlas. The normal
-`.com` apex and redirect probes remain mandatory. Any failure restores the
-previous public-edge release.
+without a `Server` header for each alias sent directly to Atlas. The public
+HTTPS `nicolaspieper.com` apex must remain `200`. Dedicated public HTTP and
+HTTPS checks require the exact `www.nicolaspieper.com` redirect while allowing
+Cloudflare's `Server` header. Separate direct Atlas HTTP checks require exact
+`308` redirects for both the apex and `www` Personal `.com` hosts. Any failure
+restores the previous public-edge release.
 
 Open a producer PR, wait for `Validate VPS release`, merge it, then require the
 merged revision's producer workflow `VPS release` to succeed. That workflow
@@ -479,11 +482,18 @@ make retire-pieper-redirects-public-edge \
 
 This command uses the `activate` route set but does not run the standard Atlas
 DNS cutover gate. Before the transaction commits, it repeats the HTTP and HTTPS
-Cloudflare checks with `source=cloudflare-retirement`, probes the retained
-`.com` hosts, and sends each retired `.fr` Host directly to the Atlas IPv4
-address. Every direct `.fr` request must return `404` without a `Server` header.
-Do not use the standard activation command for this one-time ownership
-transfer.
+Cloudflare checks with `source=cloudflare-retirement`, retains the public HTTPS
+apex `200`, and checks the public `www.nicolaspieper.com` redirect over HTTP and
+HTTPS with `source=personal-retirement-public`. These dedicated public redirect
+checks allow Cloudflare's `Server` header but still require an exact `308`, path,
+query, and `Location`.
+
+The same operation sends `nicolaspieper.com` and `www.nicolaspieper.com`
+directly to the Atlas IPv4 address over HTTP with
+`source=personal-retirement-atlas`; each must return an exact `308` to the
+expected HTTPS target. It also sends every retired `.fr` Host directly to Atlas;
+each must return `404` without a `Server` header. Do not use the standard
+activation command for this one-time ownership transfer.
 
 ## Safe content rollback
 

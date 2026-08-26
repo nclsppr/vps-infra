@@ -19,7 +19,8 @@ The bounded `make retire-pieper-redirects-public-edge` operation removes the
 three Cloudflare-owned Personal `.fr` aliases from the active Atlas release. It
 changes no DNS record. It commits only after it validates the public HTTP and
 HTTPS one-hop Cloudflare redirects, refuses the three hosts directly on Atlas,
-and completes the retained `.com` probes.
+and completes separate public and direct Atlas probes for the retained
+Personal `.com` hosts.
 
 ## Déployer un site statique
 
