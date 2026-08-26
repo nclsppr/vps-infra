@@ -353,7 +353,7 @@
       vps_public_static_edge_operation in
       ['standard', 'retire-personal']
 
-- name: Probe one-hop HTTPS redirects for active Atlas hosts
+- name: Probe one-hop HTTPS redirects for active direct hosts
   ansible.builtin.uri:
     url: "https://{{ item.source }}/__vps_redirect_probe__?source=atlas"
     follow_redirects: none
@@ -379,6 +379,29 @@
   delegate_to: localhost
   when:
     - vps_public_static_edge_state == 'activate'
+    - vps_public_static_edge_operation == 'standard'
+
+- name: Probe retained public HTTPS redirects during Personal retirement
+  ansible.builtin.uri:
+    url: >-
+      https://{{ item.source
+      }}/__vps_redirect_probe__?source=retained-retirement
+    follow_redirects: none
+    status_code: 308
+    return_content: false
+    validate_certs: true
+  register: vps_public_static_edge_retained_https_redirect_probe
+  until:
+    - vps_public_static_edge_retained_https_redirect_probe.status == 308
     - >-
-      vps_public_static_edge_operation in
-      ['standard', 'retire-personal']
+      vps_public_static_edge_retained_https_redirect_probe.location ==
+      'https://' ~ item.target ~
+      '/__vps_redirect_probe__?source=retained-retirement'
+  retries: 12
+  delay: 5
+  loop: "{{ vps_public_static_edge_redirects }}"
+  loop_control:
+    label: "{{ item.source }}"
+  become: false
+  delegate_to: localhost
+  when: vps_public_static_edge_operation == 'retire-personal'

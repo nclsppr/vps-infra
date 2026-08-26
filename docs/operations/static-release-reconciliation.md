@@ -46,7 +46,9 @@ stages the active HTTPS route set without any Personal hostname. It skips only
 the standard Atlas DNS gate and changes no DNS record. Before commit, the
 transaction requires the GitHub Pages apex, one public Cloudflare `308` over
 HTTP and one over HTTPS for every redirect hostname, and retained unrelated
-routes. It then requires an exact `404` without a `Server` header for all five
+routes. Retained public redirects may traverse Cloudflare, so this retirement
+checks their exact status and destination without treating the proxy's
+`Server` header as an origin failure. It then requires an exact `404` without a `Server` header for all five
 Personal hostnames sent directly to Atlas. Any failure restores the previous
 public-edge release.
 

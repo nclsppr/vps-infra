@@ -2273,29 +2273,57 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             "vps_public_static_edge_retained_origin_probe.server",
             runtime_verification,
         )
-        retained_operation_condition = (
-            "vps_public_static_edge_operation in "
-            "['standard', 'retire-personal']"
+        retained_http_probe = runtime_tasks_by_name[
+            "Probe one-hop HTTP redirects for active Atlas hosts"
+        ]
+        self.assertEqual(
+            retained_http_probe["loop"],
+            "{{ vps_public_static_edge_direct_http_redirects }}",
         )
-        for task_name, expected_loop in (
-            (
-                "Probe one-hop HTTP redirects for active Atlas hosts",
-                "{{ vps_public_static_edge_direct_http_redirects }}",
-            ),
-            (
-                "Probe one-hop HTTPS redirects for active Atlas hosts",
-                "{{ vps_public_static_edge_redirects }}",
-            ),
-        ):
-            retained_probe = runtime_tasks_by_name[task_name]
-            self.assertEqual(retained_probe["loop"], expected_loop)
-            self.assertEqual(
-                retained_probe["when"],
-                [
-                    "vps_public_static_edge_state == 'activate'",
-                    retained_operation_condition,
-                ],
-            )
+        self.assertEqual(
+            retained_http_probe["when"],
+            [
+                "vps_public_static_edge_state == 'activate'",
+                "vps_public_static_edge_operation in "
+                "['standard', 'retire-personal']",
+            ],
+        )
+        direct_https_probe = runtime_tasks_by_name[
+            "Probe one-hop HTTPS redirects for active direct hosts"
+        ]
+        self.assertEqual(
+            direct_https_probe["loop"],
+            "{{ vps_public_static_edge_redirects }}",
+        )
+        self.assertEqual(
+            direct_https_probe["when"],
+            [
+                "vps_public_static_edge_state == 'activate'",
+                "vps_public_static_edge_operation == 'standard'",
+            ],
+        )
+        retained_https_probe = runtime_tasks_by_name[
+            "Probe retained public HTTPS redirects during Personal retirement"
+        ]
+        self.assertEqual(
+            retained_https_probe["loop"],
+            "{{ vps_public_static_edge_redirects }}",
+        )
+        self.assertEqual(
+            retained_https_probe["when"],
+            "vps_public_static_edge_operation == 'retire-personal'",
+        )
+        self.assertEqual(
+            retained_https_probe["until"],
+            [
+                "vps_public_static_edge_retained_https_redirect_probe.status "
+                "== 308",
+                "vps_public_static_edge_retained_https_redirect_probe.location "
+                "== 'https://' ~ item.target ~ "
+                "'/__vps_redirect_probe__?source=retained-retirement'",
+            ],
+        )
+        self.assertNotIn("server", " ".join(retained_https_probe["until"]))
 
         edge_transition = next(
             task
