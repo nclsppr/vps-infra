@@ -327,7 +327,6 @@ class SurplassePublicEdgeControllerTests(unittest.TestCase):
             sorted(path.name for path in (release / "routes").iterdir()),
             [
                 "parkventory.caddy",
-                "personal.caddy",
                 "surplasse.caddy",
             ],
         )

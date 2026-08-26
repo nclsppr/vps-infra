@@ -150,11 +150,12 @@ The captured tables support rollback, but they do not replace a reusable API
 export of A, AAAA, CNAME, MX, SPF, DKIM, DMARC, CAA, wildcard, redirect, and TTL
 state.
 
-Cloudflare owns the current web redirect boundary for `pieper.fr`,
-`www.pieper.fr`, and `nicolas.pieper.fr`. Each name uses an originless
-Cloudflare `308` redirect to `https://nicolaspieper.com`. Do not point these
-names to Atlas. Do not add them to an Atlas Caddy route, certificate request,
-DNS activation gate, or static release probe. `www.nicolas.pieper.fr` remains
+GitHub Pages owns the current `nicolaspieper.com` web origin. Cloudflare owns
+the redirect boundary for `www.nicolaspieper.com`, `pieper.fr`,
+`www.pieper.fr`, and `nicolas.pieper.fr`. Each redirect name uses an originless
+Cloudflare `308` to `https://nicolaspieper.com`. Do not point these names to
+Atlas. Do not add them to an Atlas Caddy route, certificate request, DNS
+activation gate, or static release probe. `www.nicolas.pieper.fr` remains
 outside this redirect set.
 
 Preserve the zone delegation, DNSSEC, MX, TXT, DKIM, DMARC, CAA, and every

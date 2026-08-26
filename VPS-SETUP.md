@@ -239,6 +239,9 @@ platform/
 
 ### Personal
 
+- [x] move production delivery and the canonical domain to GitHub Pages;
+- [x] move the four redirect hostnames to originless Cloudflare `308` rules;
+- [x] disable static reconciliation and remove the public edge route;
 - [x] ajouter une CI de validation ;
 - [x] assembler `site/` par allowlist ;
 - [x] prouver qu’aucun fichier interne ou d’outillage n’est publié ;
@@ -402,7 +405,8 @@ remaining full-stack rehearsal on a disposable VPS or VM.
 - [x] run bootstrap and convergence;
 - [x] verify an idempotent second convergence;
 - [x] deploy the bounded public edge and private internal platform;
-- [x] deploy the three approved static sites;
+- [x] deploy the original three approved static sites;
+- [x] retire the Papers Empire and Personal routes after their provider cutovers;
 - [x] run an isolated restore rehearsal from a verified PostgreSQL backup;
 - [ ] déployer Surplasse ;
 - [x] keep dynamic Parkventory disabled because its gates are not all green;
@@ -414,17 +418,22 @@ remaining full-stack rehearsal on a disposable VPS or VM.
 
 ## Phase 7 — bascule de production
 
-- [x] keep `pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr` outside the
-      Atlas public edge. Cloudflare owns their originless, path-preserving and
-      query-preserving `308` redirects to `https://nicolaspieper.com`;
+- [x] keep `www.nicolaspieper.com`, `pieper.fr`, `www.pieper.fr`, and
+      `nicolas.pieper.fr` outside the Atlas public edge. Cloudflare owns their
+      originless, path-preserving and query-preserving `308` redirects to
+      `https://nicolaspieper.com`;
+- [x] serve `nicolaspieper.com` directly from GitHub Pages and remove every
+      Personal hostname from the Atlas public edge;
 - [x] deploy and probe the original three static releases before the DNS change;
 - [x] retire the Papers Empire route after its Cloudflare Workers cutover;
 - [x] probe the new host with forced IPv4 resolution;
 - [x] create a verified PostgreSQL backup and complete an isolated restore
       rehearsal;
-- [x] point the apex and `www` A records for `nicolaspieper.com`,
+- [x] point the original apex and `www` A records for `nicolaspieper.com`,
       `papersempire.com`, and `parkventory.com` to Atlas. Remove their previous
       AAAA records. Do not add an Atlas AAAA record before IPv6 edge proof;
+- [x] replace the `nicolaspieper.com` A and AAAA records with the GitHub Pages
+      addresses after the later provider cutover;
 - [x] exclude the three `.fr` names from Caddy routes, Atlas certificate and
       DNS gates, positive direct-Atlas redirect probes, and `deploy-static`
       live probes. Permit only the bounded direct-Atlas `404` absence proof;

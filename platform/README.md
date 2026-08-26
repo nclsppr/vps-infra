@@ -188,8 +188,9 @@ the raw artifact digest returned by GitHub before it publishes the result.
 ## Application state
 
 The generic production release manifest disables all four legacy application
-entries. The separate static production contract enables Personal, Papers
-Empire, and the temporary Parkventory demo through the isolated public edge.
+entries. The separate static production contract enables only the temporary
+Parkventory demo through the isolated public edge. Personal and Papers Empire
+remain disabled retirement evidence.
 The base shared-platform bundle still has no active application route, scrape
 target, or alert rule. Each candidate file has a `.disabled` suffix:
 

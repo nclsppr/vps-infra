@@ -53,7 +53,7 @@ MONFLORIAN_SUBNET = "172.30.40.0/24"
 MONFLORIAN_ADDRESS = "172.30.40.254"
 EDGE_NETWORK = "edge"
 ROUTE_SHA256 = "645931a03bd1c80ab5b3982d6a285e673906d68fb010adbd1756d43d8a0cd306"
-ROUTE_NAMES = ("parkventory.caddy", "personal.caddy")
+ROUTE_NAMES = ("parkventory.caddy",)
 BASE_FILES = (
     "Caddyfile",
     "compose.yaml",
