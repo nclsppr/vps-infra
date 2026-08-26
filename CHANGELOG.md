@@ -17,6 +17,10 @@
 
 ### Added
 
+- Add a bounded `retire-pieper-redirects` public-edge operation. It skips only
+  the standard Atlas DNS gate, requires the three public Cloudflare redirects
+  over HTTP and HTTPS, refuses the retired hosts directly on Atlas, and retains
+  the `.com` probes.
 - Prepare an inactive, fail-closed Parkventory public-launch application path.
 - Define the private PostgreSQL network, database, and separate owner,
   migrator, and runtime roles without `BYPASSRLS`.

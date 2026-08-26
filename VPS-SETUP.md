@@ -426,7 +426,8 @@ remaining full-stack rehearsal on a disposable VPS or VM.
       `papersempire.com`, and `parkventory.com` to Atlas. Remove their previous
       AAAA records. Do not add an Atlas AAAA record before IPv6 edge proof;
 - [x] exclude the three `.fr` names from Caddy routes, Atlas certificate and
-      DNS gates, direct-Atlas probes, and `deploy-static` live probes;
+      DNS gates, positive direct-Atlas redirect probes, and `deploy-static`
+      live probes. Permit only the bounded direct-Atlas `404` absence proof;
 - [x] verify the public Cloudflare `308` redirect contract with a path and a
       query, separately from Atlas release evidence;
 - [x] preserve and verify the existing mail records;

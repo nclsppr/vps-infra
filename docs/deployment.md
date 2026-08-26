@@ -798,14 +798,23 @@ Cloudflare owns the public web boundary for `pieper.fr`, `www.pieper.fr`, and
 `nicolas.pieper.fr`. Each name returns an originless, path-preserving and
 query-preserving `308` redirect to `https://nicolaspieper.com`. Do not add any
 of these names to the `prepare`, `precutover`, or `activate` Caddy routes. Do
-not request an Atlas certificate, add an Atlas DNS gate, or run a direct-Atlas
-probe for them.
+not request an Atlas certificate, add an Atlas DNS gate, or use Atlas as a
+positive redirect probe for them. The bounded retirement operation is the only
+exception: it sends negative HTTP Host probes directly to Atlas and requires
+`404` to prove that the routes are absent.
 
 Validate these redirects through the Cloudflare delivery procedure. Require a
 single `308` response and the exact canonical `Location` for a path with a
 query. This validation is separate from an Atlas static release. A failure of
 one of these `.fr` redirects does not authorize an Atlas Caddy route. Preserve
 mail and DNSSEC records during any separate zone operation.
+
+Use `make retire-pieper-redirects-public-edge` once the reviewed route removal
+is on `origin/main` and all three Cloudflare redirects pass. This bounded
+operation skips only the standard Atlas DNS gate. It changes no DNS record. It
+commits the new Caddy release only after the HTTP and HTTPS Cloudflare checks,
+retained `.com` probes, and direct Atlas `404` checks for all three retired
+hosts pass.
 
 This deployment does not waive or cancel the internal platform. PostgreSQL and
 Grafana are still required for Surplasse and Parkventory. They are admitted and
