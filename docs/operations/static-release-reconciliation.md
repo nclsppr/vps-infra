@@ -358,7 +358,9 @@ after strict live HTTPS probe`.
 These probes cover only the enabled Atlas profiles. Do not pass either Papers
 Empire domain to this helper: its retirement proof is the `disabled` resolver
 status and absent deploy job above, while its public checks belong to its
-Cloudflare delivery procedure.
+Cloudflare delivery procedure. Also do not pass `pieper.fr`, `www.pieper.fr`,
+or `nicolas.pieper.fr`. These names are originless Cloudflare redirects and are
+not Atlas static profile hosts.
 
 Run strict IPv4 HTTPS probes from outside Atlas. Obtain `atlas_ipv4` from the
 independently verified Atlas inventory or provider console, not from the DNS
@@ -423,43 +425,37 @@ check_static_host() {
 
 check_static_host nicolaspieper.com nicolaspieper.com 0 || failures=$((failures + 1))
 check_static_host www.nicolaspieper.com nicolaspieper.com 1 || failures=$((failures + 1))
-check_static_host pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
-check_static_host www.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
-check_static_host nicolas.pieper.fr nicolaspieper.com 1 || failures=$((failures + 1))
 check_static_host parkventory.com parkventory.com 0 || failures=$((failures + 1))
 check_static_host www.parkventory.com parkventory.com 1 || failures=$((failures + 1))
 test "$failures" -eq 0
 ```
 
-Each apex must return `200` with zero redirects and TLS verification result `0`.
-Each alias must follow exactly one HTTPS redirect to its canonical apex, return
-`200`, and have TLS verification result `0`. For the Personal aliases, the
-Ansible runtime probe also requires a direct `308` from HTTP and HTTPS for a path
-with a query. Both the DNS-routed and direct-Atlas probes must report the
-independently verified Atlas IPv4 as `remote_ip`.
+Each canonical host must return `200` with zero redirects and TLS verification
+result `0`. Each Atlas `www` alias must follow exactly one HTTPS redirect to its
+canonical host, return `200`, and have TLS verification result `0`. For
+`www.nicolaspieper.com`, the Ansible runtime probe also requires a direct `308`
+from HTTP and HTTPS for a path with a query. Both the DNS-routed and direct-Atlas
+probes must report the independently verified Atlas IPv4 as `remote_ip`.
 
-Canonical responses and the Parkventory redirect require HSTS. The four
-Personal redirects require HSTS to be absent while retaining
+Canonical responses and the Parkventory redirect require HSTS. The
+`www.nicolaspieper.com` redirect requires HSTS to be absent while retaining
 `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and
-`Permissions-Policy`, and they must not expose a `Server` header.
+`Permissions-Policy`. It must not expose a `Server` header.
 
-Before the `.fr` DNS change, the pre-cutover edge intentionally has no HTTPS
-site block for those pending aliases. Probe their path-preserving HTTP redirects
-directly on Atlas instead:
+The `.fr` Personal aliases use a separate Cloudflare contract:
 
 ```bash
 for host in pieper.fr www.pieper.fr nicolas.pieper.fr; do
   curl --disable --silent --show-error --output /dev/null \
     --dump-header - \
-    --header "Host: ${host}" \
-    "http://${atlas_ipv4}/__vps_redirect_probe__?source=operator-precutover"
+    "https://${host}/__vps_redirect_probe__?source=cloudflare"
 done
 ```
 
 Each response must be `308` with an exact `Location` of
-`https://nicolaspieper.com/__vps_redirect_probe__?source=operator-precutover`.
-Run the complete valid-TLS probe set above only after DNS activation and the
-bounded certificate issuance step.
+`https://nicolaspieper.com/__vps_redirect_probe__?source=cloudflare`. Do not use
+`--resolve` with the Atlas address. Do not count this Cloudflare check as Atlas
+release evidence.
 
 ## Safe content rollback
 

@@ -126,8 +126,8 @@ Pour chaque zone :
 - CAA ;
 - TTL actuels ;
 - délégation et serveurs autoritatifs ;
-- redirections historiques, notamment `pieper.fr`, `www.pieper.fr`,
-  `nicolas.pieper.fr` et `www.nicolas.pieper.fr` ;
+- configuration historique des redirections `.fr`, pour comparaison et
+  rollback uniquement ;
 - origine canonique exacte `https://papersempire.com`.
 - Parkventory apex origin `https://parkventory.com` and its `www` redirect.
 
@@ -150,23 +150,18 @@ The captured tables support rollback, but they do not replace a reusable API
 export of A, AAAA, CNAME, MX, SPF, DKIM, DMARC, CAA, wildcard, redirect, and TTL
 state.
 
-The `pieper.fr` web cutover changes only the A and AAAA records for the apex,
-`www`, and `nicolas` names. Each A answer must contain only the
-Atlas IPv4 address and each AAAA answer must be empty before HTTPS activation.
-Preserve the zone delegation, DNSSEC, MX, TXT, DKIM, DMARC, CAA, and every other
-record. Do not replace the apex with a CNAME and do not change mail records as
-part of the web cutover.
+Cloudflare owns the current web redirect boundary for `pieper.fr`,
+`www.pieper.fr`, and `nicolas.pieper.fr`. Each name uses an originless
+Cloudflare `308` redirect to `https://nicolaspieper.com`. Do not point these
+names to Atlas. Do not add them to an Atlas Caddy route, certificate request,
+DNS activation gate, or static release probe. `www.nicolas.pieper.fr` remains
+outside this redirect set.
 
-Treat TTL preparation as a separate web-only change. Lower the TTL for those
-three names without changing a target, confirm the lower value at every
-authoritative server, and then wait at least the previously published TTL before
-installing the pre-cutover edge state or changing A and AAAA answers. Keep both
-the previous targets and TTLs in the out-of-Git export. A rollback restores only
-those exact web records; it never synthesizes a new zone or rewrites protected
-mail and DNSSEC state. Before declaring success, compare the exact MX, TXT, NS,
-DS, and DNSKEY answers with that export and complete an iCloud send and receive
-test. The web edge emits no HSTS on these aliases, which keeps DNS rollback
-available during the propagation window.
+Preserve the zone delegation, DNSSEC, MX, TXT, DKIM, DMARC, CAA, and every
+unrelated record during a separate Cloudflare or DNS operation. Keep the
+previous web targets and TTL values in the out-of-Git export. A rollback must
+restore only the exact web records from that export. It must not synthesize a
+new zone or rewrite protected mail and DNSSEC state.
 
 ## Activation GitHub
 

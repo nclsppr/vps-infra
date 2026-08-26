@@ -11,7 +11,7 @@
 	}
 }
 
-{$PERSONAL_WWW_DOMAIN:www.nicolaspieper.com}, {$PERSONAL_LEGACY_DOMAIN:nicolas.pieper.fr} {
+{$PERSONAL_WWW_DOMAIN:www.nicolaspieper.com} {
 	import security_headers
 	redir https://{$PERSONAL_DOMAIN:nicolaspieper.com}{uri} 308
 }

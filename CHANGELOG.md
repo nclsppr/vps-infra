@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Move the `pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr` redirect
+  boundary out of Atlas. Originless Cloudflare `308` redirects now own these
+  names. Atlas retains `nicolaspieper.com` and `www.nicolaspieper.com`.
 - Stage the Mon Florian public route for source revision
   `4c5619f807c98c929becf7589886577c2bdf9a5b`.
 

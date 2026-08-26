@@ -1817,8 +1817,12 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("- www.papersempire.com", verify_runtime)
         self.assertNotIn("surplasse", route_text.lower())
         self.assertNotIn("grafana", route_text.lower())
-        self.assertIn("nicolas.pieper.fr", route_text)
-        self.assertNotIn("www.nicolas.pieper.fr", route_text)
+        for cloudflare_domain in (
+            "pieper.fr",
+            "www.pieper.fr",
+            "nicolas.pieper.fr",
+        ):
+            self.assertNotIn(cloudflare_domain, route_text)
         prepare_routes = "\n".join(
             path.read_text(encoding="utf-8")
             for path in sorted((edge_root / "routes-prepare").iterdir())
@@ -1834,9 +1838,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         for domain in (
             "nicolaspieper.com",
             "www.nicolaspieper.com",
-            "pieper.fr",
-            "www.pieper.fr",
-            "nicolas.pieper.fr",
             "parkventory.com",
             "www.parkventory.com",
         ):
@@ -1853,13 +1854,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         personal_activate_route = (
             edge_root / "routes-activate/personal.caddy"
         ).read_text(encoding="utf-8")
-        for domain in (
-            "www.nicolaspieper.com",
-            "pieper.fr",
-            "www.pieper.fr",
-            "nicolas.pieper.fr",
-        ):
-            self.assertIn(f"http://{domain}", personal_activate_route)
+        self.assertIn("http://www.nicolaspieper.com", personal_activate_route)
         self.assertIn(
             "redir https://nicolaspieper.com{uri} 308",
             personal_activate_route,
@@ -1892,13 +1887,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         }
         self.assertIn("nicolaspieper.com", precutover_site_labels)
         self.assertIn("www.nicolaspieper.com", precutover_site_labels)
-        for domain in (
-            "pieper.fr",
-            "www.pieper.fr",
-            "nicolas.pieper.fr",
-        ):
-            self.assertIn(f"http://{domain}", precutover_site_labels)
-            self.assertNotIn(domain, precutover_site_labels)
         self.assertEqual(
             personal_precutover_route.count("import redirect_security_headers"),
             2,
@@ -1924,9 +1912,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                     "source": "www.nicolaspieper.com",
                     "target": "nicolaspieper.com",
                 },
-                {"source": "pieper.fr", "target": "nicolaspieper.com"},
-                {"source": "www.pieper.fr", "target": "nicolaspieper.com"},
-                {"source": "nicolas.pieper.fr", "target": "nicolaspieper.com"},
             ],
         )
 
