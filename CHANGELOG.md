@@ -14,6 +14,9 @@
 
 ### Fixed
 
+- Accept Cloudflare-served Parkventory and Mon Florian redirects during the
+  bounded Personal retirement while still requiring their exact `308` status
+  and canonical destination. The standard direct-origin gate remains strict.
 - Allow the public edge transaction controller to adopt the exact immutable
   `surplasse-static-v2` release name already active on Atlas.
 
