@@ -47,9 +47,6 @@ vps_public_static_edge_route_sources:
 vps_public_static_edge_domains:
   - nicolaspieper.com
   - www.nicolaspieper.com
-  - pieper.fr
-  - www.pieper.fr
-  - nicolas.pieper.fr
   - parkventory.com
   - www.parkventory.com
   - monflorian.com
@@ -57,24 +54,12 @@ vps_public_static_edge_domains:
 vps_public_static_edge_redirects:
   - source: www.nicolaspieper.com
     target: nicolaspieper.com
-  - source: pieper.fr
-    target: nicolaspieper.com
-  - source: www.pieper.fr
-    target: nicolaspieper.com
-  - source: nicolas.pieper.fr
-    target: nicolaspieper.com
   - source: www.parkventory.com
     target: parkventory.com
   - source: www.monflorian.com
     target: monflorian.com
 vps_public_static_edge_direct_http_redirects:
   - source: www.nicolaspieper.com
-    target: nicolaspieper.com
-  - source: pieper.fr
-    target: nicolaspieper.com
-  - source: www.pieper.fr
-    target: nicolaspieper.com
-  - source: nicolas.pieper.fr
     target: nicolaspieper.com
 vps_public_static_edge_pre_cutover_https_redirects:
   - source: www.nicolaspieper.com
@@ -88,11 +73,6 @@ vps_public_static_edge_dns_zones:
     names:
       - nicolaspieper.com
       - www.nicolaspieper.com
-  - zone: pieper.fr
-    names:
-      - pieper.fr
-      - www.pieper.fr
-      - nicolas.pieper.fr
   - zone: parkventory.com
     names:
       - parkventory.com

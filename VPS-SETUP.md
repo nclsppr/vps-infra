@@ -414,16 +414,9 @@ remaining full-stack rehearsal on a disposable VPS or VM.
 
 ## Phase 7 — bascule de production
 
-- [ ] export the complete current `pieper.fr` zone and record the previous web
-      A, AAAA, and TTL values separately from the protected mail and DNSSEC
-      records;
-- [ ] lower only the TTL values of `pieper.fr`, `www.pieper.fr`, and
-      `nicolas.pieper.fr`, without changing their targets;
-- [ ] wait at least the previous web TTL after every authoritative server shows
-      the lower TTL, before changing the edge state or any web target;
-- [ ] activate and probe the `precutover` edge state: keep every established
-      HTTPS site valid and expose the three pending `.fr` aliases only as direct
-      Atlas HTTP `308` redirects;
+- [x] keep `pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr` outside the
+      Atlas public edge. Cloudflare owns their originless, path-preserving and
+      query-preserving `308` redirects to `https://nicolaspieper.com`;
 - [x] deploy and probe the original three static releases before the DNS change;
 - [x] retire the Papers Empire route after its Cloudflare Workers cutover;
 - [x] probe the new host with forced IPv4 resolution;
@@ -432,17 +425,10 @@ remaining full-stack rehearsal on a disposable VPS or VM.
 - [x] point the apex and `www` A records for `nicolaspieper.com`,
       `papersempire.com`, and `parkventory.com` to Atlas. Remove their previous
       AAAA records. Do not add an Atlas AAAA record before IPv6 edge proof;
-- [ ] point only the web A records for `pieper.fr`, `www.pieper.fr`, and
-      `nicolas.pieper.fr` to Atlas. Remove their previous AAAA records and
-      preserve the complete mail and DNSSEC state;
-- [ ] run the bounded HTTPS activation immediately after the exact DNS answers
-      are visible, and retain the `precutover` release plus the DNS export for
-      rollback;
-- [ ] verify that each `.fr` alias returns one path-preserving `308` to
-      `https://nicolaspieper.com` over both HTTP and valid HTTPS;
-- [ ] compare the exact pre/post-cutover MX, TXT, NS, DS, and DNSKEY answers for
-      `pieper.fr`, then complete one iCloud send and receive test without
-      changing the two pre-existing SPF records during this web-only cutover;
+- [x] exclude the three `.fr` names from Caddy routes, Atlas certificate and
+      DNS gates, direct-Atlas probes, and `deploy-static` live probes;
+- [x] verify the public Cloudflare `308` redirect contract with a path and a
+      query, separately from Atlas release evidence;
 - [x] preserve and verify the existing mail records;
 - [x] run external DNS, HTTP, HTTPS, certificate, redirect, and port probes;
 - [x] observe PostgreSQL, Prometheus targets, Grafana health, and container

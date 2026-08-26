@@ -66,34 +66,27 @@
          'activate': 'routes-activate'}
       - >-
         vps_public_static_edge_domains | sort ==
-        ['monflorian.com', 'nicolas.pieper.fr', 'nicolaspieper.com',
-         'parkventory.com', 'pieper.fr',
+        ['monflorian.com', 'nicolaspieper.com', 'parkventory.com',
          'www.monflorian.com', 'www.nicolaspieper.com',
-         'www.parkventory.com', 'www.pieper.fr']
+         'www.parkventory.com']
       - >-
         vps_public_static_edge_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
-         {'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'www.parkventory.com', 'target': 'parkventory.com'},
          {'source': 'www.monflorian.com', 'target': 'monflorian.com'}]
       - >-
         vps_public_static_edge_direct_http_redirects ==
-        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
-         {'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
-         {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'}]
+        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'}]
       - >-
         vps_public_static_edge_pre_cutover_https_redirects ==
         [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
          {'source': 'www.parkventory.com', 'target': 'parkventory.com'},
          {'source': 'www.monflorian.com', 'target': 'monflorian.com'}]
-      - vps_public_static_edge_dns_zones | length == 4
+      - vps_public_static_edge_dns_zones | length == 3
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='zone') | list | sort ==
-        ['monflorian.com', 'nicolaspieper.com', 'parkventory.com', 'pieper.fr']
+        ['monflorian.com', 'nicolaspieper.com', 'parkventory.com']
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='names') | flatten | list | sort ==

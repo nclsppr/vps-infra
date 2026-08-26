@@ -59,6 +59,10 @@ Le socle reste volontairement simple :
 
 Personal and the Parkventory demo are static releases served by the common
 Caddy service. Papers Empire is delivered separately by Cloudflare Workers.
+The `pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr` web names are
+originless Cloudflare `308` redirects to `https://nicolaspieper.com`. Atlas
+does not own their Caddy routes, certificates, DNS gates, or static release
+probes.
 The Parkventory backend stays disabled. Surplasse keeps its application images,
 but not its copy of Caddy, PostgreSQL,
 Prometheus, or Grafana. One physical PostgreSQL cluster is shared. Each project
@@ -143,6 +147,8 @@ controlled operator rollout recorded this live state:
 
 - the public static edge serves `nicolaspieper.com` and the static Parkventory
   demo over HTTPS; Papers Empire moved to Cloudflare Workers on 24 August 2026;
+- Cloudflare serves the three `.fr` Personal aliases as originless `308`
+  redirects. The Atlas public edge retains only the `.com` Personal names;
 - the apex and `www` DNS records for the two enabled static profiles point to
   Atlas by IPv4, with no public AAAA record;
 - PostgreSQL, Prometheus, Grafana, Node Exporter, and PostgreSQL Exporter run as

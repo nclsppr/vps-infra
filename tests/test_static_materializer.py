@@ -4676,7 +4676,7 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
     def test_live_redirect_contract_matches_the_public_edge(self) -> None:
         self.assertEqual(
             MATERIALIZER.PROFILES["personal"].redirect_domains,
-            ("www.nicolaspieper.com", "nicolas.pieper.fr"),
+            ("www.nicolaspieper.com",),
         )
         personal_live_redirects = MATERIALIZER.PROFILES["personal"].live_redirects
         self.assertEqual(
@@ -4684,15 +4684,6 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
             (
                 MATERIALIZER.RedirectContract(
                     "www.nicolaspieper.com",
-                    expected_hsts=False,
-                ),
-                MATERIALIZER.RedirectContract("pieper.fr", expected_hsts=False),
-                MATERIALIZER.RedirectContract(
-                    "www.pieper.fr",
-                    expected_hsts=False,
-                ),
-                MATERIALIZER.RedirectContract(
-                    "nicolas.pieper.fr",
                     expected_hsts=False,
                 ),
             ),
@@ -4745,6 +4736,7 @@ class StaticRepositoryIntegrationTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         for domain in MATERIALIZER.PROFILES["personal"].redirect_domains:
             self.assertIn(domain, integration_route)
+        self.assertNotIn("PERSONAL_LEGACY_DOMAIN", integration_route)
         self.assertNotIn("PERSONAL_LEGACY_APEX_DOMAIN", integration_route)
         self.assertNotIn("PERSONAL_LEGACY_WWW_DOMAIN", integration_route)
         self.assertNotIn("PERSONAL_LEGACY_NESTED_WWW_DOMAIN", integration_route)

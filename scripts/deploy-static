@@ -357,12 +357,9 @@ PROFILES = {
         source_ref="refs/heads/main",
         signer_workflow="nclsppr/personal/.github/workflows/vps-release.yml",
         canonical_domain="nicolaspieper.com",
-        redirect_domains=("www.nicolaspieper.com", "nicolas.pieper.fr"),
+        redirect_domains=("www.nicolaspieper.com",),
         live_redirects=(
             RedirectContract("www.nicolaspieper.com", expected_hsts=False),
-            RedirectContract("pieper.fr", expected_hsts=False),
-            RedirectContract("www.pieper.fr", expected_hsts=False),
-            RedirectContract("nicolas.pieper.fr", expected_hsts=False),
         ),
         site_repository="ghcr.io/nclsppr/personal/site",
         routes_repository="ghcr.io/nclsppr/personal/routes",
