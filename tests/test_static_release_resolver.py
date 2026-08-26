@@ -115,7 +115,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(
             [(application.enabled, application.mode) for application in contract.applications],
             [
-                (True, "static-site"),
+                (False, "static-site"),
                 (False, "static-site"),
                 (True, "temporary-static-demo"),
             ],
@@ -215,7 +215,7 @@ class ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             {application.name: application.enabled for application in contract.applications},
-            {"personal": True, "papersempire": False, "parkventory": True},
+            {"personal": False, "papersempire": False, "parkventory": True},
         )
 
 
@@ -223,7 +223,10 @@ class CheckRunTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.contract = RESOLVER.load_contract(ROOT / "releases/static-production.json")
-        cls.personal = cls.contract.applications[0]
+        cls.personal = RESOLVER.dataclasses.replace(
+            cls.contract.applications[0],
+            enabled=True,
+        )
         cls.park = cls.contract.applications[2]
 
     def resolution(self, application, runs, manifests=None):
@@ -367,16 +370,10 @@ class CheckRunTests(unittest.TestCase):
         self.assertIn("required-checks-not-successful", result.reason)
         self.assertEqual(manifest_calls, [])
 
-    def test_one_blocked_application_does_not_suppress_ready_applications(self):
+    def test_disabled_applications_do_not_suppress_ready_application(self):
         paper = self.contract.applications[1]
         client = FakeClient(
             [
-                api_response(
-                    [
-                        check_run("Publish immutable VPS artifacts"),
-                        check_run("build", conclusion="failure"),
-                    ]
-                ),
                 api_response(
                     [
                         check_run("Publish immutable VPS artifacts"),
@@ -398,7 +395,7 @@ class CheckRunTests(unittest.TestCase):
         )
         self.assertEqual(
             [(result.application, result.status) for result in results],
-            [("personal", "blocked"), (paper.name, "disabled"), ("parkventory", "ready")],
+            [("personal", "disabled"), (paper.name, "disabled"), ("parkventory", "ready")],
         )
 
     def test_head_change_during_resolution_never_yields_an_old_candidate(self):
@@ -451,7 +448,10 @@ class RegistryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.contract = RESOLVER.load_contract(ROOT / "releases/static-production.json")
-        cls.personal = cls.contract.applications[0]
+        cls.personal = RESOLVER.dataclasses.replace(
+            cls.contract.applications[0],
+            enabled=True,
+        )
 
     def test_registry_404_is_pending_and_produces_no_candidate(self):
         client = FakeClient(

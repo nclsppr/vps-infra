@@ -509,9 +509,10 @@ déploiement de code courant ne les transporte pas depuis GitHub Actions.
 
 ## Déployer un site statique
 
-Personal, Papers Empire, and the Parkventory demo publish complete archives as
-OCI artifacts in GHCR. The producer workflows use ORAS to publish and attest
-these artifacts.
+The Parkventory demo publishes complete archives as OCI artifacts in GHCR. Its
+producer workflow uses ORAS to publish and attest these artifacts. The retired
+Personal and Papers Empire profiles remain disabled contract history and do not
+enter the deployment matrix.
 The VPS materializer downloads the site, route, and integration manifests and
 payloads through HTTPS with transfer limits and digest references. The common
 contract defines media types, deterministic archives, source SHA annotations,
@@ -520,31 +521,11 @@ special files.
 
 ### Personal
 
-Le workflow construit un répertoire `site/` par allowlist. Il inclut seulement
-les pages HTML, erreurs, assets, favicons, manifest, robots, sitemap et fichiers
-publics voulus. Il exclut notamment :
-
-- `.git`, `.github` et `.claude` ;
-- `AGENTS.md`, `README.md` et `CHANGELOG.md` ;
-- `infos/` et toute source éditoriale interne ;
-- scripts de génération et fichiers temporaires.
-
-Before publication, the allowlist generates one inventory entry for every
-regular file. The producer workflow does not start an HTTP server. The VPS
-materializer probes each resulting file route through temporary Caddy.
-Host-based redirects are not file routes. The temporary probe verifies only the
-redirects carried by the exact platform integration pinned in
-`releases/static-production.json`; it must not assume routes from a newer
-checkout. The temporary and live Atlas probes verify only
-`www.nicolaspieper.com`. It must return one permanent redirect to
-`https://nicolaspieper.com` while it preserves the request path and query. The
-live probe requires the complete redirect security-header set without HSTS.
-Canonical Personal responses still require HSTS.
-
-The `pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr` web names are
-originless Cloudflare `308` redirects. Cloudflare owns their public redirect
-contract. They are not Personal route-artifact aliases, Atlas Caddy hosts,
-certificate names, DNS activation gates, or `deploy-static` live probes.
+Personal moved to GitHub Pages on 2026-08-26. Its static profile is disabled and
+its domains are absent from the public edge base. The producer repository no
+longer publishes VPS artifacts. GitHub Pages owns the canonical apex, while
+Cloudflare owns the originless `308` redirects for `www.nicolaspieper.com`,
+`pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr`.
 
 ### Papers Empire
 
@@ -781,7 +762,7 @@ make activate-public-static-edge \
 The activation refuses to start while an authoritative or recursive A answer
 differs from Atlas or while any AAAA answer remains. It atomically switches to
 the HTTPS routes, waits for certificate issuance, and requires strict HTTPS
-responses for all three apexes and all three `www` redirects. The bounded
+responses for the reviewed active apex and `www` redirect set. The bounded
 rollback is:
 
 ```bash
@@ -792,29 +773,31 @@ make stop-public-static-edge \
 Stopping the edge preserves all three static release trees and the ACME volumes.
 DNS rollback restores the exact records captured before the cutover.
 
-### Keep the `.fr` aliases on Cloudflare
+### Keep Personal on GitHub Pages and Cloudflare
 
-Cloudflare owns the public web boundary for `pieper.fr`, `www.pieper.fr`, and
-`nicolas.pieper.fr`. Each name returns an originless, path-preserving and
-query-preserving `308` redirect to `https://nicolaspieper.com`. Do not add any
-of these names to the `prepare`, `precutover`, or `activate` Caddy routes. Do
+GitHub Pages serves `nicolaspieper.com`. Cloudflare owns the public redirect
+boundary for `www.nicolaspieper.com`, `pieper.fr`, `www.pieper.fr`, and
+`nicolas.pieper.fr`. Each redirect name returns an originless, path-preserving
+and query-preserving `308` to `https://nicolaspieper.com`. Do not add any of
+these five names to the `prepare`, `precutover`, or `activate` Caddy routes. Do
 not request an Atlas certificate, add an Atlas DNS gate, or use Atlas as a
-positive redirect probe for them. The bounded retirement operation is the only
+positive probe for them. The bounded retirement operation is the only
 exception: it sends negative HTTP Host probes directly to Atlas and requires
 `404` to prove that the routes are absent.
 
 Validate these redirects through the Cloudflare delivery procedure. Require a
 single `308` response and the exact canonical `Location` for a path with a
-query. This validation is separate from an Atlas static release. A failure of
-one of these `.fr` redirects does not authorize an Atlas Caddy route. Preserve
-mail and DNSSEC records during any separate zone operation.
+query. Require `200` and a valid certificate from the GitHub Pages apex. This
+validation is separate from an Atlas static release. A redirect failure does
+not authorize an Atlas Caddy route. Preserve mail and DNSSEC records during any
+separate zone operation.
 
-Use `make retire-pieper-redirects-public-edge` once the reviewed route removal
-is on `origin/main` and all three Cloudflare redirects pass. This bounded
+Use `make retire-personal-public-edge` once the reviewed route removal is on
+`origin/main` and all four Cloudflare redirects pass. This bounded
 operation skips only the standard Atlas DNS gate. It changes no DNS record. It
 commits the new Caddy release only after the HTTP and HTTPS Cloudflare checks,
-retained `.com` probes, and direct Atlas `404` checks for all three retired
-hosts pass.
+the GitHub Pages apex probe, retained unrelated probes, and direct Atlas `404`
+checks for all five retired hosts pass.
 
 This deployment does not waive or cancel the internal platform. PostgreSQL and
 Grafana are still required for Surplasse and Parkventory. They are admitted and

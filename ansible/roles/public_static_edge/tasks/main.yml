@@ -7,7 +7,7 @@
         ['prepare', 'precutover', 'activate', 'stopped']
       - >-
         vps_public_static_edge_operation in
-        ['standard', 'retire-papersempire', 'retire-pieper-redirects']
+        ['standard', 'retire-papersempire', 'retire-personal']
       - >-
         vps_public_static_edge_operation == 'standard' or
         vps_public_static_edge_state == 'activate'
@@ -58,7 +58,7 @@
         ['Caddyfile', 'compose.yaml', 'expected-images.json', 'validate-compose']
       - >-
         vps_public_static_edge_routes | sort ==
-        ['monflorian.caddy', 'parkventory.caddy', 'personal.caddy']
+        ['monflorian.caddy', 'parkventory.caddy']
       - >-
         vps_public_static_edge_route_sources ==
         {'prepare': 'routes-prepare',
@@ -66,22 +66,24 @@
          'activate': 'routes-activate'}
       - >-
         vps_public_static_edge_domains | sort ==
-        ['monflorian.com', 'nicolaspieper.com', 'parkventory.com',
-         'www.monflorian.com', 'www.nicolaspieper.com',
+        ['monflorian.com', 'parkventory.com', 'www.monflorian.com',
          'www.parkventory.com']
       - >-
         vps_public_static_edge_redirects ==
-        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
-         {'source': 'www.parkventory.com', 'target': 'parkventory.com'},
+        [{'source': 'www.parkventory.com', 'target': 'parkventory.com'},
          {'source': 'www.monflorian.com', 'target': 'monflorian.com'}]
       - >-
-        vps_public_static_edge_direct_http_redirects ==
-        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'}]
+        vps_public_static_edge_direct_http_redirects == []
       - >-
         vps_public_static_edge_cloudflare_redirects ==
-        [{'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
+        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
+         {'source': 'pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'www.pieper.fr', 'target': 'nicolaspieper.com'},
          {'source': 'nicolas.pieper.fr', 'target': 'nicolaspieper.com'}]
+      - >-
+        vps_public_static_edge_retired_personal_hosts ==
+        ['nicolaspieper.com', 'www.nicolaspieper.com', 'pieper.fr',
+         'www.pieper.fr', 'nicolas.pieper.fr']
       - >-
         vps_public_static_edge_cloudflare_redirects |
         map(attribute='source') | list |
@@ -93,14 +95,13 @@
                   map(attribute='source') | list) | length == 0
       - >-
         vps_public_static_edge_pre_cutover_https_redirects ==
-        [{'source': 'www.nicolaspieper.com', 'target': 'nicolaspieper.com'},
-         {'source': 'www.parkventory.com', 'target': 'parkventory.com'},
+        [{'source': 'www.parkventory.com', 'target': 'parkventory.com'},
          {'source': 'www.monflorian.com', 'target': 'monflorian.com'}]
-      - vps_public_static_edge_dns_zones | length == 3
+      - vps_public_static_edge_dns_zones | length == 2
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='zone') | list | sort ==
-        ['monflorian.com', 'nicolaspieper.com', 'parkventory.com']
+        ['monflorian.com', 'parkventory.com']
       - >-
         vps_public_static_edge_dns_zones |
         map(attribute='names') | flatten | list | sort ==
@@ -366,51 +367,6 @@
             vps_public_static_edge_monflorian_network_state.Labels[
               'com.nclsppr.vps-infra.managed'] | default('') == 'true'
         fail_msg: app_monflorian differs from the managed host contract.
-
-    - name: Inspect active static release links
-      ansible.builtin.stat:
-        path: "/srv/www/{{ item }}/current"
-        follow: false
-      register: vps_public_static_edge_links
-      loop:
-        - personal
-
-    - name: Require protected relative static release links
-      ansible.builtin.assert:
-        that:
-          - item.stat.exists
-          - item.stat.islnk
-          - item.stat.uid == 0
-          - item.stat.gid == 0
-          - item.stat.lnk_target is match('^releases/sha256-[0-9a-f]{64}$')
-        fail_msg: >-
-          Each static site must have a root-owned digest release link before
-          the public edge can start.
-      loop: "{{ vps_public_static_edge_links.results }}"
-      loop_control:
-        label: "{{ item.item }}"
-
-    - name: Inspect resolved static release roots
-      ansible.builtin.stat:
-        path: "/srv/www/{{ item }}/current"
-        follow: true
-      register: vps_public_static_edge_roots
-      loop:
-        - personal
-
-    - name: Require protected static release directories
-      ansible.builtin.assert:
-        that:
-          - item.stat.exists
-          - item.stat.isdir
-          - item.stat.uid == 0
-          - item.stat.gid == 0
-          - not item.stat.wgrp
-          - not item.stat.woth
-        fail_msg: The resolved static release root is not protected.
-      loop: "{{ vps_public_static_edge_roots.results }}"
-      loop_control:
-        label: "{{ item.item }}"
 
     - name: Derive the exact Atlas IPv4 allowlist
       ansible.builtin.set_fact:
@@ -697,10 +653,10 @@
           - >-
             vps_public_static_edge_route_entries.files |
             map(attribute='path') | map('basename') | list | sort ==
-            ['monflorian.caddy', 'parkventory.caddy', 'personal.caddy']
+            ['monflorian.caddy', 'parkventory.caddy']
           - >-
             vps_public_static_edge_route_entries.files |
-            selectattr('isreg', 'equalto', true) | list | length == 3
+            selectattr('isreg', 'equalto', true) | list | length == 2
           - >-
             (vps_public_static_edge_provenance.results[0].content |
              b64decode | trim) == vps_infra_revision

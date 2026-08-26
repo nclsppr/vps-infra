@@ -39,47 +39,42 @@ vps_public_static_edge_files:
 vps_public_static_edge_routes:
   - monflorian.caddy
   - parkventory.caddy
-  - personal.caddy
 vps_public_static_edge_route_sources:
   prepare: routes-prepare
   precutover: routes-precutover
   activate: routes-activate
 vps_public_static_edge_domains:
-  - nicolaspieper.com
-  - www.nicolaspieper.com
   - parkventory.com
   - www.parkventory.com
   - monflorian.com
   - www.monflorian.com
 vps_public_static_edge_redirects:
-  - source: www.nicolaspieper.com
-    target: nicolaspieper.com
   - source: www.parkventory.com
     target: parkventory.com
   - source: www.monflorian.com
     target: monflorian.com
-vps_public_static_edge_direct_http_redirects:
+vps_public_static_edge_direct_http_redirects: []
+vps_public_static_edge_cloudflare_redirects:
   - source: www.nicolaspieper.com
     target: nicolaspieper.com
-vps_public_static_edge_cloudflare_redirects:
   - source: pieper.fr
     target: nicolaspieper.com
   - source: www.pieper.fr
     target: nicolaspieper.com
   - source: nicolas.pieper.fr
     target: nicolaspieper.com
+vps_public_static_edge_retired_personal_hosts:
+  - nicolaspieper.com
+  - www.nicolaspieper.com
+  - pieper.fr
+  - www.pieper.fr
+  - nicolas.pieper.fr
 vps_public_static_edge_pre_cutover_https_redirects:
-  - source: www.nicolaspieper.com
-    target: nicolaspieper.com
   - source: www.parkventory.com
     target: parkventory.com
   - source: www.monflorian.com
     target: monflorian.com
 vps_public_static_edge_dns_zones:
-  - zone: nicolaspieper.com
-    names:
-      - nicolaspieper.com
-      - www.nicolaspieper.com
   - zone: parkventory.com
     names:
       - parkventory.com

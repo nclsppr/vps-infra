@@ -1719,9 +1719,9 @@ class SecurityBoundaryContractTests(unittest.TestCase):
     def test_public_static_edge_is_caddy_only_and_reversible(self) -> None:
         edge_root = ROOT / "platform/public-static-edge"
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-        self.assertIn("retire-pieper-redirects-public-edge:", makefile)
+        self.assertIn("retire-personal-public-edge:", makefile)
         self.assertIn(
-            "./scripts/converge --retire-pieper-redirects-public-edge",
+            "./scripts/converge --retire-personal-public-edge",
             makefile,
         )
         compose = yaml.safe_load((edge_root / "compose.yaml").read_text(encoding="utf-8"))
@@ -1801,7 +1801,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 {path.name for path in (edge_root / route_directory).iterdir()},
                 {
                     "monflorian.caddy",
-                    "personal.caddy",
                     "parkventory.caddy",
                 },
             )
@@ -1810,7 +1809,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             for route_directory in route_directories
             for path in sorted((edge_root / route_directory).iterdir())
         )
-        self.assertIn("nicolaspieper.com", route_text)
         self.assertIn("parkventory.com", route_text)
         self.assertIn("monflorian.com", route_text)
         verify_runtime = (
@@ -1823,12 +1821,14 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn("- www.papersempire.com", verify_runtime)
         self.assertNotIn("surplasse", route_text.lower())
         self.assertNotIn("grafana", route_text.lower())
-        for cloudflare_domain in (
+        for retired_personal_domain in (
+            "nicolaspieper.com",
+            "www.nicolaspieper.com",
             "pieper.fr",
             "www.pieper.fr",
             "nicolas.pieper.fr",
         ):
-            self.assertNotIn(cloudflare_domain, route_text)
+            self.assertNotIn(retired_personal_domain, route_text)
         prepare_routes = "\n".join(
             path.read_text(encoding="utf-8")
             for path in sorted((edge_root / "routes-prepare").iterdir())
@@ -1842,28 +1842,16 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             for path in sorted((edge_root / "routes-precutover").iterdir())
         )
         for domain in (
-            "nicolaspieper.com",
-            "www.nicolaspieper.com",
             "parkventory.com",
             "www.parkventory.com",
         ):
             self.assertIn(f"http://{domain}", prepare_routes)
-        self.assertNotIn("http://nicolaspieper.com", activate_routes)
         self.assertNotIn("http://parkventory.com", activate_routes)
-        self.assertNotIn("http://nicolaspieper.com", precutover_routes)
         self.assertNotIn("http://parkventory.com", precutover_routes)
         self.assertNotIn("papersempire.com", route_text)
         self.assertEqual(
             (edge_root / "routes-precutover/parkventory.caddy").read_bytes(),
             (edge_root / "routes-activate/parkventory.caddy").read_bytes(),
-        )
-        personal_activate_route = (
-            edge_root / "routes-activate/personal.caddy"
-        ).read_text(encoding="utf-8")
-        self.assertIn("http://www.nicolaspieper.com", personal_activate_route)
-        self.assertIn(
-            "redir https://nicolaspieper.com{uri} 308",
-            personal_activate_route,
         )
         caddyfile = (edge_root / "Caddyfile").read_text(encoding="utf-8")
         self.assertIn("metrics /metrics", caddyfile)
@@ -1877,25 +1865,6 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertIn(
             'Referrer-Policy "strict-origin-when-cross-origin"',
             redirect_headers,
-        )
-        self.assertEqual(
-            personal_activate_route.count("import redirect_security_headers"),
-            2,
-        )
-        personal_precutover_route = (
-            edge_root / "routes-precutover/personal.caddy"
-        ).read_text(encoding="utf-8")
-        precutover_site_labels = {
-            label
-            for line in personal_precutover_route.splitlines()
-            if line and not line[0].isspace() and line.endswith(" {")
-            for label in line.removesuffix(" {").split(", ")
-        }
-        self.assertIn("nicolaspieper.com", precutover_site_labels)
-        self.assertIn("www.nicolaspieper.com", precutover_site_labels)
-        self.assertEqual(
-            personal_precutover_route.count("import redirect_security_headers"),
-            2,
         )
         edge_defaults = yaml.safe_load(
             (
@@ -1913,12 +1882,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertEqual(
             edge_defaults["vps_public_static_edge_direct_http_redirects"],
-            [
-                {
-                    "source": "www.nicolaspieper.com",
-                    "target": "nicolaspieper.com",
-                },
-            ],
+            [],
         )
         cloudflare_redirects = edge_defaults[
             "vps_public_static_edge_cloudflare_redirects"
@@ -1926,12 +1890,26 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         self.assertEqual(
             cloudflare_redirects,
             [
+                {
+                    "source": "www.nicolaspieper.com",
+                    "target": "nicolaspieper.com",
+                },
                 {"source": "pieper.fr", "target": "nicolaspieper.com"},
                 {"source": "www.pieper.fr", "target": "nicolaspieper.com"},
                 {
                     "source": "nicolas.pieper.fr",
                     "target": "nicolaspieper.com",
                 },
+            ],
+        )
+        self.assertEqual(
+            edge_defaults["vps_public_static_edge_retired_personal_hosts"],
+            [
+                "nicolaspieper.com",
+                "www.nicolaspieper.com",
+                "pieper.fr",
+                "www.pieper.fr",
+                "nicolas.pieper.fr",
             ],
         )
         self.assertTrue(
@@ -1970,7 +1948,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         allowed_operations = (
             "vps_public_static_edge_operation in "
-            "['standard', 'retire-papersempire', 'retire-pieper-redirects']"
+            "['standard', 'retire-papersempire', 'retire-personal']"
         )
         self.assertIn(
             allowed_operations,
@@ -1991,10 +1969,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         self.assertIn("Pull the exact verified Caddy image", role_text)
         self.assertIn("Validate Caddy with the staged production files", role_text)
-        self.assertIn(
-            "item.stat.lnk_target is match('^releases/sha256-[0-9a-f]{64}$')",
-            role_text,
-        )
+        self.assertNotIn("Inspect active static release links", role_text)
         self.assertNotIn(
             "item.stat.lnk_source is match('^releases/sha256-[0-9a-f]{64}$')",
             role_text,
@@ -2223,14 +2198,12 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         for scheme, task_name, register in (
             (
                 "http",
-                "Validate originless Cloudflare HTTP redirects during "
-                "Personal alias retirement",
+                "Validate originless HTTP redirects during Personal retirement",
                 "vps_public_static_edge_cloudflare_http_redirect_probe",
             ),
             (
                 "https",
-                "Validate originless Cloudflare HTTPS redirects during "
-                "Personal alias retirement",
+                "Validate originless HTTPS redirects during Personal retirement",
                 "vps_public_static_edge_cloudflare_https_redirect_probe",
             ),
         ):
@@ -2254,7 +2227,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 cloudflare_probe["when"],
-                "vps_public_static_edge_operation == 'retire-pieper-redirects'",
+                "vps_public_static_edge_operation == 'retire-personal'",
             )
             self.assertEqual(
                 cloudflare_probe["until"],
@@ -2265,34 +2238,34 @@ class SecurityBoundaryContractTests(unittest.TestCase):
                 ],
             )
 
-        retired_alias_probe = runtime_tasks_by_name[
-            "Refuse retired Personal aliases directly on Atlas"
+        retired_personal_probe = runtime_tasks_by_name[
+            "Refuse retired Personal hosts directly on Atlas"
         ]
         self.assertEqual(
-            retired_alias_probe["ansible.builtin.uri"],
+            retired_personal_probe["ansible.builtin.uri"],
             {
                 "url": "http://{{ ansible_default_ipv4.address }}"
                 "/__vps_redirect_probe__?source=atlas-retirement",
-                "headers": {"Host": "{{ item.source }}"},
+                "headers": {"Host": "{{ item }}"},
                 "follow_redirects": "none",
                 "status_code": 404,
                 "return_content": False,
             },
         )
         self.assertEqual(
-            retired_alias_probe["loop"],
-            "{{ vps_public_static_edge_cloudflare_redirects }}",
+            retired_personal_probe["loop"],
+            "{{ vps_public_static_edge_retired_personal_hosts }}",
         )
         self.assertEqual(
-            retired_alias_probe["when"],
-            "vps_public_static_edge_operation == 'retire-pieper-redirects'",
+            retired_personal_probe["when"],
+            "vps_public_static_edge_operation == 'retire-personal'",
         )
         self.assertEqual(
-            retired_alias_probe["until"],
+            retired_personal_probe["until"],
             [
-                "vps_public_static_edge_retired_personal_alias_probe.status "
+                "vps_public_static_edge_retired_personal_probe.status "
                 "== 404",
-                "vps_public_static_edge_retired_personal_alias_probe.server "
+                "vps_public_static_edge_retired_personal_probe.server "
                 "is not defined",
             ],
         )
@@ -2302,7 +2275,7 @@ class SecurityBoundaryContractTests(unittest.TestCase):
         )
         retained_operation_condition = (
             "vps_public_static_edge_operation in "
-            "['standard', 'retire-pieper-redirects']"
+            "['standard', 'retire-personal']"
         )
         for task_name, expected_loop in (
             (
@@ -4538,8 +4511,8 @@ fi
                     "retire-papersempire",
                 ),
                 (
-                    "--retire-pieper-redirects-public-edge",
-                    "retire-pieper-redirects",
+                    "--retire-personal-public-edge",
+                    "retire-personal",
                 ),
             ):
                 log.unlink()

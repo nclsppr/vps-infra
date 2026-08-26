@@ -6,11 +6,11 @@ This document describes both the proved static production boundary and the
 not-yet-activated target architecture for Compose applications. Dated facts
 remain historical evidence and must be verified again before an operation.
 
-The project states consolidated on 2026-08-18 are:
+The current project states are:
 
 | Project | Proved state | VPS consequence |
 |---|---|---|
-| `personal` | Immutable site and route artifacts from `163b9c9643dd9c54e9b1bb5d558d34a670e28e52` are active on Atlas. | Keep the allowlisted static producer and automatic reconciliation. |
+| `personal` | GitHub Pages serves the canonical site and Cloudflare owns its four canonical redirects. | Keep static promotion disabled and every Personal hostname out of the public edge route set. |
 | `papersempire` | Production moved to Cloudflare Workers on 2026-08-24. | Keep static promotion disabled and keep its domains out of the public edge route set. |
 | `parkventory` | The static demo from `db9571cc59d0fcc31c6554af259eda4c29988a6a` is active. Backend, frontend, integration, and application-release artifacts exist but are not active. | Keep the Compose application disabled until the explicit ownership handoff and all ADR-0010 blockers pass. |
 | `surplasse` | An immutable tester release and integration bundle exist. Canonical admission is enabled, but no Atlas application activation is proved. | Keep the legacy adapter locked and require every canonical secret, edge, migration, recovery, and public-probe check before activation. |
@@ -53,7 +53,6 @@ sinistre tant qu'aucune copie chiffrée hors d'Atlas n'existe.
 flowchart LR
     Internet --> Caddy["Caddy plateforme<br/>80 / 443"]
 
-    Caddy --> Personal["release personal<br/>fichiers statiques"]
     Caddy --> ParkStatic["Parkventory demo<br/>static release"]
     Caddy -. disabled .-> Surplasse["modules Surplasse<br/>Backend + frontends"]
     Caddy -. disabled .-> Parkventory["Parkventory React + Java<br/>Compose application"]
@@ -150,8 +149,8 @@ platform/caddy/
 ```
 
 The first live unit is `vps-public-static-edge`. It is a separate Compose
-project with exactly one Caddy service and three base route files. It mounts the
-verified `current` roots for Personal and the Parkventory demo read-only.
+project with exactly one Caddy service and two base route files. It retains the
+Parkventory demo route and no Personal route.
 It keeps separate ACME volumes and does not receive a DNS provider credential.
 It joins only the dedicated external `edge` bridge. It does not join the
 internal observability network `ops`.
@@ -216,8 +215,8 @@ Avant tout rechargement :
 
 ## Sites statiques sans runtime dupliqué
 
-Personal and the Parkventory demo are served directly by Caddy. The retained
-Papers Empire directory is inactive retirement residue, not a route:
+Only the Parkventory demo is served directly by Caddy. The retained Personal
+and Papers Empire directories are inactive retirement residue, not routes:
 
 ```text
 /srv/www/

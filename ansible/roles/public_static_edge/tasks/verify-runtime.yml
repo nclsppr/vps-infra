@@ -149,7 +149,6 @@
   retries: 6
   delay: 5
   loop:
-    - nicolaspieper.com
     - parkventory.com
   become: false
   delegate_to: localhost
@@ -175,7 +174,7 @@
   become: false
   delegate_to: localhost
 
-- name: Validate originless Cloudflare HTTP redirects during Personal alias retirement
+- name: Validate originless HTTP redirects during Personal retirement
   ansible.builtin.uri:
     url: >-
       http://{{ item.source
@@ -197,9 +196,9 @@
     label: "{{ item.source }}"
   become: false
   delegate_to: localhost
-  when: vps_public_static_edge_operation == 'retire-pieper-redirects'
+  when: vps_public_static_edge_operation == 'retire-personal'
 
-- name: Validate originless Cloudflare HTTPS redirects during Personal alias retirement
+- name: Validate originless HTTPS redirects during Personal retirement
   ansible.builtin.uri:
     url: >-
       https://{{ item.source
@@ -222,31 +221,31 @@
     label: "{{ item.source }}"
   become: false
   delegate_to: localhost
-  when: vps_public_static_edge_operation == 'retire-pieper-redirects'
+  when: vps_public_static_edge_operation == 'retire-personal'
 
-- name: Refuse retired Personal aliases directly on Atlas
+- name: Refuse retired Personal hosts directly on Atlas
   ansible.builtin.uri:
     url: >-
       http://{{ ansible_default_ipv4.address
       }}/__vps_redirect_probe__?source=atlas-retirement
     headers:
-      Host: "{{ item.source }}"
+      Host: "{{ item }}"
     follow_redirects: none
     status_code: 404
     return_content: false
-  register: vps_public_static_edge_retired_personal_alias_probe
+  register: vps_public_static_edge_retired_personal_probe
   until:
-    - vps_public_static_edge_retired_personal_alias_probe.status == 404
+    - vps_public_static_edge_retired_personal_probe.status == 404
     - >-
-      vps_public_static_edge_retired_personal_alias_probe.server is not defined
+      vps_public_static_edge_retired_personal_probe.server is not defined
   retries: 6
   delay: 5
-  loop: "{{ vps_public_static_edge_cloudflare_redirects }}"
+  loop: "{{ vps_public_static_edge_retired_personal_hosts }}"
   loop_control:
-    label: "{{ item.source }}"
+    label: "{{ item }}"
   become: false
   delegate_to: localhost
-  when: vps_public_static_edge_operation == 'retire-pieper-redirects'
+  when: vps_public_static_edge_operation == 'retire-personal'
 
 - name: Probe pending one-hop HTTP redirects directly on Atlas before DNS cutover
   ansible.builtin.uri:
@@ -352,7 +351,7 @@
     - vps_public_static_edge_state == 'activate'
     - >-
       vps_public_static_edge_operation in
-      ['standard', 'retire-pieper-redirects']
+      ['standard', 'retire-personal']
 
 - name: Probe one-hop HTTPS redirects for active Atlas hosts
   ansible.builtin.uri:
@@ -371,10 +370,6 @@
     - >-
       vps_public_static_edge_external_https_redirect_probe.x_content_type_options |
       default('') == 'nosniff'
-    - >-
-      item.target != 'nicolaspieper.com' or
-      vps_public_static_edge_external_https_redirect_probe.strict_transport_security
-      is not defined
   retries: 36
   delay: 5
   loop: "{{ vps_public_static_edge_redirects }}"
@@ -386,4 +381,4 @@
     - vps_public_static_edge_state == 'activate'
     - >-
       vps_public_static_edge_operation in
-      ['standard', 'retire-pieper-redirects']
+      ['standard', 'retire-personal']

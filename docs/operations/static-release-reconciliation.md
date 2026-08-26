@@ -6,7 +6,7 @@ This runbook operates the automatic releases for these static profiles:
 
 | Profile | Canonical branch | Mode | Promotion |
 |---|---|---|---|
-| `personal` | `main` | `static-site` | enabled |
+| `personal` | `main` | `static-site` | disabled; production moved to GitHub Pages |
 | `papersempire` | `main` | `static-site` | disabled; production moved to Cloudflare Workers |
 | `parkventory` | `main` | `temporary-static-demo` | enabled |
 
@@ -28,29 +28,27 @@ A normal content release starts in the producer repository:
 
 | Profile | Producer procedure | Merge branch |
 |---|---|---|
-| `personal` | [Comment déployer sur Atlas](https://github.com/nclsppr/personal#comment-déployer-sur-atlas) | `main` |
 | `parkventory` | [Parkventory runbook](https://github.com/nclsppr/parkventory/blob/main/RUNBOOK.md) | `main` |
 
-Papers Empire releases no longer use this workflow. Its disabled entry remains
-visible in resolver evidence and must not be re-enabled while Cloudflare owns
-`papersempire.com` and `www.papersempire.com`.
+Personal and Papers Empire releases no longer use this workflow. Their disabled
+entries remain visible in resolver evidence and must not be re-enabled while
+their current delivery providers own their domains.
 
 The one-time public-edge retirement uses
 `make retire-papersempire-public-edge`. It stages the active HTTPS route set
 without either Papers Empire host, skips the unrelated legacy direct-DNS
 cutover gate, and changes no DNS record. Before commit, the transaction forces
-origin probes that retain Personal and Parkventory and requires an exact `404`
+origin probes that retain Parkventory and requires an exact `404`
 without a `Server` header for both retired Papers Empire hosts.
 
-The one-time Personal alias retirement uses
-`make retire-pieper-redirects-public-edge`. It stages the active HTTPS route
-set without `pieper.fr`, `www.pieper.fr`, or `nicolas.pieper.fr`. It skips only
+The one-time Personal retirement uses `make retire-personal-public-edge`. It
+stages the active HTTPS route set without any Personal hostname. It skips only
 the standard Atlas DNS gate and changes no DNS record. Before commit, the
-transaction requires one public Cloudflare `308` over HTTP and one over HTTPS,
-with the exact path and query, for each alias. It then requires an exact `404`
-without a `Server` header for each alias sent directly to Atlas. The normal
-`.com` apex and redirect probes remain mandatory. Any failure restores the
-previous public-edge release.
+transaction requires the GitHub Pages apex, one public Cloudflare `308` over
+HTTP and one over HTTPS for every redirect hostname, and retained unrelated
+routes. It then requires an exact `404` without a `Server` header for all five
+Personal hostnames sent directly to Atlas. Any failure restores the previous
+public-edge release.
 
 Open a producer PR, wait for `Validate VPS release`, merge it, then require the
 merged revision's producer workflow `VPS release` to succeed. That workflow
@@ -236,12 +234,12 @@ skips SSH because the canonical HEAD changed immediately before the request.
 
 For a complete reconciliation, require all of these facts:
 
-1. the resolver summary reports `ready` for Personal and Parkventory and
-   `disabled` for Papers Empire;
-2. the run contains `Deploy personal` and `Deploy parkventory`, with no
+1. the resolver summary reports `ready` for Parkventory and `disabled` for
+   Personal and Papers Empire;
+2. the run contains `Deploy parkventory`, with no `Deploy personal` or
    `Deploy papersempire` job;
-3. `Request the exact static deployment` completed successfully in both jobs;
-4. `Report disabled static deployment` was skipped in both jobs;
+3. `Request the exact static deployment` completed successfully in that job;
+4. `Report disabled static deployment` was skipped in that job;
 5. the logs contain no canonical-HEAD skip, disabled warning, refusal, or
    activation failure;
 6. Atlas state and public probes match the selected immutable tuples.
@@ -433,30 +431,23 @@ check_static_host() {
   done
 }
 
-check_static_host nicolaspieper.com nicolaspieper.com 0 || failures=$((failures + 1))
-check_static_host www.nicolaspieper.com nicolaspieper.com 1 || failures=$((failures + 1))
 check_static_host parkventory.com parkventory.com 0 || failures=$((failures + 1))
 check_static_host www.parkventory.com parkventory.com 1 || failures=$((failures + 1))
 test "$failures" -eq 0
 ```
 
-Each canonical host must return `200` with zero redirects and TLS verification
-result `0`. Each Atlas `www` alias must follow exactly one HTTPS redirect to its
-canonical host, return `200`, and have TLS verification result `0`. For
-`www.nicolaspieper.com`, the Ansible runtime probe also requires a direct `308`
-from HTTP and HTTPS for a path with a query. Both the DNS-routed and direct-Atlas
-probes must report the independently verified Atlas IPv4 as `remote_ip`.
+Each active canonical host must return `200` with zero redirects and TLS
+verification result `0`. Each active Atlas `www` alias must follow exactly one
+HTTPS redirect to its canonical host, return `200`, and have TLS verification
+result `0`. The probes must report the independently verified Atlas IPv4 as
+`remote_ip`.
 
-Canonical responses and the Parkventory redirect require HSTS. The
-`www.nicolaspieper.com` redirect requires HSTS to be absent while retaining
-`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and
-`Permissions-Policy`. It must not expose a `Server` header.
-
-The `.fr` Personal aliases use a separate Cloudflare contract:
+Personal uses a separate GitHub Pages and Cloudflare contract. The apex must
+return `200` with a valid certificate. The redirect hosts use this check:
 
 ```bash
 for scheme in http https; do
-  for host in pieper.fr www.pieper.fr nicolas.pieper.fr; do
+  for host in www.nicolaspieper.com pieper.fr www.pieper.fr nicolas.pieper.fr; do
     curl --disable --silent --show-error --output /dev/null \
       --dump-header - \
       "${scheme}://${host}/__vps_redirect_probe__?source=cloudflare"
@@ -473,17 +464,17 @@ After the Cloudflare checks pass and the reviewed controller revision is on
 `origin/main`, deploy the route retirement through the bounded operation:
 
 ```bash
-make retire-pieper-redirects-public-edge \
+make retire-personal-public-edge \
   ANSIBLE_EXTRA_VARS=/absolute/path/to/bootstrap-public.yml
 ```
 
 This command uses the `activate` route set but does not run the standard Atlas
 DNS cutover gate. Before the transaction commits, it repeats the HTTP and HTTPS
-Cloudflare checks with `source=cloudflare-retirement`, probes the retained
-`.com` hosts, and sends each retired `.fr` Host directly to the Atlas IPv4
-address. Every direct `.fr` request must return `404` without a `Server` header.
-Do not use the standard activation command for this one-time ownership
-transfer.
+Cloudflare checks with `source=cloudflare-retirement`, probes the GitHub Pages
+apex and retained unrelated hosts, and sends all five retired Personal Host
+values directly to the Atlas IPv4 address. Every direct request must return
+`404` without a `Server` header. Do not use the standard activation command for
+this one-time ownership transfer.
 
 ## Safe content rollback
 

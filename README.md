@@ -3,10 +3,16 @@
 Source de vérité publique pour reconstruire et exploiter un VPS OVHcloud
 hébergeant :
 
-- `personal` (`nicolaspieper.com`) ;
 - `surplasse` et ses frontends ;
 - the static Parkventory demo (`parkventory.com`), separate from its disabled
   backend application.
+
+Personal moved to GitHub Pages on 26 August 2026. Its static promotion entry
+stays disabled as retirement evidence and is no longer part of the active
+delivery set. The bounded `make retire-personal-public-edge` operation removes
+its five residual Caddy hosts without changing DNS. It commits only after
+public GitHub Pages and Cloudflare probes succeed, retained hosts stay healthy,
+and direct origin probes refuse every retired Personal hostname.
 
 Papers Empire moved to Cloudflare Workers on 24 August 2026. Its static
 promotion entry stays disabled as retirement evidence and is no longer part of
@@ -15,20 +21,13 @@ the active delivery set. The bounded
 hosts without changing DNS and refuses to commit unless direct origin probes
 prove the retained and retired host sets.
 
-The bounded `make retire-pieper-redirects-public-edge` operation removes the
-three Cloudflare-owned Personal `.fr` aliases from the active Atlas release. It
-changes no DNS record. It commits only after it validates the public HTTP and
-HTTPS one-hop Cloudflare redirects, refuses the three hosts directly on Atlas,
-and completes the retained `.com` probes.
-
 ## Déployer un site statique
 
 Pour livrer un changement de contenu sur Atlas, modifier le dépôt du site, pas
 `vps-infra` :
 
 1. ouvrir une PR vers `main` pour
-   [Personal](https://github.com/nclsppr/personal#comment-déployer-sur-atlas),
-   ou [Parkventory](https://github.com/nclsppr/parkventory) ;
+   [Parkventory](https://github.com/nclsppr/parkventory) ;
 2. attendre le check PR `Validate VPS release`, puis fusionner ;
 3. vérifier que le workflow producteur `VPS release` du SHA fusionné publie les
    artefacts immuables avec succès ;
@@ -63,12 +62,12 @@ Le socle reste volontairement simple :
 6. le VPS tire uniquement un commit `vps-infra` autorisé et des digests déjà
    validés. Il ne compile jamais les dépôts applicatifs.
 
-Personal and the Parkventory demo are static releases served by the common
-Caddy service. Papers Empire is delivered separately by Cloudflare Workers.
-The `pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr` web names are
-originless Cloudflare `308` redirects to `https://nicolaspieper.com`. Atlas
-does not own their Caddy routes, certificates, DNS gates, or static release
-probes.
+The Parkventory demo is the only static release served by the common Caddy
+service. Papers Empire is delivered separately by Cloudflare Workers. Personal
+is delivered separately by GitHub Pages. The `www.nicolaspieper.com`,
+`pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr` web names are originless
+Cloudflare `308` redirects to `https://nicolaspieper.com`. Atlas does not own
+their Caddy routes, certificates, DNS gates, or static release probes.
 The Parkventory backend stays disabled. Surplasse keeps its application images,
 but not its copy of Caddy, PostgreSQL,
 Prometheus, or Grafana. One physical PostgreSQL cluster is shared. Each project
@@ -88,7 +87,7 @@ Le premier socle exécutable est livré :
 - Compose plateforme durci et images amont épinglées par digest ;
 - Caddy with a generated, checksum-locked Go graph and the OVH DNS provider;
 - GitHub CLI 2.97.0 with archive and executable checksums, plus a fail-closed
-  static OCI materializer for Personal and the Parkventory demo;
+  static OCI materializer for the Parkventory demo;
 - Codex CLI 0.147.0 from the standalone OpenAI package, with an isolated
   runtime account, managed permissions, and a private persistent App Server
   Unix socket for an optional bounded SSH gateway or outbound mobile control;
@@ -104,8 +103,8 @@ Le premier socle exécutable est livré :
 - deterministic platform integration publication from an exact runtime
   allowlist. The workflow verifies the manifest and both GHCR layer payloads
   before it creates and verifies GitHub provenance.
-- a fail-closed static release reconciler for Personal and Parkventory. It
-  keeps the retired Papers Empire profile disabled, selects only the canonical branch HEAD after every observed
+- a fail-closed static release reconciler for the Parkventory demo. It keeps
+  the retired Personal and Papers Empire profiles disabled, selects only the canonical branch HEAD after every observed
   check is complete and non-failing and every configured required check is a
   success, resolves the coherent site and route tags to
   digests, and uses one bounded Atlas command. The dedicated
@@ -151,12 +150,12 @@ The Atlas host is provisioned from this repository. It passed bootstrap,
 repeated convergence, a bounded predictive check, and a complete reboot. The
 controlled operator rollout recorded this live state:
 
-- the public static edge serves `nicolaspieper.com` and the static Parkventory
-  demo over HTTPS; Papers Empire moved to Cloudflare Workers on 24 August 2026;
-- Cloudflare serves the three `.fr` Personal aliases as originless `308`
-  redirects. The Atlas public edge retains only the `.com` Personal names;
-- the apex and `www` DNS records for the two enabled static profiles point to
-  Atlas by IPv4, with no public AAAA record;
+- the public static edge serves the static Parkventory demo over HTTPS;
+- Personal is served by GitHub Pages. Cloudflare owns its four originless
+  canonical redirects, and the Atlas public edge owns no Personal hostname;
+- Papers Empire is served by Cloudflare Workers;
+- the apex and `www` DNS records for the remaining enabled static profile point
+  to Atlas by IPv4, with no public AAAA record;
 - PostgreSQL, Prometheus, Grafana, Node Exporter, and PostgreSQL Exporter run as
   the private internal platform;
 - only SSH, HTTP, and HTTPS use public host ports. Grafana binds to loopback.
@@ -165,7 +164,7 @@ controlled operator rollout recorded this live state:
 - `atlas-codex-app-server.service` is active and running as the isolated `codex`
   account on its managed private Unix socket, with no public listener.
 
-On 2026-08-18, central reconciliation run
+As historical evidence, the 2026-08-18 central reconciliation run
 [`32086151183`](https://github.com/nclsppr/vps-infra/actions/runs/32086151183)
 contained the resolver and all three successful deploy jobs after the final
 controller convergence. Atlas reported the exact immutable tuples for Personal
@@ -174,11 +173,11 @@ controller convergence. Atlas reported the exact immutable tuples for Personal
 (`db9571cc59d0fcc31c6554af259eda4c29988a6a`) as active and healthy. The
 complete site and route digests, controller boundary, and TLS probes are in the
 [rollout evidence](docs/evidence/2026-08-18-static-reconciliation-rollout.md).
-Use the
+Those Personal and Papers Empire tuples are no longer active. Use the
 [static reconciliation runbook](docs/operations/static-release-reconciliation.md)
 for enablement, suspension, run inspection, rollback, recovery, and key
-rotation. A green workflow conclusion alone is not proof that all three
-profiles were `ready`.
+rotation. A green workflow conclusion alone is not proof that every enabled
+profile was `ready`.
 
 This bounded rollout did not enable the legacy dynamic release manifest or
 invoke the Compose application controller. `releases/production.yaml` still

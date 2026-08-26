@@ -4,9 +4,11 @@
 
 ### Changed
 
-- Move the `pieper.fr`, `www.pieper.fr`, and `nicolas.pieper.fr` redirect
-  boundary out of Atlas. Originless Cloudflare `308` redirects now own these
-  names. Atlas retains `nicolaspieper.com` and `www.nicolaspieper.com`.
+- Move Personal delivery out of Atlas. GitHub Pages serves
+  `nicolaspieper.com`. Originless Cloudflare `308` redirects own
+  `www.nicolaspieper.com`, `pieper.fr`, `www.pieper.fr`, and
+  `nicolas.pieper.fr`. Disable static reconciliation and remove all five names
+  from the active Caddy route contract.
 - Stage the Mon Florian public route for source revision
   `4c5619f807c98c929becf7589886577c2bdf9a5b`.
 
@@ -17,10 +19,10 @@
 
 ### Added
 
-- Add a bounded `retire-pieper-redirects` public-edge operation. It skips only
-  the standard Atlas DNS gate, requires the three public Cloudflare redirects
-  over HTTP and HTTPS, refuses the retired hosts directly on Atlas, and retains
-  the `.com` probes.
+- Add a bounded `retire-personal` public-edge operation. It skips only the
+  standard Atlas DNS gate, requires the public GitHub Pages and Cloudflare
+  contracts, refuses all five retired hosts directly on Atlas, and retains the
+  unrelated public routes.
 - Prepare an inactive, fail-closed Parkventory public-launch application path.
 - Define the private PostgreSQL network, database, and separate owner,
   migrator, and runtime roles without `BYPASSRLS`.

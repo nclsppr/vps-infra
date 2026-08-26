@@ -177,9 +177,9 @@ required because Atlas uses `sudo-rs`, whose sudoers implementation does not
 support argument regular expressions.
 
 `releases/static-production.json` independently controls whether each static
-profile may enter that boundary. It records `static-site` for Personal and
-Papers Empire and `temporary-static-demo` for Parkventory. The resolver omits a
-disabled entry, and the root materializer re-reads both the protected static
+profile may enter that boundary. It records disabled `static-site` profiles for
+Personal and Papers Empire and a `temporary-static-demo` profile for
+Parkventory. The resolver omits a disabled entry, and the root materializer re-reads both the protected static
 contract, `releases/production.yaml`, and the protected active dynamic manifest.
 It refuses an application that is disabled statically, enabled simultaneously
 as a Compose application, or still present in active Compose state. The future
@@ -213,8 +213,8 @@ Before it downloads a payload layer, the materializer verifies GitHub artifact
 attestations for the site manifest, route manifest, and integration manifest.
 Each verification binds the subject to its exact repository, full source
 revision, canonical source ref, and signer workflow. It rejects a self-hosted
-runner as the signer. The Personal and Papers Empire source refs are
-`refs/heads/main`. The integration source ref is
+runner as the signer. The retained disabled Personal and Papers Empire profile
+contracts use `refs/heads/main`. The integration source ref is
 `refs/heads/main` in `nclsppr/vps-infra`.
 
 A network-enabled systemd `DynamicUser` execution downloads the bounded
